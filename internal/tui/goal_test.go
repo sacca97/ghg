@@ -13,29 +13,21 @@ import (
 
 	"github.com/sacca97/ghg/internal/agent"
 	"github.com/sacca97/ghg/internal/config"
+	goalstate "github.com/sacca97/ghg/internal/goal"
 	"github.com/sacca97/ghg/internal/llm"
 )
 
 func TestGoalHelpers(t *testing.T) {
 	p := goalContinuePrompt("ship the feature")
-	if !strings.Contains(p, "ship the feature") || !strings.Contains(p, goalMetToken) {
+	if !strings.Contains(p, "ship the feature") || !strings.Contains(p, "update_goal") {
 		t.Fatalf("prompt: %q", p)
 	}
-	// stopping requires the explicit leading token
-	if !goalMet("GOAL_MET — everything verified") {
-		t.Fatal("leading token must count as met")
+	record := goalstate.New("ship the feature")
+	if err := (goalstate.Update{GoalID: record.ID, Status: goalstate.StatusComplete, Progress: "verified"}).Validate(record.ID); err != nil {
+		t.Fatalf("complete update should validate: %v", err)
 	}
-	if !goalMet("\n  GOAL_MET done") {
-		t.Fatal("leading whitespace tolerated")
-	}
-	for _, s := range []string{
-		"I am making progress toward GOAL_MET soon", // mentioned, not leading
-		"almost done",
-		"",
-	} {
-		if goalMet(s) {
-			t.Fatalf("%q must not count as met", s)
-		}
+	if err := (goalstate.Update{GoalID: record.ID, Status: goalstate.StatusComplete}).Validate(record.ID); err == nil {
+		t.Fatal("completion without verification should fail")
 	}
 }
 

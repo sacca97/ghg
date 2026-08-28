@@ -38,7 +38,8 @@ ghg auth <profile> <key>
 ```
 
 Then `ghg` and you're in. First things to try: `/context-doctor` (audit
-what a fresh session injects, in tokens), `/goal <text>` (work until done),
+what a fresh session injects, in tokens), `/goal <text>` (work until a structured
+goal update completes it),
 drop a `.mcp.json` in the repo (MCP servers just appear — `/mcp` to see them).
 
 ## Run

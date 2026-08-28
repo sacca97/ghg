@@ -1,0 +1,144 @@
+package session
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/sacca97/ghg/internal/observation"
+	"github.com/sacca97/ghg/internal/search"
+)
+
+// SaveObservation persists the exact bounded bytes issued by a read. The
+// session id is always supplied by the agent; callers cannot save an
+// observation without an owning session.
+func (s *Store) SaveObservation(ctx context.Context, sessionID string, record observation.Record) error {
+	if strings.TrimSpace(sessionID) == "" {
+		return fmt.Errorf("session id is required")
+	}
+	if record.ID == "" || record.Path == "" {
+		return fmt.Errorf("observation id and path are required")
+	}
+	complete := 0
+	if record.Complete {
+		complete = 1
+	}
+	_, err := s.db.ExecContext(ctx, `INSERT OR REPLACE INTO observations
+		(session_id, observation_id, path, start_line, end_line, next_offset,
+		 issued_bytes, content, complete, created_at)
+		VALUES (?,?,?,?,?,?,?,?,?,?)`,
+		sessionID, record.ID, record.Path, record.StartLine, record.EndLine,
+		record.NextOffset, record.IssuedBytes, record.Content, complete,
+		record.CreatedAt.UTC().Format(time.RFC3339))
+	return err
+}
+
+// LoadObservation returns an observation only from the supplied session.
+func (s *Store) LoadObservation(ctx context.Context, sessionID, id string) (observation.Record, error) {
+	if strings.TrimSpace(sessionID) == "" {
+		return observation.Record{}, fmt.Errorf("session id is required")
+	}
+	var record observation.Record
+	var complete int
+	var created string
+	err := s.db.QueryRowContext(ctx, `SELECT observation_id, path, start_line,
+		end_line, next_offset, issued_bytes, content, complete, created_at
+		FROM observations WHERE session_id=? AND observation_id=?`, sessionID, id).
+		Scan(&record.ID, &record.Path, &record.StartLine, &record.EndLine,
+			&record.NextOffset, &record.IssuedBytes, &record.Content, &complete, &created)
+	if err != nil {
+		return observation.Record{}, err
+	}
+	record.SessionID = sessionID
+	record.Complete = complete != 0
+	record.CreatedAt, _ = time.Parse(time.RFC3339, created)
+	return record, nil
+}
+
+// SaveSearchSnapshot persists an immutable bounded search result set for a
+// session. The JSON payload keeps the SQL schema small while preserving the
+// exact item ordering used by its cursor.
+func (s *Store) SaveSearchSnapshot(ctx context.Context, sessionID string, snapshot search.Snapshot) error {
+	if strings.TrimSpace(sessionID) == "" {
+		return fmt.Errorf("session id is required")
+	}
+	data, err := json.Marshal(snapshot)
+	if err != nil {
+		return fmt.Errorf("marshal search snapshot: %w", err)
+	}
+	_, err = s.db.ExecContext(ctx, `INSERT OR REPLACE INTO search_snapshots
+		(session_id, snapshot_id, kind, snapshot, created_at) VALUES (?,?,?,?,?)`,
+		sessionID, snapshot.ID, snapshot.Kind, string(data), snapshot.CreatedAt.UTC().Format(time.RFC3339))
+	return err
+}
+
+// LoadSearchSnapshot returns a cursor snapshot only from the supplied session.
+func (s *Store) LoadSearchSnapshot(ctx context.Context, sessionID, id string) (search.Snapshot, error) {
+	if strings.TrimSpace(sessionID) == "" {
+		return search.Snapshot{}, fmt.Errorf("session id is required")
+	}
+	var data string
+	err := s.db.QueryRowContext(ctx, `SELECT snapshot FROM search_snapshots WHERE session_id=? AND snapshot_id=?`, sessionID, id).Scan(&data)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return search.Snapshot{}, err
+		}
+		return search.Snapshot{}, err
+	}
+	var snapshot search.Snapshot
+	if err := json.Unmarshal([]byte(data), &snapshot); err != nil {
+		return search.Snapshot{}, fmt.Errorf("decode search snapshot %s: %w", id, err)
+	}
+	return snapshot, nil
+}
+
+type observationRegistryStore struct{ store *Store }
+
+func (s observationRegistryStore) Save(ctx context.Context, sessionID string, record observation.Record) error {
+	return s.store.SaveObservation(ctx, sessionID, record)
+}
+
+func (s observationRegistryStore) SaveObservation(ctx context.Context, sessionID string, record observation.Record) error {
+	return s.store.SaveObservation(ctx, sessionID, record)
+}
+
+func (s observationRegistryStore) Load(ctx context.Context, sessionID, id string) (observation.Record, error) {
+	return s.store.LoadObservation(ctx, sessionID, id)
+}
+
+func (s observationRegistryStore) LoadObservation(ctx context.Context, sessionID, id string) (observation.Record, error) {
+	return s.store.LoadObservation(ctx, sessionID, id)
+}
+
+// ObservationRegistryStore adapts the durable session store to the live
+// registry used by tools without making the observation package depend on SQL.
+func (s *Store) ObservationRegistryStore() observation.Store {
+	return observationRegistryStore{store: s}
+}
+
+type searchRegistryStore struct{ store *Store }
+
+func (s searchRegistryStore) Save(ctx context.Context, sessionID string, snapshot search.Snapshot) error {
+	return s.store.SaveSearchSnapshot(ctx, sessionID, snapshot)
+}
+
+func (s searchRegistryStore) SaveSearchSnapshot(ctx context.Context, sessionID string, snapshot search.Snapshot) error {
+	return s.store.SaveSearchSnapshot(ctx, sessionID, snapshot)
+}
+
+func (s searchRegistryStore) Load(ctx context.Context, sessionID, id string) (search.Snapshot, error) {
+	return s.store.LoadSearchSnapshot(ctx, sessionID, id)
+}
+
+func (s searchRegistryStore) LoadSearchSnapshot(ctx context.Context, sessionID, id string) (search.Snapshot, error) {
+	return s.store.LoadSearchSnapshot(ctx, sessionID, id)
+}
+
+// SearchRegistryStore adapts the durable session store to the live search
+// registry used by tools without coupling that package to database/sql.
+func (s *Store) SearchRegistryStore() search.Store {
+	return searchRegistryStore{store: s}
+}

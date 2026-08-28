@@ -86,6 +86,22 @@ Prompt.
 	}
 }
 
+func TestSubagentGuidanceMatchesBoundedExplorationTools(t *testing.T) {
+	prompt := subagentPrompt()
+	for _, fragment := range []string{"grep", "glob", "find_files", "bounded read", "observed edit ranges"} {
+		if !strings.Contains(prompt, fragment) {
+			t.Errorf("subagent prompt lacks %q: %s", fragment, prompt)
+		}
+	}
+	parent := New(nil, "model", 100, "system")
+	description := taskTool(parent).Def.Function.Description
+	for _, fragment := range []string{"grep", "glob", "find_files", "observed edit ranges"} {
+		if !strings.Contains(description, fragment) {
+			t.Errorf("task description lacks %q: %s", fragment, description)
+		}
+	}
+}
+
 func TestRunDefinitionStopsAtSubmitPlanAndReportsTelemetry(t *testing.T) {
 	args := `{"goal":"ship it","steps":["write code"],"acceptance_checks":["tests pass"]}`
 	backend := &definitionBackend{messages: []llm.Message{{

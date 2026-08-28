@@ -108,6 +108,8 @@ func (m *model) activateRoute(modelName, providerName, role string) error {
 		ag.Todos = append([]agent.Todo(nil), old.Todos...)
 		ag.CompactBackend = old.CompactBackend
 		ag.CompactModel = old.CompactModel
+		ag.CompactProvider = old.CompactProvider
+		ag.CompactProtocol = old.CompactProtocol
 		ag.CompactThreshold = old.CompactThreshold
 	} else {
 		ag.Effort = m.cfg.DefaultEffort

@@ -57,6 +57,15 @@ func TestSystemPromptAppendsTrustedProjectInstructions(t *testing.T) {
 	}
 }
 
+func TestSystemPromptPrefersBoundedExplorationTools(t *testing.T) {
+	prompt := systemPrompt()
+	for _, fragment := range []string{"Prefer grep for text", "glob for exact paths", "find_files for fuzzy paths", "read with offset/limit", "Reserve bash for builds, tests, git"} {
+		if !strings.Contains(prompt, fragment) {
+			t.Errorf("system prompt lacks %q", fragment)
+		}
+	}
+}
+
 func TestContinueSessionIDUsesCurrentDirectory(t *testing.T) {
 	home := t.TempDir()
 	root := t.TempDir()

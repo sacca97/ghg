@@ -44,6 +44,13 @@ func FanIn(evs ...Events) Events {
 				}
 			}
 		},
+		OnToolTelemetry: func(telemetry ToolTelemetry) {
+			for _, e := range evs {
+				if e.OnToolTelemetry != nil {
+					e.OnToolTelemetry(telemetry)
+				}
+			}
+		},
 		OnSteer: func(text string) {
 			for _, e := range evs {
 				if e.OnSteer != nil {
@@ -62,6 +69,13 @@ func FanIn(evs ...Events) Events {
 			for _, e := range evs {
 				if e.OnUsage != nil {
 					e.OnUsage(u)
+				}
+			}
+		},
+		OnGoalUpdate: func(update GoalUpdate) {
+			for _, e := range evs {
+				if e.OnGoalUpdate != nil {
+					e.OnGoalUpdate(update)
 				}
 			}
 		},

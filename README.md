@@ -60,7 +60,7 @@ install script above.
 
 ```
 /context-doctor     audit what a fresh session injects, in tokens
-/goal <text>        work until done
+/goal <text>        work until a structured goal update completes it
 /model              pick a model — type to filter (new) entries come from the
                     provider catalog, no config needed
 ```

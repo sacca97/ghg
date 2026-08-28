@@ -1,7 +1,7 @@
 # Features
 
 ghg is a minimal coding agent: an interactive bubbletea TUI driving an
-LLM tool-use loop (bash / read / write / edit / grep / glob / task) with provider-routable
+LLM tool-use loop (bash / read / write / edit / grep / glob / find_files / task) with provider-routable
 models. This document is the map of what's shipped and where it lives. Each
 section links the behavior to the code and its tests.
 
@@ -21,9 +21,10 @@ to goroutines and collects results on a buffered channel, laid back out in
 
 `internal/agent/filelocks.go` — mutations to the same file serialize through a
 **per-canonical-path channel semaphore** (a 1-capacity `chan struct{}` per
-path: send to acquire, receive to release). Two edits to `foo.go` can't
-interleave; edits to different files run truly in parallel. `bash` takes a
-global lock because a command's side effects aren't attributable to one path.
+path: send to acquire, receive to release). Multi-file edits acquire all
+canonical paths in sorted order, so overlapping calls cannot deadlock. Edits
+to different files run in parallel; `bash` takes the global write side of a
+read/write lock because its side effects aren't attributable to one path.
 Reads don't lock.
 
 This is the Go-native port of pi's `withFileMutationQueue` (per-path promise
@@ -34,17 +35,16 @@ Tests: `parallel_test.go` — `TestToolCallsRunInParallel` (overlap measured via
 a concurrency counter), `TestSamePathEditsSerialize`, `TestToolMutationPath`,
 `TestCanonicalPathKey`.
 
-### Native grep and glob
+### Native grep, glob, and fuzzy path search
 
-`internal/tools/search.go` provides read-only native `grep` and `glob` tools.
-`grep` searches text files with a regular expression (or `literal: true`) and
-returns stable `path:line:match` rows; `include` applies a slash-aware glob
-filter and `case_sensitive: false` enables case-insensitive matching. `glob`
-returns regular files matching a relative pattern, with `**` spanning path
-separators. A pattern without a slash stays at the selected directory level;
-`**` makes recursion explicit.
+`internal/tools/search.go` provides read-only native `grep`, `glob`, and
+`find_files` tools. `grep` accepts a regular expression or an OR `patterns`
+array, groups matching lines by file, ranks narrow/touched/modified paths, and
+returns stable cursor pages with a small per-file cap. `glob` returns exact
+relative-pattern matches; `find_files` uses the shared fuzzy path index and
+scores every candidate before applying its result cap.
 
-Both tools default to the current working directory and accept an explicitly
+These tools default to the current working directory and accept an explicitly
 selected existing file or directory. Directory searches use Go's `os.Root`,
 never follow symlink entries, skip `.git` and non-regular files, and return absolute
 paths only when the selected root is outside the working directory. Explicit
@@ -54,15 +54,48 @@ files are searched directly even when their parent directory is ignored.
 supports negation, leading-slash anchoring, basename patterns, and directory-only
 rules. An ignored parent prevents a child negation from leaking files back into
 the result; negating the directory itself reopens its subtree. Binary files are
-skipped. Results are bounded by the shared 50,000-byte tool budget, a default
-1,000-result limit (maximum 10,000), and a 100,000-entry scan limit, with an
-explicit marker when a limit stops the search. All filesystem walks honor the
-call context.
+skipped. Search pages default to 25 results and select complete rendered entries
+under the model-facing 8 KiB ceiling. The cursor advances only past entries
+actually displayed, so `search_displayed`, `search_remaining`, and later-page
+counts cannot skip an unseen result; an entry that cannot fit leaves the cursor
+unchanged and asks for a narrower search. Pages paginate over a bounded
+immutable snapshot retained in the session/artifact path. Snapshots cap at
+10,000 results and a 100,000-entry scan limit, with explicit displayed/remaining
+and incomplete-retention metadata. All filesystem walks honor the call context.
+The TUI's fuzzy `@` completion uses the same shared index, so strong matches
+late in a tree are not lost to an early traversal cutoff.
 
 Tests: `internal/tools/search_test.go` — `TestGrepTool`,
 `TestGlobToolPatternsAndOrdering`, `TestGitignoreRules`,
 `TestSearchLimitsCancellationAndInvalidArguments`,
 `TestMalformedGitignore`, and `TestExplicitIgnoredFileIsSearchable`.
+
+`internal/tools/phase25_test.go` and `internal/search/state_test.go` cover OR
+patterns, stable cursors, noisy-file diversity, fuzzy late matches, long-result
+byte ceilings, later-page accounting, and exploration redirects. The Phase 2.5
+acceptance matrix also covers every observed edit operation, overlap/stale/
+cross-session rejection, byte-limited reads, line-ending preservation, sorted
+multi-file locking, publication rollback, and bounded readback; the LSP output
+budget has a dedicated `internal/lsp/diagnostic_test.go` regression.
+
+### Stateful observed edits
+
+`internal/tools/read.go` records each bounded complete-line `read` as an
+observation containing the exact bytes issued, canonical path, line range, and
+continuation offset. A byte-limited observation still authorizes the complete
+lines it returned; only lines outside that record require a narrower reread.
+`internal/tools/edit.go` makes `mode: "observed"` with an `edits` array the
+primary mutation shape. It authorizes only ranges from the same session and
+path, uses same-position matching first and unique exact-byte relocation after
+shifts, and rejects stale, ambiguous, intersecting, or unobserved ranges.
+`mode: "exact"` is an explicit temporary compatibility mode.
+
+Observations and search snapshots mirror into `sessions.db`; live registries
+are shared by subagents and survive model switches. Multi-file edits preflight
+all originals and permissions, stage same-directory files, publish atomically,
+preserve modes/line endings, and return a compact diff, readback, and
+diagnostics. `ToolTelemetry` reports preview/retained/original bytes,
+truncation, and Bash exploration redirects to JSON consumers.
 
 ### Project instructions and streamed tool output
 
@@ -170,11 +203,12 @@ turn. This is the channel-native port of opencode's `background-job.ts`
 registry.
 
 Each task is a `BackgroundTask` with a `Done chan struct{}`. When the subagent
-settles, the registry `settle()`s and **closes `Done` once** — closing a
-channel broadcasts to every waiter at once, so the tool caller, the TUI, and
-`/tasks` all wake together with no per-waiter state (opencode needs a per-job
-`Deferred` for the same thing). On settle the report fans back into the parent
-as a **steered message**, so the model sees it on the next loop boundary.
+settles, the registry records the final state, runs `OnChange` and `OnRecord`,
+and then **closes `Done` once** — closing a channel broadcasts to every waiter
+at once, so the tool caller, the TUI, and `/tasks` all wake after persistence
+has completed (opencode needs a per-job `Deferred` for the same thing). On
+settle the report fans back into the parent as a **steered message**, so the
+model sees it on the next loop boundary.
 
 - `Tasks().List()` / `Get(id)` / `Cancel(id)` — registry snapshot + cancel.
 - `Tasks().OnChange` — the TUI installs a callback that sends a message to
@@ -200,7 +234,8 @@ it by design. Cancelling a task cancels its subagent's turn.
 Tests: `TestBackgroundTaskDeliversReport`, `TestBackgroundTaskBroadcastsToManyWaiters`
 (8 waiters all woken by one channel close), `TestBackgroundTaskCancel`;
 persistence: `session.TestTaskRoundTrip`, `TestRestoreTaskSettledAndVisible`,
-`TestResumeRestoresTasks`, `TestTaskPersistsOnStartAndSettle`;
+`TestResumeRestoresTasks`, `TestTaskPersistsOnStartAndSettle`, and
+`TestTaskDoneWaitsForSettlementCallbacks`;
 dock click hit-testing: `TestDockClickOpensClickedRow`,
 `TestDockClickIgnoredWhilePaletteOpen`.
 
@@ -373,9 +408,9 @@ guarded, and a successful auth builds the first agent in place. Headless
   and shift-drag still selects. `"mouse": false` in config disables capture at
   startup; run `/mouse on` to re-enable it for the current session.
 - Queueing (enter while busy), steering (empty enter), history recall (↑/↓),
-  `@file` mentions, `$skill` invocation, `/goal` loop, `/resume` session
-  picker, `--continue`, `/effort` reasoning levels — see the roadmap for the
-  full list.
+  `@file` mentions, `$skill` invocation, structured `/goal` lifecycle with
+  explicit `/goal resume` after restart, `/resume` session picker, `--continue`,
+  and `/effort` reasoning levels — see the roadmap for the full list.
 - **Settings commands run mid-turn.** `/theme`, `/mouse`, `/effort`, `/tasks`,
   `/help`, `/cd`, `/pwd`, and the non-submitting `/goal` forms (bare, `clear`,
   `rounds`) execute immediately while busy instead of queueing — queued text
@@ -409,7 +444,7 @@ guarded, and a successful auth builds the first agent in place. Headless
   concrete outcome line plus a bullet list of checkable completion criteria —
   with one non-streaming call on the current model (the compact-model override
   is deliberately ignored), then sets it exactly like `/goal <text>` and starts
-  the goal loop. The transcript note states the exact window used. Prompt
+  the structured goal lifecycle. The transcript note states the exact window used. Prompt
   building is pure (`agent.BuildGoalFromContextPrompt` over the window from
   `agent.GoalFromContextMessages`); the TUI command mirrors `/compact`'s
   goroutine + `goalFromContextMsg` pattern, refusing while busy and running
@@ -456,6 +491,9 @@ session. There is no autonomous replan loop.
 Headless JSON output includes `model_call_start` and `model_call_end` events for
 planning, acting, and compaction calls. Each event identifies the role, provider,
 wire adapter protocol, model, latency, finish reason, and provider-reported usage.
+Compaction reports the configured `tiny` route rather than the primary route;
+title generation, `/goal-from-context`, and declarative one-shot calls use the
+same route-aware telemetry wrapper.
 
 ## Conversation time travel
 

@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/sacca97/ghg/internal/artifact"
+	goalstate "github.com/sacca97/ghg/internal/goal"
 	"github.com/sacca97/ghg/internal/llm"
 	"github.com/sacca97/ghg/internal/tools"
 )
@@ -45,6 +46,99 @@ func TestReasoningRequestUsesToggleMetadata(t *testing.T) {
 				t.Fatalf("toggle value = %v, want %v", *gotOn, tc.wantOn)
 			}
 		})
+	}
+}
+
+func TestTurnWithGoalUsesEphemeralContextAndStructuredUpdate(t *testing.T) {
+	var requests []llm.Request
+	var mu sync.Mutex
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req llm.Request
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode request: %v", err)
+			return
+		}
+		mu.Lock()
+		requests = append(requests, req)
+		call := len(requests)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "text/event-stream")
+		if call == 1 {
+			fmt.Fprint(w, `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"goal-call","type":"function","function":{"name":"update_goal","arguments":"{\"status\":\"active\",\"progress\":\"implementation complete; verification passed\"}"}}]}}]}`+"\n\n")
+		} else {
+			fmt.Fprint(w, `data: {"choices":[{"delta":{"content":"ready"},"finish_reason":"stop"}]}`+"\n\n")
+		}
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
+	ag.Tools = nil
+	record := goalstate.New("ship the feature")
+	record.ID = "goal-1"
+	var updates []GoalUpdate
+	final, err := ag.TurnWithGoal(context.Background(), "start", record, Events{
+		OnGoalUpdate: func(update GoalUpdate) { updates = append(updates, update) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if final != "ready" {
+		t.Fatalf("final = %q", final)
+	}
+	if len(updates) != 1 || updates[0].Status != goalstate.StatusActive || updates[0].GoalID != record.ID {
+		t.Fatalf("updates: %+v", updates)
+	}
+	mu.Lock()
+	gotRequests := append([]llm.Request(nil), requests...)
+	mu.Unlock()
+	if len(gotRequests) != 2 {
+		t.Fatalf("requests = %d, want 2", len(gotRequests))
+	}
+	for i, req := range gotRequests {
+		foundGoalTool := false
+		for _, tool := range req.Tools {
+			if tool.Function.Name == goalUpdateToolName {
+				foundGoalTool = true
+			}
+		}
+		if !foundGoalTool {
+			t.Fatalf("request %d does not expose update_goal", i+1)
+		}
+	}
+	if !strings.Contains(gotRequests[0].Messages[len(gotRequests[0].Messages)-1].Content, "ship the feature") {
+		t.Fatalf("first request missing goal context: %+v", gotRequests[0].Messages)
+	}
+	if !strings.Contains(gotRequests[1].Messages[len(gotRequests[1].Messages)-1].Content, "implementation complete") {
+		t.Fatalf("second request missing latest checkpoint: %+v", gotRequests[1].Messages)
+	}
+	for _, msg := range ag.MessagesSnapshot() {
+		if msg.Role == "system" && strings.Contains(msg.Content, "request-scoped") {
+			t.Fatal("goal context must not be persisted in Agent.Messages")
+		}
+	}
+}
+
+func TestTurnWithGoalCompletionStopsWithoutAnotherRequest(t *testing.T) {
+	requests := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"goal-call","type":"function","function":{"name":"update_goal","arguments":"{\"status\":\"complete\",\"progress\":\"tests passed\"}"}}]}}]}`+"\n\n")
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
+	ag.Tools = nil
+	record := goalstate.New("finish")
+	record.ID = "goal-2"
+	var update GoalUpdate
+	if _, err := ag.TurnWithGoal(context.Background(), "go", record, Events{OnGoalUpdate: func(g GoalUpdate) { update = g }}); err != nil {
+		t.Fatal(err)
+	}
+	if requests != 1 || update.Status != goalstate.StatusComplete {
+		t.Fatalf("requests=%d update=%+v", requests, update)
 	}
 }
 
@@ -821,6 +915,55 @@ func TestCompactUsesCompactModel(t *testing.T) {
 	if len(models) != 1 || models[0] != "summary-model" {
 		t.Fatalf("summary should run on summary-model, got %v", models)
 	}
+}
+
+func TestCompactionTelemetryUsesSummaryRoute(t *testing.T) {
+	conversation := &routeBackend{protocol: llm.ProtocolOpenAIChatCompletions}
+	summary := &routeBackend{protocol: llm.ProtocolAnthropicMessages}
+	ag := New(conversation, "conversation-model", 100, "sys")
+	ag.Role, ag.Provider, ag.Protocol = "fast", "main-provider", string(conversation.protocol)
+	ag.CompactBackend = summary
+	ag.CompactModel = "tiny-model"
+	ag.CompactProvider = "tiny-provider"
+	ag.CompactProtocol = string(summary.protocol)
+	for i := 0; i < 8; i++ {
+		ag.Messages = append(ag.Messages,
+			llm.Message{Role: "user", Content: fmt.Sprintf("question %d", i)},
+			llm.Message{Role: "assistant", Content: fmt.Sprintf("answer %d", i)},
+		)
+	}
+	var starts []ModelCallStart
+	var ends []ModelCallEnd
+	if err := ag.ManualCompact(context.Background(), Events{
+		OnModelCallStart: func(call ModelCallStart) { starts = append(starts, call) },
+		OnModelCallEnd:   func(call ModelCallEnd) { ends = append(ends, call) },
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(starts) != 1 || len(ends) != 1 {
+		t.Fatalf("compaction telemetry start/end = %d/%d", len(starts), len(ends))
+	}
+	want := ModelCallStart{Role: "tiny", Provider: "tiny-provider", Model: "tiny-model", Protocol: string(summary.protocol)}
+	if starts[0] != want {
+		t.Fatalf("compaction start route = %+v, want %+v", starts[0], want)
+	}
+	if ends[0].Model != want.Model || ends[0].Provider != want.Provider || ends[0].Protocol != want.Protocol {
+		t.Fatalf("compaction end route = %+v", ends[0])
+	}
+}
+
+type routeBackend struct {
+	protocol llm.Protocol
+}
+
+func (b *routeBackend) AdapterProtocol() llm.Protocol { return b.protocol }
+
+func (b *routeBackend) Stream(context.Context, llm.Request, llm.EventSink) (llm.Message, llm.Usage, error) {
+	return llm.Message{}, llm.Usage{}, nil
+}
+
+func (b *routeBackend) Complete(context.Context, llm.Request) (llm.Message, llm.Usage, error) {
+	return llm.Message{Role: "assistant", Content: "summary"}, llm.Usage{}, nil
 }
 
 func TestCompactTooLittleHistory(t *testing.T) {

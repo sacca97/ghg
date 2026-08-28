@@ -83,11 +83,18 @@ ported. This fork does not merge from upstream — see `UPSTREAM.md`.
 
 ## Agent loop
 
-- [x] `/goal <text>` (codex-style): keep driving turns until the model verifies and explicitly declares `GOAL_MET` — continuing is the default, so it can't terminate early like claude's; `/goal resume` re-engages (also after `/resume` of a session — goals persist), `/goal clear` drops, 20-round cap pauses with a resume hint
+- [x] Structured `/goal <text>` lifecycle: a persisted goal ID tracks status, rounds,
+  provider accounting, progress, and blockers; the request-local `update_goal` tool
+  records verified completion or genuine blocking; restart pauses active work until
+  `/goal resume`, `/goal clear` records an explicit drop, and the round cap is only a
+  circuit breaker (`active`, `paused`, `blocked`, `usage-limited`, `budget-limited`,
+  `complete`)
 
-- [x] Parallel tool-call execution with per-path file mutation lock (pi: `withFileMutationQueue`, `executeToolCallsParallel`) — `agent.runTools` fans a tool-call batch out to goroutines; write/edit serialize through a per-canonical-path channel semaphore, bash takes a global lock; results land in call order, OnToolStart/End fire per call
+- [x] Parallel tool-call execution with per-path file mutation lock (pi: `withFileMutationQueue`, `executeToolCallsParallel`) — `agent.runTools` fans a tool-call batch out to goroutines; same-file mutations serialize, multi-file edits lock sorted canonical paths, bash takes the global lock; results land in call order
 - [x] Retry with backoff on provider errors (pi settings: `retry: {maxRetries, baseDelayMs}`) — transient failures (429/5xx/transport) retry with exponential backoff (1s→2s→4s… capped 20s, jittered), configurable via `maxRetries` (default 8, 1 disables); streaming retries stop once visible text has been emitted so the transcript never double-prints, and context-limit errors pass straight through to the compaction retry
-- [x] Native `grep` and `glob` tools — bounded regex/path searches with deterministic ordering, binary/symlink policy, cancellation, and nested `.gitignore` matching
+- [x] Native `grep`, `glob`, and `find_files` — bounded grouped/OR text search, exact and fuzzy path search, stable cursors, byte-honest 8 KiB pages whose displayed/remaining metadata matches rendered entries, ranking, per-file caps, deterministic ordering, binary/symlink policy, cancellation, and nested `.gitignore` matching
+- [x] Stateful observed edits — bounded read observations authorize explicit range operations, including complete lines returned before a byte ceiling; same-session exact-byte relocation, sorted multi-file locks, permission-first atomic publication, mode/line-ending preservation, compact diff/readback, diagnostics, and session persistence
+- [x] Tool-output telemetry and exploration redirects — per-tool preview/retained/original byte accounting, truncation metadata, route-correct model-call telemetry (including tiny compaction/title/goal calls), and conservative non-executing redirects for simple recursive inspection commands
 - [x] Streamed partial tool output — per-call context callback, 100ms accumulated snapshots, tool-id events, and a last-three-lines TUI tail that collapses on completion (plan.md Phase 0.5)
 - [ ] Spill truncated bash output to a temp file and mention the path (pi bash tool) — **superseded** by plan.md Phase 1 artifacts — do not port
 - [x] Recoverable tool-result artifacts — structured bounded results, deterministic head/tail retention up to 10 MiB, SHA-256 content-addressed payloads, session-scoped `artifact_list`/`artifact_read`, fork/rewind-safe metadata, explicit opt-out, no-session cleanup, untrusted-output delimiters, and `ghg artifacts gc` — plan.md Phase 1
@@ -100,7 +107,7 @@ ported. This fork does not merge from upstream — see `UPSTREAM.md`.
 - [x] Subagents: a `task` tool that runs a self-contained prompt in a fresh `tiny`-role agent with the same tools (minus `task` — no recursion) and returns its final report; role-less legacy configs clone the parent route
 - [x] `$skill-name` invocation (codex-style) with live completion dropdown; skills re-indexed every turn and every `$` keystroke, so new skills load without restarting the ghg
 - [x] Custom agent definitions (`.agents/*.md` and `~/.ghg/agents/*.md` with strict `name`, `description`, `role`, `tools`, `max_rounds` frontmatter and Markdown prompts) — project-over-user precedence, unknown-tool load errors, and the reserved built-in planner; `/plan`, `ghg run --plan`, and `ghg run --plan-only` use the same bounded read-only planner runner — **plan.md Phase 2**
-- [x] Parallel/background subagents (pi streams tool `onUpdate`; opencode `background-job.ts`) — `task` with `background:true` runs concurrently and reports back via a steered message; a `taskRegistry` keyed by id holds a `Done` channel whose single close broadcasts completion to every waiter; `/tasks` lists them and updates live via `OnChange`; tasks persist in the session store and are restored on `--resume` (a stale "running" row comes back as interrupted-error)
+- [x] Parallel/background subagents (pi streams tool `onUpdate`; opencode `background-job.ts`) — `task` with `background:true` runs concurrently and reports back via a steered message; a `taskRegistry` keyed by id holds a `Done` channel whose single close follows the final `OnChange`/`OnRecord` callbacks and broadcasts persisted completion to every waiter; `/tasks` lists them and updates live via `OnChange`; tasks persist in the session store and are restored on `--resume` (a stale "running" row comes back as interrupted-error)
 - [ ] `@agent` mentions to target a named subagent (opencode autocomplete) — **deferred**
 
 ## Models & providers

@@ -9,6 +9,8 @@ import (
 	"sort"
 	"strings"
 	"testing"
+
+	"github.com/sacca97/ghg/internal/search"
 )
 
 func writeSearchFile(t *testing.T, root, name, content string) string {
@@ -42,7 +44,7 @@ func TestGrepTool(t *testing.T) {
 	}
 
 	out := run(t, "grep", fmt.Sprintf(`{"pattern":"needle","path":%q,"include":"**/*.go"}`, dir))
-	if !strings.Contains(out, match+":2:needle one") {
+	if !strings.Contains(out, match+":\n  2:needle one") {
 		t.Fatalf("expected matching line, got %q", out)
 	}
 	for _, unwanted := range []string{"hidden.go", "scratch.tmp", "binary.go", "link.go", "b.txt"} {
@@ -52,12 +54,12 @@ func TestGrepTool(t *testing.T) {
 	}
 
 	out = Execute(context.Background(), All(), "grep", json.RawMessage(fmt.Sprintf(`{"pattern":"NEEDLE","path":%q,"case_sensitive":false,"literal":true}`, dir)))
-	if !strings.Contains(out, match+":2:needle one") {
+	if !strings.Contains(out, match+":\n  2:needle one") {
 		t.Fatalf("case-insensitive literal search missed match: %q", out)
 	}
 
 	out = run(t, "grep", fmt.Sprintf(`{"pattern":"package","path":%q,"include":"*.go"}`, filepath.Join(dir, "src")))
-	if !strings.Contains(out, match+":1:package src") {
+	if !strings.Contains(out, match+":\n  1:package src") {
 		t.Fatalf("grep pattern relative to selected directory missed match: %q", out)
 	}
 }
@@ -89,15 +91,15 @@ func TestGlobToolPatternsAndOrdering(t *testing.T) {
 	}
 
 	out = run(t, "glob", fmt.Sprintf(`{"pattern":"**/z.?o","path":%q}`, dir))
-	if strings.TrimSpace(out) != nestedGo {
+	if !strings.Contains(out, nestedGo) {
 		t.Fatalf("glob ? pattern: got %q, want %q", out, nestedGo)
 	}
 	out = run(t, "glob", fmt.Sprintf(`{"pattern":"**/[az].go","path":%q}`, dir))
-	if strings.TrimSpace(out) != nestedGo {
+	if !strings.Contains(out, nestedGo) {
 		t.Fatalf("glob character class: got %q, want %q", out, nestedGo)
 	}
 	out = run(t, "glob", fmt.Sprintf(`{"pattern":"*.go","path":%q}`, filepath.Join(dir, "nested")))
-	if strings.TrimSpace(out) != nestedGo {
+	if !strings.Contains(out, nestedGo) {
 		t.Fatalf("glob pattern relative to selected directory: got %q, want %q", out, nestedGo)
 	}
 
@@ -207,15 +209,147 @@ func TestExplicitIgnoredFileIsSearchable(t *testing.T) {
 	writeSearchFile(t, dir, ".gitignore", "ignored/\n")
 	file := writeSearchFile(t, dir, "ignored/file.txt", "needle\n")
 	out := run(t, "grep", fmt.Sprintf(`{"pattern":"needle","path":%q}`, file))
-	if !strings.Contains(out, file+":1:needle") {
+	if !strings.Contains(out, file+":\n  1:needle") {
 		t.Fatalf("explicit ignored file should be searchable: %q", out)
+	}
+}
+
+func TestGrepPatternsGroupingAndStableCursor(t *testing.T) {
+	dir := t.TempDir()
+	first := writeSearchFile(t, dir, "src/app.ts", "TODO one\nFIXME two\n")
+	second := writeSearchFile(t, dir, "utils.ts", "TODO three\nFIXME four\n")
+	registry := search.NewRegistry()
+	ctx := WithSearchStore(context.Background(), "session-1", registry)
+	ctx = WithSearchHints(ctx, SearchHints{Touched: []string{first}})
+	args := fmt.Sprintf(`{"patterns":["TODO","FIXME"],"path":%q,"max_results":2}`, dir)
+	page := ExecuteResult(ctx, All(), "grep", json.RawMessage(args))
+	if page.Metadata["search_cursor"] == "" || page.Metadata["search_remaining"] != "2" {
+		t.Fatalf("first page metadata = %+v", page.Metadata)
+	}
+	if !strings.Contains(page.Preview, first+":") || !strings.Contains(page.Preview, "TODO one") {
+		t.Fatalf("first grouped page = %q", page.Preview)
+	}
+	page2Args := fmt.Sprintf(`{"cursor":%q,"max_results":2}`, page.Metadata["search_cursor"])
+	page2 := ExecuteResult(ctx, All(), "grep", json.RawMessage(page2Args))
+	if page2.Metadata["search_cursor"] != "" || !strings.Contains(page2.Preview, second+":") || !strings.Contains(page2.Preview, "FIXME four") {
+		t.Fatalf("second stable page = %+v", page2)
+	}
+	if strings.Contains(page2.Preview, "TODO one") {
+		t.Fatalf("second page repeated first page: %q", page2.Preview)
+	}
+}
+
+func TestGrepRankingKeepsNoisyFilesFromFloodingFirstPage(t *testing.T) {
+	dir := t.TempDir()
+	noisy := strings.Repeat("TODO noisy\n", 30)
+	writeSearchFile(t, dir, "zz/noisy.txt", noisy)
+	app := writeSearchFile(t, dir, "src/app.ts", "TODO relevant\n")
+	utils := writeSearchFile(t, dir, "utils.ts", "TODO helper\n")
+	ctx := WithSearchHints(context.Background(), SearchHints{Touched: []string{app}})
+	result := ExecuteResult(ctx, All(), "grep", json.RawMessage(fmt.Sprintf(`{"pattern":"TODO","path":%q,"max_results":6}`, dir)))
+	if !strings.Contains(result.Preview, app) || !strings.Contains(result.Preview, utils) {
+		t.Fatalf("relevant files missing from first page: %q", result.Preview)
+	}
+	if strings.Count(result.Preview, "TODO noisy") > searchPerFileCap {
+		t.Fatalf("noisy file exceeded display cap: %q", result.Preview)
+	}
+	var displayed int
+	if _, err := fmt.Sscan(result.Metadata["search_displayed"], &displayed); err != nil || displayed > 6 {
+		t.Fatalf("search page exceeded max_results: displayed=%q result=%q", result.Metadata["search_displayed"], result.Preview)
+	}
+}
+
+func TestGrepPageDoesNotOverflowOnWholeFileGroups(t *testing.T) {
+	dir := t.TempDir()
+	first := writeSearchFile(t, dir, "a.txt", strings.Repeat("TODO\n", 4))
+	writeSearchFile(t, dir, "b.txt", strings.Repeat("TODO\n", 4))
+	ctx := WithSearchStore(context.Background(), "session-1", search.NewRegistry())
+	ctx = WithSearchHints(ctx, SearchHints{Touched: []string{first}})
+	result := ExecuteResult(ctx, All(), "grep", json.RawMessage(fmt.Sprintf(`{"pattern":"TODO","path":%q,"max_results":6}`, dir)))
+	var displayed int
+	if _, err := fmt.Sscan(result.Metadata["search_displayed"], &displayed); err != nil {
+		t.Fatalf("search page metadata = %+v", result.Metadata)
+	}
+	if displayed > 6 {
+		t.Fatalf("grouped page overflowed max_results: %d\n%s", displayed, result.Preview)
+	}
+	if !strings.Contains(result.Preview, first) {
+		t.Fatalf("ranked first file missing: %q", result.Preview)
+	}
+}
+
+func TestSearchPreviewPaginationDoesNotSkipLongResults(t *testing.T) {
+	dir := t.TempDir()
+	first := writeSearchFile(t, dir, "a.txt", "FIRST "+strings.Repeat("x", maxMatchLineBytes)+"\n")
+	second := writeSearchFile(t, dir, "b.txt", "SECOND "+strings.Repeat("y", maxMatchLineBytes)+"\n")
+	ctx := WithSearchStore(context.Background(), "session-1", search.NewRegistry())
+	args := fmt.Sprintf(`{"pattern":"FIRST|SECOND","path":%q,"max_results":2}`, dir)
+	page := ExecuteResult(ctx, All(), "grep", json.RawMessage(args))
+	if len(page.Preview) > searchPreviewBytes {
+		t.Fatalf("first search preview exceeded byte ceiling: %d", len(page.Preview))
+	}
+	if page.Metadata["search_displayed"] != "1" || page.Metadata["search_remaining"] != "1" {
+		t.Fatalf("first page accounting = %+v", page.Metadata)
+	}
+	if !strings.Contains(page.Preview, first) || strings.Contains(page.Preview, second) {
+		t.Fatalf("first page rendered the wrong results: %q", page.Preview)
+	}
+	cursor := page.Metadata["search_cursor"]
+	if cursor == "" {
+		t.Fatal("first page should retain the unseen long result behind a cursor")
+	}
+	page2 := ExecuteResult(ctx, All(), "grep", json.RawMessage(fmt.Sprintf(`{"cursor":%q,"max_results":2}`, cursor)))
+	if len(page2.Preview) > searchPreviewBytes {
+		t.Fatalf("second search preview exceeded byte ceiling: %d", len(page2.Preview))
+	}
+	if page2.Metadata["search_displayed"] != "1" || page2.Metadata["search_remaining"] != "0" || page2.Metadata["search_cursor"] != "" {
+		t.Fatalf("second page accounting = %+v", page2.Metadata)
+	}
+	if !strings.Contains(page2.Preview, second) || strings.Contains(page2.Preview, first) {
+		t.Fatalf("second page skipped or repeated a result: %q", page2.Preview)
+	}
+}
+
+func TestUngroupedSearchRemainingUsesCursorOffset(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"one.txt", "two.txt", "three.txt"} {
+		writeSearchFile(t, dir, name, "")
+	}
+	ctx := WithSearchStore(context.Background(), "session-1", search.NewRegistry())
+	page := ExecuteResult(ctx, All(), "glob", json.RawMessage(fmt.Sprintf(`{"pattern":"*.txt","path":%q,"max_results":1}`, dir)))
+	if page.Metadata["search_displayed"] != "1" || page.Metadata["search_remaining"] != "2" {
+		t.Fatalf("first ungrouped page accounting = %+v", page.Metadata)
+	}
+	for wantRemaining := 1; wantRemaining >= 0; wantRemaining-- {
+		cursor := page.Metadata["search_cursor"]
+		if cursor == "" {
+			t.Fatalf("page with %d remaining results lost its cursor", wantRemaining+1)
+		}
+		page = ExecuteResult(ctx, All(), "glob", json.RawMessage(fmt.Sprintf(`{"cursor":%q,"max_results":1}`, cursor)))
+		if page.Metadata["search_displayed"] != "1" || page.Metadata["search_remaining"] != fmt.Sprint(wantRemaining) {
+			t.Fatalf("page remaining = %d, metadata = %+v", wantRemaining, page.Metadata)
+		}
+	}
+	if page.Metadata["search_cursor"] != "" {
+		t.Fatalf("last ungrouped page should not expose a cursor: %+v", page.Metadata)
+	}
+}
+
+func TestFindFilesUsesSharedFuzzyIndex(t *testing.T) {
+	dir := t.TempDir()
+	writeSearchFile(t, dir, "archive/road-notes.txt", "")
+	want := writeSearchFile(t, dir, "src/roadmap.md", "")
+	writeSearchFile(t, dir, "README.md", "")
+	out := run(t, "find_files", fmt.Sprintf(`{"query":"roadmap","path":%q,"max_results":5}`, dir))
+	if !strings.Contains(out, want) {
+		t.Fatalf("fuzzy path search missed best candidate %q: %q", want, out)
 	}
 }
 
 func nonEmptySearchLines(s string) []string {
 	var lines []string
 	for _, line := range strings.Split(strings.TrimSpace(s), "\n") {
-		if line != "" {
+		if line != "" && !strings.HasPrefix(line, "glob: ") && !strings.HasPrefix(line, "[cursor=") && !strings.HasPrefix(line, "[incomplete") {
 			lines = append(lines, line)
 		}
 	}

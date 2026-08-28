@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -13,7 +14,10 @@ import (
 	"time"
 
 	"github.com/sacca97/ghg/internal/artifact"
+	goalstate "github.com/sacca97/ghg/internal/goal"
 	"github.com/sacca97/ghg/internal/llm"
+	"github.com/sacca97/ghg/internal/observation"
+	"github.com/sacca97/ghg/internal/search"
 	"github.com/sacca97/ghg/internal/tools"
 )
 
@@ -29,8 +33,25 @@ type Events struct {
 	OnCompacted      func(summary string, cutoff int) // a compaction ran; record it (raw log survives)
 	OnUsage          func(u llm.Usage)                // a request reported its token usage
 	OnRetry          func(ev llm.RetryEvent)          // a transient request failure is being retried
+	OnGoalUpdate     func(GoalUpdate)                 // structured active-goal checkpoint
+	OnToolTelemetry  func(ToolTelemetry)              // bounded-output accounting for one tool call
 	OnModelCallStart func(ModelCallStart)
 	OnModelCallEnd   func(ModelCallEnd)
+}
+
+// ToolTelemetry records the distinction between what a tool produced, what
+// was retained for recovery, and what the model actually saw. It is emitted
+// after artifact attachment so the artifact path is included in the same
+// lifecycle boundary as the tool result.
+type ToolTelemetry struct {
+	ID            string            `json:"id,omitempty"`
+	Name          string            `json:"name"`
+	PreviewBytes  int               `json:"preview_bytes"`
+	RetainedBytes int               `json:"retained_bytes"`
+	OriginalBytes int64             `json:"original_bytes"`
+	Truncated     bool              `json:"truncated"`
+	BashRedirect  bool              `json:"bash_redirect"`
+	Metadata      map[string]string `json:"metadata,omitempty"`
 }
 
 // ModelCallStart describes the route selected for one provider request.
@@ -106,9 +127,12 @@ type Agent struct {
 	// is then disabled and only the reactive context-limit retry applies).
 	ContextLimit int
 	// CompactBackend and CompactModel run the compaction summary; nil/"" uses
-	// the conversation's own backend and model.
-	CompactBackend llm.Backend
-	CompactModel   string
+	// the conversation's own backend and model. The provider/protocol fields
+	// keep route telemetry correct when the summary uses the tiny role.
+	CompactBackend  llm.Backend
+	CompactModel    string
+	CompactProvider string
+	CompactProtocol string
 	// CompactThreshold is the fraction of ContextLimit at which Turn compacts
 	// proactively; 0 uses defaultCompactThreshold.
 	CompactThreshold float64
@@ -126,8 +150,24 @@ type Agent struct {
 	// consistent slice. Mutations hold it only for the append.
 	msgsMu sync.Mutex
 
+	// stateMu guards the live observation/search registries and their durable
+	// adapters. A TUI command can clear or replace an agent while a background
+	// task is still constructing its subagent, so pointer hand-off must be
+	// synchronized just like message snapshots.
+	stateMu sync.RWMutex
+
 	files *fileLocks // per-path mutation locks for parallel tool calls
 	bg    *taskRegistry
+
+	// These registries are shared with delegated agents so a read made by a
+	// subagent and a later edit in the parent still use one session boundary.
+	observations     *observation.Registry
+	searchState      *search.Registry
+	observationStore observation.Store
+	searchStore      search.Store
+
+	touchedMu sync.Mutex
+	touched   map[string]struct{}
 
 	// Todos is the todowrite plan, rewritten in full by the model and
 	// injected per round. Like Messages, it is only mutated by the turn
@@ -270,6 +310,9 @@ func New(backend llm.Backend, model string, maxTokens int, systemPrompt string) 
 	a.Tools = append(a.Tools, artifactTools(a)...)
 	a.files = newFileLocks()
 	a.bg = newTaskRegistry()
+	a.observations = observation.NewRegistry()
+	a.searchState = search.NewRegistry()
+	a.touched = make(map[string]struct{})
 	return a
 }
 
@@ -291,6 +334,13 @@ func (a *Agent) newSubagent(ctx context.Context, role string) (*Agent, error) {
 	if sub == nil {
 		return nil, fmt.Errorf("subagent factory returned no agent for role %q", role)
 	}
+	observations, searchState, observationStore, searchStore := a.stateSnapshot()
+	sub.stateMu.Lock()
+	sub.observations = observations
+	sub.searchState = searchState
+	sub.observationStore = observationStore
+	sub.searchStore = searchStore
+	sub.stateMu.Unlock()
 	sub.Effort = a.Effort
 	if a.SubagentFactory == nil {
 		sub.ReasoningToggle = a.ReasoningToggle
@@ -312,6 +362,168 @@ func (a *Agent) newSubagent(ctx context.Context, role string) (*Agent, error) {
 	sub.SetSessionID(a.currentSessionID())
 	sub.Tools = append(sub.Tools, artifactTools(sub)...)
 	return sub, nil
+}
+
+// SetObservationStore installs the durable observation mirror. The live
+// registry remains owned by the agent and is safe to share with subagents.
+func (a *Agent) SetObservationStore(store observation.Store) {
+	if a == nil {
+		return
+	}
+	a.stateMu.Lock()
+	registry := a.observations
+	a.observationStore = store
+	if registry != nil {
+		registry.SetPersistent(store)
+	}
+	a.stateMu.Unlock()
+}
+
+// SetSearchStore installs the durable search-snapshot mirror.
+func (a *Agent) SetSearchStore(store search.Store) {
+	if a == nil {
+		return
+	}
+	a.stateMu.Lock()
+	registry := a.searchState
+	a.searchStore = store
+	if registry != nil {
+		registry.SetPersistent(store)
+	}
+	a.stateMu.Unlock()
+}
+
+// ResetState discards live observations, search cursors, and ranking hints
+// when the conversation is cleared. Durable state remains available for the
+// next session through the stores previously installed by the caller.
+func (a *Agent) ResetState() {
+	if a == nil {
+		return
+	}
+	a.stateMu.Lock()
+	observations := observation.NewRegistry()
+	observations.SetPersistent(a.observationStore)
+	searchState := search.NewRegistry()
+	searchState.SetPersistent(a.searchStore)
+	a.observations = observations
+	a.searchState = searchState
+	a.stateMu.Unlock()
+	a.touchedMu.Lock()
+	a.touched = make(map[string]struct{})
+	a.touchedMu.Unlock()
+}
+
+// ShareState carries live observations, search snapshots, and ranking hints
+// to a replacement agent during a model/provider switch in the same session.
+func (a *Agent) ShareState(other *Agent) {
+	if a == nil || other == nil {
+		return
+	}
+	observations, searchState, observationStore, searchStore := a.stateSnapshot()
+	a.touchedMu.Lock()
+	touched := make(map[string]struct{}, len(a.touched))
+	for path := range a.touched {
+		touched[path] = struct{}{}
+	}
+	a.touchedMu.Unlock()
+	other.stateMu.Lock()
+	other.observations = observations
+	other.searchState = searchState
+	other.observationStore = observationStore
+	other.searchStore = searchStore
+	other.stateMu.Unlock()
+	other.touchedMu.Lock()
+	other.touched = touched
+	other.touchedMu.Unlock()
+}
+
+// BindState persists observations and search snapshots collected before the
+// session id existed. The caller owns the context and can bound database work.
+func (a *Agent) BindState(ctx context.Context) error {
+	if a == nil {
+		return nil
+	}
+	observations, searchState, _, _ := a.stateSnapshot()
+	id := a.currentSessionID()
+	if err := observations.BindSession(ctx, id); err != nil {
+		return err
+	}
+	return searchState.BindSession(ctx, id)
+}
+
+func (a *Agent) stateSnapshot() (*observation.Registry, *search.Registry, observation.Store, search.Store) {
+	if a == nil {
+		return nil, nil, nil, nil
+	}
+	a.stateMu.RLock()
+	observations, searchState := a.observations, a.searchState
+	observationStore, searchStore := a.observationStore, a.searchStore
+	a.stateMu.RUnlock()
+	return observations, searchState, observationStore, searchStore
+}
+
+// RebuildTouched rehydrates the ranking hints from a resumed conversation.
+// The hints never grant access or change search results; they only improve the
+// first-page order for files the session already inspected.
+func (a *Agent) RebuildTouched(msgs []llm.Message) {
+	if a == nil {
+		return
+	}
+	for _, msg := range msgs {
+		if msg.Role != "assistant" {
+			continue
+		}
+		for _, call := range msg.ToolCalls {
+			a.recordTouched(call.Function.Name, call.Function.Arguments)
+		}
+	}
+}
+
+func (a *Agent) recordTouched(toolName, args string) {
+	paths := toolMutationPaths(toolName, args)
+	if toolName == "read" {
+		var in struct {
+			Path string `json:"path"`
+		}
+		if json.Unmarshal([]byte(args), &in) == nil && in.Path != "" {
+			paths = append(paths, in.Path)
+		}
+	}
+	if len(paths) == 0 {
+		return
+	}
+	a.touchedMu.Lock()
+	defer a.touchedMu.Unlock()
+	for _, name := range paths {
+		if key := canonicalPathHint(name); key != "" {
+			a.touched[key] = struct{}{}
+		}
+	}
+}
+
+func (a *Agent) searchHints() tools.SearchHints {
+	a.touchedMu.Lock()
+	paths := make([]string, 0, len(a.touched))
+	for path := range a.touched {
+		paths = append(paths, path)
+	}
+	a.touchedMu.Unlock()
+	sort.Strings(paths)
+	return tools.SearchHints{Touched: paths}
+}
+
+func canonicalPathHint(name string) string {
+	if strings.TrimSpace(name) == "" {
+		return ""
+	}
+	abs, err := filepath.Abs(name)
+	if err != nil {
+		return ""
+	}
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		abs = resolved
+	}
+	return filepath.Clean(abs)
 }
 
 // MessagesSnapshot returns a copy of the conversation safe to read while a
@@ -368,7 +580,15 @@ func (a *Agent) Stream(ctx context.Context, req llm.Request, sink llm.EventSink,
 // Complete performs one non-streaming model call with the same telemetry
 // boundary as Stream. It does not mutate the agent's usage totals.
 func (a *Agent) Complete(ctx context.Context, req llm.Request, ev Events) (llm.Message, llm.Usage, error) {
-	return a.callComplete(ctx, a.Backend, a.Role, a.Provider, a.Protocol, req, ev)
+	return a.CompleteWithRoute(ctx, a.Backend, a.Role, a.Provider, a.Protocol, req, ev)
+}
+
+// CompleteWithRoute runs one non-streaming call through the shared telemetry
+// wrapper using the route that actually owns backend. It is used by direct
+// one-shot callers such as title generation and goal formulation, which do
+// not run through Turn but must still report their provider and adapter.
+func (a *Agent) CompleteWithRoute(ctx context.Context, backend llm.Backend, role, provider, protocol string, req llm.Request, ev Events) (llm.Message, llm.Usage, error) {
+	return a.callComplete(ctx, backend, role, provider, protocol, req, ev)
 }
 
 func (a *Agent) callInfo(backend llm.Backend, role, provider, protocol, model string) ModelCallStart {
@@ -437,7 +657,7 @@ func (a *Agent) emitCallEnd(ev Events, call ModelCallStart, start time.Time, msg
 // exceeded its context window, Turn auto-compacts (summarizing old turns) and
 // retries once before surfacing the error to the caller.
 func (a *Agent) Turn(ctx context.Context, input string, ev Events) (string, error) {
-	return a.turn(ctx, input, nil, false, ev)
+	return a.turn(ctx, input, nil, false, nil, ev)
 }
 
 // TurnAuthored is Turn for a message the human actually typed and submitted
@@ -445,17 +665,45 @@ func (a *Agent) Turn(ctx context.Context, input string, ev Events) (string, erro
 // The message is marked Authored so input-history recall cycles only real
 // submissions.
 func (a *Agent) TurnAuthored(ctx context.Context, input string, ev Events) (string, error) {
-	return a.turn(ctx, input, nil, true, ev)
+	return a.turn(ctx, input, nil, true, nil, ev)
 }
 
 // TurnWithImages is TurnAuthored for a submission that attaches images. Each
 // part is a vision ContentPart (see llm.ImagePart); the model receives the
 // text and the images together as a multimodal content array.
 func (a *Agent) TurnWithImages(ctx context.Context, input string, parts []llm.ContentPart, ev Events) (string, error) {
-	return a.turn(ctx, input, parts, true, ev)
+	return a.turn(ctx, input, parts, true, nil, ev)
 }
 
-func (a *Agent) turn(ctx context.Context, input string, parts []llm.ContentPart, authored bool, ev Events) (string, error) {
+// TurnWithGoal runs a normal turn with a request-scoped active goal context.
+// The goal record is copied so model updates cannot mutate caller state; the
+// caller receives each validated update through Events.OnGoalUpdate.
+func (a *Agent) TurnWithGoal(ctx context.Context, input string, goal goalstate.Record, ev Events) (string, error) {
+	return a.turn(ctx, input, nil, false, &goal, ev)
+}
+
+// TurnAuthoredWithGoal is TurnWithGoal for a human-authored submission.
+func (a *Agent) TurnAuthoredWithGoal(ctx context.Context, input string, goal goalstate.Record, ev Events) (string, error) {
+	return a.turn(ctx, input, nil, true, &goal, ev)
+}
+
+// TurnWithImagesAndGoal combines an authored multimodal turn with a
+// request-scoped active goal context.
+func (a *Agent) TurnWithImagesAndGoal(ctx context.Context, input string, parts []llm.ContentPart, goal goalstate.Record, ev Events) (string, error) {
+	return a.turn(ctx, input, parts, true, &goal, ev)
+}
+
+func (a *Agent) turn(ctx context.Context, input string, parts []llm.ContentPart, authored bool, goalCtx *goalstate.Record, ev Events) (string, error) {
+	var activeGoal *goalstate.Record
+	if goalCtx != nil {
+		goal := *goalCtx
+		if err := goal.Validate(); err != nil {
+			return "", fmt.Errorf("invalid goal context: %w", err)
+		}
+		if goal.Status == goalstate.StatusActive {
+			activeGoal = &goal
+		}
+	}
 	msg := llm.Message{Role: "user", Content: input, Parts: parts, Authored: authored}
 	if authored {
 		now := time.Now()
@@ -481,6 +729,14 @@ func (a *Agent) turn(ctx context.Context, input string, parts []llm.ContentPart,
 			msgs = append(append([]llm.Message(nil), a.Messages...),
 				llm.Message{Role: "system", Content: block})
 		}
+		available := a.AllTools()
+		if activeGoal != nil {
+			// The goal tool is request-local. Ordinary conversations, planner
+			// definitions, and subagents never receive this control surface.
+			available = append(available, goalUpdateTool(*activeGoal))
+			msgs = append(append([]llm.Message(nil), msgs...),
+				llm.Message{Role: "system", Content: goalContextBlock(*activeGoal)})
+		}
 		// Surface transient-request retries through the event hook so the UI
 		// shows "retrying" instead of looking hung. The sink is request-local;
 		// the backend remains safe to share with foreground and background turns.
@@ -488,7 +744,7 @@ func (a *Agent) turn(ctx context.Context, input string, parts []llm.ContentPart,
 		msg, usage, err := a.Stream(ctx, llm.Request{
 			Model:            a.Model,
 			Messages:         msgs,
-			Tools:            tools.Defs(a.AllTools()),
+			Tools:            tools.Defs(available),
 			ReasoningEffort:  reasoningEffort,
 			ReasoningEnabled: reasoningEnabled,
 		}, llm.EventSink{
@@ -527,7 +783,7 @@ func (a *Agent) turn(ctx context.Context, input string, parts []llm.ContentPart,
 		a.Messages = append(a.Messages, msg)
 		a.msgsMu.Unlock()
 		if len(msg.ToolCalls) > 0 {
-			results := a.runToolResults(ctx, msg.ToolCalls, ev)
+			results := a.runToolResultsWithTools(ctx, msg.ToolCalls, ev, available)
 			a.msgsMu.Lock()
 			for i, tc := range msg.ToolCalls {
 				a.Messages = append(a.Messages, llm.Message{
@@ -541,6 +797,34 @@ func (a *Agent) turn(ctx context.Context, input string, parts []llm.ContentPart,
 				})
 			}
 			a.msgsMu.Unlock()
+			if activeGoal != nil {
+				terminal := false
+				for i := range results {
+					update, ok := goalUpdateFromResult(results[i])
+					if !ok {
+						continue
+					}
+					if err := update.Validate(activeGoal.ID); err != nil {
+						// The tool validates before producing metadata. Keep this
+						// guard at the agent boundary in case a future result
+						// producer supplies goal metadata directly.
+						continue
+					}
+					activeGoal.Status = update.Status
+					activeGoal.Progress = update.Progress
+					activeGoal.Blocker = update.Blocker
+					if ev.OnGoalUpdate != nil {
+						ev.OnGoalUpdate(update)
+					}
+					if update.Status == goalstate.StatusBlocked || update.Status == goalstate.StatusComplete {
+						terminal = true
+					}
+				}
+				if terminal {
+					a.compacted = false
+					return msg.Content, nil
+				}
+			}
 			if ctx.Err() != nil {
 				return "", ctx.Err()
 			}
@@ -629,14 +913,15 @@ func (a *Agent) runToolResultsWithTools(ctx context.Context, calls []llm.ToolCal
 		go func(i int, tc llm.ToolCall) {
 			defer wg.Done()
 			name, args := tc.Function.Name, tc.Function.Arguments
+			a.recordTouched(name, args)
 
 			// Serialize against other mutations before starting. Acquiring here
 			// (before OnToolStart) keeps "running" rows honest: a tool only
 			// shows as running once it actually holds its lock.
 			var release func()
 			if a.files != nil {
-				if path, ok := toolMutationPath(name, args); ok {
-					release = a.files.acquirePath(path)
+				if paths := toolMutationPaths(name, args); len(paths) > 0 {
+					release = a.files.acquirePaths(paths)
 				} else if name == "bash" {
 					release = a.files.acquireGlobal()
 				}
@@ -655,9 +940,29 @@ func (a *Agent) runToolResultsWithTools(ctx context.Context, calls []llm.ToolCal
 					ev.OnToolOutput(tc.ID, output)
 				})
 			}
+			observations, searchState, _, _ := a.stateSnapshot()
+			toolCtx = tools.WithObservationStore(toolCtx, a.currentSessionID(), observations)
+			toolCtx = tools.WithSearchStore(toolCtx, a.currentSessionID(), searchState)
+			toolCtx = tools.WithSearchHints(toolCtx, a.searchHints())
 			result := tools.ExecuteResult(toolCtx, available, name, json.RawMessage(args))
 			result = a.attachArtifact(ctx, result)
 			ms := time.Since(start).Milliseconds()
+			if ev.OnToolTelemetry != nil {
+				metadata := make(map[string]string, len(result.Metadata))
+				for key, value := range result.Metadata {
+					metadata[key] = value
+				}
+				ev.OnToolTelemetry(ToolTelemetry{
+					ID:            tc.ID,
+					Name:          name,
+					PreviewBytes:  len(result.Preview),
+					RetainedBytes: len(result.Retained),
+					OriginalBytes: result.OriginalBytes,
+					Truncated:     !result.Complete || result.OriginalBytes > int64(len(result.Preview)),
+					BashRedirect:  result.Metadata["bash_redirect"] == "true",
+					Metadata:      metadata,
+				})
+			}
 			if ev.OnToolEnd != nil {
 				ev.OnToolEnd(tc.ID, name, result.Preview)
 			}
@@ -817,8 +1122,10 @@ func (a *Agent) compactWithEvents(ctx context.Context, ev Events) (summary strin
 	role, provider, protocol := a.Role, a.Provider, a.Protocol
 	if backend != a.Backend || mdl != a.Model {
 		role = "tiny"
+		provider = a.CompactProvider
+		protocol = a.CompactProtocol
 	}
-	sum, usage, cerr := a.callComplete(ctx, backend, role, provider, protocol, llm.Request{
+	sum, usage, cerr := a.CompleteWithRoute(ctx, backend, role, provider, protocol, llm.Request{
 		Model:     mdl,
 		MaxTokens: 1024,
 		Messages: []llm.Message{

@@ -13,11 +13,12 @@ flowchart TB
 
     subgraph core["core — internal/tools"]
         BASH["bash<br/>shell commands, global lock,<br/>interactive PTY for sudo"]
-        READ["read<br/>file with line numbers"]
+        READ["read<br/>bounded observed line ranges"]
         WRITE["write<br/>create/overwrite"]
-        EDIT["edit<br/>exact-string replacement"]
-        GREP["grep<br/>regex text search"]
-        GLOB["glob<br/>path search"]
+        EDIT["edit<br/>observed range edits"]
+        GREP["grep<br/>grouped regex search"]
+        GLOB["glob<br/>exact path search"]
+        FIND["find_files<br/>fuzzy path search"]
         SUGGEST["suggest<br/>file completions"]
     end
 
@@ -37,13 +38,13 @@ flowchart TB
 
 ## Design rules
 
-1. **Few, composable tools beat many special cases.** There is no "search
-   the web" tool — there is `bash` and `curl`. There is no "rename symbol"
-   tool — there is `edit` plus LSP diagnostics that catch what the edit
-   broke. The model composes the primitives.
-2. **Reads are free, mutations are locked.** `read` and `suggest` never
-   block. `write`/`edit` serialize per canonical path; `bash` serializes
-   globally because its side effects can't be attributed to one file.
+1. **Dedicated exploration stays bounded.** `grep` searches text, `glob`
+   handles exact paths, `find_files` handles fuzzy paths, and `read` returns
+   complete numbered ranges. Bash is for builds, tests, git, and operations
+   those tools cannot express.
+2. **Reads are observations; mutations are locked.** `read` records the exact
+   bytes issued to the model. Observed `edit` ranges must match that evidence;
+   write/edit serialize per canonical path, while bash takes the global lock.
 3. **Failure is data.** Tool errors return as results the model can act on —
    a failed `bash` includes exit code and stderr tail; a slow MCP server
    fails fast with an actionable message instead of blocking the loop.
@@ -53,18 +54,41 @@ flowchart TB
 
 ## grep and glob
 
-`grep` and `glob` are native, read-only workspace searches. They avoid a shell
-process, honor cancellation, and produce deterministic output. `grep` returns
-`path:line:matching line` rows for a regular expression; `literal: true`,
-`case_sensitive: false`, `include`, and `max_results` refine the search. `glob`
-returns regular files for a relative pattern; `**` is the recursive wildcard.
+`grep`, `glob`, and `find_files` are native, read-only workspace searches. They
+avoid a shell process, honor cancellation, and produce deterministic output.
+`grep` accepts one regular expression or a `patterns` OR array, groups matches
+by file, ranks touched/modified and narrow-path results, and defaults to 25
+matches per page. `glob` is exact; `find_files` scores every candidate before
+selecting fuzzy path matches. Each search can return a cursor for a stable
+session snapshot.
 
-Both tools load nested `.gitignore` files with negation, anchoring, and
-directory-only rules. They skip `.git`, binary files (`grep`), symlinks, and
-non-regular files. The default root is the current working directory; an
-explicit root is allowed but all traversal remains inside an `os.Root`.
-Output is capped at 50,000 bytes, results default to 1,000 and cap at 10,000,
-and traversal stops at 100,000 entries with a visible limit marker.
+`grep` and `glob` load nested `.gitignore` files with negation, anchoring, and
+directory-only rules. All three skip `.git`, symlinks, and non-regular files;
+`grep` also skips binaries. The default root is the current working directory;
+an explicit root is allowed but all native traversal remains inside an `os.Root`.
+The model-facing search page is capped at 8 KiB, while the cursor snapshot is
+bounded by the artifact ceiling. Results cap at 10,000 and traversal stops at
+100,000 entries with an explicit incomplete-retention warning. Large retained
+snapshots use the normal artifact path.
+
+## read observations and edit
+
+`read` returns at most 200 complete numbered lines (1,000 maximum) and a
+32 KiB output budget. It includes an opaque observation id and continuation
+offset, and stores the exact original line bytes in the session registry. A
+primary `edit` uses `mode: "observed"` with one `edits` array; operations are
+`replace`, `delete`, `insert_before`, or `insert_after` and must target an
+issued range from the same session and canonical path. If surrounding lines
+shift, only one exact occurrence of the stored bytes may relocate the range.
+Changed, missing, ambiguous, overlapping, or unobserved ranges fail without
+writing. `mode: "exact"` retains the old unique `old_string` shape as an
+explicit compatibility escape hatch.
+
+Multi-file observed edits preflight immutable originals, permissions, and
+intersections, acquire sorted path locks, stage same-directory temporary files,
+publish each with rename, and best-effort roll back earlier publications on a
+later failure. Results contain a compact diff, changed-line readback, and LSP
+diagnostics. File modes and line endings are preserved.
 
 ## artifact_list and artifact_read
 
@@ -91,6 +115,16 @@ evidence.
 ## bash
 
 Runs through `internal/tools/bashrun` so the agent can:
+
+- **avoid accidental exploration** — simple recursive `grep`, `find .`,
+  `ls -R`, and inspection-only `cat`/`sed` calls return a dedicated-tool
+  redirect without executing. Pipelines, `git grep`, advanced predicates, and
+  paths outside the workspace remain an explicit bash escape hatch.
+
+- **stay within context** — recognized search/listing output previews are
+  capped near 8 KiB; ordinary commands near 14 KiB. The retained result still
+  follows the artifact policy, and JSON runs receive per-tool byte/redirect
+  telemetry.
 
 - **see progress** — non-interactive calls publish accumulated stdout/stderr
   snapshots at most every 100ms. The agent event carries the tool-call id and

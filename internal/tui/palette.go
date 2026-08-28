@@ -894,6 +894,7 @@ func (m *model) previewModel(it modelItem) {
 		ag.Effort = m.agent.Effort
 		ag.Messages = append(ag.Messages, m.agent.Messages[1:]...) // carry history
 		ag.CompactBackend, ag.CompactModel = m.agent.CompactBackend, m.agent.CompactModel
+		ag.CompactProvider, ag.CompactProtocol = m.agent.CompactProvider, m.agent.CompactProtocol
 		ag.CompactThreshold = m.agent.CompactThreshold
 	} else {
 		ag.Effort = m.cfg.DefaultEffort

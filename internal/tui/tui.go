@@ -26,6 +26,7 @@ import (
 	"github.com/sacca97/ghg/internal/agent"
 	"github.com/sacca97/ghg/internal/artifact"
 	"github.com/sacca97/ghg/internal/config"
+	goalstate "github.com/sacca97/ghg/internal/goal"
 	"github.com/sacca97/ghg/internal/llm"
 	"github.com/sacca97/ghg/internal/lsp"
 	"github.com/sacca97/ghg/internal/mcp"
@@ -68,6 +69,8 @@ type goalFromContextMsg struct {
 	err  error
 }
 
+type goalUpdateMsg struct{ update agent.GoalUpdate }
+
 type planProposalMsg struct {
 	plan agent.Plan
 	err  error
@@ -80,11 +83,13 @@ type compactMsg struct {
 	err        error
 }
 type turnDoneMsg struct {
-	final string
-	err   error
-	at    int    // conversation index the turn started at (snapshot key)
-	snap  string // pre-turn workspace snapshot commit ("" = not a git repo)
-	clean bool   // the turn left the tree clean — snap is worthless, drop it
+	final       string
+	err         error
+	at          int    // conversation index the turn started at (snapshot key)
+	snap        string // pre-turn workspace snapshot commit ("" = not a git repo)
+	clean       bool   // the turn left the tree clean — snap is worthless, drop it
+	goalUpdates []agent.GoalUpdate
+	goalUsage   llm.Usage
 }
 type catalogsMsg map[string]config.Catalog // background /models fetch result
 type noticeMsg string                      // dim one-liner appended to the transcript
@@ -167,8 +172,9 @@ type model struct {
 	interrupt1 bool     // first ctrl+c pressed while busy; second cancels
 	quit1      bool     // first ctrl+c pressed while idle; second quits (armed briefly)
 
-	goal         string      // active /goal; the loop continues until GOAL_MET
-	goalRounds   int         // continuation turns spent on the current goal
+	goal         string // compatibility mirror of the active structured goal
+	goalRounds   int    // compatibility mirror of the structured goal rounds
+	goalRecord   *goalstate.Record
 	titled       bool        // an auto-title has been attempted for this session
 	proposedPlan *agent.Plan // latest /plan result, waiting for /execute
 	mode         string      // user-visible operating mode: plan or execute
@@ -800,6 +806,36 @@ func (m *model) resume(id string) error {
 	if err != nil {
 		return err
 	}
+	var restoredGoal goalstate.Record
+	hasGoal, err := func() (bool, error) {
+		record, ok, err := m.store.LoadGoal(meta.ID)
+		if err != nil {
+			return false, err
+		}
+		if !ok && strings.TrimSpace(meta.Goal) != "" {
+			record = goalstate.New(meta.Goal)
+			record.ID = "legacy-" + meta.ID
+			ok = true
+		}
+		if ok {
+			restoredGoal = record
+			// A process can only resume an active goal after an explicit
+			// command. Treat an active record loaded from disk as interrupted,
+			// so a restart never silently launches autonomous work.
+			if restoredGoal.Status == goalstate.StatusActive {
+				restoredGoal.Status = goalstate.StatusPaused
+				restoredGoal.Blocker = "process ended; resume explicitly"
+				restoredGoal.UpdatedAt = m.nowFn().UTC()
+				if err := m.store.CheckpointGoal(meta.ID, restoredGoal); err != nil {
+					return false, err
+				}
+			}
+		}
+		return ok, nil
+	}()
+	if err != nil {
+		return err
+	}
 	// prefer the session's model/provider; fall back to current on error.
 	// The session's own effort wins; a row that pre-dates per-session effort
 	// ("") inherits the current default and gets stamped on the next save.
@@ -821,6 +857,9 @@ func (m *model) resume(id string) error {
 	// Publish before restoring so the settled rows record against this session.
 	m.agent.Tasks().SetSessionID(meta.ID)
 	m.agent.SetSessionID(meta.ID)
+	if err := m.agent.BindState(context.Background()); err != nil {
+		config.LogEvent("session.state", "bind failed: "+err.Error())
+	}
 	// Restore the session's background subagents into the dock. Everything
 	// comes back settled: a process exit kills in-flight subagents, so a row
 	// still "running" on disk means it died with the last exit.
@@ -841,6 +880,7 @@ func (m *model) resume(id string) error {
 		config.LogEvent("session.task", "load failed: "+terr.Error())
 	}
 	m.agent.Messages = append(m.agent.Messages, msgs...)
+	m.agent.RebuildTouched(msgs)
 	m.agent.LoadTodosJSON(m.store.Todos(meta.ID))
 	m.snapshots = m.store.Snapshots(meta.ID)
 	// restore the cumulative token totals saved with the session; a row that
@@ -892,8 +932,13 @@ func (m *model) resume(id string) error {
 	m.msgBlock = nil
 	m.future = nil // a different session's tail isn't this session's redo
 	m.proposedPlan = nil
-	m.goal = meta.Goal
-	m.goalRounds = 0
+	m.goalRecord = nil
+	if hasGoal {
+		m.applyGoalRecord(restoredGoal)
+	} else {
+		m.goal = ""
+		m.goalRounds = 0
+	}
 	m.append(dimStyle.Render(fmt.Sprintf("resumed %s · %s · %s @ %s", meta.ID, meta.Title, m.modelName, m.provName)))
 	interrupted := 0
 	for _, msg := range msgs {
@@ -904,8 +949,8 @@ func (m *model) resume(id string) error {
 	if interrupted > 0 {
 		m.append(dimStyle.Render(fmt.Sprintf("⚠ %d tool call(s) were interrupted when this session last ended; the model knows and can retry them.", interrupted)))
 	}
-	if m.goal != "" {
-		m.append(dimStyle.Render("◎ goal restored — /goal resume to keep working on it"))
+	if hasGoal {
+		m.append(dimStyle.Render(fmt.Sprintf("◎ goal %s restored (%s) — /goal resume to keep working on it", restoredGoal.ID, restoredGoal.Status)))
 	}
 	m.seedTranscript(msgs, 1)
 	return nil
@@ -971,11 +1016,16 @@ func (m *model) persist() {
 		bashrun.SetMarkers(id, m.agent.Model)
 		m.agent.Tasks().SetSessionID(id) // publish before Save so a settling subagent records
 		m.agent.SetSessionID(id)         // scopes the per-session memory file
+		if err := m.agent.BindState(context.Background()); err != nil {
+			config.LogEvent("session.state", "bind failed: "+err.Error())
+		}
 	}
 	// Bookkeeping re-stamps every persist — even one with no new messages —
-	// so a resume restores goal/effort, and the cumulative token totals that
-	// survive a compaction rewrite of the messages.
-	_ = m.store.SetGoal(m.sessionID, m.goal)
+	// so a resume restores the structured goal lifecycle, effort, and the
+	// cumulative token totals that survive a compaction rewrite of messages.
+	if record, ok := m.goalRecordForSession(); ok {
+		m.persistGoal(record, false)
+	}
 	_ = m.store.SetEffort(m.sessionID, m.agent.Effort)
 	_ = m.store.SetTodos(m.sessionID, m.agent.TodosJSON())
 	if u := m.agent.Usage(); u.PromptTokens > 0 || u.CompletionTokens > 0 {
@@ -1074,13 +1124,58 @@ func (m *model) resetEffort(lv string) {
 	}
 }
 
-// setGoal updates the active goal and persists it with the session.
-func (m *model) setGoal(goal string) {
-	m.goal = goal
-	m.goalRounds = 0
-	if m.store != nil && m.sessionID != "" {
-		_ = m.store.SetGoal(m.sessionID, goal)
+// setGoal creates a fresh structured goal or records an explicit user clear.
+// A cleared goal remains in the ledger as paused so its ID, progress, and
+// blocker history are not silently discarded.
+func (m *model) setGoal(objective string) {
+	objective = strings.TrimSpace(objective)
+	if objective == "" {
+		if record, ok := m.goalRecordForSession(); ok {
+			record.Status = goalstate.StatusPaused
+			record.Progress = ""
+			record.Blocker = "cleared by user"
+			record.UpdatedAt = m.nowFn().UTC()
+			m.applyGoalRecord(record)
+			m.persistGoal(record, true)
+		} else {
+			m.goal = ""
+			m.goalRounds = 0
+			m.goalRecord = nil
+			if m.store != nil && m.sessionID != "" {
+				_ = m.store.ClearGoal(m.sessionID)
+			}
+		}
+		m.goal = ""
+		return
 	}
+	record := goalstate.New(objective)
+	if err := record.Validate(); err != nil {
+		m.append(errStyle.Render("goal: " + err.Error()))
+		return
+	}
+	m.applyGoalRecord(record)
+	m.persistGoal(record, true)
+}
+
+// resumeGoal is the only path that turns a persisted non-active goal back into
+// active work. This keeps process restart and blocked/limited goals explicit.
+func (m *model) resumeGoal() bool {
+	record, ok := m.goalRecordForSession()
+	if !ok {
+		m.append(errStyle.Render("no goal to resume — set one with /goal <text>"))
+		return false
+	}
+	if record.Status == goalstate.StatusComplete {
+		m.append(dimStyle.Render("goal is complete — set a new goal with /goal <text>"))
+		return false
+	}
+	record.Status = goalstate.StatusActive
+	record.Blocker = ""
+	record.UpdatedAt = m.nowFn().UTC()
+	m.applyGoalRecord(record)
+	m.persistGoal(record, true)
+	m.append(dimStyle.Render("◎ resuming goal " + record.ID + ": " + record.Objective))
+	return true
 }
 
 func artifactsDisabled(cfg *config.Config) bool {
@@ -1123,6 +1218,10 @@ func (m *model) configureArtifactAgent(ag *agent.Agent) {
 	}
 	ag.ArtifactStore = m.artifactStore
 	ag.ArtifactCatalog = m.store
+	if m.store != nil {
+		ag.SetObservationStore(m.store.ObservationRegistryStore())
+		ag.SetSearchStore(m.store.SearchRegistryStore())
+	}
 	ag.ArtifactsDisabled = artifactsDisabled(m.cfg)
 	if !ag.ArtifactsDisabled {
 		ag.ArtifactWriter = m.artifactStore
@@ -2087,6 +2186,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.applyShellDone(msg)
 		return m, nil
 
+	case goalUpdateMsg:
+		m.applyGoalUpdate(msg.update)
+		return m, nil
+
 	case goalFromContextMsg:
 		// the formulation call finished between turns; on success set the
 		// goal and kick off the goal loop exactly like /goal <text>
@@ -2171,6 +2274,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else if canceled {
 			m.append(dimStyle.Render("(interrupted — any running tool calls will be recorded as interrupted; ghg can retry them next turn)"))
 		}
+		continueGoal := m.goalTurnFinished(msg, canceled)
 		m.persist()
 		switch {
 		case msg.snap != "" && msg.clean:
@@ -2198,19 +2302,13 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m.drainQueueHead()
 		}
-		// goal loop: keep working until the model explicitly declares GOAL_MET
-		if m.goal != "" && msg.err == nil {
-			if goalMet(msg.final) {
-				m.append(dimStyle.Render("◎ goal met after " + fmt.Sprint(m.goalRounds) + " round(s)"))
-				m.setGoal("")
-				return m, nil
+		// Structured update_goal controls continuation. A plain assistant
+		// response never completes or pauses an active goal.
+		if continueGoal {
+			record, ok := m.goalRecordForSession()
+			if ok && record.Status == goalstate.StatusActive {
+				return m.submitGoal(goalContinuePrompt(record.Objective))
 			}
-			if m.goalRounds >= m.goalMaxRounds() {
-				m.append(errStyle.Render(fmt.Sprintf("◎ goal paused after %d rounds — /goal resume to continue, /goal clear to drop", m.goalRounds)))
-				return m, nil
-			}
-			m.goalRounds++
-			return m.submitGoal(goalContinuePrompt(m.goal))
 		}
 		return m, nil
 
@@ -2924,6 +3022,7 @@ func (m *model) applyCompactModel() {
 		return
 	}
 	m.agent.CompactBackend, m.agent.CompactModel = nil, ""
+	m.agent.CompactProvider, m.agent.CompactProtocol = "", ""
 	cm := m.compactModel
 	cp := m.compactProv
 	if cm == "" {
@@ -2984,6 +3083,8 @@ func (m *model) applyCompactModel() {
 		if backendErr == nil {
 			m.agent.CompactBackend = backend
 			m.agent.CompactModel = apiID
+			m.agent.CompactProvider = provName
+			m.agent.CompactProtocol = protocol
 		} else if m.compactModel != "" {
 			m.append(errStyle.Render("compaction model: " + backendErr.Error() + " — using current model"))
 		}
@@ -3087,17 +3188,20 @@ func (m *model) tasksView() string {
 
 // switchModel rebuilds the agent on a new model/provider, carrying history.
 func (m *model) switchModel(name, prov string) {
+	previous := m.agent
 	ag, mn, pn, err := buildAgent(m.cfg, name, prov, m.sysPrompt)
 	if err != nil {
 		m.append(errStyle.Render(err.Error()))
 		return
 	}
 	ag.ReasoningToggle = m.reasoningToggleFor(pn, ag.Model)
-	if m.agent != nil {
-		ag.Effort = m.agent.Effort
-		ag.Messages = append(ag.Messages, m.agent.Messages[1:]...) // carry history
-		ag.CompactBackend, ag.CompactModel = m.agent.CompactBackend, m.agent.CompactModel
-		ag.CompactThreshold = m.agent.CompactThreshold
+	if previous != nil {
+		ag.Effort = previous.Effort
+		ag.Messages = append(ag.Messages, previous.Messages[1:]...) // carry history
+		ag.CompactBackend, ag.CompactModel = previous.CompactBackend, previous.CompactModel
+		ag.CompactProvider, ag.CompactProtocol = previous.CompactProvider, previous.CompactProtocol
+		ag.CompactThreshold = previous.CompactThreshold
+		previous.ShareState(ag)
 	} else {
 		ag.Effort = m.cfg.DefaultEffort
 		if ag.Effort == "" {
@@ -3540,6 +3644,8 @@ func (m *model) submitTurn(text string, authored bool) (tea.Model, tea.Cmd) {
 	if m.agent != nil {
 		m.agent.Tasks().ClearSettled()
 	}
+	goalCtx, hasGoal := m.goalRecordForSession()
+	hasGoal = hasGoal && goalCtx.Status == goalstate.StatusActive
 	ctx, cancel := context.WithCancel(context.Background())
 	m.cancel = cancel
 	p := m.prog
@@ -3557,6 +3663,8 @@ func (m *model) submitTurn(text string, authored bool) (tea.Model, tea.Cmd) {
 	// on the same timer.
 	var mu sync.Mutex
 	var pend, thinkPend string
+	var goalUpdates []agent.GoalUpdate
+	var goalUsage llm.Usage
 	var timer *time.Timer
 	flush := func() {
 		mu.Lock()
@@ -3607,7 +3715,31 @@ func (m *model) submitTurn(text string, authored bool) (tea.Model, tea.Cmd) {
 				send(steeredMsg(s))
 			},
 			OnCompacted: func(sum string, cutoff int) { send(compactMsg{summary: sum, cutoff: cutoff}) },
-			OnUsage:     func(u llm.Usage) { send(usageMsg(u)) },
+			OnUsage: func(u llm.Usage) {
+				mu.Lock()
+				goalUsage.PromptTokens += u.PromptTokens
+				goalUsage.CompletionTokens += u.CompletionTokens
+				goalUsage.CacheCreationTokens += u.CacheCreationTokens
+				if cached := u.Cached(); cached > 0 {
+					if goalUsage.PromptTokensDetails == nil {
+						goalUsage.PromptTokensDetails = &struct {
+							CachedTokens int `json:"cached_tokens"`
+						}{}
+					}
+					goalUsage.PromptTokensDetails.CachedTokens += cached
+				}
+				mu.Unlock()
+				send(usageMsg(u))
+			},
+			OnGoalUpdate: func(update agent.GoalUpdate) {
+				mu.Lock()
+				goalUpdates = append(goalUpdates, update)
+				mu.Unlock()
+				if p != nil {
+					send(goalUpdateMsg{update: update})
+					return
+				}
+			},
 			OnRetry: func(ev llm.RetryEvent) {
 				flush()
 				send(noticeMsg(fmt.Sprintf("⚠ request failed (%s) — retrying in %s (attempt %d/%d)",
@@ -3618,18 +3750,34 @@ func (m *model) submitTurn(text string, authored bool) (tea.Model, tea.Cmd) {
 		var err error
 		switch {
 		case len(parts) > 0:
-			final, err = m.agent.TurnWithImages(ctx, prepared, parts, events)
+			if hasGoal {
+				final, err = m.agent.TurnWithImagesAndGoal(ctx, prepared, parts, goalCtx, events)
+			} else {
+				final, err = m.agent.TurnWithImages(ctx, prepared, parts, events)
+			}
 		case authored:
-			final, err = m.agent.TurnAuthored(ctx, prepared, events)
+			if hasGoal {
+				final, err = m.agent.TurnAuthoredWithGoal(ctx, prepared, goalCtx, events)
+			} else {
+				final, err = m.agent.TurnAuthored(ctx, prepared, events)
+			}
 		default:
-			final, err = m.agent.Turn(ctx, prepared, events)
+			if hasGoal {
+				final, err = m.agent.TurnWithGoal(ctx, prepared, goalCtx, events)
+			} else {
+				final, err = m.agent.Turn(ctx, prepared, events)
+			}
 		}
 		flush()
+		mu.Lock()
+		updates := append([]agent.GoalUpdate(nil), goalUpdates...)
+		usage := goalUsage
+		mu.Unlock()
 		// stamp rewind provenance on the submitted message (appended by turn)
 		if rewoundFrom != "" && userMsgIdx < len(m.agent.Messages) {
 			m.agent.Messages[userMsgIdx].RewoundFrom = rewoundFrom
 		}
-		send(turnDoneMsg{final: final, err: err, at: userMsgIdx, snap: preSnap, clean: workspaceClean()})
+		send(turnDoneMsg{final: final, err: err, at: userMsgIdx, snap: preSnap, clean: workspaceClean(), goalUpdates: updates, goalUsage: usage})
 	}()
 	m.append(youStyle.Render("❯ ") + linkifyFilePaths(text, realFileExists))
 	if authored {
@@ -3686,10 +3834,12 @@ func (m *model) command(text string) (tea.Model, tea.Cmd) {
 		m.msgBlock = nil
 		m.future = nil // no redo across a cleared conversation
 		m.proposedPlan = nil
-		m.setGoal("")    // clear before detaching so the old session's goal is dropped too
+		m.setGoal("") // clear before detaching so the old session's goal is dropped too
+		m.goalRecord = nil
 		m.sessionID = "" // next turn starts a fresh session
 		m.agent.Tasks().SetSessionID("")
 		m.agent.SetSessionID("")
+		m.agent.ResetState()
 		m.saved = 1
 		m.append(dimStyle.Render("(conversation cleared)"))
 	case "/memory":
@@ -3860,13 +4010,13 @@ func (m *model) command(text string) (tea.Model, tea.Cmd) {
 		prompt := agent.BuildGoalFromContextPrompt(tail)
 		formulate := func() (string, error) {
 			reasoningEffort, reasoningEnabled := ag.ReasoningRequest()
-			message, usage, err := ag.Backend.Complete(ctx, llm.Request{
+			message, usage, err := ag.CompleteWithRoute(ctx, ag.Backend, ag.Role, ag.Provider, ag.Protocol, llm.Request{
 				Model:            ag.Model,
 				MaxTokens:        8192,
 				Messages:         []llm.Message{{Role: "user", Content: prompt}},
 				ReasoningEffort:  reasoningEffort,
 				ReasoningEnabled: reasoningEnabled,
-			})
+			}, agent.Events{})
 			ag.AddUsage(usage) // the formulation call is session spend too
 			return message.TextContent(), err
 		}
@@ -3905,10 +4055,17 @@ func (m *model) command(text string) (tea.Model, tea.Cmd) {
 	case "/goal":
 		switch {
 		case len(fields) == 1:
-			if m.goal == "" {
+			record, ok := m.goalRecordForSession()
+			if !ok {
 				m.append(dimStyle.Render("no goal set — /goal <text> to set one"))
 			} else {
-				m.append(dimStyle.Render(fmt.Sprintf("◎ goal (round %d/%d): %s", m.goalRounds, m.goalMaxRounds(), m.goal)))
+				m.append(dimStyle.Render(fmt.Sprintf("◎ goal %s (%s, round %d/%d): %s", record.ID, record.Status, record.Rounds, m.goalMaxRounds(), record.Objective)))
+				if record.Progress != "" {
+					m.append(dimStyle.Render("  progress: " + record.Progress))
+				}
+				if record.Blocker != "" {
+					m.append(dimStyle.Render("  blocker: " + record.Blocker))
+				}
 			}
 		case fields[1] == "clear":
 			m.setGoal("")
@@ -3919,13 +4076,11 @@ func (m *model) command(text string) (tea.Model, tea.Cmd) {
 			if !m.requireAgent() {
 				break
 			}
-			if m.goal == "" {
-				m.append(errStyle.Render("no goal to resume — set one with /goal <text>"))
+			if !m.resumeGoal() {
 				break
 			}
-			m.goalRounds = 0
-			m.append(dimStyle.Render("◎ resuming goal: " + m.goal))
-			return m.submitGoal(goalContinuePrompt(m.goal))
+			record, _ := m.goalRecordForSession()
+			return m.submitGoal(goalContinuePrompt(record.Objective))
 		default:
 			if !m.requireAgent() {
 				break

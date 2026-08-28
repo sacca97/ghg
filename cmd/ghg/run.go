@@ -150,6 +150,14 @@ func runCLI(args []string) error {
 		ev.OnToolEnd = func(_, name, result string) {
 			emit(map[string]string{"type": "tool_end", "name": name, "result": result})
 		}
+		ev.OnToolTelemetry = func(telemetry agent.ToolTelemetry) {
+			emit(map[string]any{
+				"type": "tool_telemetry", "id": telemetry.ID, "name": telemetry.Name,
+				"preview_bytes": telemetry.PreviewBytes, "retained_bytes": telemetry.RetainedBytes,
+				"original_bytes": telemetry.OriginalBytes, "truncated": telemetry.Truncated,
+				"bash_redirect": telemetry.BashRedirect, "metadata": telemetry.Metadata,
+			})
+		}
 		ev.OnModelCallStart = func(call agent.ModelCallStart) {
 			emit(map[string]any{
 				"type": "model_call_start", "role": call.Role, "provider": call.Provider,
@@ -320,9 +328,17 @@ func runCLI(args []string) error {
 			}
 		}
 	}
-	ag.SetSessionID(sessionID)
 	if store != nil {
 		ag.ArtifactCatalog = store
+		ag.SetObservationStore(store.ObservationRegistryStore())
+		ag.SetSearchStore(store.SearchRegistryStore())
+	}
+	ag.SetSessionID(sessionID)
+	if err := ag.BindState(ctx); err != nil {
+		return fmt.Errorf("bind session tool state: %w", err)
+	}
+	if *resumeFlag != "" {
+		ag.RebuildTouched(ag.MessagesSnapshot())
 	}
 
 	final, err := ag.Turn(ctx, prompt, ev)

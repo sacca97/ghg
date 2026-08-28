@@ -21,10 +21,11 @@ const (
 	TaskCancelled TaskStatus = "cancelled"
 )
 
-// BackgroundTask is one backgrounded subagent. Done is closed exactly once when
-// the task settles — closing a channel broadcasts to every waiter at once,
-// which is what makes the "any number of watchers get woken together" shape
-// free in Go (opencode needs a per-job Deferred for the same thing).
+// BackgroundTask is one backgrounded subagent. Done is closed exactly once
+// after settlement callbacks finish — closing a channel broadcasts to every
+// waiter at once, which is what makes the "any number of watchers get woken
+// together" shape free in Go (opencode needs a per-job Deferred for the same
+// thing).
 type BackgroundTask struct {
 	ID          string
 	Description string
@@ -167,7 +168,9 @@ func (r *taskRegistry) Cancel(id string) bool {
 	return true
 }
 
-// settle records the final state and closes Done to wake every waiter.
+// settle records the final state, runs the settlement callbacks, and then
+// closes Done to wake every waiter. Done is the happens-before signal for the
+// complete settlement operation, including persistence in OnRecord.
 func (r *taskRegistry) settle(id string, status TaskStatus, report string) {
 	r.mu.Lock()
 	t, ok := r.tasks[id]
@@ -177,13 +180,13 @@ func (r *taskRegistry) settle(id string, status TaskStatus, report string) {
 	}
 	t.Status, t.Report, t.EndedAt = status, report, time.Now()
 	r.mu.Unlock()
-	close(t.Done) // broadcast to all waiters
 	if r.OnChange != nil {
 		r.OnChange(t)
 	}
 	if r.OnRecord != nil {
 		r.OnRecord(r.recordSession(), t)
 	}
+	close(t.Done) // broadcast only after the final state is persisted
 }
 
 var taskIDCounter atomic.Int64
@@ -238,7 +241,8 @@ func (a *Agent) StartBackground(ctx context.Context, description, prompt string)
 		delete(a.bg.subs, id)
 		a.bg.mu.Unlock()
 		// Fan the result back into the parent as a steered message so the model
-		// sees it on the next loop boundary — channel-close (settle) → Steer.
+		// sees it on the next loop boundary — settlement callbacks → channel
+		// close → Steer.
 		// text/status are locals (not the shared task struct), so no race.
 		a.Steer(fmt.Sprintf("[background task %s %s] %s\n\n%s", id, status, description, text))
 	}()

@@ -15,6 +15,7 @@ import (
 	_ "modernc.org/sqlite"
 
 	"github.com/sacca97/ghg/internal/artifact"
+	"github.com/sacca97/ghg/internal/goal"
 	"github.com/sacca97/ghg/internal/llm"
 )
 
@@ -102,7 +103,67 @@ CREATE TABLE IF NOT EXISTS compactions (
 	summary    TEXT NOT NULL,
 	created_at TEXT NOT NULL,
 	PRIMARY KEY (session_id, seq)
-);`
+);
+-- Goal state is separate from the legacy sessions.goal mirror so a goal can
+-- retain its identity, lifecycle, accounting, and checkpoint history.
+CREATE TABLE IF NOT EXISTS goals (
+	session_id       TEXT NOT NULL REFERENCES sessions(id),
+	goal_id          TEXT NOT NULL,
+	objective        TEXT NOT NULL,
+	status           TEXT NOT NULL,
+	rounds           INTEGER NOT NULL DEFAULT 0,
+	usage_in         INTEGER NOT NULL DEFAULT 0,
+	usage_cached     INTEGER NOT NULL DEFAULT 0,
+	usage_out        INTEGER NOT NULL DEFAULT 0,
+	progress         TEXT NOT NULL DEFAULT '',
+	blocker          TEXT NOT NULL DEFAULT '',
+	created_at       TEXT NOT NULL,
+	updated_at       TEXT NOT NULL,
+	PRIMARY KEY (session_id, goal_id)
+);
+CREATE INDEX IF NOT EXISTS goals_session_updated ON goals(session_id, updated_at DESC);
+CREATE TABLE IF NOT EXISTS goal_checkpoints (
+	session_id       TEXT NOT NULL REFERENCES sessions(id),
+	goal_id          TEXT NOT NULL,
+	seq              INTEGER NOT NULL,
+	status           TEXT NOT NULL,
+	rounds           INTEGER NOT NULL DEFAULT 0,
+	usage_in         INTEGER NOT NULL DEFAULT 0,
+	usage_cached     INTEGER NOT NULL DEFAULT 0,
+	usage_out       INTEGER NOT NULL DEFAULT 0,
+	progress         TEXT NOT NULL DEFAULT '',
+	blocker          TEXT NOT NULL DEFAULT '',
+	created_at       TEXT NOT NULL,
+	PRIMARY KEY (session_id, goal_id, seq)
+);
+-- Read observations are exact, bounded byte ranges issued to the model. They
+-- are session-owned authorization evidence for stateful edits, not hashes.
+CREATE TABLE IF NOT EXISTS observations (
+	session_id   TEXT NOT NULL REFERENCES sessions(id),
+	observation_id TEXT NOT NULL,
+	path         TEXT NOT NULL,
+	start_line   INTEGER NOT NULL,
+	end_line     INTEGER NOT NULL,
+	next_offset  INTEGER NOT NULL,
+	issued_bytes INTEGER NOT NULL,
+	content      TEXT NOT NULL,
+	complete     INTEGER NOT NULL,
+	created_at   TEXT NOT NULL,
+	PRIMARY KEY (session_id, observation_id)
+);
+CREATE INDEX IF NOT EXISTS observations_session_path ON observations(session_id, path);
+-- Search snapshots back cursor pagination with an immutable, bounded result
+-- set. The JSON payload is intentionally opaque to SQL.
+CREATE TABLE IF NOT EXISTS search_snapshots (
+	session_id TEXT NOT NULL REFERENCES sessions(id),
+	snapshot_id TEXT NOT NULL,
+	kind       TEXT NOT NULL,
+	snapshot   TEXT NOT NULL,
+	created_at TEXT NOT NULL,
+	PRIMARY KEY (session_id, snapshot_id)
+);
+CREATE INDEX IF NOT EXISTS search_snapshots_session_created ON search_snapshots(session_id, created_at);
+`
 
 // extraColumns are added idempotently after the base schema: SQLite's
 // ADD COLUMN errors if the column already exists, so each is guarded by an
@@ -170,13 +231,33 @@ func Open(path string) (*Store, error) {
 	// The artifact table was introduced after the initial Phase 1 slice; keep
 	// databases created by that slice readable when metadata is added.
 	_, _ = db.Exec(`ALTER TABLE artifacts ADD COLUMN metadata TEXT NOT NULL DEFAULT ''`)
+	if err := migrateLegacyGoals(db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	return &Store{db: db}, nil
 }
 
 // SetGoal stores the session's active goal ("" clears it).
-func (s *Store) SetGoal(id, goal string) error {
-	_, err := s.db.Exec(`UPDATE sessions SET goal=? WHERE id=?`, goal, id)
-	return err
+func (s *Store) SetGoal(id, objective string) error {
+	objective = strings.TrimSpace(objective)
+	if objective == "" {
+		return s.ClearGoal(id)
+	}
+	record, ok, err := s.LoadGoal(id)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		record = goal.New(objective)
+		record.ID = "legacy-" + id
+	} else {
+		record.Objective = objective
+		record.Status = goal.StatusActive
+		record.Blocker = ""
+		record.UpdatedAt = time.Now().UTC()
+	}
+	return s.CheckpointGoal(id, record)
 }
 
 // SetTodos stores the session's todowrite plan as JSON ("" clears it). The
@@ -526,7 +607,7 @@ func (s *Store) DeleteSession(id string) error {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	for _, table := range []string{"artifacts", "messages", "tasks", "snapshots", "schedules", "compactions"} {
+	for _, table := range []string{"artifacts", "messages", "tasks", "snapshots", "schedules", "compactions", "goal_checkpoints", "goals", "observations", "search_snapshots"} {
 		if _, err := tx.Exec(`DELETE FROM `+table+` WHERE session_id=?`, id); err != nil {
 			return err
 		}
@@ -1004,6 +1085,22 @@ func (s *Store) Fork(srcID string, uptoSeq int, title string) (string, error) {
 	if _, err := tx.Exec(`INSERT INTO sessions (id, created_at, updated_at, cwd, model, provider, title, goal, forked_from, fork_seq, effort)
 		SELECT ?, ?, ?, cwd, model, provider, ?, goal, ?, ?, effort FROM sessions WHERE id=?`,
 		newID, now(), now(), title, srcID, uptoSeq, srcID); err != nil {
+		return "", err
+	}
+	if _, err := tx.Exec(`INSERT INTO goals
+		(session_id, goal_id, objective, status, rounds, usage_in, usage_cached,
+		 usage_out, progress, blocker, created_at, updated_at)
+		SELECT ?, goal_id, objective, status, rounds, usage_in, usage_cached,
+		 usage_out, progress, blocker, created_at, updated_at
+		FROM goals WHERE session_id=?`, newID, srcID); err != nil {
+		return "", err
+	}
+	if _, err := tx.Exec(`INSERT INTO goal_checkpoints
+		(session_id, goal_id, seq, status, rounds, usage_in, usage_cached,
+		 usage_out, progress, blocker, created_at)
+		SELECT ?, goal_id, seq, status, rounds, usage_in, usage_cached,
+		 usage_out, progress, blocker, created_at
+		FROM goal_checkpoints WHERE session_id=?`, newID, srcID); err != nil {
 		return "", err
 	}
 	if uptoSeq > 0 {

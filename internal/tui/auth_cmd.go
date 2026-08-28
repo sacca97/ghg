@@ -260,6 +260,7 @@ func (m *model) applyAuthResult(res authResultMsg) {
 				ag.Messages = append(ag.Messages, m.agent.Messages[1:]...)
 			}
 			ag.CompactBackend, ag.CompactModel = m.agent.CompactBackend, m.agent.CompactModel
+			ag.CompactProvider, ag.CompactProtocol = m.agent.CompactProvider, m.agent.CompactProtocol
 			ag.CompactThreshold = m.agent.CompactThreshold
 			m.agent = ag
 			m.configureArtifactAgent(m.agent)

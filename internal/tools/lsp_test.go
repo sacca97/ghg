@@ -38,7 +38,7 @@ func TestWriteEditAppendLSPDiagnostics(t *testing.T) {
 		t.Fatalf("hook calls: %v", stub.calls)
 	}
 
-	args, _ = json.Marshal(map[string]any{"path": p, "old_string": "main", "new_string": "main2"})
+	args, _ = json.Marshal(map[string]any{"mode": "exact", "path": p, "old_string": "main", "new_string": "main2"})
 	out = Execute(context.Background(), All(), "edit", args)
 	if !strings.Contains(out, "<diagnostics") {
 		t.Fatalf("edit output missing diagnostics: %q", out)

@@ -28,12 +28,12 @@ func TestToolRoundTrip(t *testing.T) {
 	if !strings.Contains(out, "2\ttwo") {
 		t.Fatalf("read missing line numbers: %q", out)
 	}
-	out = run(t, "edit", fmt.Sprintf(`{"path":%q,"old_string":"two","new_string":"2"}`, f))
+	out = run(t, "edit", fmt.Sprintf(`{"mode":"exact","path":%q,"old_string":"two","new_string":"2"}`, f))
 	if strings.HasPrefix(out, "Error") {
 		t.Fatal(out)
 	}
 	out = run(t, "read", fmt.Sprintf(`{"path":%q,"offset":2,"limit":1}`, f))
-	if strings.TrimSpace(out) != "2\t2" {
+	if !strings.Contains(out, "2\t2") {
 		t.Fatalf("edit not applied: %q", out)
 	}
 	readResult := ExecuteResult(context.Background(), All(), "read", json.RawMessage(fmt.Sprintf(`{"path":%q}`, f)))
@@ -42,7 +42,7 @@ func TestToolRoundTrip(t *testing.T) {
 	}
 	// ambiguous edit must fail without replace_all
 	run(t, "write", fmt.Sprintf(`{"path":%q,"content":"x x"}`, f))
-	out = run(t, "edit", fmt.Sprintf(`{"path":%q,"old_string":"x","new_string":"y"}`, f))
+	out = run(t, "edit", fmt.Sprintf(`{"mode":"exact","path":%q,"old_string":"x","new_string":"y"}`, f))
 	if !strings.HasPrefix(out, "Error") {
 		t.Fatalf("expected ambiguity error, got %q", out)
 	}
@@ -65,20 +65,14 @@ func TestReadConsumesAndBoundsAnOversizedSingleLine(t *testing.T) {
 	}
 
 	result := ExecuteResult(context.Background(), All(), "read", json.RawMessage(fmt.Sprintf(`{"path":%q}`, path)))
-	if result.Preview == "" || result.Source != "read" || !IsUntrusted(result) {
-		t.Fatalf("oversized read result = %+v", result)
-	}
-	if result.Complete || result.OriginalBytes <= int64(len(result.Retained)) {
-		t.Fatalf("oversized read should retain bounded head/tail: original=%d retained=%d complete=%t", result.OriginalBytes, len(result.Retained), result.Complete)
-	}
-	if int64(len(result.Retained)) > maxArtifactBytes {
-		t.Fatalf("retained read exceeded hard cap: %d", len(result.Retained))
+	if !strings.HasPrefix(result.Preview, "Error:") || !strings.Contains(result.Preview, "line exceeds") {
+		t.Fatalf("oversized read should fail without issuing a partial line: %+v", result)
 	}
 }
 
 func TestHelpersAndEdgeCases(t *testing.T) {
-	if len(Defs(All())) != 6 {
-		t.Fatal("expected 6 tool defs")
+	if len(Defs(All())) != 7 {
+		t.Fatal("expected 7 tool defs")
 	}
 	long := strings.Repeat("x", maxOutput+10)
 	if out := truncate(long); !strings.Contains(out, "truncated 10 bytes") {
@@ -123,14 +117,14 @@ func TestHelpersAndEdgeCases(t *testing.T) {
 		t.Fatalf("bad parent: %q", out)
 	}
 	// edit: missing file, not-found old_string, replace_all
-	if out := run(t, "edit", fmt.Sprintf(`{"path":%q,"old_string":"x","new_string":"y"}`, filepath.Join(dir, "nope"))); !strings.HasPrefix(out, "Error") {
+	if out := run(t, "edit", fmt.Sprintf(`{"mode":"exact","path":%q,"old_string":"x","new_string":"y"}`, filepath.Join(dir, "nope"))); !strings.HasPrefix(out, "Error") {
 		t.Fatalf("edit missing file: %q", out)
 	}
-	if out := run(t, "edit", fmt.Sprintf(`{"path":%q,"old_string":"zzz","new_string":"y"}`, f)); !strings.Contains(out, "not found") {
+	if out := run(t, "edit", fmt.Sprintf(`{"mode":"exact","path":%q,"old_string":"zzz","new_string":"y"}`, f)); !strings.Contains(out, "not found") {
 		t.Fatalf("edit not found: %q", out)
 	}
 	run(t, "write", fmt.Sprintf(`{"path":%q,"content":"x x x"}`, f))
-	if out := run(t, "edit", fmt.Sprintf(`{"path":%q,"old_string":"x","new_string":"y","replace_all":true}`, f)); !strings.Contains(out, "3 occurrence") {
+	if out := run(t, "edit", fmt.Sprintf(`{"mode":"exact","path":%q,"old_string":"x","new_string":"y","replace_all":true}`, f)); !strings.Contains(out, "3 occurrence") {
 		t.Fatalf("replace_all: %q", out)
 	}
 

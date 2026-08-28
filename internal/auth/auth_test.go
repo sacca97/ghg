@@ -135,7 +135,7 @@ func TestAuthenticateCatalogUsesOneValidatedResponse(t *testing.T) {
 	if !result.Validated || result.NeedsConfirmation || len(result.Models) != 1 {
 		t.Fatalf("unexpected authentication result: %+v", result)
 	}
-	if result.Profile.Auth.EnvVar != "OPENCODE_GO_KEY" || result.Profile.Docs.KeysURL == "" {
+	if result.Profile.Auth.EnvVar != "OPENCODE_KEY" || result.Profile.Docs.KeysURL == "" {
 		t.Errorf("profile metadata was not carried through: %+v", result.Profile)
 	}
 	if got := atomic.LoadInt32(requests); got != 1 {

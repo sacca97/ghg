@@ -51,7 +51,7 @@ const (
 var definitionNameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
 
 var knownDefinitionTools = map[string]struct{}{
-	"bash": {}, "read": {}, "write": {}, "edit": {}, "grep": {}, "glob": {},
+	"bash": {}, "read": {}, "write": {}, "edit": {}, "grep": {}, "glob": {}, "find_files": {},
 	"task": {}, "todowrite": {}, "remember": {}, "forget": {},
 	"artifact_list": {}, "artifact_read": {}, "submit_plan": {},
 }

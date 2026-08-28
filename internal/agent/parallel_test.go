@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -110,6 +112,98 @@ func TestSamePathEditsSerialize(t *testing.T) {
 	ag.runTools(context.Background(), calls, Events{})
 	if maxConc.Load() != 1 {
 		t.Fatalf("same-path writes must serialize (max concurrency 1), got %d", maxConc.Load())
+	}
+}
+
+func TestMultiFileMutationsWithReversePathOrderDoNotDeadlock(t *testing.T) {
+	ag := New(testBackend("http://unused", "k"), "m", 100, "sys")
+	var conc, maxConc atomic.Int32
+	edit := tools.Tool{
+		Def: llm.NewTool("edit", "e", `{"type":"object","properties":{"edits":{"type":"array"}}}`),
+		Run: func(ctx context.Context, _ json.RawMessage) (string, error) {
+			n := conc.Add(1)
+			for {
+				previous := maxConc.Load()
+				if n <= previous || maxConc.CompareAndSwap(previous, n) {
+					break
+				}
+			}
+			select {
+			case <-time.After(5 * time.Millisecond):
+			case <-ctx.Done():
+			}
+			conc.Add(-1)
+			return "ok", nil
+		},
+	}
+	ag.Tools = []tools.Tool{edit}
+	first := llm.ToolCall{ID: "first", Function: struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	}{Name: "edit", Arguments: `{"edits":[{"path":"/tmp/ghg-a"},{"path":"/tmp/ghg-b"}]}`}}
+	second := llm.ToolCall{ID: "second", Function: struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	}{Name: "edit", Arguments: `{"edits":[{"path":"/tmp/ghg-b"},{"path":"/tmp/ghg-a"}]}`}}
+
+	done := make(chan struct{})
+	go func() {
+		ag.runTools(context.Background(), []llm.ToolCall{first, second}, Events{})
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("reverse-order multi-file mutations deadlocked")
+	}
+	if maxConc.Load() != 1 {
+		t.Fatalf("overlapping multi-file mutations ran concurrently: %d", maxConc.Load())
+	}
+}
+
+func TestTaskDoneWaitsForSettlementCallbacks(t *testing.T) {
+	r := newTaskRegistry()
+	task := &BackgroundTask{ID: "task-callbacks", Status: TaskRunning, Done: make(chan struct{})}
+	r.tasks[task.ID] = task
+
+	changeEntered := make(chan struct{})
+	allowChange := make(chan struct{})
+	recordEntered := make(chan struct{})
+	allowRecord := make(chan struct{})
+	r.OnChange = func(*BackgroundTask) {
+		close(changeEntered)
+		<-allowChange
+	}
+	r.OnRecord = func(string, *BackgroundTask) {
+		close(recordEntered)
+		<-allowRecord
+	}
+
+	settled := make(chan struct{})
+	go func() {
+		r.settle(task.ID, TaskDone, "report")
+		close(settled)
+	}()
+	assertTaskDoneOpen := func(stage string) {
+		t.Helper()
+		select {
+		case <-task.Done:
+			t.Fatalf("Done closed before %s callback completed", stage)
+		default:
+		}
+	}
+
+	<-changeEntered
+	assertTaskDoneOpen("OnChange")
+	close(allowChange)
+	<-recordEntered
+	assertTaskDoneOpen("OnRecord")
+	close(allowRecord)
+	<-settled
+	select {
+	case <-task.Done:
+	case <-time.After(time.Second):
+		t.Fatal("Done did not close after settlement callbacks")
 	}
 }
 
@@ -273,6 +367,18 @@ func TestCanonicalPathKey(t *testing.T) {
 	b := canonicalPathKey("bar/baz.go")
 	if a != b {
 		t.Fatalf("canonical keys differ: %q vs %q", a, b)
+	}
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target.go")
+	link := filepath.Join(dir, "link.go")
+	if err := os.WriteFile(target, []byte("package p\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if got, want := canonicalPathKey(link), canonicalPathKey(target); got != want {
+		t.Fatalf("symlink keys differ: %q vs %q", got, want)
 	}
 }
 

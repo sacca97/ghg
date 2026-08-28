@@ -8,7 +8,8 @@ Branch: TBD
 user's latest ask + the assistant's latest reply), asks the **current model**
 to distill them into a single concrete goal statement via one non-streaming
 call, sets the result as the session goal (exactly like `/goal <text>`), and
-immediately submits it — kicking off the goal loop until `GOAL_MET`.
+immediately submits it — kicking off the structured goal lifecycle. Completion
+and blocking are recorded through the active turn's `update_goal` tool.
 
 ## Goal
 
@@ -17,7 +18,7 @@ immediately submits it — kicking off the goal loop until `GOAL_MET`.
   the style of `agent.buildSummaryPrompt`, `truncateField` caps included).
 - Formulation call: `agent.Client.Complete` on the **current model only**
   (deliberately ignores the compact-model override — user asked for current).
-- On success: `m.setGoal(goal)` (persists via `store.SetGoal`) + `m.submit(goal)`
+- On success: `m.setGoal(goal)` (persists the structured goal record) + `m.submit(goal)`
   so the loop starts immediately — identical UX to `/goal <text>`.
 - Errors (`Complete` failure, empty reply, <2 messages, busy) are transcript
   notes, never aborts.
@@ -26,7 +27,8 @@ immediately submits it — kicking off the goal loop until `GOAL_MET`.
 
 - No settings sub-panel (the existing Goal panel already edits/launches goals).
 - No streaming for the formulation call (one-shot `Complete`, like compaction).
-- No changes to the goal loop itself (`goal.go`, `goalContinuePrompt`, rounds).
+- The goal lifecycle itself is documented and implemented in the Phase 2.5
+  goal-lifecycle plan; this command only supplies the objective.
 
 ## Design
 
@@ -54,8 +56,8 @@ In `internal/tui/goal_test.go` (httptest server like `compactCmdModel`):
 
 - `TestGoalFromContextPrompt` — pure builder: renders last-2 messages, truncates long fields.
 - `TestGoalFromContextSetsGoal` — httptest returns `"fix the flaky test"`;
-  after the command, `m.goal` == that, session store got `SetGoal` (or at
-  minimum `m.goal` + transcript note).
+  after the command, `m.goal` == that, and the session store has a structured
+  goal record (or at minimum `m.goal` + transcript note).
 - `TestGoalFromContextErrors` — server 500 → error note, goal untouched.
 - `TestGoalFromContextNeedsHistory` — <2 messages → error note.
 - Busy path: note appended, no call made.

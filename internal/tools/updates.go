@@ -1,8 +1,23 @@
 package tools
 
-import "context"
+import (
+	"context"
+
+	"github.com/sacca97/ghg/internal/observation"
+	"github.com/sacca97/ghg/internal/search"
+)
 
 type onUpdateKey struct{}
+type observationStoreKey struct{}
+type searchStoreKey struct{}
+type searchHintsKey struct{}
+
+// SearchHints are presentation hints supplied by the agent. They do not
+// change which matches a search returns; they only improve first-page order.
+type SearchHints struct {
+	Touched  []string
+	Modified []string
+}
 
 // WithOnUpdate attaches a per-tool-call callback for accumulated output
 // snapshots. The value lives in the call context rather than package state, so
@@ -17,4 +32,73 @@ func WithOnUpdate(ctx context.Context, fn func(snapshot string)) context.Context
 func onUpdate(ctx context.Context) func(snapshot string) {
 	fn, _ := ctx.Value(onUpdateKey{}).(func(string))
 	return fn
+}
+
+// WithObservationStore supplies the session-scoped observation registry used
+// by read and stateful edit. sessionID is part of the context value so an
+// edit cannot accidentally authorize bytes from another session.
+func WithObservationStore(ctx context.Context, sessionID string, store interface {
+	Save(context.Context, string, observation.Record) error
+	Load(context.Context, string, string) (observation.Record, error)
+}) context.Context {
+	if store == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, observationStoreKey{}, observationContext{sessionID: sessionID, store: store})
+}
+
+type observationContext struct {
+	sessionID string
+	store     interface {
+		Save(context.Context, string, observation.Record) error
+		Load(context.Context, string, string) (observation.Record, error)
+	}
+}
+
+func observationContextFor(ctx context.Context) (string, interface {
+	Save(context.Context, string, observation.Record) error
+	Load(context.Context, string, string) (observation.Record, error)
+}) {
+	value, _ := ctx.Value(observationStoreKey{}).(observationContext)
+	return value.sessionID, value.store
+}
+
+// WithSearchStore supplies the stable snapshot registry used by grep/glob
+// pagination. The registry can mirror snapshots into the session database.
+func WithSearchStore(ctx context.Context, sessionID string, store interface {
+	Save(context.Context, string, search.Snapshot) error
+	Load(context.Context, string, string) (search.Snapshot, error)
+}) context.Context {
+	if store == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, searchStoreKey{}, searchContext{sessionID: sessionID, store: store})
+}
+
+type searchContext struct {
+	sessionID string
+	store     interface {
+		Save(context.Context, string, search.Snapshot) error
+		Load(context.Context, string, string) (search.Snapshot, error)
+	}
+}
+
+func searchContextFor(ctx context.Context) (string, interface {
+	Save(context.Context, string, search.Snapshot) error
+	Load(context.Context, string, string) (search.Snapshot, error)
+}) {
+	value, _ := ctx.Value(searchStoreKey{}).(searchContext)
+	return value.sessionID, value.store
+}
+
+// WithSearchHints attaches non-authoritative ranking hints for one search.
+func WithSearchHints(ctx context.Context, hints SearchHints) context.Context {
+	hints.Touched = append([]string(nil), hints.Touched...)
+	hints.Modified = append([]string(nil), hints.Modified...)
+	return context.WithValue(ctx, searchHintsKey{}, hints)
+}
+
+func searchHintsFor(ctx context.Context) SearchHints {
+	hints, _ := ctx.Value(searchHintsKey{}).(SearchHints)
+	return hints
 }

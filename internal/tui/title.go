@@ -7,6 +7,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
+	"github.com/sacca97/ghg/internal/agent"
 	"github.com/sacca97/ghg/internal/llm"
 )
 
@@ -28,15 +29,17 @@ func (m *model) maybeTitle() tea.Cmd {
 		return nil
 	}
 	m.titled = true // one attempt per session, win or lose
-	backend, mdl := m.agent.CompactBackend, m.agent.CompactModel
-	if backend == nil {
-		backend = m.agent.Backend
+	backend, mdl := m.agent.Backend, m.agent.Model
+	role, provider, protocol := m.agent.Role, m.agent.Provider, m.agent.Protocol
+	if m.agent.CompactBackend != nil {
+		backend, mdl = m.agent.CompactBackend, m.agent.CompactModel
+		role, provider, protocol = "tiny", m.agent.CompactProvider, m.agent.CompactProtocol
 	}
 	if mdl == "" {
 		mdl = m.agent.Model
 	}
 	var userTxt, asstTxt string
-	for _, msg := range m.agent.Messages {
+	for _, msg := range m.agent.MessagesSnapshot() {
 		if userTxt == "" && msg.Role == "user" {
 			userTxt = msg.TextContent()
 		} else if msg.Role == "assistant" {
@@ -53,14 +56,14 @@ func (m *model) maybeTitle() tea.Cmd {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
-		out, _, err := backend.Complete(ctx, llm.Request{
+		out, _, err := m.agent.CompleteWithRoute(ctx, backend, role, provider, protocol, llm.Request{
 			Model:     mdl,
 			MaxTokens: 24,
 			Messages: []llm.Message{
 				{Role: "system", Content: "You name chat sessions. Reply with a short title (3-6 words, plain text, no quotes, no trailing period) summarizing the user's request."},
 				{Role: "user", Content: "Request: " + truncLine(userTxt, 300) + "\nResponse: " + truncLine(asstTxt, 200)},
 			},
-		})
+		}, agent.Events{})
 		if err != nil {
 			return
 		}
@@ -69,7 +72,7 @@ func (m *model) maybeTitle() tea.Cmd {
 			return
 		}
 		if p != nil {
-			p.Send(titleMsg{title})
+			go p.Send(titleMsg{title})
 		}
 	}()
 	return nil

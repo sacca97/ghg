@@ -1,22 +1,22 @@
 package tui
 
 import (
-	"io/fs"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/sacca97/ghg/internal/search"
 )
 
 // fileIndexTTL is how long a cached recursive file listing is reused.
 // Rebuilding walks the tree, so completion must not do it per keystroke.
 const fileIndexTTL = 2 * time.Second
 
-// fileIndex caches one recursive listing per root directory (os.Getwd in
-// production, the model's working dir in tests) so @mention fuzzy completion
-// never re-walks the tree on a keystroke.
+// fileIndex is a small compatibility/invalidation wrapper around the shared
+// search index. Keeping the fields lets completion tests reset the cache
+// without making the TUI own a second traversal implementation.
 var fileIndex struct {
 	sync.Mutex
 	builtAt time.Time
@@ -29,42 +29,24 @@ var fileIndex struct {
 // effective root; the fallback keeps the bare completion helpers testable.
 var currentRoot = os.Getwd
 
-// refreshFileIndex rebuilds the recursive listing if it is stale or the root
-// changed. Skips hidden dirs (.git, .agents) and heavy dependency dirs
-// (vendor, node_modules) so the index stays small and the walk stays fast.
+// refreshFileIndex invalidates the shared index when the TUI's root changes or
+// its short completion cache expires.
 func refreshFileIndex() {
-	fileIndex.Lock()
-	defer fileIndex.Unlock()
 	wd, err := currentRoot()
 	if err != nil {
 		return
 	}
+	fileIndex.Lock()
 	if wd == fileIndex.root && time.Since(fileIndex.builtAt) < fileIndexTTL {
+		fileIndex.Unlock()
 		return
 	}
-	var files []string
-	_ = filepath.WalkDir(wd, func(path string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return nil // unreadable entry; keep going
-		}
-		if path == wd {
-			return nil
-		}
-		name := d.Name()
-		if d.IsDir() {
-			if strings.HasPrefix(name, ".") || name == "vendor" || name == "node_modules" {
-				return filepath.SkipDir
-			}
-			return nil
-		}
-		rel, err := filepath.Rel(wd, path)
-		if err != nil {
-			return nil
-		}
-		files = append(files, filepath.ToSlash(rel))
-		return nil
-	})
-	fileIndex.root, fileIndex.files, fileIndex.builtAt = wd, files, time.Now()
+	fileIndex.root, fileIndex.builtAt = wd, time.Now()
+	fileIndex.Unlock()
+	search.InvalidateFileIndex(wd)
+	fileIndex.Lock()
+	fileIndex.files = search.FuzzyFiles(wd, "", 0)
+	fileIndex.Unlock()
 }
 
 // fuzzyFiles returns up to limit files from the index matching query, best
@@ -75,48 +57,11 @@ func refreshFileIndex() {
 // pathological queries in huge trees, where the top-ranked matches win anyway.
 func fuzzyFiles(query string, limit int) []string {
 	refreshFileIndex()
-	fileIndex.Lock()
-	files := append([]string(nil), fileIndex.files...)
-	fileIndex.Unlock()
-
-	q := strings.ToLower(query)
-	type hit struct {
-		f    string
-		tier int
+	root, err := currentRoot()
+	if err != nil {
+		return nil
 	}
-	var hits []hit
-	for _, f := range files {
-		tier := matchTier(f, q)
-		if tier < 0 {
-			continue
-		}
-		hits = append(hits, hit{f, tier})
-		if q != "" && len(hits) >= limit {
-			break // rough cut; the partial resort below ranks what we kept
-		}
-	}
-	if q != "" {
-		sort.SliceStable(hits, func(a, b int) bool {
-			if hits[a].tier != hits[b].tier {
-				return hits[a].tier < hits[b].tier
-			}
-			return hits[a].f < hits[b].f
-		})
-	} else {
-		sort.Strings(files)
-		hits = hits[:0]
-		for _, f := range files {
-			hits = append(hits, hit{f, 0})
-		}
-	}
-	out := make([]string, 0, min(len(hits), limit))
-	for _, h := range hits {
-		out = append(out, h.f)
-		if len(out) == limit {
-			break
-		}
-	}
-	return out
+	return search.FuzzyFiles(root, query, limit)
 }
 
 // matchTier grades how well q matches file f (both compared lowercase):

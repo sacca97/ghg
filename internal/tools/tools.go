@@ -2,12 +2,10 @@
 package tools
 
 import (
-	"bufio"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -50,7 +48,7 @@ var LSP interface {
 
 // All returns the built-in tool set.
 func All() []Tool {
-	return []Tool{bashTool(), readTool(), writeTool(), editTool(), grepTool(), globTool()}
+	return []Tool{bashTool(), readTool(), writeTool(), editTool(), grepTool(), globTool(), findFilesTool()}
 }
 
 // Defs returns the llm.Tool definitions for a tool set.
@@ -161,7 +159,7 @@ func TruncateTail(s string) string {
 func bashTool() Tool {
 	return Tool{
 		Def: llm.NewTool("bash",
-			"Execute a bash command in the current working directory and return its combined stdout/stderr. Use for running programs, git, searching (grep/rg), listing files, etc.",
+			"Execute a bash command in the current working directory and return its combined stdout/stderr. Use for builds, tests, git, and operations the dedicated read/search/edit tools cannot express. Prefer grep, glob, find_files, and bounded read for exploration; simple recursive inspection commands may be redirected.",
 			`{"type":"object","properties":{"command":{"type":"string","description":"The bash command to execute"},"timeout":{"type":"number","description":"Timeout in seconds (default 120)"},"interactive":{"type":"boolean","description":"Run in a PTY so sudo/ssh-style password prompts work. ghg stays in control of the terminal and forwards your keystrokes; the command is killed after 15s of no input. Use only for commands that genuinely need a password."}},"required":["command"]}`),
 		Run: func(ctx context.Context, args json.RawMessage) (string, error) {
 			result, err := runBashResult(ctx, args)
@@ -183,6 +181,17 @@ func runBashResult(ctx context.Context, args json.RawMessage) (ToolResult, error
 	if a.Timeout <= 0 {
 		a.Timeout = 120
 	}
+	if redirect, ok := redirectBashSearch(a.Command); ok {
+		result := textResult(redirect.Message, redirect.Message, 0)
+		result.Source = "bash"
+		result.Metadata = map[string]string{
+			"source":           "bash",
+			"bash_redirect":    "true",
+			"redirect_tool":    redirect.Tool,
+			"redirect_command": strings.Fields(a.Command)[0],
+		}
+		return result, nil
+	}
 	if deny := checkGate("bash", a.Command); deny != "" {
 		return ToolResult{}, errors.New(deny)
 	}
@@ -194,12 +203,12 @@ func runBashResult(ctx context.Context, args json.RawMessage) (ToolResult, error
 	if a.Interactive && InteractiveBash != nil {
 		keys := make(chan []byte, 16)
 		out := InteractiveBash.Run(ctx, a.Command, dur, keys)
-		return textResult(out, TruncateTail(out), 0), nil
+		return MarkUntrusted(TextResultWithSize(out, boundedTailPreview(out, bashPreviewLimit(a.Command)), int64(len(out)), true, 0), "bash"), nil
 	}
 
 	var update func(string)
 	if fn := onUpdate(ctx); fn != nil {
-		update = func(snapshot string) { fn(TruncateTail(snapshot)) }
+		update = func(snapshot string) { fn(boundedTailPreview(snapshot, bashPreviewLimit(a.Command))) }
 	}
 	res := bashrun.Run(ctx, bashrun.Options{
 		Command:  a.Command,
@@ -222,7 +231,7 @@ func runBashResult(ctx context.Context, args json.RawMessage) (ToolResult, error
 		originalBytes += int64(len(marker))
 	}
 	return MarkUntrusted(
-		capturedResult(full, TruncateTail(full), originalBytes, complete, boolToExitCode(res.Exit == "" && !res.TimedOut)),
+		capturedResult(full, boundedTailPreview(full, bashPreviewLimit(a.Command)), originalBytes, complete, boolToExitCode(res.Exit == "" && !res.TimedOut)),
 		"bash",
 	), nil
 }
@@ -237,8 +246,8 @@ func boolToExitCode(success bool) int {
 func readTool() Tool {
 	return Tool{
 		Def: llm.NewTool("read",
-			"Read a file and return its contents with line numbers.",
-			`{"type":"object","properties":{"path":{"type":"string","description":"Path to the file"},"offset":{"type":"number","description":"1-based line to start from"},"limit":{"type":"number","description":"Max lines to return (default 2000)"}},"required":["path"]}`),
+			"Read a bounded range of complete lines and issue an observation id for later range-authorized edits. Use offset/limit to continue.",
+			`{"type":"object","properties":{"path":{"type":"string","description":"Path to the file"},"offset":{"type":"number","description":"1-based line to start from (default 1)"},"limit":{"type":"number","description":"Max complete lines to return (default 200, maximum 1000)"}},"required":["path"]}`),
 		Run: func(ctx context.Context, args json.RawMessage) (string, error) {
 			result, err := runReadResult(ctx, args)
 			return result.Preview, err
@@ -256,83 +265,7 @@ func runReadResult(ctx context.Context, args json.RawMessage) (ToolResult, error
 	if err := json.Unmarshal(args, &a); err != nil {
 		return ToolResult{}, err
 	}
-	if err := ctx.Err(); err != nil {
-		return ToolResult{}, err
-	}
-	f, err := os.Open(a.Path)
-	if err != nil {
-		return ToolResult{}, err
-	}
-	defer func() { _ = f.Close() }()
-	start := max(a.Offset-1, 0)
-	limit := a.Limit
-	if limit <= 0 {
-		limit = 2000
-	}
-	reader := bufio.NewReaderSize(f, 64<<10)
-	capture := NewTextCapture(maxArtifactBytes)
-	lineNo := 0
-	selected := 0
-	for {
-		if err := ctx.Err(); err != nil {
-			return ToolResult{}, err
-		}
-		want := lineNo >= start && selected < limit
-		first := true
-		done := false
-		for {
-			chunk, readErr := reader.ReadSlice('\n')
-			if want {
-				if first {
-					capture.WriteString(fmt.Sprintf("%d\t", lineNo+1))
-					first = false
-				}
-				capture.WriteString(string(chunk))
-			}
-			switch readErr {
-			case nil:
-				// The newline terminates this line.
-			case bufio.ErrBufferFull:
-				// Keep consuming a pathological line in bounded chunks; the
-				// capture, not the reader, owns the hard retention ceiling.
-				continue
-			case io.EOF:
-				if len(chunk) == 0 {
-					done = true // empty file or the byte after a final newline
-					break
-				}
-				// The final unterminated fragment is still one line.
-				if want {
-					selected++
-				}
-				lineNo++
-				done = true
-			default:
-				return ToolResult{}, fmt.Errorf("read %s: %w", a.Path, readErr)
-			}
-			if done || readErr == nil {
-				break
-			}
-		}
-		if done {
-			break
-		}
-		if want {
-			selected++
-		}
-		lineNo++
-		if selected >= limit {
-			break
-		}
-	}
-	if lineNo <= start {
-		return ToolResult{}, fmt.Errorf("offset %d past end of file (%d lines)", a.Offset, lineNo)
-	}
-	raw := capture.String()
-	return MarkUntrusted(
-		capturedResult(raw, truncate(raw), capture.total, !capture.truncated, 0),
-		"read",
-	), nil
+	return runObservedRead(ctx, a)
 }
 
 func writeTool() Tool {
@@ -372,8 +305,8 @@ func runWriteResult(ctx context.Context, args json.RawMessage) (ToolResult, erro
 func editTool() Tool {
 	return Tool{
 		Def: llm.NewTool("edit",
-			"Replace an exact string in a file. old_string must appear exactly once unless replace_all is true.",
-			`{"type":"object","properties":{"path":{"type":"string","description":"Path to the file"},"old_string":{"type":"string","description":"Exact text to replace"},"new_string":{"type":"string","description":"Replacement text"},"replace_all":{"type":"boolean","description":"Replace every occurrence"}},"required":["path","old_string","new_string"]}`),
+			"Apply one or more observed line-range edits atomically. Each primary edit references a read observation; use mode=exact only for temporary unique old_string compatibility.",
+			`{"type":"object","properties":{"mode":{"type":"string","enum":["observed","exact"],"description":"observed is the primary range-authorized mode; exact is compatibility mode"},"edits":{"type":"array","description":"Observed operations to apply atomically across one or more files","items":{"type":"object","properties":{"observation":{"type":"string"},"path":{"type":"string"},"start_line":{"type":"integer"},"end_line":{"type":"integer"},"operation":{"type":"string","enum":["replace","delete","insert_before","insert_after"]},"content":{"type":"string"}},"required":["observation","path","start_line","end_line","operation","content"]}},"path":{"type":"string","description":"Compatibility-mode file path"},"old_string":{"type":"string","description":"Compatibility-mode exact text"},"new_string":{"type":"string","description":"Compatibility-mode replacement"},"replace_all":{"type":"boolean","description":"Compatibility-mode replace every occurrence"}},"required":["mode"]}`),
 		Run: func(ctx context.Context, args json.RawMessage) (string, error) {
 			result, err := runEditResult(ctx, args)
 			return result.Preview, err
@@ -383,40 +316,7 @@ func editTool() Tool {
 }
 
 func runEditResult(ctx context.Context, args json.RawMessage) (ToolResult, error) {
-	var a struct {
-		Path       string `json:"path"`
-		OldString  string `json:"old_string"`
-		NewString  string `json:"new_string"`
-		ReplaceAll bool   `json:"replace_all"`
-	}
-	if err := json.Unmarshal(args, &a); err != nil {
-		return ToolResult{}, err
-	}
-	if deny := checkGate("edit", a.Path); deny != "" {
-		return ToolResult{}, errors.New(deny)
-	}
-	data, err := os.ReadFile(a.Path)
-	if err != nil {
-		return ToolResult{}, err
-	}
-	s := string(data)
-	n := strings.Count(s, a.OldString)
-	switch {
-	case n == 0:
-		return ToolResult{}, fmt.Errorf("old_string not found in %s", a.Path)
-	case n > 1 && !a.ReplaceAll:
-		return ToolResult{}, fmt.Errorf("old_string appears %d times in %s; make it unique or set replace_all", n, a.Path)
-	}
-	s = strings.ReplaceAll(s, a.OldString, a.NewString)
-	if err := os.WriteFile(a.Path, []byte(s), 0o644); err != nil {
-		return ToolResult{}, err
-	}
-	out := fmt.Sprintf("Replaced %d occurrence(s) in %s", n, a.Path)
-	if d := editDiff(a.OldString, a.NewString); d != "" {
-		out += "\n```diff\n" + d + "\n```"
-	}
-	raw := out + lspDiagnostics(ctx, a.Path)
-	return textResult(raw, truncate(raw), 0), nil
+	return runEdit(ctx, args)
 }
 
 // editDiff renders the changed region of an edit as a compact unified-ish
@@ -446,14 +346,39 @@ func editDiff(oldS, newS string) string {
 	if p > 0 {
 		ctxLine(" ", o[p-1])
 	}
-	for _, l := range o[p : len(o)-s] {
-		ctxLine("-", l)
-	}
-	for _, l := range n[p : len(n)-s] {
-		ctxLine("+", l)
-	}
+	writeCappedDiffLines(&b, "-", o[p:len(o)-s])
+	writeCappedDiffLines(&b, "+", n[p:len(n)-s])
 	if s > 0 {
 		ctxLine(" ", o[len(o)-1])
 	}
 	return strings.TrimSuffix(b.String(), "\n")
+}
+
+const maxEditDiffLines = 40
+
+func writeCappedDiffLines(b *strings.Builder, prefix string, lines []string) {
+	if len(lines) <= maxEditDiffLines {
+		for _, line := range lines {
+			if len(line) > 200 {
+				line = line[:200] + "…"
+			}
+			b.WriteString(prefix + line + "\n")
+		}
+		return
+	}
+	head := maxEditDiffLines / 2
+	tail := maxEditDiffLines - head
+	for _, line := range lines[:head] {
+		if len(line) > 200 {
+			line = line[:200] + "…"
+		}
+		b.WriteString(prefix + line + "\n")
+	}
+	fmt.Fprintf(b, "%s... [%d lines omitted]\n", prefix, len(lines)-maxEditDiffLines)
+	for _, line := range lines[len(lines)-tail:] {
+		if len(line) > 200 {
+			line = line[:200] + "…"
+		}
+		b.WriteString(prefix + line + "\n")
+	}
 }

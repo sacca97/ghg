@@ -103,7 +103,7 @@ project. If AST tools become necessary, the escape hatch is an optional external
 
 ### Generalized `/auth` — any profile, not just OpenRouter ✅
 
-### Roles, agent definitions, and the planner/executor workflow
+### ✅ Roles, agent definitions, and the planner/executor workflow
 
 - ✅ JSONC roles and routing (`default`, `smart`, `fast`, and `tiny`).
 - ✅ Interactive `/plan` → `/execute` workflow with structured validation and todo seeding.
@@ -133,148 +133,57 @@ and closes the inherited roadmap's open "custom agent definitions" item for free
   end of this document. The definitions are the valuable half; the mention syntax is
   surface.
 
-### Model-call observability
+### ✅ Model-call observability
 
 4. ✅ Emit structured `model_call_start` / `model_call_end` events containing role,
    provider instance, model, adapter protocol, latency, finish reason, and usage. Keep
    this independent of agent-definition loading; it verifies routing and makes planner
    and executor calls distinguishable in JSON output.
 
-## Phase 2.5 — Current implementation checkpoint
+## Phase 2.5 — Search quality and stateful edits (Phase 3 checkpoint pending)
 
-This checkpoint reconciles the plan with the working tree inspected on 2026-08-28.
-The repository is still based on fork commit
-`5b8b9d8297184cf69ca34ccd62a4be91457a8bbc`, but the implementation is a large
-uncommitted change set. Create a reviewable checkpoint commit before beginning Phase 3
-so the real post-fork baseline is reproducible and the completed work below is not
-accidentally reimplemented or lost.
+The bounded search and observation-authorized editing features are implemented. The
+stabilization gate below is complete in code and tests; create the reviewable
+checkpoint before beginning Phase 3. The implementation remains based on fork
+commit `5b8b9d8297184cf69ca34ccd62a4be91457a8bbc`.
 
-### Confirmed implemented
+### ✅ Confirmed implemented
 
-- The fork/detach and `ghg`/`.ghg`/`GHG_*` rename are complete; attribution remains,
-  browser/computer-control and the Swift driver are removed, and
-  `CGO_ENABLED=0 go build ./...` passes.
-- The provider-neutral backend is in use across turns, compaction, authentication, and
-  subagents. Preserve all three compiled adapters now present:
-  `openai-chat-completions`, `anthropic-messages`, and `openai-responses`.
-- The generic YAML provider system is real, not pending: embedded, user, and trusted
-  project profiles load with strict schema/unknown-field, URL, auth, header, protocol,
-  and precedence validation. Shipped profiles cover Anthropic, generic OpenAI,
-  inference.net, OpenRouter, and OpenCode Go. Ordered model-glob routes can choose a
-  compiled protocol/auth/header shape under one profile. Compatible providers should
-  remain YAML-only; only a new wire protocol requires Go.
-- Profile-driven authentication, public/authenticated/catalog-less discovery, cold TUI
-  startup, models.dev metadata fallback, reasoning controls, and session cost tracking
-  are wired.
-- Native `grep`/`glob`, structured `ToolResult`, content-addressed artifacts,
-  session-scoped artifact tools, artifact-aware fork/rewind/cleanup, non-destructive raw
-  history, token-budgeted atomic compaction tails, the tool ledger, and artifact
-  manifests are implemented. This closes the recoverability gap for large tool results
-  across compaction.
-- Anthropic Messages and OpenAI Responses are implemented and tested. The settled role
-  vocabulary is `default`, `smart`, `fast`, and `tiny`; planning/acting map to
-  `smart`/`fast`, while compaction and subagents prefer `tiny`.
-- Interactive `/plan` and `/execute` work: planning validates structured JSON and
-  retries once, while execution switches to `fast`, seeds `todowrite`, and starts the
-  acting turn.
-- Declarative agent definitions load from trusted project `.agents/*.md` and user
-  `~/.ghg/agents/*.md` with strict frontmatter and project-over-user precedence. The
-  reserved built-in `planner` definition runs with `smart`, a four-round bound,
-  `read`/`grep`/`glob`, and `submit_plan`; TUI `/plan` and headless plan flows share
-  this runner.
-- Headless `ghg run --plan-only` emits a structured proposal and exits, while
-  `ghg run --plan` explicitly hands that proposal to the `fast` executor. JSON
-  output now emits route-aware `model_call_start`/`model_call_end` telemetry.
+- ✅ Fork/detach, the `ghg`/`.ghg`/`GHG_*` rename, attribution, browser removal, and the CGO-free build are complete.
+- ✅ Provider-neutral turns, compaction, auth, subagents, and all three adapters: `openai-chat-completions`, `anthropic-messages`, and `openai-responses`.
+- ✅ Strict declarative provider profiles, ordered routing, profile-driven auth, catalog discovery, models.dev fallback, reasoning controls, and session usage tracking.
+- ✅ Native tools, bounded structured results, artifacts, compaction recovery, raw history, fork/rewind cleanup, and the tool ledger.
+- ✅ Roles `default`/`smart`/`fast`/`tiny`, explicit `/plan` → `/execute`, and role-aware TUI controls; planning uses `smart`, execution uses `fast`, and compaction/subagents use `tiny`.
+- ✅ Declarative agent definitions, the bounded read-only planner, headless `--plan`/`--plan-only`, and route-aware model-call telemetry.
+- ✅ Structured GOAL lifecycle with persisted IDs, accounting, checkpoints, request-scoped context, validated `update_goal`, explicit resume, and six lifecycle states.
 
-### Must finish or explicitly carry into Phase 3
+### ✅ Delivered
 
-- Upgrade GOAL before depending on it for long autonomous work. It still uses the
-  inherited TUI-owned `GOAL_MET` text scan and persists only an objective string.
-  Replace that with a persisted goal ID and status/accounting record, a structured
-  `update_goal` tool for completion or genuine blocking, ephemeral per-request goal
-  context, progress/blocker checkpoints, and explicit
-  active/paused/blocked/usage-limited/budget-limited/complete states. Keep the round cap
-  only as a circuit breaker and retain explicit resume after process restart.
-- Fix search routing and context budgets before adding more tools. GHG currently tells
-  the model to use Bash for `ls`, `grep`, `rg`, and `find` in both the base system prompt
-  and Bash tool description, while the subagent prompt omits the built-in `grep` and
-  `glob` tools. That actively steers untuned models toward unbounded shell exploration;
-  project `AGENTS.md` guidance cannot reliably override contradictory harness guidance.
-  Implement the following as one measured search-quality slice:
-  - Make the base prompt, Bash schema, `grep`/`glob` schemas, task tool description, and
-    subagent prompt agree: prefer `grep` for text, `glob`/future `find_files` for paths,
-    then `read` with `offset`/`limit`; reserve Bash for builds, tests, git, and operations
-    the dedicated tools cannot express. When Bash search is genuinely necessary, prefer
-    scoped `rg`, which respects `.gitignore` and skips binaries by default.
-  - Add a conservative soft redirect for simple accidental exploration commands such as
-    recursive `grep`, `find .`, `ls -R`, and inspection-only `cat`/`sed`. Do not execute
-    them; return an actionable result naming the dedicated replacement. Preserve an
-    explicit escape hatch for advanced `rg`, `find` predicates, `git grep`, pipelines,
-    and known paths outside the workspace; never silently rewrite a shell command.
-  - Reduce `grep`/`glob`'s default from 1,000 results to roughly 20–30 and give search a
-    model-facing byte budget below the generic 50 KB tool ceiling. Reduce ordinary Bash
-    previews to roughly 12–16 KB and recognized search/listing previews to roughly 8 KB;
-    retain bounded omitted output through the existing artifact path.
-  - Return grep results grouped by file with a small per-file display cap so one noisy
-    file cannot consume the page. Rank explicit/narrow paths first, then session-touched
-    files, git-modified files, path relevance/depth, and finally lexical order. Ranking
-    is a presentation concern: exhaustive matches remain available through pagination.
-  - Add cursor pagination over a stable bounded result snapshot. Prefer a cursor that
-    references a structured search artifact plus an item offset, so later pages remain
-    consistent if the worktree changes and compaction can recover the evidence. Report
-    displayed/remaining counts and incomplete-retention warnings explicitly.
-  - Extend `grep` with a `patterns` array for one-traversal OR searches instead of
-    requiring a separate `multi_grep` tool unless evaluation shows the explicit name is
-    necessary for model selection. Add a fuzzy `find_files` operation by moving the TUI
-    file index into shared search code, but fix its current early cutoff so every
-    candidate is scored before selecting the top results. Keep deterministic `glob` for
-    exact patterns.
-  - Keep the implementation native Go and CGO-free. The valuable FFF ideas are ranking,
-    grouping, pagination, and indexing—not importing Pi's Node/Rust extension. Defer a
-    persistent background content index until benchmarks show traversal is the
-    bottleneck; output selection and token use are the immediate problem.
-  - Emit per-tool preview bytes, retained bytes, truncation, and Bash-exploration redirect
-    telemetry. Add deterministic tests for all prompt/schema guidance, parent and
-    subagent tool selection, redirect/escape cases, `.gitignore`, noisy-file diversity,
-    stable cursors, artifact recovery, and strict context-byte ceilings. Include an eval
-    fixture with `src/app.ts`, `utils.ts`, and 30+ noisy `TODO` matches and require the
-    first page to surface relevant files without flooding the context.
-- Replace fragile read-then-`old_string` editing with stateful, range-authorized unified
-  edits. GHG already owns session and artifact state, so do not put a hash beside every
-  displayed line by default. Use the observation itself as the authority:
-  - `read` keeps `offset`/`limit`, lowers its ordinary line/byte budget, returns only
-    complete numbered lines plus a short observation ID and continuation offset, and
-    records the exact bytes actually issued to the model. Retained-but-truncated bytes
-    do not grant edit authority. Persist bounded observation metadata through the
-    existing session/artifact path so compaction and resume can recover it; otherwise
-    require a fresh read.
-  - Make the primary `edit` shape one `edits` array. Each operation references an
-    observation, path, authorized start/end line, operation (`replace`, `delete`,
-    `insert_before`, or `insert_after`), and new content. Keep exact unique
-    `old_string` replacement only as a temporary compatibility mode, with an explicit
-    mode discriminator rather than two ambiguous argument shapes.
-  - Bind every observation to its session and canonical path. At apply time verify that
-    every targeted line—not only the endpoints—was issued and still matches its stored
-    exact bytes. Same-position comparison is the fast path; if surrounding edits shifted
-    the range, relocate only an exact, unique stored byte sequence. Never fuzzy-match or
-    choose the nearest candidate. Missing, changed, ambiguous, overlapping, or unseen
-    ranges fail with the smallest useful `read offset/limit` retry hint.
-  - Preflight all same- and multi-file operations against immutable in-memory originals,
-    acquire canonical-path locks in sorted order, obtain all permissions before writing,
-    reject intersecting edits, stage writes, publish each file atomically, and report
-    partial publication honestly with best-effort rollback for a multi-file failure.
-    Preserve file mode and line endings, then return a compact unified diff, changed-line
-    readback, and post-edit diagnostics.
-  - Hashing is an internal optimization, not the authorization boundary. If benchmarks
-    justify it, use a pure-Go keyed BLAKE3 implementation for snapshot IDs, cache keys,
-    or exact-sequence relocation while keeping the stored issued bytes authoritative.
-    Do not expose per-line hash tags unless model evals show a material targeting gain
-    over observation ID + line ranges. New files, versioned LSP edits, and verified full
-    replacements do not require hashline semantics.
-- Restore a green verification gate. `go test ./...` currently passes every package
-  except `internal/auth`: `TestAuthenticateCatalogUsesOneValidatedResponse` creates
-  `OPENCODE_KEY` but asserts the obsolete `OPENCODE_GO_KEY`. Reconcile the test with the
-  single-profile OpenCode design, then rerun the full suite and CGO-free build.
+- ✅ Search routing and bounded context: native search, stable ranked cursors, complete-entry
+  8 KiB pages, artifacts, telemetry, and deterministic pagination tests.
+- ✅ Stateful edits: byte-limited complete-line observations, exact-byte relocation, sorted
+  atomic multi-file publication, preserved modes/line endings, bounded output, and diagnostics.
+- ✅ Verification: `go test ./... -count=1`, `go test -race ./... -count=1`, `go vet ./...`,
+  changed-file `gopls check`, and `CGO_ENABLED=0 go build` pass.
+
+### ⬜ Phase 3 entry gate
+
+Do not begin Phase 3 until the implementation items and checkpoint below are complete:
+
+1. ✅ **Byte-honest search pagination.** Complete rendered entries determine cursor,
+   displayed, and remaining metadata; long-line and ungrouped later-page regressions cover it.
+2. ✅ **Route-correct model-call telemetry.** Compaction uses tiny route metadata, and title,
+   goal-from-context, and other one-shot calls use the shared wrapper.
+3. ✅ **Phase 2.5 acceptance matrix.** Edit operations, conflicts, observations, publication,
+   locking, preservation, bounded output, diagnostics, search limits, and task settlement ordering
+   have deterministic tests.
+4. ✅ **Observation range granularity.** Returned complete lines authorize edits even when the
+   read hit its byte ceiling; unchanged targets relocate, while stale/ambiguous targets fail.
+5. ⬜ **Reviewable checkpoint commit.** Checkpoint the verified Phase 2/2.5 implementation
+   separately before expanding the tool, trust, or network surface.
+
+The code/test work for items 1–4 is complete. Item 5 remains intentionally pending until the
+reviewable commit is created; Phase 3 must remain closed in the meantime.
 
 ### Phase 3 boundary
 
