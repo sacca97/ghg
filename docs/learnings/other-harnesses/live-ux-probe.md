@@ -1,11 +1,11 @@
-# Live UX probe: claude-code, codex, grok, opencode, pi (and whip)
+# Live UX probe: claude-code, codex, grok, opencode, pi (and ghg)
 
 Method: launched each harness in a PTY (`/tmp/harness-probe/probe2.py`), answered
 its terminal queries (OSC 11 background, cursor-position), drove it with
 keystrokes (trust prompt → `/` menu → filter), captured the stripped screen.
 Versions: claude 2.1.239, codex-cli 0.147.0 (broken install on this machine —
 missing `@openai/codex-linux-x64`), grok 1.0.4, opencode 1.18.19, pi 0.84.2,
-whip @ mcp-support.
+ghg @ mcp-support.
 
 ## What each does at first paint
 
@@ -21,7 +21,7 @@ cancel", and it keeps the UI alive instead of dying.
 Pickle` model line, `tab agents · ctrl+p commands` hints, a *rotating tip* in
 the footer ("Run /connect to add an AI provider"), cwd + version bottom-right.
 `/` opens a live-filtered command list with right-aligned descriptions and
-`esc/enter` hints; ctrl+p is the fuller action palette.
+`esc/enter` hints; ctrl+p is the fuller action settings.
 
 **pi**: the most information-dense startup. Footer teaches keys immediately
 (`escape interrupt · ctrl+c/ctrl+d clear/exit · / commands · ! bash · ctrl+o
@@ -40,15 +40,15 @@ a terminal query it never times out is bricked in any non-mainstream terminal.*
 source at ~/code/coding-harnesses): quiet startup, `/goal`-style persistence,
 queued steers.
 
-**whip (ours, for contrast)**: trust gate → one header line
-(`whip · model @ provider · cwd · 0% ctx ⚡ medium`) → `/` opens a clean
+**ghg (ours, for contrast)**: trust gate → one header line
+(`ghg · model @ provider · cwd · 0% ctx ⚡ medium`) → `/` opens a clean
 completion list. Solid, but *silent*: no tips, no "what's loaded", no next-step
 guidance.
 
-## Concrete UX gaps in whip, ranked by value/line
+## Concrete UX gaps in ghg, ranked by value/line
 
 1. **Startup resource report (pi's [Skills]/[Extensions]/[Skill conflicts]).**
-   whip already scans skills and MCP servers at startup — but says nothing.
+   ghg already scans skills and MCP servers at startup — but says nothing.
    One block at first paint: `skills: 47 loaded · mcp: docs ✓ (4 tools), ghost ✗
    (see /mcp)` plus **validation warnings** (pi surfaces a skill whose
    description is too long! we have `maxDesc = 300` silently truncating — the
@@ -59,19 +59,19 @@ guidance.
    teach features (mentions, $skills, /goal, MCP). Ours is static/blank. A
    `[]string` of examples + rotate on idle tick; zero deps.
 
-3. **First-run "next steps" card (claude).** On a brand-new `~/.whip`, show 3
+3. **First-run "next steps" card (claude).** On a brand-new `~/.ghg`, show 3
    lines: set a key, try /goal, drop a .mcp.json. Disappears once config exists.
    We currently drop users into a header and silence.
 
 4. **Degraded-mode honesty (claude's renderer fallback notice, spend-limit
-   notice).** whip has silent degradation: skills truncated at maxDesc, MCP
+   notice).** ghg has silent degradation: skills truncated at maxDesc, MCP
    discovery errors (we append one errStyle line — good), catalog fetch
    failures (silent). The rule from claude: *every fallback names itself and
    its remedy*.
 
 5. **Keybind hint footer at idle (pi).** One line under the input cycling
    2-3 high-value hints (`esc interrupt · ctrl+p commands · @ file · $ skill`).
-   We teach keys only in `/help` and palette hints — invisible until sought.
+   We teach keys only in `/help` and settings hints — invisible until sought.
 
 6. **`/` completion with right-aligned descriptions + pagination (pi).** Ours
    shows name + short text already; pi's is grouped and paged `(1/11)` — ours
@@ -90,7 +90,7 @@ guidance.
 - opencode's ASCII-art logo — one paint of charm, then permanent noise.
 - claude's auto-permission-mode banner complexity — ours is simpler (trust gate).
 
-## Where whip already beats them
+## Where ghg already beats them
 
 - Trust gate is clearer than claude's (theirs buries the risk in chattiness).
 - MCP failure UX after the polish pass (fail-fast + did-you-mean + first-settle

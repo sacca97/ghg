@@ -1,6 +1,6 @@
 # Architecture
 
-How a keystroke becomes a tool call. whip is a single Go binary with no
+How a keystroke becomes a tool call. ghg is a single Go binary with no
 framework between you and the code — each box below is one package under
 `internal/`.
 
@@ -8,23 +8,22 @@ framework between you and the code — each box below is one package under
 
 ```mermaid
 flowchart TB
-    subgraph cmd["cmd/whip — main()"]
+    subgraph cmd["cmd/ghg — main()"]
         M[flag parsing, config load, wiring]
     end
 
     subgraph internal
-        TUI["tui<br/>bubbletea session, transcript,<br/>palette, status line"]
+        TUI["tui<br/>bubbletea session, transcript,<br/>settings, status line"]
         AGENT["agent<br/>Agent.Turn: the tool-use loop,<br/>compaction, subagents, todos"]
-        LLM["llm<br/>streaming OpenAI-compatible client,<br/>usage bookkeeping"]
+        LLM["llm<br/>Backend contract + compiled adapters,<br/>usage bookkeeping"]
+        PROV["provider<br/>strict profiles, precedence,<br/>URL/auth metadata"]
         TOOLS["tools<br/>bash, read, write, edit, suggest"]
-        CFG["config<br/>~/.whip/config.json, model catalog"]
+        CFG["config<br/>~/.ghg/config.json, model catalog"]
         SESS["session<br/>SQLite session store"]
         MCP["mcp<br/>external MCP servers<br/>(3 config styles)"]
         SKILLS["skills<br/>.agents/skills injection"]
         LSP["lsp<br/>diagnostics after edits"]
         MEM["memory<br/>markdown durable memory"]
-        BROWSER["browser<br/>Chrome via CDP / extension relay"]
-        COMPUTER["computer<br/>macOS desktop automation"]
         SCHED["schedule<br/>@every / @at wakeups"]
     end
 
@@ -32,11 +31,12 @@ flowchart TB
     TUI -->|user message, steers, interrupts| AGENT
     AGENT -->|stream events, tool results| TUI
     AGENT --> LLM
+    TUI --> PROV
+    M --> PROV
+    PROV --> CFG
     AGENT --> TOOLS
     AGENT --> MCP
     TOOLS --> LSP
-    TOOLS --> BROWSER
-    TOOLS --> COMPUTER
     AGENT --> SESS
     AGENT --> MEM
     AGENT --> SKILLS
@@ -47,7 +47,7 @@ flowchart TB
 
 Dependencies point one way: `tui` owns the screen, `agent` owns the
 conversation, everything else is a leaf the agent calls. Nothing imports
-`tui` except `cmd/whip` — the loop is headless-testable, and `whip mcp serve`
+`tui` except `cmd/ghg` — the loop is headless-testable, and `ghg mcp serve`
 reuses the tools without a UI.
 
 ## One turn, end to end
@@ -87,19 +87,24 @@ Key invariants:
 - **Steering happens at loop boundaries.** A message you send mid-turn is
   queued and injected between iterations — never spliced into a half-streamed
   completion.
-- **The provider is just an HTTP endpoint.** `llm` speaks OpenAI-compatible
-  chat completions with streaming; routing, discovery, and pricing live in
-  `config` + `~/.whip/models.json`. See [models-providers.md](models-providers.md).
+- **The provider is an adapter selected at the boundary.** `agent` consumes
+  `llm.Backend`; the current compiled adapter speaks OpenAI-compatible chat
+  completions with streaming. Routing, profile metadata, discovery, pricing,
+  and fallback context windows live in `config` + `provider` + the two catalog
+  caches (`~/.ghg/models.json` and `~/.ghg/models-dev.json`). See
+  [models-providers.md](models-providers.md).
 
 ## Where things live on disk
 
 | Path | What | Format |
 |---|---|---|
-| `~/.whip/config.json` | providers, models, MCP, browser mode | JSON, hand-editable |
-| `~/.whip/sessions.db` | conversation history, tasks | SQLite |
-| `~/.whip/models.json` | provider `/models` catalog cache | JSON, 24h TTL |
-| `~/.whip/memory.md` | durable memory the model maintains | Markdown checkboxes |
-| `~/.whip/browser/extension/` | the Chrome extension for `browser.mode=extension` | unpacked extension |
+| `~/.ghg/config.json` | providers, models, roles, MCP, and UI settings | JSON, hand-editable |
+| `~/.ghg/sessions.db` | conversation history, tasks | SQLite |
+| `~/.ghg/models.json` | provider `/models` catalog cache | JSON, 24h TTL |
+| `~/.ghg/models-dev.json` | public context and reasoning metadata for listed models | JSON, 24h TTL |
+| `~/.ghg/providers/*.yaml` | user provider profiles | strict YAML, non-secret metadata |
+| `.ghg/providers/*.yaml` | trusted-project provider profiles | strict YAML, non-secret metadata |
+| `~/.ghg/memory.md` | durable memory the model maintains | Markdown checkboxes |
 | `.agents/skills/` (repo) | project skills injected into sessions | Markdown `SKILL.md` |
 | `.mcp.json` (repo) | claude-style MCP servers | JSON |
 
@@ -112,16 +117,15 @@ process.
 | Package | One-liner |
 |---|---|
 | `internal/agent` | the tool-use loop: `Agent.Turn`, compaction, background subagents, todos |
-| `internal/llm` | streaming chat-completions client, usage/cost parsing |
+| `internal/llm` | provider-neutral backend contract, compiled adapters, usage/cost parsing |
+| `internal/provider` | strict YAML profile loading, precedence, URL/auth validation, instance resolution |
 | `internal/tools` | bash, read, write, edit, suggest + tool schema definitions |
-| `internal/tui` | bubbletea session: transcript, input, palette, status line |
+| `internal/tui` | bubbletea session: transcript, input, settings, status line |
 | `internal/config` | config file, model catalog cache, provider resolution |
 | `internal/session` | SQLite persistence for conversations and tasks |
 | `internal/mcp` | MCP client: three config styles, lazy connect, auto-reconnect |
 | `internal/skills` | skill discovery and injection |
 | `internal/lsp` | gopls diagnostics surfaced to the model after edits |
-| `internal/browser` | Chrome automation: live attach, dedicated, headless, extension relay |
-| `internal/computer` | macOS computer-use: AX tree, screenshots, Chrome AppleScript |
 | `internal/memory` | markdown-file durable memory |
 | `internal/schedule` | `@every` / `@at` wakeups |
 

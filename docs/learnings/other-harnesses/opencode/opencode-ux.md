@@ -13,7 +13,7 @@ the repo root. The curated to-do view of all this lives in [../../../roadmap.md]
   `keybind(defaultKeys, description)`. From that single table it derives the JSON schema
   for user overrides, the description map, and a `CommandMap` from keybind name → dotted
   command id (`session_compact` → `session.compact`).
-- Keybinds, command palette, help text, which-key, and config schema are all generated
+- Keybinds, command settings, help text, which-key, and config schema are all generated
   from one declaration. Add an action once, it appears everywhere. In Go: a
   `map[string]struct{Default, Desc string}` plus a `Command` registry keyed by the same names.
 - Multi-key defaults in one string (`"ctrl+c,ctrl+d,<leader>q"`); `"none"` unbinds.
@@ -35,10 +35,10 @@ the repo root. The curated to-do view of all this lives in [../../../roadmap.md]
   `autocomplete`, `question`). Dialogs push on mount, pop on cleanup; bindings declare
   their mode. Kills the "escape does the wrong thing" bug class.
 
-### Command palette
-- `component/command-palette.tsx` — `ctrl+p`, 79 lines, a projection over the keymap
+### Command settings
+- `component/command-settings.tsx` — `ctrl+p`, 79 lines, a projection over the keymap
   registry filtered to reachable commands. Shows title, description, category, and the
-  current keybind (the palette teaches the shortcuts). `suggested: true` entries pin to
+  current keybind (the settings teaches the shortcuts). `suggested: true` entries pin to
   a "Suggested" category when the filter is empty.
 
 ### One fuzzy-select widget for every picker
@@ -110,7 +110,7 @@ the repo root. The curated to-do view of all this lives in [../../../roadmap.md]
 - Streaming-aware markdown (`<markdown streaming={true}>`) so partial output doesn't
   flicker; grid tables; 18 markdown + 9 syntax theme keys.
 - **Conceal** (`<leader>h`): hides markdown syntax noise while keeping styling — vim
-  conceallevel for chat. Reasoning blocks render with a desaturated syntax palette and a
+  conceallevel for chat. Reasoning blocks render with a desaturated syntax settings and a
   `thinkingOpacity` theme knob.
 
 ### Tool-call display (`routes/session/index.tsx` ~1708–2600)
@@ -146,7 +146,7 @@ the repo root. The curated to-do view of all this lives in [../../../roadmap.md]
   clipboard, title flips to "Copy share link"; `/unshare` revokes.
 - **Clickable links**: a `Link` component (`packages/tui/src/ui/link.tsx`) opens
   `href` via `open()` on `onMouseUp` — but it's only used in auth dialogs, never
-  in the chat transcript. whip instead emits terminal-native OSC 8 hyperlinks
+  in the chat transcript. harness instead emits terminal-native OSC 8 hyperlinks
   transcript-wide (URLs + existing local files), so every link is clickable with
   no per-widget mouse plumbing (`internal/tui/links.go`).
 - **Rename** (ctrl+r), **fork** from timeline or from any message's action menu (fork
@@ -207,11 +207,11 @@ the repo root. The curated to-do view of all this lives in [../../../roadmap.md]
 - **34 JSON themes**; format is `defs` (named colors) + values that are hex, a def ref,
   or a `{dark, light}` pair — one file serves both modes. Layered precedence:
   defaults < plugins < user files < generated "system" theme built from the terminal's
-  OSC-queried palette (prewarmed to avoid a flash). `selectedForeground()` computes
+  OSC-queried settings (prewarmed to avoid a flash). `selectedForeground()` computes
   readable selection contrast by luminance for transparent terminals.
-- **KV prefs** (`context/kv.tsx`): file-locked atomic `kv.json`; every palette toggle
+- **KV prefs** (`context/kv.tsx`): file-locked atomic `kv.json`; every settings toggle
   persists (animations, diff wrap, tips, conceal, tool details, pinned sessions,
-  share consent…). For whip: one `settings(key, value)` table in sessions.db.
+  share consent…). For harness: one `settings(key, value)` table in sessions.db.
 - `/status` dialog: MCP/LSP/formatters/plugins with per-item status colors.
 - Rotating home-screen tips, auto-hidden after first session.
 
@@ -237,9 +237,9 @@ Entry `packages/opencode/src/index.ts` (yargs). Worth copying:
 - Global flags: `--print-logs`, `--log-level`, `--pure` (no external plugins — great for
   bug reports). Env markers for children: `AGENT=1`, `OPENCODE=1`, `OPENCODE_PID`.
 
-## Cheapest-first shortlist for whip
+## Cheapest-first shortlist for harness
 
-1. Keybind/command single registry → palette, help, slash commands, config schema.
+1. Keybind/command single registry → settings, help, slash commands, config schema.
 2. One DialogSelect-equivalent fuzzy widget; every picker becomes ~40 lines.
 3. Toasts + KV prefs table.
 4. Paste summarization + pasted-path-becomes-attachment.

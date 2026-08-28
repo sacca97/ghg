@@ -37,14 +37,14 @@ func TestHelpContainsEveryRegistryHint(t *testing.T) {
 	}
 }
 
-// The palette's slash-command rows take their description from the registry:
+// The settings's slash-command rows take their description from the registry:
 // for every row whose hint is a slash name, the rendered description must
 // contain the registry hint.
 func TestPaletteListsRegistryCommands(t *testing.T) {
 	m := compactCmdModel()
 	m.openPalette()
 	rows := 0
-	for _, it := range m.palette.all {
+	for _, it := range m.settings.all {
 		if it.dynHint == nil || it.dynDesc == nil {
 			continue
 		}
@@ -54,16 +54,16 @@ func TestPaletteListsRegistryCommands(t *testing.T) {
 		}
 		e := registryFind(hint)
 		if e == nil {
-			t.Errorf("palette row %q hints %q, which is not in the registry", it.title, hint)
+			t.Errorf("settings row %q hints %q, which is not in the registry", it.title, hint)
 			continue
 		}
 		if !strings.Contains(it.dynDesc(m), e.Hint) {
-			t.Errorf("palette row %q desc %q doesn't come from the registry hint %q", it.title, it.dynDesc(m), e.Hint)
+			t.Errorf("settings row %q desc %q doesn't come from the registry hint %q", it.title, it.dynDesc(m), e.Hint)
 		}
 		rows++
 	}
 	if rows < 8 {
-		t.Fatalf("expected the palette to surface registry commands, found %d rows", rows)
+		t.Fatalf("expected the settings to surface registry commands, found %d rows", rows)
 	}
 }
 

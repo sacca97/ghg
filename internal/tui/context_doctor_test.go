@@ -6,13 +6,14 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/context-labs/whip/internal/mcp"
-	"github.com/context-labs/whip/internal/skills"
+	"github.com/sacca97/ghg/internal/config"
+	"github.com/sacca97/ghg/internal/mcp"
+	"github.com/sacca97/ghg/internal/skills"
 )
 
 func TestDoctorFreshSession(t *testing.T) {
 	m := tasksModel("http://unused")
-	m.sysPrompt = "You are an expert coding assistant operating inside whip. "
+	m.sysPrompt = "You are an expert coding assistant operating inside ghg. "
 	disabled := false
 	m.mcpMgr = mcp.NewManager(map[string]mcp.ServerConfig{
 		"off":     {Command: []string{"true"}, Enabled: &disabled},
@@ -52,7 +53,7 @@ func TestDoctorCommandWired(t *testing.T) {
 }
 
 // TestDoctorSkillSources pins the attribution: each skill named in "biggest:"
-// carries the directory it was discovered from, home-relative for ~/.whip
+// carries the directory it was discovered from, home-relative for ~/.ghg
 // and ./-relative for the project dir — answering "where does this skill come
 // from?" without leaving the report.
 func TestDoctorSkillSources(t *testing.T) {
@@ -73,7 +74,7 @@ func TestDoctorSkillSources(t *testing.T) {
 		}
 	}
 	writeSkill(filepath.Join(proj, ".agents", "skills"), "proj-skill", "from the project")
-	writeSkill(filepath.Join(home, ".whip", "skills"), "user-skill", "from the user dir")
+	writeSkill(filepath.Join(home, ".ghg", "skills"), "user-skill", "from the user dir")
 
 	m := tasksModel("http://unused")
 	m.skillScan = func() []skills.Skill { return skills.Scan(skills.DefaultDirs()...) }
@@ -84,8 +85,36 @@ func TestDoctorSkillSources(t *testing.T) {
 	if !strings.Contains(out, "proj-skill ~") || !strings.Contains(out, "(./.agents/skills)") {
 		t.Errorf("project skill should point at ./.agents/skills:\n%s", out)
 	}
-	if !strings.Contains(out, "(~/.whip/skills)") {
-		t.Errorf("user skill should point at ~/.whip/skills:\n%s", out)
+	if !strings.Contains(out, "(~/.ghg/skills)") {
+		t.Errorf("user skill should point at ~/.ghg/skills:\n%s", out)
+	}
+}
+
+func TestDoctorProjectInstructions(t *testing.T) {
+	home := t.TempDir()
+	root := t.TempDir()
+	t.Setenv("GHG_HOME", home)
+	t.Chdir(root)
+	if err := config.Trust(root); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "AGENTS.md"), []byte("run task check\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m := tasksModel("http://unused")
+	m.sysPrompt = "base\n\n" + config.ProjectInstructions(root, true)
+	out := m.doctorReport()
+	if !strings.Contains(out, "project instructions (AGENTS.md)") || !strings.Contains(out, "trusted project") {
+		t.Fatalf("trusted project instructions should be audited:\n%s", out)
+	}
+
+	// A fresh model in an untrusted directory must not report or count the file.
+	other := t.TempDir()
+	t.Chdir(other)
+	m.sysPrompt = "base"
+	out = m.doctorReport()
+	if strings.Contains(out, "project instructions (AGENTS.md)") {
+		t.Fatalf("untrusted project instructions should be absent:\n%s", out)
 	}
 }
 
@@ -97,7 +126,7 @@ func TestShortSkillsDir(t *testing.T) {
 	wd := t.TempDir()
 	t.Chdir(wd)
 	cases := map[string]string{
-		filepath.Join(home, ".whip", "skills"):                     "~/.whip/skills",
+		filepath.Join(home, ".ghg", "skills"):                      "~/.ghg/skills",
 		filepath.Join(wd, ".agents", "skills"):                     "./.agents/skills",
 		filepath.Join(string(filepath.Separator), "opt", "skills"): "/opt/skills",
 	}

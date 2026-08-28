@@ -5,6 +5,8 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/sacca97/ghg/internal/llm"
 )
 
 // catalogTTL is how long a provider's fetched model list stays fresh.
@@ -17,12 +19,14 @@ type Catalog struct {
 	Models    []ModelInfoLite `json:"models"`
 }
 
-// ModelInfoLite is the subset of the provider's /models entry whip uses.
+// ModelInfoLite is the subset of the provider's /models entry ghg uses.
 type ModelInfoLite struct {
 	ID                  string   `json:"id"`
 	ContextLength       int      `json:"contextLength,omitempty"`       // model's context window (input), 0 if unadvertised
 	MaxCompletionTokens int      `json:"maxCompletionTokens,omitempty"` // provider's output cap, 0 if unadvertised
 	ReasoningEfforts    []string `json:"reasoningEfforts,omitempty"`
+	ReasoningKnown      bool     `json:"reasoningKnown,omitempty"`  // models.dev/provider explicitly described the reasoning surface
+	ReasoningToggle     bool     `json:"reasoningToggle,omitempty"` // a separate on/off reasoning control is available
 	InPrice             float64  `json:"inPrice,omitempty"`         // USD per prompt token, 0 if unadvertised
 	OutPrice            float64  `json:"outPrice,omitempty"`        // USD per completion token, 0 if unadvertised
 	CacheReadPrice      float64  `json:"cacheReadPrice,omitempty"`  // USD per cached prompt token, 0 = bill at InPrice
@@ -101,7 +105,7 @@ func catalogPath() (string, error) {
 	return filepath.Join(dir, "models.json"), nil
 }
 
-// LoadCatalogs reads ~/.whip/models.json. A missing or unreadable file is
+// LoadCatalogs reads ~/.ghg/models.json. A missing or unreadable file is
 // not an error and yields an empty (non-nil) map, so callers can always write
 // into the result.
 func LoadCatalogs() map[string]Catalog {
@@ -120,7 +124,7 @@ func LoadCatalogs() map[string]Catalog {
 	return cats
 }
 
-// SaveCatalogs writes ~/.whip/models.json.
+// SaveCatalogs writes ~/.ghg/models.json.
 func SaveCatalogs(cats map[string]Catalog) error {
 	p, err := catalogPath()
 	if err != nil {
@@ -131,6 +135,36 @@ func SaveCatalogs(cats map[string]Catalog) error {
 		return err
 	}
 	return os.WriteFile(p, append(data, '\n'), 0o600)
+}
+
+// ModelInfoLites converts provider model records into the catalog-cache shape.
+// Keeping this conversion beside the cache prevents each onboarding surface
+// from drifting when a capability field is added.
+func ModelInfoLites(infos []llm.ModelInfo) []ModelInfoLite {
+	lites := make([]ModelInfoLite, len(infos))
+	for i, mi := range infos {
+		lites[i] = ModelInfoLite{
+			ID:                  mi.ID,
+			ContextLength:       mi.ContextLength,
+			MaxCompletionTokens: mi.MaxCompletionTokens,
+			ReasoningEfforts:    mi.ReasoningEfforts,
+			ReasoningKnown:      len(mi.ReasoningEfforts) > 0,
+			InputModalities:     mi.InputModalities,
+		}
+		if mi.Pricing != nil {
+			lites[i].InPrice, lites[i].OutPrice, lites[i].CacheReadPrice = mi.Pricing.Rates()
+		}
+	}
+	return lites
+}
+
+// SaveCatalog merges one provider's freshly validated model list into the
+// catalog cache. A successful auth flow uses the same response for validation
+// and seeding, so it never needs a second discovery request.
+func SaveCatalog(name, baseURL string, infos []llm.ModelInfo) error {
+	cats := LoadCatalogs()
+	cats[name] = Catalog{FetchedAt: time.Now(), BaseURL: baseURL, Models: ModelInfoLites(infos)}
+	return SaveCatalogs(cats)
 }
 
 // Stale reports whether the cached catalog should be refetched.

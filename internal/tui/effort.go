@@ -1,6 +1,10 @@
 package tui
 
-import "github.com/context-labs/whip/internal/config"
+import (
+	"strings"
+
+	"github.com/sacca97/ghg/internal/config"
+)
 
 // defaultEfforts are the fallback levels when the provider doesn't advertise
 // supported reasoning efforts; "" means off (parameter omitted from requests).
@@ -14,22 +18,41 @@ var effortCands = []cand{
 	{"high", "Deep reasoning, slower"},
 }
 
+func (m *model) currentEffort() string {
+	if m.agent == nil {
+		return ""
+	}
+	return m.agent.Effort
+}
+
 // effortsFor returns the cycle of effort levels available for the current
-// model: the provider-advertised levels if known (each prefixed by off), else
-// the defaults.
+// model. A known models.dev/provider surface is authoritative: its effort
+// values are returned verbatim (with "none" folded into off), a toggle-only
+// surface becomes off/on, and an explicitly empty surface becomes off only.
+// Unknown models retain the legacy low/medium/high fallback.
 func (m *model) effortsFor() []string {
 	if c, ok := m.catalogs[m.provName]; ok {
-		apiID := m.agent.Model
+		apiID := m.modelName
+		if m.agent != nil {
+			apiID = m.agent.Model
+		}
 		for _, mi := range c.Models {
 			if mi.ID != apiID {
 				continue
 			}
-			if len(mi.ReasoningEfforts) == 0 {
-				break // model doesn't reason: use defaults
+			if !mi.ReasoningKnown && len(mi.ReasoningEfforts) == 0 && !mi.ReasoningToggle {
+				break // the model has no reasoning metadata yet: use defaults
 			}
 			out := []string{""}
+			if mi.ReasoningToggle && len(mi.ReasoningEfforts) == 0 {
+				return append(out, "on")
+			}
 			for _, e := range mi.ReasoningEfforts {
-				if e != "none" { // "none" is our off ("")
+				e = strings.TrimSpace(e)
+				if strings.EqualFold(e, "none") || strings.EqualFold(e, "off") || e == "" {
+					continue // "none"/"off" are our off ("")
+				}
+				if !contains(out, e) {
 					out = append(out, e)
 				}
 			}
@@ -84,6 +107,10 @@ func effortCandsFor(levels []string) []cand {
 // fetch completes).
 func (m *model) updateCatalogs(cats map[string]config.Catalog) {
 	m.catalogs = cats
+	if m.agent == nil {
+		return
+	}
+	m.agent.ReasoningToggle = m.reasoningToggleFor(m.provName, m.agent.Model)
 	if n := m.contextLimitFor(m.provName, m.agent.Model); n != m.agent.ContextLimit {
 		m.agent.ContextLimit = n // /models is the source of truth
 	}

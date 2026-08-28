@@ -1,12 +1,13 @@
 ---
 name: golang-how-to
-description: "Golang skills orchestrator — always active on any Go coding, review, debug, or setup task. Loads the most relevant samber/cc-skills-golang skills, disambiguating overlapping clusters. Configures agent-config files (CLAUDE.md, AGENTS.md, GEMINI.md, Cursor, Copilot) to force-trigger skills."
+description: "Golang skills orchestrator — always active on any Go coding, review, debug, or setup task. Routes to the right golang-* skill and names the boundary when two overlap."
 user-invocable: true
 license: MIT
 compatibility: Designed for Claude Code, Codex or similar harness. Requires git.
 metadata:
   author: samber
-  version: "1.4.0"
+  version: "1.4.0-ghg"
+  note: "Trimmed for this repo: routing rows for libraries absent from go.mod were removed along with their skills. Upstream: https://github.com/samber/cc-skills-golang"
   openclaw:
     emoji: "🧭"
     homepage: https://github.com/samber/cc-skills-golang
@@ -21,21 +22,11 @@ metadata:
 allowed-tools: Read Edit Write Glob Grep Bash(go:*) Bash(git:*) Agent AskUserQuestion LSP Bash(gopls:*) mcp__gopls__*
 ---
 
-**Persona:** You are a Go skills orchestrator. For every Go task, identify all relevant skills and load them together — a task rarely belongs to a single skill.
+**Persona:** You are a Go skills orchestrator. A task rarely belongs to one skill — load the primary and every applicable secondary together, at the start, without waiting.
 
-**Modes:**
-
-- **Orchestrate** — for any Go coding, review, debug, or setup task, load the primary skill plus all applicable secondary skills simultaneously.
-- **Disambiguate** — when two skills seem to overlap, show the boundary table. See [disambiguation.md](references/disambiguation.md).
-- **Configure** — write the always-load directive for `golang-how-to` itself, plus an optional `## Required Go skills` block, to the project's agent-config file (CLAUDE.md, AGENTS.md, or equivalent). Follow [project-config.md](references/project-config.md).
-
-**Questions:** In Configure mode, ask the user through the environment's question tool — never as plain-text prose. One question at a time, wait for the answer. If the environment has no question tool, ask in prose with the same options.
-
-**Dependencies:** `gopls` — `go install golang.org/x/tools/gopls@latest`; Claude Code's built-in `LSP` tool also needs `ENABLE_LSP_TOOL=1` and a Go language server wired (see [Code navigation with gopls](#code-navigation-with-gopls)).
+**Repo context:** this module is stdlib + charmbracelet + `modelcontextprotocol/go-sdk` + `modernc.org/sqlite`, built `CGO_ENABLED=0`. It uses no DI container, no cobra/viper, no testify, no ORM, no gRPC/GraphQL. Skills for those were removed rather than kept as dead routes. Surviving skills that point at one are marked "(upstream skill, not installed here)" inline; their `references/` files were left untouched, so treat any `golang-*` name there that has no local directory as upstream history. Adding one of those dependencies is a `plan.md` decision, not a skill lookup.
 
 ## Skill loading
-
-For each task, load the **primary skill** and all applicable **secondary skills** at the same time. Do not wait — load them together at the start.
 
 | Intent | Primary | Also load |
 | --- | --- | --- |
@@ -45,116 +36,52 @@ For each task, load the **primary skill** and all applicable **secondary skills*
 | Write goroutines, channels, sync | `golang-concurrency` | `golang-context` (if cancellation) |
 | Pass deadlines / cancel operations | `golang-context` | `golang-concurrency` (if goroutines) |
 | Design structs, embed, use interfaces | `golang-structs-interfaces` | `golang-design-patterns` |
-| Database queries and transactions | `golang-database` | `golang-error-handling`, `golang-security` |
-| Build a gRPC service | `golang-grpc` | `golang-testing`, `golang-error-handling` |
-| Build a GraphQL API | `golang-graphql` | `golang-testing`, `golang-error-handling` |
-| Build a CLI command tree | `golang-spf13-cobra` | `golang-cli`, `golang-spf13-viper` (if config) |
-| Layer config from flags/env/file | `golang-spf13-viper` | `golang-spf13-cobra` |
-| Write tests | `golang-testing` | `golang-stretchr-testify` (if using testify) |
+| Build or change the bubbletea TUI | `bubbletea-tui` | `golang-concurrency`, `golang-testing` |
+| SQLite queries, transactions, schema | `golang-database` | `golang-error-handling`, `golang-security` |
+| Build or extend the CLI surface | `golang-cli` | `golang-testing` |
+| Write tests | `golang-testing` | `golang-concurrency` (if `-race` matters) |
 | Apply optimization patterns | `golang-performance` | `golang-benchmark` (measure first) |
 | Measure with pprof / benchstat | `golang-benchmark` | `golang-performance` (fix), `golang-troubleshooting` (root cause) |
 | Debug a panic or unexpected behavior | `golang-troubleshooting` | `golang-safety`, `golang-benchmark` (if perf-related) |
-| Monitor in production | `golang-observability` | `golang-performance` (if SLO breach) |
+| Instrument for production | `golang-observability` | `golang-performance` (if SLO breach) |
 | Audit security vulnerabilities | `golang-security` | `golang-safety`, `golang-lint` |
 | Review formatting and style | `golang-code-style` | `golang-naming`, `golang-lint` |
 | Refactor or restructure existing code | `golang-refactoring` | `golang-naming`, `golang-code-style`, `golang-project-layout` |
 | Configure golangci-lint | `golang-lint` | `golang-code-style` |
 | Write godoc / README / CHANGELOG | `golang-documentation` | `golang-naming` |
-| Set up a new project structure | `golang-project-layout` | `golang-design-patterns`, `golang-dependency-injection`, `golang-lint` |
+| Set up or reorganize package layout | `golang-project-layout` | `golang-design-patterns`, `golang-lint` |
 | Set up CI/CD pipeline | `golang-continuous-integration` | `golang-lint`, `golang-security` |
-| Choose a library | `golang-popular-libraries` | relevant library-specific skill |
+| Consider a library | `golang-popular-libraries` | `golang-dependency-management` — but see the repo context above |
 | Look up a package's docs, versions, importers, or CVEs | `golang-pkg-go-dev` | `golang-dependency-management` |
-| Navigate, diagnose, or refactor local code (definitions, references, rename) | `golang-gopls` | — |
+| Navigate, diagnose, or refactor local code | `golang-gopls` | — |
 | Adopt new Go language features | `golang-modernize` | `golang-lint` |
-| Use samber/lo (slice/map helpers) | `golang-samber-lo` | `golang-data-structures`, `golang-performance` |
-| Use samber/oops (structured errors) | `golang-samber-oops` | `golang-error-handling` |
-| Use log/slog | `golang-samber-slog` | `golang-observability`, `golang-error-handling` |
-| Use dependency injection | `golang-dependency-injection` | `golang-google-wire` or `golang-uber-dig` or `golang-uber-fx` or `golang-samber-do` |
 
-All skill identifiers above are short forms of `samber/cc-skills-golang@<name>`.
+Non-Go work in this repo (feature design, roadmap triage, minimalism) belongs to `new-feature-development` and `ponytail`, not to this table.
 
-## Code navigation with gopls
+## gopls vs godig vs govulncheck
 
-`gopls` gives semantic code intelligence for Go — go-to-definition, find references, diagnostics, package API, symbol search, refactoring. → See `samber/cc-skills-golang@golang-gopls` skill for the three ways to reach it (its own MCP server, the native `LSP` tool, and its CLI), the full capability matrix, and efficient read/edit workflows.
+Three tools, three scopes — they do not overlap:
 
-`gopls` only reasons about code that is present and resolvable in the local build: your workspace plus every dependency exactly as pinned in `go.sum` (including `replace` directives). For any fact that isn't tied to your local build — version history, licenses, ecosystem-wide importers, a package you haven't added yet — use `golang-pkg-go-dev` (`godig`). See the `godig` vs gopls vs Context7 vs govulncheck section below for the full boundary.
+- **`gopls`** (→ `golang-gopls`) answers questions about **your build**: your code plus dependencies exactly as pinned in `go.sum`, `replace` directives included. Definitions, references, `documentSymbol`, diagnostics after an edit, safe rename, and a single-shot `go_vulncheck`. Reach for it first for anything local.
+- **`godig`** (→ `golang-pkg-go-dev`) answers questions about the **published ecosystem** — any module, whether or not it is in `go.mod` yet. Versions, exported symbols, examples, licenses, `imported-by`, known CVEs for a version in isolation. It never reads your checkout.
+- **`govulncheck`** (→ `golang-security`) is the **whole-tree audit**: walks the module's call graph to confirm which known vulnerabilities are actually reachable. The tool of record for CI gates; `gopls`'s `go_vulncheck` is the lighter mid-edit version.
 
-## `godig` vs gopls vs Context7 vs govulncheck
-
-Four tools can answer "is this dependency OK to use," and they don't overlap as much as they look:
-
-- **Context7** is a general-purpose, cross-language documentation fetcher — useful when no more specific source exists. For a Go package or module, `godig` is almost always the better choice: it pulls **structured, Go-specific data** straight from pkg.go.dev — exact versions, exported symbols with signatures, runnable examples, `imported-by`, and known vulnerabilities — rather than Context7's generic scraped/curated docs, which don't expose that structure and can lag or miss lesser-known Go modules. Reach for Context7 only when a dependency's documentation genuinely doesn't exist or isn't indexed on pkg.go.dev.
-- **`godig`** answers questions about the **published ecosystem**: any Go package or module, whether or not it's in your `go.mod` yet — it calls the remote pkg.go.dev API and never touches your local checkout. Its `vulns` command reports CVEs known for a package/version in isolation, regardless of whether your build actually reaches the vulnerable code path.
-- **`gopls`** (→ `samber/cc-skills-golang@golang-gopls`, via its MCP server, the native `LSP` tool, or its CLI) answers questions about **your specific build**: your code plus every dependency exactly as pinned in `go.sum`, including `replace` directives pointing at forks or local paths — neither `godig` nor Context7 can see that. Its `go_vulncheck` operation runs a single, on-demand reachability check against the workspace as it stands right now.
-- **`govulncheck`** (the standalone CLI, wrapped by the `samber/cc-skills-golang@golang-security` skill) is the whole-tree audit: it walks the entire module's call graph to confirm which known vulnerabilities are actually reachable, and is the tool of record for CI gates and periodic security sweeps — `gopls`'s `go_vulncheck` is a lighter-weight, single-shot version of the same analysis for use mid-edit.
-
-Pick by task:
-
-| Task | Tool | How |
-| --- | --- | --- |
-| Find where a symbol is defined in your own repo | `gopls` | `samber/cc-skills-golang@golang-gopls` — `go_search`, then `go_file_context` |
-| Understand a file's intra-package dependencies | `gopls` | `samber/cc-skills-golang@golang-gopls` — `go_file_context` |
-| Jump into a dependency's exact resolved source (incl. forks/`replace`d versions) | `gopls` | `samber/cc-skills-golang@golang-gopls` — `go_package_api`, or the native `LSP` tool's `goToDefinition` |
-| Find every call site in your own code that references a dependency's symbol | `gopls` | `samber/cc-skills-golang@golang-gopls` — `go_symbol_references` — `godig`'s `imported-by` only lists public _packages_, not call sites in your repo |
-| Get compiler diagnostics right after an edit | `gopls` | `samber/cc-skills-golang@golang-gopls` — `go_diagnostics` (MCP), or automatic with the native `LSP` tool |
-| Check whether your current build can reach a known vulnerability, mid-edit | `gopls` | `samber/cc-skills-golang@golang-gopls` — `go_vulncheck` |
-| Rename, extract, inline, or otherwise refactor local code | `gopls` | `samber/cc-skills-golang@golang-gopls` — safe rename, `refactor.*` code actions |
-| Whole-tree vulnerability audit across the module (CI, periodic sweep) | `govulncheck` | `samber/cc-skills-golang@golang-security` skill — `govulncheck ./...` |
-| List available versions of a published package | `godig` | `godig versions <path>` |
-| Check known CVEs for a package/version you haven't added yet | `godig` | `godig vulns <path>` |
-| See exported symbols/signatures of a published package | `godig` | `godig symbols` / `symbol doc` |
-| Get runnable code examples for a symbol | `godig` | `godig symbol examples` |
-| Read a package's rendered README/docs | `godig` | `godig module readme` / `package doc` |
-| See who imports a package across the whole public ecosystem | `godig` | `godig imported-by` |
-| Search for a package or library candidate | `godig` | `godig search` |
-| Check a package's or module's license | `godig` | `godig package licenses` / `module licenses` |
-| Get docs for a non-Go library, or a Go module not indexed on pkg.go.dev | Context7 | `resolve-library-id` / `query-docs` |
-
-See the `samber/cc-skills-golang@golang-pkg-go-dev` skill for the full `godig` command reference, and the `samber/cc-skills-golang@golang-security` skill for the whole-tree `govulncheck` remediation workflow.
-
-## Categories at a glance
-
-Full catalog with "use when" hooks: [by-category.md](references/by-category.md)
-
-| Category | Skills |
-| --- | --- |
-| Code Quality | `golang-code-style` `golang-documentation` `golang-error-handling` `golang-lint` `golang-naming` `golang-safety` `golang-security` `golang-structs-interfaces` |
-| Architecture & Design | `golang-concurrency` `golang-context` `golang-data-structures` `golang-database` `golang-dependency-injection` `golang-design-patterns` `golang-modernize` `golang-refactoring` |
-| QA & Performance | `golang-benchmark` `golang-observability` `golang-performance` `golang-testing` `golang-troubleshooting` |
-| Project Setup | `golang-cli` `golang-continuous-integration` `golang-dependency-management` `golang-gopls` `golang-pkg-go-dev` `golang-popular-libraries` `golang-project-layout` `golang-stay-updated` |
-| APIs | `golang-graphql` `golang-grpc` `golang-swagger` |
-| Dependency Injection | `golang-dependency-injection` `golang-google-wire` `golang-uber-dig` `golang-uber-fx` `golang-samber-do` |
-| Frameworks | `golang-spf13-cobra` `golang-spf13-viper` |
-| samber/\* | `golang-samber-do` `golang-samber-hot` `golang-samber-lo` `golang-samber-mo` `golang-samber-oops` `golang-samber-ro` `golang-samber-slog` |
-| Testing | `golang-stretchr-testify` `golang-testing` |
+Use Context7 only for a library whose docs are genuinely not on pkg.go.dev.
 
 ## Competing clusters — boundary lines
 
-Full boundary tables with routing examples: [disambiguation.md](references/disambiguation.md)
-
-Key clusters and their owners:
+Full boundary tables and routing examples: [disambiguation.md](references/disambiguation.md). Full catalog with "use when" hooks: [by-category.md](references/by-category.md). Both still describe skills that were removed from this repo; treat those rows as history.
 
 - **Performance**: `golang-performance` (optimization patterns) · `golang-benchmark` (measurement) · `golang-troubleshooting` (root cause) · `golang-observability` (always-on production)
-- **DI**: `golang-dependency-injection` (concepts/decision) · `golang-google-wire` (compile-time) · `golang-uber-dig` (runtime reflection) · `golang-uber-fx` (lifecycle framework) · `golang-samber-do` (type-safe container)
-- **samber/\***: `golang-samber-lo` (finite transforms) · `golang-samber-ro` (reactive streams) · `golang-samber-mo` (monadic types)
-- **Errors**: `golang-error-handling` (idioms) · `golang-samber-oops` (structured errors) · `golang-safety` (prevent panics)
+- **Errors**: `golang-error-handling` (idioms) vs `golang-safety` (preventing panics)
 - **Style**: `golang-code-style` · `golang-naming` · `golang-lint` · `golang-documentation`
-- **CLI**: `golang-cli` (architecture) · `golang-spf13-cobra` (command tree) · `golang-spf13-viper` (config layering)
-- **Package lookup**: `golang-pkg-go-dev` (query pkg.go.dev for an existing path: versions/docs/symbols/importers/CVEs) · `golang-gopls` (navigate/refactor your locally resolved build) · `golang-popular-libraries` (which library to adopt) · `golang-dependency-management` (manage go.mod) · `golang-security` (whole-tree CVE scan)
-- **Gap — type vs arch**: `golang-structs-interfaces` (type design) vs `golang-design-patterns` (architectural patterns)
-- **Gap — goroutine vs cancel**: `golang-concurrency` + `golang-context` — load both when cancelling goroutines via context
-- **Gap — correctness vs threat**: `golang-safety` (internal bugs) vs `golang-security` (external threats)
-- **Gap — features vs rules**: `golang-modernize` (language adoption) vs `golang-lint` (static analysis config)
-- **Gap — process vs target rules**: `golang-refactoring` (the safe, staged, at-scale _process_ of changing existing code — planning, ordering, gopls-driven mechanics, staged PRs) vs `golang-naming`/`golang-code-style`/`golang-project-layout`/`golang-design-patterns`/`golang-modernize` (what the resulting code should look like) — load `golang-refactoring` alongside whichever of these owns the target shape
-
-## Configure mode
-
-Write an always-load directive for `golang-how-to` itself to the project's agent-config file (CLAUDE.md, AGENTS.md, GEMINI.md, Cursor rules, or Copilot instructions — whichever the project's harness reads), and optionally force-trigger specific secondary skills too.
-
-`samber/cc-skills-golang@golang-project-layout` writes the always-load directive automatically at project creation, with no user confirmation needed — it costs one skill description and never imposes project-specific choices. Running `/golang-how-to configure` writes it too if missing, and additionally lets the user confirm a `## Required Go skills` block for skills that must always apply beyond routing. Follow [project-config.md](references/project-config.md).
+- **Package lookup**: `golang-pkg-go-dev` (published) · `golang-gopls` (local build) · `golang-dependency-management` (go.mod) · `golang-security` (whole-tree CVE scan)
+- **Type vs architecture**: `golang-structs-interfaces` (type design) vs `golang-design-patterns` (architectural patterns)
+- **Goroutine vs cancel**: load `golang-concurrency` + `golang-context` together when cancelling goroutines via context
+- **Correctness vs threat**: `golang-safety` (internal bugs) vs `golang-security` (external threats)
+- **Features vs rules**: `golang-modernize` (language adoption) vs `golang-lint` (static analysis config)
+- **Process vs target shape**: `golang-refactoring` owns the safe, staged *process* of changing existing code; `golang-naming`/`golang-code-style`/`golang-project-layout`/`golang-design-patterns`/`golang-modernize` own what the result should look like. Load `golang-refactoring` alongside whichever owns the target shape.
 
 ---
 
-This skill is not exhaustive. Refer to individual skill files and the official Go documentation for detailed guidance.
-
-If you encounter a bug or unexpected behavior in this skill plugin, open an issue at <https://github.com/samber/cc-skills-golang/issues>.
+Not exhaustive — refer to individual skill files and the official Go documentation. Upstream issues: <https://github.com/samber/cc-skills-golang/issues>.

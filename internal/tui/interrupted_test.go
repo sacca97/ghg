@@ -7,8 +7,8 @@ import (
 
 	"github.com/charmbracelet/x/ansi"
 
-	"github.com/context-labs/whip/internal/llm"
-	"github.com/context-labs/whip/internal/session"
+	"github.com/sacca97/ghg/internal/llm"
+	"github.com/sacca97/ghg/internal/session"
 )
 
 // Resuming an interrupted session tells the user exactly what the model was

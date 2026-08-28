@@ -8,9 +8,10 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/context-labs/whip/internal/agent"
-	"github.com/context-labs/whip/internal/mcp"
-	"github.com/context-labs/whip/internal/skills"
+	"github.com/sacca97/ghg/internal/agent"
+	"github.com/sacca97/ghg/internal/config"
+	"github.com/sacca97/ghg/internal/mcp"
+	"github.com/sacca97/ghg/internal/skills"
 )
 
 // /context-doctor — audit what a FRESH session injects before
@@ -33,13 +34,24 @@ func (r ctxRow) tokens() int { return (r.bytes + 3) / 4 }
 func (m *model) doctorReport() string {
 	var rows []ctxRow
 
-	// Base system prompt (the static text; skills/MCP blocks are appended per
-	// turn in prepareTurn).
-	rows = append(rows, ctxRow{"system prompt (base)", len(m.sysPrompt), ""})
+	// Base system prompt; skills/MCP blocks are appended per turn in
+	// prepareTurn. Project instructions are called out separately so the audit
+	// identifies the trusted repository input instead of hiding it in the base
+	// total.
+	baseBytes := len(m.sysPrompt)
+	if wd, err := os.Getwd(); err == nil {
+		if project := config.ProjectInstructions(wd, config.Trusted(wd)); project != "" {
+			if strings.Contains(m.sysPrompt, project) && baseBytes >= len(project)+2 {
+				baseBytes -= len(project) + 2 // systemPrompt joins blocks with two newlines
+			}
+			rows = append(rows, ctxRow{"project instructions (AGENTS.md)", len(project), "trusted project"})
+		}
+	}
+	rows = append(rows, ctxRow{"system prompt (base)", baseBytes, ""})
 
 	// Skills: block total + the worst offenders, each named with the directory
 	// it was discovered from — "where does this skill come from?" should be
-	// answerable here, not by hunting ~/.whip/skills vs .agents/skills.
+	// answerable here, not by hunting ~/.ghg/skills vs .agents/skills.
 	scan := m.skillScan
 	if scan == nil { // headless tests build models without the seam
 		scan = func() []skills.Skill { return skills.Scan(skills.DefaultDirs()...) }
@@ -100,20 +112,33 @@ func (m *model) doctorReport() string {
 
 	// Built-in tool schemas (what the provider is sent every request).
 	var tb int
-	for _, t := range m.agent.AllTools() {
-		schema, _ := json.Marshal(t.Def)
-		tb += len(schema) + 8
+	var toolCount int
+	if m.agent != nil {
+		toolCount = len(m.agent.AllTools())
+		for _, t := range m.agent.AllTools() {
+			schema, _ := json.Marshal(t.Def)
+			tb += len(schema) + 8
+		}
 	}
-	rows = append(rows, ctxRow{fmt.Sprintf("tool schemas (%d tools)", len(m.agent.AllTools())), tb, "sent with every request"})
+	note := "sent with every request"
+	if m.agent == nil {
+		note = "unavailable until a provider is configured"
+	}
+	rows = append(rows, ctxRow{fmt.Sprintf("tool schemas (%d tools)", toolCount), tb, note})
 
 	// History: tokens already in the conversation (0 on a fresh session).
-	hist := agent.EstimateTokens(m.agent.Messages)
+	var hist int
+	if m.agent != nil {
+		hist = agent.EstimateTokens(m.agent.Messages)
+	}
 	if hist > 0 {
 		rows = append(rows, ctxRow{"conversation history", hist * 4, "estimated"})
 	}
 	// Session spend so far (real usage, if any request has happened).
-	if u := m.agent.Usage(); u.PromptTokens > 0 {
-		rows = append(rows, ctxRow{"session spend so far", 0, fmt.Sprintf("%s in / %s out (actual)", tok(u.PromptTokens), tok(u.CompletionTokens))})
+	if m.agent != nil {
+		if u := m.agent.Usage(); u.PromptTokens > 0 {
+			rows = append(rows, ctxRow{"session spend so far", 0, fmt.Sprintf("%s in / %s out (actual)", tok(u.PromptTokens), tok(u.CompletionTokens))})
+		}
 	}
 
 	// Render.
@@ -140,7 +165,7 @@ func (m *model) doctorReport() string {
 }
 
 // shortSkillsDir compacts a skills directory for the doctor's per-skill
-// attribution: home-relative ("~/.whip/skills") when under the user's home,
+// attribution: home-relative ("~/.ghg/skills") when under the user's home,
 // cwd-relative ("./.agents/skills") when under the working directory,
 // absolute otherwise.
 func shortSkillsDir(dir string) string {

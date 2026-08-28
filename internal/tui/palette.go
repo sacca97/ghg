@@ -6,32 +6,31 @@ import (
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
 
-	"github.com/context-labs/whip/internal/browser"
-	"github.com/context-labs/whip/internal/config"
-	"github.com/context-labs/whip/internal/mcp"
+	"github.com/sacca97/ghg/internal/mcp"
 )
 
-// paletteItem is one row in the ctrl+p command palette. It mirrors opencode's
+// paletteItem is one row in the ctrl+p command settings. It mirrors opencode's
 // DialogSelectOption: title + description + category header + a dimmed hint
-// (the keybind or slash form — the palette teaches the shortcuts).
+// (the keybind or slash form — the settings teaches the shortcuts).
 //
 // Items are interactive: every row either toggles a live setting in place
-// (enter, or ←/→ for reversible ones) or opens a sub-panel inside the palette
+// (enter, or ←/→ for reversible ones) or opens a sub-panel inside the settings
 // where the change is explored and applied without leaving ctrl+p. Nothing
-// closes the palette just to make a change — esc backs out instead.
+// closes the settings just to make a change — esc backs out instead.
 type paletteItem struct {
 	title    string // display name, e.g. "Model"
 	category string // "Agent", "Session", "Display", "App"
 
-	// dynDesc/dynHint render live state, so the palette always shows the
+	// dynDesc/dynHint render live state, so the settings always shows the
 	// current value instead of a static description.
 	dynDesc func(m *model) string
 	dynHint func(m *model) string
 
 	suggested bool // pinned into a "Suggested" group when the filter is empty
 
-	// action rows: enter runs it (palette stays open)
+	// action rows: enter runs it (settings stays open)
 	run func(m *model) (tea.Model, tea.Cmd)
 
 	// sub-panel rows: enter/→ drills in (push), esc pops back
@@ -42,27 +41,30 @@ type paletteItem struct {
 	stepFwd  func(m *model)
 }
 
-// panelKind enumerates the palette's sub-panels.
+// panelKind enumerates the settings's sub-panels.
 type panelKind int
 
 const (
 	panelModel panelKind = iota
+	panelRole
+	panelMode
 	panelEffort
 	panelGoal
 	panelCompact
 	panelTheme
-	panelBrowser
 )
 
-// ppanel is a palette sub-panel: the interactive editor behind a row. Key
+// ppanel is a settings sub-panel: the interactive editor behind a row. Key
 // handling switches on kind; the slice fields hold whatever that kind lists
 // (models, effort levels, …).
 type ppanel struct {
 	kind  panelKind
 	title string
 
-	items []modelItem // panelModel: flattened model@provider routes
-	idx   int
+	items      []modelItem // panelModel: flattened provider/model routes
+	idx        int
+	role       string // panelModel: user-facing role whose route is edited; empty is a direct switch
+	staleHints []string
 
 	levels []string // panelEffort: available levels ("" = off)
 	lidx   int
@@ -73,26 +75,28 @@ type ppanel struct {
 	list  []string // panelCompact: "default (…)" + cands; panelTheme: {"auto","light","dark"}
 	midx  int      // panelCompact: selection, 0 = the built-in default; panelTheme: selection
 
-	err string // inline error from a failed apply (bad compact model, …)
+	err    string // inline error from a failed apply (bad compact model, …)
+	offset int    // first visible rendered row in a scrollable panel
 
 	// direct marks a panel a slash command opened straight into (bare /effort,
-	// /theme): enter applies and closes the whole palette instead of popping
+	// /theme): enter applies and closes the whole settings instead of popping
 	// back to the root list, since the user never asked for ctrl+p.
 	direct bool
 }
 
-// palette is the ctrl+p command palette: a modal full-screen dialog with its
+// settings is the ctrl+p command settings: a modal full-screen dialog with its
 // own filter line (opencode's DialogSelect). Typing fuzzy-filters, ↑/↓ moves,
 // enter applies or drills in, ←/→ steps reversible settings, esc pops a level.
-type palette struct {
+type settings struct {
 	items  []paletteItem // filtered
 	all    []paletteItem // unfiltered
 	idx    int
 	filter string
 	stack  []*ppanel
+	offset int // first visible rendered row in the root list
 }
 
-// Hint/keybind constants for the palette-only rows that don't dispatch
+// Hint/keybind constants for the settings-only rows that don't dispatch
 // through the command switch. /help renders from these too, so a keybind or
 // description lives in exactly one place.
 const (
@@ -102,7 +106,7 @@ const (
 	palHintQuit     = "ctrl+c ctrl+c"
 )
 
-// slashHint looks a command's one-liner up in the registry so the palette
+// slashHint looks a command's one-liner up in the registry so the settings
 // and /help can never disagree about what a command does.
 func slashHint(m *model, name string) string {
 	if e := registryFind(name); e != nil {
@@ -114,25 +118,21 @@ func slashHint(m *model, name string) string {
 func (m *model) paletteItems() []paletteItem {
 	return []paletteItem{
 		{title: "Model", category: "Agent", suggested: true,
-			// first suggestion: ctrl+p → enter opens the model panel directly
-			dynDesc: func(m *model) string { return m.modelName + " @ " + m.provName },
+			// first suggestion: ctrl+p → enter opens the role selector
+			dynDesc: func(m *model) string { return m.provName + "/" + m.modelName },
 			dynHint: func(m *model) string { return "/model · tab" },
 			panel: func(m *model) *ppanel {
-				items := buildModelItems(m.cfg)
-				if len(items) == 0 {
-					return nil
-				}
-				pp := &ppanel{kind: panelModel, title: "Model", items: items}
-				for i, it := range items { // start on the active route
-					if it.model == m.modelName && it.provider == m.provName {
-						pp.idx = i
-						break
-					}
-				}
-				return pp
+				return m.modelRolePanel(false)
 			}},
+		{title: "Mode", category: "Agent", suggested: true,
+			dynDesc: func(m *model) string { return m.uiMode() },
+			dynHint: func(m *model) string { return "plan · execute" },
+			panel:   func(m *model) *ppanel { return m.modePanel(false) }},
 		{title: "Reasoning effort", category: "Agent",
 			dynDesc: func(m *model) string {
+				if m.agent == nil {
+					return "configure a provider first"
+				}
 				return "thinking level for " + m.agent.Model
 			},
 			dynHint: func(m *model) string { return "/effort " + slashHint(m, "/effort") },
@@ -140,20 +140,37 @@ func (m *model) paletteItems() []paletteItem {
 				levels := m.effortsFor()
 				pp := &ppanel{kind: panelEffort, title: "Reasoning effort", levels: levels}
 				for i, e := range levels {
-					if e == m.agent.Effort {
+					if e == m.currentEffort() {
 						pp.lidx = i
 						break
 					}
 				}
 				return pp
 			},
-			stepBack: func(m *model) { m.setEffort(prevEffort(m.effortsFor(), m.agent.Effort)) },
-			stepFwd:  func(m *model) { m.setEffort(nextEffort(m.effortsFor(), m.agent.Effort)) }},
+			stepBack: func(m *model) { m.setEffort(prevEffort(m.effortsFor(), m.currentEffort())) },
+			stepFwd:  func(m *model) { m.setEffort(nextEffort(m.effortsFor(), m.currentEffort())) }},
+		{title: "Plan", category: "Agent", suggested: true,
+			dynDesc: func(m *model) string { return slashHint(m, "/plan") },
+			dynHint: func(m *model) string { return "/plan <goal>" },
+			run: func(m *model) (tea.Model, tea.Cmd) {
+				m.settings = nil
+				m.input.SetValue("/plan ")
+				m.input.CursorEnd()
+				m.refreshMenu()
+				return m, nil
+			}},
+		{title: "Execute plan", category: "Agent", suggested: true,
+			dynDesc: func(m *model) string { return slashHint(m, "/execute") },
+			dynHint: func(m *model) string { return "/execute" },
+			run: func(m *model) (tea.Model, tea.Cmd) {
+				m.settings = nil
+				return m.command("/execute")
+			}},
 		{title: "Resume session", category: "Session", suggested: true,
 			dynDesc: func(m *model) string { return slashHint(m, "/resume") },
 			dynHint: func(m *model) string { return "/resume" },
 			run: func(m *model) (tea.Model, tea.Cmd) {
-				m.palette = nil
+				m.settings = nil
 				m.openPicker()
 				return m, nil
 			}},
@@ -166,7 +183,7 @@ func (m *model) paletteItems() []paletteItem {
 			},
 			dynHint: func(m *model) string { return palHintRewind },
 			run: func(m *model) (tea.Model, tea.Cmd) {
-				m.palette = nil
+				m.settings = nil
 				if m.busy {
 					return m, nil
 				}
@@ -177,7 +194,7 @@ func (m *model) paletteItems() []paletteItem {
 			dynDesc: func(m *model) string { return slashHint(m, "/fork") },
 			dynHint: func(m *model) string { return "/fork" },
 			run: func(m *model) (tea.Model, tea.Cmd) {
-				m.palette = nil
+				m.settings = nil
 				if !m.busy {
 					m.forkCommand("")
 				}
@@ -195,7 +212,7 @@ func (m *model) paletteItems() []paletteItem {
 			},
 			dynHint: func(m *model) string { return "/rename " + slashHint(m, "/rename") },
 			run: func(m *model) (tea.Model, tea.Cmd) {
-				m.palette = nil
+				m.settings = nil
 				if !m.busy {
 					m.renameCommand("")
 				}
@@ -205,7 +222,7 @@ func (m *model) paletteItems() []paletteItem {
 			dynDesc: func(m *model) string { return slashHint(m, "/clear") },
 			dynHint: func(m *model) string { return "/clear" },
 			run: func(m *model) (tea.Model, tea.Cmd) {
-				m.palette = nil
+				m.settings = nil
 				return m.command("/clear")
 			}},
 		{title: "Compact session", category: "Session", suggested: true,
@@ -227,7 +244,7 @@ func (m *model) paletteItems() []paletteItem {
 		{title: "Compaction model", category: "Session",
 			dynDesc: func(m *model) string {
 				if m.compactModel == "" {
-					return "default (" + config.DefaultCompactModel + ")"
+					return "default (" + m.defaultCompactModelName() + ")"
 				}
 				return m.compactModel
 			},
@@ -242,7 +259,7 @@ func (m *model) paletteItems() []paletteItem {
 					kind:  panelCompact,
 					title: "Compaction model",
 					cands: names,
-					list:  append([]string{"default (" + config.DefaultCompactModel + ")"}, names...),
+					list:  append([]string{"default (" + m.defaultCompactModelName() + ")"}, names...),
 				}
 				for i, name := range pp.list {
 					if name == m.compactModel {
@@ -300,24 +317,6 @@ func (m *model) paletteItems() []paletteItem {
 			},
 			stepBack: func(m *model) { m.setTheme("light") },
 			stepFwd:  func(m *model) { m.setTheme("dark") }},
-		{title: "Browser driver", category: "Display",
-			dynDesc: func(m *model) string {
-				return "current: " + browser.Driver + " — which automation engine drives Chrome"
-			},
-			dynHint: func(m *model) string { return "WHIP_BROWSER_DRIVER" },
-			panel: func(m *model) *ppanel {
-				list := browser.Drivers
-				pp := &ppanel{kind: panelBrowser, title: "Browser driver", list: list}
-				for i, d := range list {
-					if d == browser.Driver {
-						pp.midx = i
-						break
-					}
-				}
-				return pp
-			},
-			stepBack: func(m *model) { m.switchBrowserDriver(browser.DriverRod) },
-			stepFwd:  func(m *model) { m.switchBrowserDriver(browser.DriverChromedp) }},
 		{title: "Mouse capture", category: "Display",
 			dynDesc: func(m *model) string { return slashHint(m, "/mouse") },
 			dynHint: func(m *model) string { return "/mouse" },
@@ -330,17 +329,17 @@ func (m *model) paletteItems() []paletteItem {
 			dynDesc: func(m *model) string { return slashHint(m, "/help") },
 			dynHint: func(m *model) string { return "/help" },
 			run: func(m *model) (tea.Model, tea.Cmd) {
-				m.palette = nil
+				m.settings = nil
 				return m.command("/help")
 			}},
 		{title: "Quit", category: "App",
-			dynDesc: func(m *model) string { return "exit whip" },
+			dynDesc: func(m *model) string { return "exit ghg" },
 			dynHint: func(m *model) string { return "/quit · " + palHintQuit },
 			run:     func(m *model) (tea.Model, tea.Cmd) { return m, tea.Quit }},
 	}
 }
 
-// setMouse applies a mouse-capture state (the palette's reversible steppers
+// setMouse applies a mouse-capture state (the settings's reversible steppers
 // need to set an explicit value; /mouse toggles).
 func (m *model) setMouse(on bool) {
 	if m.mouseOn == on {
@@ -351,23 +350,23 @@ func (m *model) setMouse(on bool) {
 
 func (m *model) openPalette() {
 	all := m.paletteItems()
-	m.palette = &palette{all: all}
-	m.palette.applyFilter(m)
+	m.settings = &settings{all: all}
+	m.settings.applyFilter(m)
 }
 
-// openPaletteOn opens the palette and drills straight into the named row's
+// openPaletteOn opens the settings and drills straight into the named row's
 // sub-panel (used by bare slash commands like /theme that should land on a
 // switcher, not toggle blindly). The invocation counts as being inside the
-// panel — not the palette — so enter applies AND closes; esc pops back to
+// panel — not the settings — so enter applies AND closes; esc pops back to
 // the root list.
 func (m *model) openPaletteOn(title string) {
 	m.openPalette()
-	for i, it := range m.palette.items {
+	for i, it := range m.settings.items {
 		if strings.EqualFold(it.title, title) && it.panel != nil {
-			m.palette.idx = i
+			m.settings.idx = i
 			pp := it.panel(m)
 			pp.direct = true
-			m.palette.stack = append(m.palette.stack, pp)
+			m.settings.stack = append(m.settings.stack, pp)
 			return
 		}
 	}
@@ -407,7 +406,7 @@ func itemHaystack(m *model, it paletteItem) string {
 // applyFilter recomputes the visible rows. With an empty filter,
 // suggested entries pin into a "Suggested" category on top (opencode), then
 // everything else grouped by category.
-func (p *palette) applyFilter(m *model) {
+func (p *settings) applyFilter(m *model) {
 	q := p.filter
 	var items []paletteItem
 	for _, it := range p.all {
@@ -447,13 +446,14 @@ func (p *palette) applyFilter(m *model) {
 		}
 	}
 	p.items = grouped
+	p.offset = 0
 	if p.idx >= len(p.items) {
 		p.idx = max(len(p.items)-1, 0)
 	}
 }
 
 // selected returns the highlighted row (nil when the filter matched nothing).
-func (p *palette) selected() *paletteItem {
+func (p *settings) selected() *paletteItem {
 	if len(p.items) == 0 {
 		return nil
 	}
@@ -461,7 +461,7 @@ func (p *palette) selected() *paletteItem {
 }
 
 // top returns the active sub-panel (nil = the root command list).
-func (p *palette) top() *ppanel {
+func (p *settings) top() *ppanel {
 	if len(p.stack) == 0 {
 		return nil
 	}
@@ -469,7 +469,7 @@ func (p *palette) top() *ppanel {
 }
 
 // move moves the root-list selection by delta, wrapping at both ends.
-func (p *palette) move(delta int) {
+func (p *settings) move(delta int) {
 	n := len(p.items)
 	if n == 0 {
 		return
@@ -477,17 +477,22 @@ func (p *palette) move(delta int) {
 	p.idx = (p.idx + delta + n) % n
 }
 
-// paletteKey handles input while the palette is open: esc pops one level
+// paletteKey handles input while the settings is open: esc pops one level
 // (sub-panel → root list → closed), typing edits the filter or the active
 // sub-panel's editor.
 func (m *model) paletteKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	p := m.palette
+	p := m.settings
+	if p == nil {
+		return m, nil
+	}
 	if pp := p.top(); pp != nil {
-		return m.panelKey(msg, pp)
+		tm, cmd := m.panelKey(msg, pp)
+		m.ensurePaletteVisible()
+		return tm, cmd
 	}
 	switch msg.Type {
 	case tea.KeyEsc, tea.KeyCtrlC:
-		m.palette = nil
+		m.settings = nil
 	case tea.KeyUp, tea.KeyCtrlP, tea.KeyShiftTab:
 		p.move(-1)
 	case tea.KeyDown, tea.KeyCtrlN, tea.KeyTab:
@@ -527,7 +532,157 @@ func (m *model) paletteKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		p.idx = 0
 		p.applyFilter(m)
 	}
+	if m.settings != nil {
+		m.ensurePaletteVisible()
+	}
 	return m, nil
+}
+
+// paletteMouse handles list clicks and scrolling. The modal consumes mouse
+// events so the transcript cannot move underneath an open picker.
+func (m *model) paletteMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	if m.settings == nil {
+		return m, nil
+	}
+	if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft {
+		if pp := m.settings.top(); pp != nil {
+			return m.panelMouse(msg.Y, pp)
+		}
+		return m.paletteRootMouse(msg.Y)
+	}
+	delta := 0
+	switch msg.Button {
+	case tea.MouseButtonWheelUp:
+		delta = -3
+	case tea.MouseButtonWheelDown:
+		delta = 3
+	default:
+		return m, nil
+	}
+	if pp := m.settings.top(); pp != nil {
+		switch pp.kind {
+		case panelModel:
+			pp.idx = paletteClamp(pp.idx+delta, 0, len(pp.items)-1)
+			if len(pp.items) > 0 && pp.role == "" {
+				m.previewModel(pp.items[pp.idx])
+			}
+		case panelRole, panelMode, panelCompact, panelTheme:
+			pp.midx = paletteClamp(pp.midx+delta, 0, len(pp.list)-1)
+		case panelEffort:
+			pp.lidx = paletteClamp(pp.lidx+delta, 0, len(pp.levels)-1)
+		}
+	} else if len(m.settings.items) > 0 {
+		m.settings.idx = paletteClamp(m.settings.idx+delta, 0, len(m.settings.items)-1)
+	}
+	m.ensurePaletteVisible()
+	return m, nil
+}
+
+// paletteRootListStart is the first row of the root list inside paletteView.
+// The caller adds one for the always-visible TUI header.
+func (m *model) paletteRootListStart() int {
+	start := 1 // title
+	if !m.paletteCompact() {
+		start++ // separator below title
+	}
+	start++ // filter
+	if !m.paletteCompact() {
+		start++ // separator below filter
+	}
+	return start
+}
+
+// paletteRootMouse selects and activates the root row under a click. Category
+// headings, separators, and the footer are intentionally inert.
+func (m *model) paletteRootMouse(y int) (tea.Model, tea.Cmd) {
+	p := m.settings
+	if p == nil {
+		return m, nil
+	}
+	rows, positions := m.paletteRootRows()
+	row := y - 1 - m.paletteRootListStart() // account for the TUI header
+	if row < 0 {
+		return m, nil
+	}
+	actual := p.offset + row
+	if actual < 0 || actual >= len(rows) {
+		return m, nil
+	}
+	for i, position := range positions {
+		if position != actual {
+			continue
+		}
+		p.idx = i
+		return m.activatePaletteSelection()
+	}
+	return m, nil
+}
+
+// panelMouse selects and commits the panel row under a click. It shares the
+// keyboard Enter path so role/model persistence and direct-panel closing keep
+// exactly the same behavior regardless of input device.
+func (m *model) panelMouse(y int, pp *ppanel) (tea.Model, tea.Cmd) {
+	if m.settings == nil || pp == nil {
+		return m, nil
+	}
+	rows, _, footer := m.panelContent(pp)
+	cap := m.panelListCapacity(len(footer))
+	start := min(max(pp.offset, 0), len(rows))
+	visible := min(cap, len(rows)-start)
+	panelStart := 1 // title
+	if !m.paletteCompact() {
+		panelStart++ // separator below title
+	}
+	row := y - 1 - panelStart // account for the TUI header
+	if row < 0 || row >= visible {
+		return m, nil
+	}
+	selected := start + row
+	switch pp.kind {
+	case panelModel:
+		if selected >= len(pp.items) {
+			return m, nil // the empty-state row is not selectable
+		}
+		pp.idx = selected
+	case panelRole, panelMode, panelCompact, panelTheme:
+		if selected >= len(pp.list) {
+			return m, nil
+		}
+		pp.midx = selected
+	case panelEffort:
+		if selected >= len(pp.levels) {
+			return m, nil
+		}
+		pp.lidx = selected
+	case panelGoal:
+		return m, nil // the goal row is an editor, not a button
+	}
+	return m.panelKey(tea.KeyMsg{Type: tea.KeyEnter}, pp)
+}
+
+func (m *model) activatePaletteSelection() (tea.Model, tea.Cmd) {
+	if m.settings == nil {
+		return m, nil
+	}
+	it := m.settings.selected()
+	if it == nil {
+		return m, nil
+	}
+	if it.panel != nil {
+		m.pushPanel(it)
+		return m, nil
+	}
+	if it.run != nil {
+		return it.run(m)
+	}
+	return m, nil
+}
+
+func paletteClamp(n, low, high int) int {
+	if high < low {
+		return low
+	}
+	return min(max(n, low), high)
 }
 
 // pushPanel drills into an item's sub-panel. Items whose setting can't be
@@ -535,40 +690,111 @@ func (m *model) paletteKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m *model) pushPanel(it *paletteItem) {
 	pp := it.panel(m)
 	if pp == nil {
-		m.append(errStyle.Render(it.title + ": nothing to choose from (check ~/.whip/config.json)"))
+		m.append(errStyle.Render(it.title + ": nothing to choose from (check ~/.ghg/config.json)"))
 		return
 	}
-	m.palette.stack = append(m.palette.stack, pp)
+	m.settings.stack = append(m.settings.stack, pp)
+	pp.offset = 0
 }
 
 // panelKey routes keys inside a sub-panel: esc applies-and-pops (goal) or
 // just pops, ↑/↓ moves, enter applies.
 func (m *model) panelKey(msg tea.KeyMsg, pp *ppanel) (tea.Model, tea.Cmd) {
-	p := m.palette
+	p := m.settings
 	pop := func() {
 		p.stack = p.stack[:len(p.stack)-1]
 		// a slash command opened this panel directly (bare /effort, /theme):
 		// commit-and-close, never land on the root list the user didn't open
 		if pp.direct && len(p.stack) == 0 {
-			m.palette = nil
+			m.settings = nil
 		}
 	}
 
 	switch pp.kind {
 	case panelModel:
+		if len(pp.items) == 0 {
+			if msg.Type == tea.KeyEsc || msg.Type == tea.KeyCtrlC {
+				pop()
+			}
+			break
+		}
 		switch msg.Type {
 		case tea.KeyEsc, tea.KeyCtrlC:
 			pop()
 		case tea.KeyUp, tea.KeyCtrlP, tea.KeyShiftTab:
 			pp.idx = (pp.idx - 1 + len(pp.items)) % len(pp.items)
-			m.previewModel(pp.items[pp.idx])
+			if pp.role == "" {
+				m.previewModel(pp.items[pp.idx])
+			}
 		case tea.KeyDown, tea.KeyCtrlN, tea.KeyTab:
 			pp.idx = (pp.idx + 1) % len(pp.items)
-			m.previewModel(pp.items[pp.idx])
+			if pp.role == "" {
+				m.previewModel(pp.items[pp.idx])
+			}
 		case tea.KeyEnter:
 			it := pp.items[pp.idx]
-			m.switchModel(it.model, it.provider)
+			if it.unavailable {
+				pp.err = "model unavailable: " + it.unavailableReason
+				break
+			}
+			if pp.role == "" {
+				m.switchModel(it.model, it.provider)
+				pop()
+				break
+			}
+			if err := m.selectRoleModel(pp.role, it); err != nil {
+				pp.err = err.Error()
+				break
+			}
+			if pp.direct {
+				m.settings = nil
+			} else {
+				pop()
+			}
+		}
+
+	case panelRole:
+		if len(pp.list) == 0 {
+			if msg.Type == tea.KeyEsc || msg.Type == tea.KeyCtrlC {
+				pop()
+			}
+			break
+		}
+		switch msg.Type {
+		case tea.KeyEsc, tea.KeyCtrlC:
 			pop()
+		case tea.KeyUp, tea.KeyCtrlP, tea.KeyShiftTab:
+			pp.midx = (pp.midx - 1 + len(pp.list)) % len(pp.list)
+		case tea.KeyDown, tea.KeyCtrlN, tea.KeyTab:
+			pp.midx = (pp.midx + 1) % len(pp.list)
+		case tea.KeyEnter, tea.KeyRight:
+			child := m.roleModelPanel(pp.list[pp.midx], pp.direct)
+			p.stack = append(p.stack, child)
+		}
+
+	case panelMode:
+		if len(pp.list) == 0 {
+			if msg.Type == tea.KeyEsc || msg.Type == tea.KeyCtrlC {
+				pop()
+			}
+			break
+		}
+		switch msg.Type {
+		case tea.KeyEsc, tea.KeyCtrlC:
+			pop()
+		case tea.KeyUp, tea.KeyCtrlP, tea.KeyShiftTab:
+			pp.midx = (pp.midx - 1 + len(pp.list)) % len(pp.list)
+		case tea.KeyDown, tea.KeyCtrlN, tea.KeyTab:
+			pp.midx = (pp.midx + 1) % len(pp.list)
+		case tea.KeyLeft, tea.KeyRight, tea.KeyEnter:
+			if err := m.setMode(pp.list[pp.midx]); err != nil {
+				pp.err = err.Error()
+				break
+			}
+			pp.err = ""
+			if msg.Type == tea.KeyEnter {
+				pop()
+			}
 		}
 
 	case panelEffort:
@@ -634,21 +860,6 @@ func (m *model) panelKey(msg tea.KeyMsg, pp *ppanel) (tea.Model, tea.Cmd) {
 			}
 		}
 
-	case panelBrowser:
-		switch msg.Type {
-		case tea.KeyEsc, tea.KeyCtrlC:
-			pop()
-		case tea.KeyUp, tea.KeyCtrlP, tea.KeyShiftTab:
-			pp.midx = (pp.midx - 1 + len(pp.list)) % len(pp.list)
-		case tea.KeyDown, tea.KeyCtrlN, tea.KeyTab:
-			pp.midx = (pp.midx + 1) % len(pp.list)
-		case tea.KeyLeft, tea.KeyRight, tea.KeyEnter:
-			m.switchBrowserDriver(pp.list[pp.midx])
-			if msg.Type == tea.KeyEnter {
-				pop()
-			}
-		}
-
 	case panelGoal:
 		switch msg.Type {
 		case tea.KeyEsc, tea.KeyCtrlC:
@@ -678,11 +889,23 @@ func (m *model) previewModel(it modelItem) {
 	if err != nil {
 		return // unresolved routes stay visible but unselectable-feeling
 	}
-	ag.Effort = m.agent.Effort
-	ag.Messages = append(ag.Messages, m.agent.Messages[1:]...) // carry history
-	ag.CompactClient, ag.CompactModel = m.agent.CompactClient, m.agent.CompactModel
-	ag.CompactThreshold = m.agent.CompactThreshold
+	ag.ReasoningToggle = m.reasoningToggleFor(pn, ag.Model)
+	if m.agent != nil {
+		ag.Effort = m.agent.Effort
+		ag.Messages = append(ag.Messages, m.agent.Messages[1:]...) // carry history
+		ag.CompactBackend, ag.CompactModel = m.agent.CompactBackend, m.agent.CompactModel
+		ag.CompactThreshold = m.agent.CompactThreshold
+	} else {
+		ag.Effort = m.cfg.DefaultEffort
+		if ag.Effort == "" {
+			ag.Effort = "medium"
+		}
+		ag.CompactThreshold = compactThresholdFor(m.cfg)
+	}
 	m.agent, m.modelName, m.provName = ag, mn, pn
+	m.configureArtifactAgent(m.agent)
+	m.applyCompactModel()
+	m.wireTasks()
 	if !contains(m.effortsFor(), ag.Effort) {
 		m.setEffort("") // the previewed model doesn't support the current level
 	}
@@ -722,43 +945,58 @@ func prevEffort(levels []string, cur string) string {
 	return levels[0]
 }
 
-// paletteView renders the modal dialog: a title bar, the filter line, and
-// category-grouped rows with dimmed hints. A sub-panel replaces the list.
-func (m *model) paletteView() string {
-	p := m.palette
-	var b strings.Builder
-	title := " Commands"
-	if pp := p.top(); pp != nil {
-		title = " Commands › " + pp.title
+// paletteBodyHeight is the space below the always-visible TUI header. A zero
+// height means a headless test model has not received a WindowSizeMsg yet;
+// leave that case unbounded so those models still render the complete dialog.
+func (m *model) paletteBodyHeight() int {
+	if m.height <= 0 {
+		return 0
 	}
-	b.WriteString(botStyle.Render(title))
-	if p.top() == nil && p.filter != "" {
-		b.WriteString(dimStyle.Render("  — type to filter"))
+	return max(m.height-1, 1)
+}
+
+func (m *model) paletteCompact() bool {
+	h := m.paletteBodyHeight()
+	return h > 0 && h <= 12
+}
+
+func paletteFitLine(s string, width int) string {
+	if width <= 0 {
+		return s
 	}
-	b.WriteString("\n\n")
+	return ansi.Truncate(s, width, "…")
+}
 
-	if pp := p.top(); pp != nil {
-		b.WriteString(m.panelView(pp))
-		return b.String()
+func paletteFitLines(lines []string, width, height int) string {
+	if height > 0 && len(lines) > height {
+		lines = lines[:height]
 	}
+	for i := range lines {
+		lines[i] = paletteFitLine(lines[i], width)
+	}
+	return strings.Join(lines, "\n")
+}
 
-	b.WriteString(" " + youStyle.Render("❯ ") + p.filter + dimStyle.Render("█"))
-	b.WriteString("\n\n")
-
+// paletteRootRows turns the grouped item list into rendered rows and records
+// the rendered row occupied by each selectable item. Scrolling by rendered
+// rows keeps category headings and blank separators aligned with the list.
+func (m *model) paletteRootRows() ([]string, []int) {
+	p := m.settings
+	rows := make([]string, 0, len(p.items)*2+1)
+	positions := make([]int, len(p.items))
 	lastCat := ""
 	hintW := 0
 	for _, it := range p.items {
 		if it.dynHint != nil {
-			hintW = max(hintW, len(it.dynHint(m)))
+			hintW = max(hintW, ansi.StringWidth(it.dynHint(m)))
 		}
 	}
 	for i, it := range p.items {
 		if it.category != lastCat {
 			if lastCat != "" {
-				b.WriteString("\n")
+				rows = append(rows, "")
 			}
-			b.WriteString(dimStyle.Render("  " + it.category))
-			b.WriteString("\n")
+			rows = append(rows, dimStyle.Render("  "+it.category))
 			lastCat = it.category
 		}
 		hint := ""
@@ -771,26 +1009,109 @@ func (m *model) paletteView() string {
 		}
 		state := paletteState(m, it)
 		if i == p.idx {
-			b.WriteString(botStyle.Render("→") + line + state + "  " + hint)
+			rows = append(rows, botStyle.Render("→")+line+state+"  "+hint)
 		} else {
-			b.WriteString(" " + line + state + "  " + hint)
+			rows = append(rows, " "+line+state+"  "+hint)
 		}
-		b.WriteString("\n")
+		positions[i] = len(rows) - 1
 	}
 	if len(p.items) == 0 {
-		b.WriteString(dimStyle.Render("  (no matches)"))
-		b.WriteString("\n")
+		rows = append(rows, dimStyle.Render("  (no matches)"))
 	}
-	b.WriteString("\n" + dimStyle.Render(fmt.Sprintf("  (%d/%d) ↑/↓ select · enter open/apply · ←/→ change · esc close",
-		min(p.idx+1, len(p.items)), len(p.items))))
-	return b.String()
+	return rows, positions
+}
+
+func (m *model) rootListCapacity() int {
+	rows, _ := m.paletteRootRows()
+	if h := m.paletteBodyHeight(); h > 0 {
+		chrome := 6 // title, two separators, filter, separator, footer
+		if m.paletteCompact() {
+			chrome = 3 // title, filter, footer
+		}
+		return max(h-chrome, 1)
+	}
+	return max(len(rows), 1)
+}
+
+// ensurePaletteVisible keeps the selected item (or active panel selection) in
+// the modal viewport after keyboard navigation, filtering, or resizing.
+func (m *model) ensurePaletteVisible() {
+	if m.settings == nil {
+		return
+	}
+	if pp := m.settings.top(); pp != nil {
+		m.ensurePanelVisible(pp)
+		return
+	}
+	p := m.settings
+	rows, positions := m.paletteRootRows()
+	cap := m.rootListCapacity()
+	selected := 0
+	if len(p.items) > 0 {
+		selected = positions[min(max(p.idx, 0), len(positions)-1)]
+	}
+	if selected < p.offset {
+		p.offset = selected
+	}
+	if selected >= p.offset+cap {
+		p.offset = selected - cap + 1
+	}
+	p.offset = min(max(p.offset, 0), max(len(rows)-cap, 0))
+}
+
+// paletteView renders the modal dialog: a title bar, the filter line, and a
+// scrollable category-grouped list. A sub-panel replaces the root list.
+func (m *model) paletteView() string {
+	p := m.settings
+	if p == nil {
+		return ""
+	}
+	m.ensurePaletteVisible()
+	compact := m.paletteCompact()
+	lines := []string{" Commands"}
+	if pp := p.top(); pp != nil {
+		lines[0] = " Commands › " + pp.title
+		if !compact {
+			lines = append(lines, "")
+		}
+		lines = append(lines, strings.Split(m.panelView(pp), "\n")...)
+		return paletteFitLines(lines, m.width, m.paletteBodyHeight())
+	}
+	if p.filter != "" {
+		lines[0] += "  — type to filter"
+	}
+	if !compact {
+		lines = append(lines, "")
+	}
+	lines = append(lines, " "+youStyle.Render("❯ ")+p.filter+dimStyle.Render("█"))
+	if !compact {
+		lines = append(lines, "")
+	}
+	rows, _ := m.paletteRootRows()
+	cap := m.rootListCapacity()
+	start := min(max(p.offset, 0), len(rows))
+	end := min(start+cap, len(rows))
+	lines = append(lines, rows[start:end]...)
+	if !compact {
+		lines = append(lines, "")
+	}
+	more := ""
+	if start > 0 {
+		more += " ↑ more"
+	}
+	if end < len(rows) {
+		more += " ↓ more"
+	}
+	lines = append(lines, dimStyle.Render(fmt.Sprintf("  (%d/%d) ↑/↓ select · enter open/apply · ←/→ change · esc close%s",
+		min(p.idx+1, len(p.items)), len(p.items), more)))
+	return paletteFitLines(lines, m.width, m.paletteBodyHeight())
 }
 
 // paletteState renders a row's live value (toggle state, effort level, …).
 func paletteState(m *model, it paletteItem) string {
 	switch it.title {
 	case "Reasoning effort":
-		return dimStyle.Render("  [" + effortLabel(m.agent.Effort) + "]")
+		return dimStyle.Render("  [" + effortLabel(m.currentEffort()) + "]")
 	case "Thinking tokens":
 		return dimStyle.Render("  [" + onOff(m.showThinking) + "]")
 	case "Mouse capture":
@@ -817,50 +1138,104 @@ func paletteState(m *model, it paletteItem) string {
 	return ""
 }
 
-// panelView renders the active sub-panel.
-func (m *model) panelView(pp *ppanel) string {
-	var b strings.Builder
+// panelContent returns selectable rows, the selected row, and fixed footer
+// rows for the active sub-panel. Keeping these separate lets large model
+// lists scroll without losing the selection or the help line.
+func (m *model) panelContent(pp *ppanel) (rows []string, selected int, footer []string) {
 	switch pp.kind {
 	case panelModel:
-		lastModel := ""
 		for i, it := range pp.items {
-			if it.model != lastModel {
-				heading := " " + it.model
-				if it.fromCatalog {
-					heading = dimStyle.Render(heading + dimNew)
-				}
-				b.WriteString(heading + "\n")
-				lastModel = it.model
-			}
 			cur := ""
-			if it.model == m.modelName && it.provider == m.provName {
+			currentModel, currentProvider := m.modelName, m.provName
+			if pp.role != "" {
+				if target, err := m.roleRoute(pp.role); err == nil {
+					currentModel, currentProvider = target.Model, target.Provider
+				}
+			}
+			if it.model == currentModel && it.provider == currentProvider {
 				cur = dimStyle.Render("  (current)")
 			}
-			line := fmt.Sprintf("%-12s  ", it.provider) + dimStyle.Render(it.url)
-			if it.fromCatalog {
+			line := modelItemLabel(it)
+			if it.fromCatalog || it.unavailable {
 				line = dimStyle.Render(line)
 			}
 			if i == pp.idx {
-				b.WriteString(botStyle.Render("   → "+line) + cur + "\n")
+				selected = len(rows)
+				rows = append(rows, botStyle.Render(" → "+line)+cur)
 			} else {
-				b.WriteString("     " + line + cur + "\n")
+				rows = append(rows, "   "+line+cur)
 			}
 		}
-		b.WriteString("\n" + dimStyle.Render(fmt.Sprintf("  (%d/%d) ↑/↓ preview · enter switch · esc back", pp.idx+1, len(pp.items))))
+		if len(rows) == 0 {
+			rows = append(rows, dimStyle.Render("  (no models from configured providers)"))
+		}
+		if pp.err != "" {
+			footer = append(footer, errStyle.Render("  "+pp.err))
+		}
+		action := "switch"
+		if pp.role != "" {
+			action = "save"
+		}
+		position := 0
+		if len(pp.items) > 0 {
+			position = pp.idx + 1
+		}
+		footer = append(footer, "", dimStyle.Render(fmt.Sprintf("  (%d/%d) ↑/↓ select · enter %s · esc back", position, len(pp.items), action)))
+		if len(pp.staleHints) > 0 {
+			footer = append(footer, dimStyle.Render("  catalog stale for "+strings.Join(pp.staleHints, ", ")+" — /model refresh to pull newly announced models"))
+		}
+
+	case panelRole:
+		active := m.activeRoleLabel()
+		for i, label := range pp.list {
+			cur := ""
+			if label == active {
+				cur = dimStyle.Render("  (current)")
+			}
+			if i == pp.midx {
+				selected = len(rows)
+				rows = append(rows, botStyle.Render(" → "+label)+cur)
+			} else {
+				rows = append(rows, "   "+label+cur)
+			}
+		}
+		footer = []string{"", dimStyle.Render("  ↑/↓ select · enter choose model · esc back")}
+
+	case panelMode:
+		for i, mode := range pp.list {
+			cur := ""
+			if mode == m.uiMode() {
+				cur = dimStyle.Render("  (current)")
+			}
+			if i == pp.midx {
+				selected = len(rows)
+				rows = append(rows, botStyle.Render(" → "+mode)+cur)
+			} else {
+				rows = append(rows, "   "+mode+cur)
+			}
+		}
+		if pp.err != "" {
+			footer = append(footer, errStyle.Render("  "+pp.err))
+		}
+		footer = append(footer, "", dimStyle.Render("  ↑/↓ select · enter apply · esc back"))
 
 	case panelEffort:
 		for i, e := range pp.levels {
 			cur := ""
-			if e == m.agent.Effort {
+			if e == m.currentEffort() {
 				cur = dimStyle.Render("  (current)")
 			}
 			if i == pp.lidx {
-				b.WriteString(botStyle.Render(" → "+effortLabel(e)) + cur + "\n")
+				selected = len(rows)
+				rows = append(rows, botStyle.Render(" → "+effortLabel(e))+cur)
 			} else {
-				b.WriteString("   " + effortLabel(e) + cur + "\n")
+				rows = append(rows, "   "+effortLabel(e)+cur)
 			}
 		}
-		b.WriteString("\n" + dimStyle.Render("  ↑/↓ select · enter/←/→ apply · esc back"))
+		if len(rows) == 0 {
+			rows = append(rows, dimStyle.Render("  (no effort levels)"))
+		}
+		footer = []string{"", dimStyle.Render("  ↑/↓ select · enter/←/→ apply · esc back")}
 
 	case panelCompact:
 		for i, name := range pp.list {
@@ -869,15 +1244,19 @@ func (m *model) panelView(pp *ppanel) string {
 				cur = dimStyle.Render("  (current)")
 			}
 			if i == pp.midx {
-				b.WriteString(botStyle.Render(" → "+name) + cur + "\n")
+				selected = len(rows)
+				rows = append(rows, botStyle.Render(" → "+name)+cur)
 			} else {
-				b.WriteString("   " + name + cur + "\n")
+				rows = append(rows, "   "+name+cur)
 			}
 		}
-		if pp.err != "" {
-			b.WriteString(errStyle.Render("  "+pp.err) + "\n")
+		if len(rows) == 0 {
+			rows = append(rows, dimStyle.Render("  (no models configured)"))
 		}
-		b.WriteString("\n" + dimStyle.Render("  ↑/↓ select · enter/←/→ apply · esc back"))
+		if pp.err != "" {
+			footer = append(footer, errStyle.Render("  "+pp.err))
+		}
+		footer = append(footer, "", dimStyle.Render("  ↑/↓ select · enter/←/→ apply · esc back"))
 
 	case panelTheme:
 		cur := m.cfg.Theme
@@ -890,31 +1269,63 @@ func (m *model) panelView(pp *ppanel) string {
 				mark = dimStyle.Render("  (current)")
 			}
 			if i == pp.midx {
-				b.WriteString(botStyle.Render(" → "+name) + mark + "\n")
+				selected = len(rows)
+				rows = append(rows, botStyle.Render(" → "+name)+mark)
 			} else {
-				b.WriteString("   " + name + mark + "\n")
+				rows = append(rows, "   "+name+mark)
 			}
 		}
-		b.WriteString("\n" + dimStyle.Render("  ↑/↓ select · enter/←/→ apply · esc back"))
-
-	case panelBrowser:
-		for i, name := range pp.list {
-			mark := ""
-			if name == browser.Driver {
-				mark = dimStyle.Render("  (current)")
-			}
-			if i == pp.midx {
-				b.WriteString(botStyle.Render(" → "+name) + mark + "\n")
-			} else {
-				b.WriteString("   " + name + mark + "\n")
-			}
-		}
-		b.WriteString("\n" + dimStyle.Render("  ↑/↓ select · enter/←/→ apply · esc back"))
+		footer = []string{"", dimStyle.Render("  ↑/↓ select · enter/←/→ apply · esc back")}
 
 	case panelGoal:
-		b.WriteString(" " + youStyle.Render("❯ ") + pp.prepare + dimStyle.Render("█"))
-		b.WriteString("\n\n" + dimStyle.Render(fmt.Sprintf("  type the goal · empty clears · enter/esc apply · max %d rounds (/goal rounds)", m.goalMaxRounds())))
+		rows = []string{" " + youStyle.Render("❯ ") + pp.prepare + dimStyle.Render("█")}
+		footer = []string{"", dimStyle.Render(fmt.Sprintf("  type the goal · empty clears · enter/esc apply · max %d rounds (/goal rounds)", m.goalMaxRounds()))}
 	}
-	b.WriteString("\n")
-	return b.String()
+	return rows, selected, footer
+}
+
+func (m *model) panelListCapacity(footerLen int) int {
+	if h := m.paletteBodyHeight(); h > 0 {
+		// The settings title and its optional separator are outside panelView.
+		prefix := 1
+		if !m.paletteCompact() {
+			prefix++
+		}
+		return max(h-prefix-footerLen, 1)
+	}
+	return 1 << 30
+}
+
+func (m *model) ensurePanelVisible(pp *ppanel) {
+	rows, selected, footer := m.panelContent(pp)
+	cap := m.panelListCapacity(len(footer))
+	if selected < pp.offset {
+		pp.offset = selected
+	}
+	if selected >= pp.offset+cap {
+		pp.offset = selected - cap + 1
+	}
+	pp.offset = min(max(pp.offset, 0), max(len(rows)-cap, 0))
+}
+
+// panelView renders the active sub-panel with a bounded, scrollable list.
+func (m *model) panelView(pp *ppanel) string {
+	m.ensurePanelVisible(pp)
+	rows, _, footer := m.panelContent(pp)
+	cap := m.panelListCapacity(len(footer))
+	start := min(max(pp.offset, 0), len(rows))
+	end := min(start+cap, len(rows))
+	visible := append([]string(nil), rows[start:end]...)
+	more := ""
+	if start > 0 {
+		more += " ↑ more"
+	}
+	if end < len(rows) {
+		more += " ↓ more"
+	}
+	if more != "" && len(footer) > 0 {
+		footer[len(footer)-1] += more
+	}
+	visible = append(visible, footer...)
+	return paletteFitLines(visible, m.width, 0)
 }

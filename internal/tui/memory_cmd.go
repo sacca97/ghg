@@ -5,7 +5,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/context-labs/whip/internal/memory"
+	"github.com/sacca97/ghg/internal/memory"
 )
 
 // /memory — the visible half of the memory feature: the user sees exactly

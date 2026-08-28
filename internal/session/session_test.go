@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/context-labs/whip/internal/llm"
+	"github.com/sacca97/ghg/internal/llm"
 )
 
 func TestTaskRoundTrip(t *testing.T) {
@@ -138,6 +138,55 @@ func TestStoreRoundTrip(t *testing.T) {
 	}
 }
 
+func TestMostRecentForCWD(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "s.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	oldID, err := st.Create("/work", "old", "p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Save(oldID, 1, []llm.Message{{Role: "system"}, {Role: "user", Content: "old"}}, "old", "p"); err != nil {
+		t.Fatal(err)
+	}
+	newID, err := st.Create("/work", "new", "p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Save(newID, 1, []llm.Message{{Role: "system"}, {Role: "user", Content: "new"}}, "new", "p"); err != nil {
+		t.Fatal(err)
+	}
+	otherID, err := st.Create("/other", "other", "p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Save(otherID, 1, []llm.Message{{Role: "system"}, {Role: "user", Content: "other"}}, "other", "p"); err != nil {
+		t.Fatal(err)
+	}
+	// Make recency unambiguous even on filesystems/clocks with second-level
+	// timestamps, and prove an unrelated cwd cannot win.
+	if _, err := st.db.Exec(`UPDATE sessions SET updated_at=? WHERE id=?`, "2025-01-01T00:00:00Z", oldID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.Exec(`UPDATE sessions SET updated_at=? WHERE id=?`, "2025-01-03T00:00:00Z", newID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.db.Exec(`UPDATE sessions SET updated_at=? WHERE id=?`, "2026-01-01T00:00:00Z", otherID); err != nil {
+		t.Fatal(err)
+	}
+
+	meta, err := st.MostRecentForCWD("/work")
+	if err != nil || meta.ID != newID {
+		t.Fatalf("most recent /work session: %+v, %v", meta, err)
+	}
+	if _, err := st.MostRecentForCWD("/missing"); err == nil || !strings.Contains(err.Error(), "no resumable session") {
+		t.Fatalf("missing cwd should be actionable, got %v", err)
+	}
+}
+
 func TestEffortRoundTrip(t *testing.T) {
 	st, err := Open(filepath.Join(t.TempDir(), "s.db"))
 	if err != nil {
@@ -224,7 +273,7 @@ func TestUserHistory(t *testing.T) {
 	}
 }
 
-// History recall must skip messages whip injected on the user's behalf
+// History recall must skip messages ghg injected on the user's behalf
 // (steered background-task results, goal-continuation prompts) — only genuinely
 // typed submissions are recalled.
 func TestUserHistorySkipsInjected(t *testing.T) {

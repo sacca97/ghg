@@ -142,7 +142,7 @@ func CurrentTheme() string {
 // the FIRST theme to render a code block wins forever and a later theme
 // switch keeps the wrong syntax colors (a light render poisons every later
 // dark render with color 235). Deleting the entry on theme change lets the
-// next render register the right palette.
+// next render register the right settings.
 func unregisterChromaStyle() {
 	delete(chromaStyles.Registry, "charm")
 }

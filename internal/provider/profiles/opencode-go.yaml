@@ -1,0 +1,27 @@
+schema: 1
+id: opencode
+display_name: OpenCode Go
+protocol: openai-chat-completions
+base_url: https://opencode.ai/zen/go/v1
+auth:
+  kind: bearer
+  header: Authorization
+  env_var: OPENCODE_API_KEY
+docs:
+  keys_url: https://opencode.ai/zen
+routes:
+  - models: ["minimax-*", "qwen3.*-max", "qwen3.*-plus"]
+    protocol: anthropic-messages
+    auth:
+      kind: header
+      header: x-api-key
+    default_headers:
+      anthropic-version: "2023-06-01"
+  - models: ["grok-*", "gpt-*", "muse-*"]
+    protocol: openai-responses
+catalog:
+  kind: openai-models
+  public: true
+  # models.dev retains the upstream provider ID even though ghg exposes the
+  # profile as "opencode".
+  models_dev: opencode-go

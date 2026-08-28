@@ -5,14 +5,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/context-labs/whip/internal/llm"
-	"github.com/context-labs/whip/internal/session"
+	"github.com/sacca97/ghg/internal/llm"
+	"github.com/sacca97/ghg/internal/session"
 )
 
 // After the first exchange, maybeTitle names the session via the cheap
 // model; a user-set title (or an already-titled session) is left alone.
 func TestAutoTitle(t *testing.T) {
-	t.Setenv("WHIP_HOME", t.TempDir())
+	t.Setenv("GHG_HOME", t.TempDir())
 	m := compactCmdModel() // canned server replies "sim" — a valid short title
 	st, _ := session.Open(filepath.Join(t.TempDir(), "s.db"))
 	defer st.Close()
@@ -44,7 +44,7 @@ func TestAutoTitle(t *testing.T) {
 // A user-renamed session keeps its title — the auto-titler only fills the
 // placeholder.
 func TestAutoTitleRespectsRename(t *testing.T) {
-	t.Setenv("WHIP_HOME", t.TempDir())
+	t.Setenv("GHG_HOME", t.TempDir())
 	m := compactCmdModel()
 	st, _ := session.Open(filepath.Join(t.TempDir(), "s.db"))
 	defer st.Close()

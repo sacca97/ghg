@@ -16,9 +16,9 @@ import (
 
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 
-	"github.com/context-labs/whip/internal/config"
-	"github.com/context-labs/whip/internal/llm"
-	"github.com/context-labs/whip/internal/tools"
+	"github.com/sacca97/ghg/internal/config"
+	"github.com/sacca97/ghg/internal/llm"
+	"github.com/sacca97/ghg/internal/tools"
 )
 
 // Status is a server's lifecycle state, mirroring opencode's discriminated
@@ -96,9 +96,9 @@ const autoReconnectMax = 3
 
 // autoReconnectDelay is the backoff between auto-reconnect attempts. Kept
 // small for tests via a fast-path env read; tests use
-// WHIP_TEST_MCP_BACKOFF_MS instead of racing a package var.
+// GHG_TEST_MCP_BACKOFF_MS instead of racing a package var.
 func autoReconnectDelay(try int) time.Duration {
-	if ms, err := strconv.Atoi(os.Getenv("WHIP_TEST_MCP_BACKOFF_MS")); err == nil && ms >= 0 {
+	if ms, err := strconv.Atoi(os.Getenv("GHG_TEST_MCP_BACKOFF_MS")); err == nil && ms >= 0 {
 		return time.Duration(ms) * time.Millisecond
 	}
 	return time.Duration(1<<try) * time.Second // 1s, 2s, 4s
@@ -228,7 +228,7 @@ func (m *Manager) Start(ctx context.Context) {
 // run is the per-server lifecycle goroutine: one connect attempt, then it
 // services reconnect requests until the process exits (Close kills sessions;
 // the goroutine parks on reconnect thereafter — it has no work but also no
-// cost, and whip exits rather than idles servers). A reconnect queued while
+// cost, and ghg exits rather than idles servers). A reconnect queued while
 // a connect was in flight is dropped when that connect just succeeded — the
 // user asked for a fresh connection and already has one.
 func (s *server) run(ctx context.Context, m *Manager) {
@@ -261,7 +261,7 @@ func (s *server) connect(ctx context.Context, m *Manager) {
 
 	transport, err := m.connectTransport(s.cfg, s.stderr)
 	if err == nil {
-		client := sdkmcp.NewClient(&sdkmcp.Implementation{Name: "whip", Title: "whip"}, nil)
+		client := sdkmcp.NewClient(&sdkmcp.Implementation{Name: "ghg", Title: "ghg"}, nil)
 		var sess *sdkmcp.ClientSession
 		sess, err = client.Connect(ctx, transport, nil)
 		if err == nil {
@@ -377,7 +377,11 @@ func (s *server) bridge(d *sdkmcp.Tool) tools.Tool {
 	return tools.Tool{
 		Def: llm.NewTool(name, fmt.Sprintf("[MCP %s] %s", s.name, desc), schema),
 		Run: func(ctx context.Context, args json.RawMessage) (string, error) {
-			return s.call(ctx, d.Name, args)
+			out, err := s.call(ctx, d.Name, args)
+			return tools.Truncate(out), err
+		},
+		RunResult: func(ctx context.Context, args json.RawMessage) (tools.ToolResult, error) {
+			return s.callResult(ctx, d.Name, args)
 		},
 	}
 }
@@ -385,7 +389,7 @@ func (s *server) bridge(d *sdkmcp.Tool) tools.Tool {
 // call runs one tool call against the session, serialized per server and
 // bounded by the configured tool timeout. Errors become error strings for
 // the model via tools.Execute — never loop-aborting (opencode throws and
-// converts to an output-error tool part; whip's "Error: …" convention is
+// converts to an output-error tool part; ghg's "Error: …" convention is
 // the same shape).
 // connectGrace caps how long a tool call waits for a still-connecting server
 // before reporting back. A call should never park the turn for the full
@@ -393,6 +397,11 @@ func (s *server) bridge(d *sdkmcp.Tool) tools.Tool {
 const connectGrace = 5 * time.Second
 
 func (s *server) call(ctx context.Context, tool string, args json.RawMessage) (string, error) {
+	result, err := s.callResult(ctx, tool, args)
+	return result.Preview, err
+}
+
+func (s *server) callResult(ctx context.Context, tool string, args json.RawMessage) (tools.ToolResult, error) {
 	// Fail fast: a server whose first connect already settled (ready/failed/
 	// disabled) never waits on the channel at all.
 	s.mu.Lock()
@@ -406,9 +415,9 @@ func (s *server) call(ctx context.Context, tool string, args json.RawMessage) (s
 		case <-grace.Done():
 			cancel()
 			if ctx.Err() != nil {
-				return "", ctx.Err()
+				return tools.ToolResult{}, ctx.Err()
 			}
-			return "", fmt.Errorf("mcp server %q is still connecting — retry in a moment (/mcp shows status)", s.name)
+			return tools.ToolResult{}, fmt.Errorf("mcp server %q is still connecting — retry in a moment (/mcp shows status)", s.name)
 		}
 		cancel()
 		s.mu.Lock()
@@ -419,13 +428,13 @@ func (s *server) call(ctx context.Context, tool string, args json.RawMessage) (s
 		switch status {
 		case StatusFailed:
 			if errMsg != "" {
-				return "", fmt.Errorf("mcp server %q unavailable: %s (/mcp %s reconnect)", s.name, errMsg, s.name)
+				return tools.ToolResult{}, fmt.Errorf("mcp server %q unavailable: %s (/mcp %s reconnect)", s.name, errMsg, s.name)
 			}
-			return "", fmt.Errorf("mcp server %q unavailable (/mcp %s reconnect)", s.name, s.name)
+			return tools.ToolResult{}, fmt.Errorf("mcp server %q unavailable (/mcp %s reconnect)", s.name, s.name)
 		case StatusDisabled:
-			return "", fmt.Errorf("mcp server %q is disabled (/mcp %s enable)", s.name, s.name)
+			return tools.ToolResult{}, fmt.Errorf("mcp server %q is disabled (/mcp %s enable)", s.name, s.name)
 		default:
-			return "", fmt.Errorf("mcp server %q is %s", s.name, status)
+			return tools.ToolResult{}, fmt.Errorf("mcp server %q is %s", s.name, status)
 		}
 	}
 	// Serialize calls per server.
@@ -433,24 +442,77 @@ func (s *server) call(ctx context.Context, tool string, args json.RawMessage) (s
 	case s.calling <- struct{}{}:
 		defer func() { <-s.calling }()
 	case <-ctx.Done():
-		return "", ctx.Err()
+		return tools.ToolResult{}, ctx.Err()
 	}
 	ctx, cancel := context.WithTimeout(ctx, s.cfg.ToolTimeoutDuration())
 	defer cancel()
 	var argMap map[string]any
 	if len(args) > 0 {
 		if err := json.Unmarshal(args, &argMap); err != nil {
-			return "", fmt.Errorf("invalid tool arguments: %w", err)
+			return tools.ToolResult{}, fmt.Errorf("invalid tool arguments: %w", err)
 		}
 	}
 	res, err := sess.CallTool(ctx, &sdkmcp.CallToolParams{Name: tool, Arguments: argMap})
 	if err != nil {
 		if ctx.Err() == context.DeadlineExceeded {
-			return "", fmt.Errorf("mcp tool %s timed out after %s", tool, s.cfg.ToolTimeoutDuration())
+			return tools.ToolResult{}, fmt.Errorf("mcp tool %s timed out after %s", tool, s.cfg.ToolTimeoutDuration())
 		}
-		return "", err
+		return tools.ToolResult{}, err
 	}
-	return flattenResult(res), nil
+	return tools.MarkUntrusted(mcpToolResult(res), ToolName(s.name, tool)), nil
+}
+
+func mcpToolResult(res *sdkmcp.CallToolResult) tools.ToolResult {
+	capture := tools.NewTextCapture(0)
+	for _, c := range res.Content {
+		switch c := c.(type) {
+		case *sdkmcp.TextContent:
+			if capture.OriginalBytes() > 0 {
+				capture.WriteString("\n")
+			}
+			capture.WriteString(c.Text)
+		case *sdkmcp.ImageContent:
+			capture.WriteString(fmt.Sprintf("\n[image content omitted: %s, %d bytes]", c.MIMEType, len(c.Data)))
+		case *sdkmcp.AudioContent:
+			capture.WriteString(fmt.Sprintf("\n[audio content omitted: %s, %d bytes]", c.MIMEType, len(c.Data)))
+		case *sdkmcp.EmbeddedResource:
+			if c.Resource != nil && c.Resource.Text != "" {
+				capture.WriteString(fmt.Sprintf("\n[resource %s]\n%s", c.Resource.URI, c.Resource.Text))
+			} else if c.Resource != nil {
+				capture.WriteString(fmt.Sprintf("\n[binary resource omitted: %s, %d bytes]", c.Resource.URI, len(c.Resource.Blob)))
+			}
+		case *sdkmcp.ResourceLink:
+			capture.WriteString(fmt.Sprintf("\n[resource link: %s (%s)]", c.URI, c.Name))
+		}
+	}
+	if capture.OriginalBytes() == 0 && res.StructuredContent != nil {
+		// Encode directly into the bounded capture. MarshalIndent would first
+		// allocate the complete server response, defeating the hard MCP
+		// retention ceiling for a large structured value.
+		enc := json.NewEncoder(textCaptureWriter{capture: capture})
+		enc.SetIndent("", "  ")
+		_ = enc.Encode(res.StructuredContent)
+	}
+	if capture.OriginalBytes() == 0 {
+		capture.WriteString("(no output)")
+	}
+	if res.IsError {
+		wrapped := tools.NewTextCapture(0)
+		wrapped.WriteString("Error: ")
+		wrapped.WriteString(capture.String())
+		original := capture.OriginalBytes() + int64(len("Error: "))
+		return tools.MarkUntrusted(tools.TextResultWithSize(wrapped.String(), tools.Truncate(wrapped.String()), original, capture.Complete() && original == int64(len(wrapped.String())), 1), "mcp")
+	}
+	return tools.MarkUntrusted(tools.CapturedTextResult(capture, tools.Truncate(capture.String()), 0), "mcp")
+}
+
+type textCaptureWriter struct {
+	capture *tools.TextCapture
+}
+
+func (w textCaptureWriter) Write(p []byte) (int, error) {
+	w.capture.WriteString(string(p))
+	return len(p), nil
 }
 
 // flattenResult renders a CallToolResult as model-facing text (pure).
@@ -460,41 +522,11 @@ func (s *server) call(ctx context.Context, tool string, args json.RawMessage) (s
 // prefixes "Error: " so the model sees failure, per the MCP spec's own
 // guidance that tool errors belong in content.
 func flattenResult(res *sdkmcp.CallToolResult) string {
-	var b strings.Builder
-	for _, c := range res.Content {
-		switch c := c.(type) {
-		case *sdkmcp.TextContent:
-			if b.Len() > 0 {
-				b.WriteString("\n")
-			}
-			b.WriteString(c.Text)
-		case *sdkmcp.ImageContent:
-			fmt.Fprintf(&b, "\n[image content omitted: %s, %d bytes]", c.MIMEType, len(c.Data))
-		case *sdkmcp.AudioContent:
-			fmt.Fprintf(&b, "\n[audio content omitted: %s, %d bytes]", c.MIMEType, len(c.Data))
-		case *sdkmcp.EmbeddedResource:
-			if c.Resource != nil && c.Resource.Text != "" {
-				fmt.Fprintf(&b, "\n[resource %s]\n%s", c.Resource.URI, c.Resource.Text)
-			} else if c.Resource != nil {
-				fmt.Fprintf(&b, "\n[binary resource omitted: %s, %d bytes]", c.Resource.URI, len(c.Resource.Blob))
-			}
-		case *sdkmcp.ResourceLink:
-			fmt.Fprintf(&b, "\n[resource link: %s (%s)]", c.URI, c.Name)
-		}
-	}
-	out := b.String()
-	if out == "" && res.StructuredContent != nil {
-		if data, err := json.MarshalIndent(res.StructuredContent, "", "  "); err == nil {
-			out = string(data)
-		}
-	}
-	if out == "" {
-		out = "(no output)"
-	}
-	if res.IsError {
-		out = "Error: " + out
-	}
-	return tools.Truncate(out)
+	return mcpToolResult(res).Preview
+}
+
+func flattenResultRaw(res *sdkmcp.CallToolResult) string {
+	return mcpToolResult(res).Retained
 }
 
 // normalizeSchema passes the server's input schema through as a JSON string,
@@ -518,7 +550,7 @@ func normalizeSchema(schema any) string {
 
 // Config returns a server's normalized config (the live definition, including
 // imported claude/codex entries) — the TUI persists this when toggling
-// enabled so whip's own config stays self-contained. ok is false for
+// enabled so ghg's own config stays self-contained. ok is false for
 // unknown names.
 func (m *Manager) Config(name string) (ServerConfig, bool) {
 	s, ok := m.servers[name]
@@ -590,7 +622,7 @@ func (m *Manager) InstructionsBlock() string {
 	return b.String()
 }
 
-// Probe connects a single server for `whip mcp test`: builds a throwaway
+// Probe connects a single server for `ghg mcp test`: builds a throwaway
 // manager with just that entry, starts it, waits for the first settle, and
 // returns the outcome with tool names. A doctor visit, not a residency.
 type ProbeResult struct {
@@ -689,7 +721,7 @@ func (m *Manager) Reconnect(name string) bool {
 
 // Close shuts every session down. Stdio transports terminate their child
 // process on Close (the SDK sends SIGTERM after stdin closes, then SIGKILL);
-// children get their own process group at spawn (defaultTransport) so whip's
+// children get their own process group at spawn (defaultTransport) so ghg's
 // exit path can also group-kill strays via the bashrun registry pattern.
 func (m *Manager) Close() {
 	for _, s := range m.servers {
@@ -731,7 +763,7 @@ func defaultTransport(cfg ServerConfig, stderr *ringBuffer) (sdkmcp.Transport, e
 		}, nil
 	}
 	cmd := exec.Command(cfg.Command[0], cfg.Command[1:]...)
-	// Inherit whip's environment and layer the server's vars on top (opencode
+	// Inherit ghg's environment and layer the server's vars on top (opencode
 	// does the same — users expect $PATH etc. to work).
 	cmd.Env = append(os.Environ(), envPairs(cfg.Env)...)
 	if cfg.Cwd != "" {
@@ -766,7 +798,7 @@ func (h headerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 
 // logf mirrors config.LogEvent for MCP lifecycle events (connect failures,
 // status transitions) so "why didn't my server come up?" is answerable from
-// ~/.whip/whip.log.
+// ~/.ghg/ghg.log.
 func logf(format string, args ...any) {
 	config.LogEvent("mcp", fmt.Sprintf(format, args...))
 }

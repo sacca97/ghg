@@ -7,7 +7,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/context-labs/whip/internal/llm"
+	"github.com/sacca97/ghg/internal/llm"
 )
 
 // Auto session titles: after the first exchange, a cheap background call
@@ -20,7 +20,7 @@ type titleMsg struct{ title string }
 // maybeTitle fires once per session, when the first turn completes with the
 // title still at its auto-derived placeholder (the raw first user message).
 func (m *model) maybeTitle() tea.Cmd {
-	if m.store == nil || m.sessionID == "" || m.titled {
+	if m.store == nil || m.sessionID == "" || m.titled || m.agent == nil {
 		return nil
 	}
 	meta, _, err := m.store.Load(m.sessionID)
@@ -28,9 +28,9 @@ func (m *model) maybeTitle() tea.Cmd {
 		return nil
 	}
 	m.titled = true // one attempt per session, win or lose
-	cli, mdl := m.agent.CompactClient, m.agent.CompactModel
-	if cli == nil {
-		cli = m.agent.Client
+	backend, mdl := m.agent.CompactBackend, m.agent.CompactModel
+	if backend == nil {
+		backend = m.agent.Backend
 	}
 	if mdl == "" {
 		mdl = m.agent.Model
@@ -53,7 +53,7 @@ func (m *model) maybeTitle() tea.Cmd {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
-		out, _, err := cli.Complete(ctx, llm.Request{
+		out, _, err := backend.Complete(ctx, llm.Request{
 			Model:     mdl,
 			MaxTokens: 24,
 			Messages: []llm.Message{
@@ -64,7 +64,7 @@ func (m *model) maybeTitle() tea.Cmd {
 		if err != nil {
 			return
 		}
-		title := strings.Trim(strings.TrimSpace(out), "\"'.")
+		title := strings.Trim(strings.TrimSpace(out.TextContent()), "\"'.")
 		if title == "" || len(title) > 80 {
 			return
 		}

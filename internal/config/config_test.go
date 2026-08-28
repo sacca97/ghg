@@ -14,7 +14,7 @@ func TestLoadSaveDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.DefaultModel != "kimi-k3-fast" || cfg.Providers["inference"].BaseURL != "https://api.inference.net/v1" {
+	if cfg.DefaultModel != "kimi-k3-fast" || cfg.Providers["inference"].BaseURL == "" || cfg.Providers["inference"].Profile != "inference" {
 		t.Fatalf("defaults: %+v", cfg)
 	}
 	cfg.DefaultModel = "glm-5.2-fast"
@@ -30,8 +30,8 @@ func TestLoadSaveDefaults(t *testing.T) {
 func TestLoadRejectsBadJSON(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
-	os.MkdirAll(filepath.Join(home, ".whip"), 0o700)
-	os.WriteFile(filepath.Join(home, ".whip", "config.json"), []byte("{nope"), 0o600)
+	os.MkdirAll(filepath.Join(home, ".ghg"), 0o700)
+	os.WriteFile(filepath.Join(home, ".ghg", "config.json"), []byte("{nope"), 0o600)
 	if _, err := Load(); err == nil {
 		t.Fatal("expected parse error")
 	}
@@ -39,12 +39,12 @@ func TestLoadRejectsBadJSON(t *testing.T) {
 
 func TestProviderKey(t *testing.T) {
 	t.Setenv("HOME", t.TempDir()) // no ~/.inf fallback available
-	t.Setenv("WHIP_TEST_KEY", "from-env")
+	t.Setenv("GHG_TEST_KEY", "from-env")
 
-	if k := (Provider{APIKeyEnv: "WHIP_TEST_KEY", APIKey: "literal"}).Key(); k != "from-env" {
+	if k := (Provider{APIKeyEnv: "GHG_TEST_KEY", APIKey: "literal"}).Key(); k != "from-env" {
 		t.Fatalf("env should win: %q", k)
 	}
-	if k := (Provider{APIKeyEnv: "WHIP_UNSET_VAR", APIKey: "literal"}).Key(); k != "literal" {
+	if k := (Provider{APIKeyEnv: "GHG_UNSET_VAR", APIKey: "literal"}).Key(); k != "literal" {
 		t.Fatalf("literal fallback: %q", k)
 	}
 	if k := (Provider{BaseURL: "https://other.example.com"}).Key(); k != "" {
@@ -55,7 +55,7 @@ func TestProviderKey(t *testing.T) {
 func TestInfKeyFallback(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
-	p := Provider{BaseURL: "https://api.inference.net/v1"}
+	p := Provider{Profile: "inference"}
 	if k := p.Key(); k != "" {
 		t.Fatalf("missing ~/.inf should yield empty, got %q", k)
 	}
@@ -126,7 +126,7 @@ func TestInfKeyBadJSON(t *testing.T) {
 func TestLoadJSONCCommentsAndTrailingCommas(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
-	os.MkdirAll(filepath.Join(home, ".whip"), 0o700)
+	os.MkdirAll(filepath.Join(home, ".ghg"), 0o700)
 	src := `{
   // default route
   "defaultModel": "m1",
@@ -135,11 +135,11 @@ func TestLoadJSONCCommentsAndTrailingCommas(t *testing.T) {
     "a": { "baseUrl": "https://a", "api": "openai-completions", }, // trailing comma
   },
   "models": {
-    "m1": { "providers": ["a",], "maxTokens": 1024, },
+    "m1": { "providers": ["a",], "api": "anthropic-messages", "maxTokens": 1024, },
   },
 }
 `
-	os.WriteFile(filepath.Join(home, ".whip", "config.json"), []byte(src), 0o600)
+	os.WriteFile(filepath.Join(home, ".ghg", "config.json"), []byte(src), 0o600)
 	cfg, err := Load()
 	if err != nil {
 		t.Fatal(err)
@@ -147,7 +147,7 @@ func TestLoadJSONCCommentsAndTrailingCommas(t *testing.T) {
 	if cfg.DefaultModel != "m1" || cfg.DefaultProvider != "a" {
 		t.Fatalf("defaults: %+v", cfg)
 	}
-	if cfg.Models["m1"].Providers[0] != "a" || cfg.Models["m1"].MaxTokens != 1024 {
+	if cfg.Models["m1"].Providers[0] != "a" || cfg.Models["m1"].API != "anthropic-messages" || cfg.Models["m1"].MaxTokens != 1024 {
 		t.Fatalf("model: %+v", cfg.Models["m1"])
 	}
 }
@@ -158,7 +158,7 @@ func TestLoadJSONCCommentsAndTrailingCommas(t *testing.T) {
 func TestMCPImportRoundTrip(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
-	os.MkdirAll(filepath.Join(home, ".whip"), 0o700)
+	os.MkdirAll(filepath.Join(home, ".ghg"), 0o700)
 	src := `{
   "defaultModel": "m1",
   "providers": { "a": { "baseUrl": "https://a", "api": "openai-completions" } },
@@ -169,7 +169,7 @@ func TestMCPImportRoundTrip(t *testing.T) {
   }
 }
 `
-	os.WriteFile(filepath.Join(home, ".whip", "config.json"), []byte(src), 0o600)
+	os.WriteFile(filepath.Join(home, ".ghg", "config.json"), []byte(src), 0o600)
 	cfg, err := Load()
 	if err != nil {
 		t.Fatal(err)
@@ -191,7 +191,7 @@ func TestMCPImportRoundTrip(t *testing.T) {
 		t.Fatalf("mcpImport did not round-trip: %+v", reloaded.MCPImport)
 	}
 	// Absent block stays nil — zero-breakage default.
-	if err := os.WriteFile(filepath.Join(home, ".whip", "config.json"), []byte(`{
+	if err := os.WriteFile(filepath.Join(home, ".ghg", "config.json"), []byte(`{
   "defaultModel": "m1",
   "providers": { "a": { "baseUrl": "https://a", "api": "openai-completions" } },
   "models": { "m1": { "providers": ["a"] } }
@@ -212,7 +212,7 @@ func TestMCPImportRoundTrip(t *testing.T) {
 func TestLoadPreservesMCPImportOnClobber(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
-	dir := filepath.Join(home, ".whip")
+	dir := filepath.Join(home, ".ghg")
 	os.MkdirAll(dir, 0o700)
 	os.WriteFile(filepath.Join(dir, "config.json"), []byte(
 		`{"providers":null,"models":null,"mcpImport":{"codex":{"enabled":false}}}`), 0o600)
@@ -228,7 +228,7 @@ func TestLoadPreservesMCPImportOnClobber(t *testing.T) {
 func TestLoadRecoversFromClobberedConfig(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
-	dir := filepath.Join(home, ".whip")
+	dir := filepath.Join(home, ".ghg")
 	os.MkdirAll(dir, 0o700)
 	p := filepath.Join(dir, "config.json")
 	// a previously-clobbered config: parses fine but has no providers/models
@@ -248,7 +248,7 @@ func TestLoadRecoversFromClobberedConfig(t *testing.T) {
 func TestLoadRegeneratesDefaultsWhenEmptyAndNoBackup(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
-	dir := filepath.Join(home, ".whip")
+	dir := filepath.Join(home, ".ghg")
 	os.MkdirAll(dir, 0o700)
 	os.WriteFile(filepath.Join(dir, "config.json"), []byte(`{"providers":null,"models":null}`), 0o600)
 	cfg, err := Load()
@@ -263,7 +263,7 @@ func TestLoadRegeneratesDefaultsWhenEmptyAndNoBackup(t *testing.T) {
 func TestSaveRefusesToClobberHealthyConfig(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
-	dir := filepath.Join(home, ".whip")
+	dir := filepath.Join(home, ".ghg")
 	os.MkdirAll(dir, 0o700)
 	p := filepath.Join(dir, "config.json")
 	healthy := `{"defaultModel":"m1","providers":{"a":{"baseUrl":"https://a","api":"openai-completions"}},"models":{"m1":{"providers":["a"]}}}`
@@ -322,7 +322,7 @@ func TestSaveWritesJSONCHeader(t *testing.T) {
 }
 
 func TestLoadCatalogsAlwaysNonNil(t *testing.T) {
-	t.Setenv("HOME", t.TempDir()) // no ~/.whip/models.json exists
+	t.Setenv("HOME", t.TempDir()) // no ~/.ghg/models.json exists
 	cats := LoadCatalogs()
 	if cats == nil {
 		t.Fatal("LoadCatalogs must return a non-nil map so callers can write into it")
@@ -334,12 +334,12 @@ func TestLoadCatalogsAlwaysNonNil(t *testing.T) {
 }
 
 func TestLogEventWritesAndRotates(t *testing.T) {
-	t.Setenv("WHIP_HOME", t.TempDir())
+	t.Setenv("GHG_HOME", t.TempDir())
 
 	LogEvent("config.save", "before=(providers=1) after=(providers=1)")
 	LogEvent("catalog.fetch", "inference ok: 42 models")
 	dir, _ := Dir()
-	b, err := os.ReadFile(filepath.Join(dir, "whip.log"))
+	b, err := os.ReadFile(filepath.Join(dir, "ghg.log"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -348,20 +348,20 @@ func TestLogEventWritesAndRotates(t *testing.T) {
 		t.Fatalf("log content: %q", s)
 	}
 
-	// rotation: oversize log rolls to whip.log.1
-	os.WriteFile(filepath.Join(dir, "whip.log"), make([]byte, logMaxBytes+1), 0o600)
+	// rotation: oversize log rolls to ghg.log.1
+	os.WriteFile(filepath.Join(dir, "ghg.log"), make([]byte, logMaxBytes+1), 0o600)
 	LogEvent("config.load", "after rotation")
-	if _, err := os.Stat(filepath.Join(dir, "whip.log.1")); err != nil {
+	if _, err := os.Stat(filepath.Join(dir, "ghg.log.1")); err != nil {
 		t.Fatalf("expected rotation: %v", err)
 	}
-	b, _ = os.ReadFile(filepath.Join(dir, "whip.log"))
+	b, _ = os.ReadFile(filepath.Join(dir, "ghg.log"))
 	if !strings.Contains(string(b), "after rotation") {
 		t.Fatalf("fresh log should hold the new event: %q", b)
 	}
 }
 
 func TestLogEventNeverFails(t *testing.T) {
-	t.Setenv("WHIP_HOME", "/nonexistent-\x7f-impossible") // Dir() will fail MkdirAll
+	t.Setenv("GHG_HOME", "/nonexistent-\x7f-impossible") // Dir() will fail MkdirAll
 	LogEvent("config.load", "should not panic or error")
 }
 
@@ -407,7 +407,7 @@ func TestCatalogMaxCompletionTokens(t *testing.T) {
 func TestLoadMixedTokenFields(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
-	os.MkdirAll(filepath.Join(home, ".whip"), 0o700)
+	os.MkdirAll(filepath.Join(home, ".ghg"), 0o700)
 	src := `{
   "defaultModel": "m1",
   "providers": { "a": { "baseUrl": "https://a", "api": "openai-completions" } },
@@ -416,8 +416,9 @@ func TestLoadMixedTokenFields(t *testing.T) {
     "m2": { "providers": ["a"], "context": 200000, "maxOut": 64000 }
   }
 }
+
 `
-	os.WriteFile(filepath.Join(home, ".whip", "config.json"), []byte(src), 0o600)
+	os.WriteFile(filepath.Join(home, ".ghg", "config.json"), []byte(src), 0o600)
 	cfg, err := Load()
 	if err != nil {
 		t.Fatal(err)
@@ -428,5 +429,39 @@ func TestLoadMixedTokenFields(t *testing.T) {
 	m2 := cfg.Models["m2"]
 	if m2.ContextWindow() != 200000 || m2.MaxOut != 64000 {
 		t.Fatalf("m2: %+v", m2)
+	}
+}
+
+func TestArtifactConfigRoundTripAndExplicitDisable(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	dir := filepath.Join(home, ".ghg")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(`{
+  "defaultModel": "m1",
+  "providers": { "a": { "baseUrl": "https://a", "api": "openai-completions" } },
+  "models": { "m1": { "providers": ["a"] } },
+  "artifacts": { "enabled": false, "maxBytes": 4096 }
+}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Artifacts == nil || cfg.Artifacts.Enabled == nil || *cfg.Artifacts.Enabled || cfg.Artifacts.MaxBytes != 4096 {
+		t.Fatalf("artifact config did not parse: %+v", cfg.Artifacts)
+	}
+	if err := cfg.Save(); err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.Artifacts == nil || reloaded.Artifacts.Enabled == nil || *reloaded.Artifacts.Enabled || reloaded.Artifacts.MaxBytes != 4096 {
+		t.Fatalf("artifact config did not round-trip: %+v", reloaded.Artifacts)
 	}
 }

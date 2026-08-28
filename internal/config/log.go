@@ -8,24 +8,24 @@ import (
 	"time"
 )
 
-// whip.log is an append-only event log for harness operations that touch
+// ghg.log is an append-only event log for ghg operations that touch
 // on-disk state: config loads/saves (with a before/after fingerprint),
 // catalog refreshes, session store activity. It exists so that when state
 // gets corrupted there is a record of which process did what, when, and
-// with what result — "did the harness misbehave?" becomes answerable.
+// with what result — "did the ghg misbehave?" becomes answerable.
 //
 // Logging never fails the caller: every write is best-effort.
 
 const (
-	logFileName = "whip.log"
-	// logMaxBytes caps the file; past it the log is rotated to whip.log.1
+	logFileName = "ghg.log"
+	// logMaxBytes caps the file; past it the log is rotated to ghg.log.1
 	// (single generation — enough history to debug, never grows unbounded).
 	logMaxBytes = 1 << 20 // 1 MiB
 )
 
 var logMu sync.Mutex
 
-// LogEvent appends one timestamped line to ~/.whip/whip.log. op is a short
+// LogEvent appends one timestamped line to ~/.ghg/ghg.log. op is a short
 // verb ("config.save", "config.load", "catalog.fetch", ...); detail is
 // free-form context. Best-effort: errors are swallowed by design.
 func LogEvent(op, detail string) {

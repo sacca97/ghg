@@ -12,8 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/context-labs/whip/internal/llm"
-	"github.com/context-labs/whip/internal/tools"
+	"github.com/sacca97/ghg/internal/llm"
+	"github.com/sacca97/ghg/internal/tools"
 )
 
 // slowTool returns a tool that records how many copies of itself are running
@@ -60,7 +60,7 @@ func TestToolCallsRunInParallel(t *testing.T) {
 	srv := parallelServer(t)
 	defer srv.Close()
 
-	ag := New(llm.New(srv.URL, "k"), "m", 100, "sys")
+	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
 	var conc, maxConc atomic.Int32
 	// one shared tool named "slow" — all three calls hit it
 	ag.Tools = []tools.Tool{slowTool("slow", &conc, &maxConc)}
@@ -77,7 +77,7 @@ func TestToolCallsRunInParallel(t *testing.T) {
 // unrelated calls run in parallel.
 func TestSamePathEditsSerialize(t *testing.T) {
 	// craft an agent whose runTools we drive directly
-	ag := New(llm.New("http://unused", "k"), "m", 100, "sys")
+	ag := New(testBackend("http://unused", "k"), "m", 100, "sys")
 
 	var conc, maxConc atomic.Int32
 	write := tools.Tool{
@@ -119,7 +119,7 @@ func TestBackgroundTaskDeliversReport(t *testing.T) {
 	srv := textServer(t, func(n int, req llm.Request) string { return "report-body" })
 	defer srv.Close()
 
-	ag := New(llm.New(srv.URL, "k"), "m", 100, "sys")
+	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
 	task := ag.StartBackground(context.Background(), "probe", "do the thing")
 
 	// wait on the Done channel — closes exactly once on settle
@@ -159,7 +159,7 @@ func TestBackgroundTaskBroadcastsToManyWaiters(t *testing.T) {
 	})
 	defer srv.Close()
 
-	ag := New(llm.New(srv.URL, "k"), "m", 100, "sys")
+	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
 	task := ag.StartBackground(context.Background(), "d", "p")
 
 	const waiters = 8
@@ -191,7 +191,7 @@ func TestBackgroundTaskCancel(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	ag := New(llm.New(srv.URL, "k"), "m", 100, "sys")
+	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
 	task := ag.StartBackground(context.Background(), "d", "p")
 	if !ag.Tasks().Cancel(task.ID) {
 		t.Fatal("cancel should succeed on a running task")
@@ -305,7 +305,7 @@ func TestBackgroundTaskSubscribersSeeLiveStream(t *testing.T) {
 	})
 	defer srv.Close()
 
-	ag := New(llm.New(srv.URL, "k"), "m", 100, "sys")
+	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
 	task := ag.StartBackground(context.Background(), "d", "p")
 
 	var got atomic.Int32
@@ -370,7 +370,7 @@ func TestBackgroundTaskSubscriberSeesToolEvents(t *testing.T) {
 	srv := toolLoopServer(t)
 	defer srv.Close()
 
-	ag := New(llm.New(srv.URL, "k"), "m", 100, "sys")
+	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
 	task := ag.StartBackground(context.Background(), "d", "p")
 
 	var mu sync.Mutex
@@ -407,7 +407,7 @@ func TestBackgroundTaskManySubscribers(t *testing.T) {
 	})
 	defer srv.Close()
 
-	ag := New(llm.New(srv.URL, "k"), "m", 100, "sys")
+	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
 	task := ag.StartBackground(context.Background(), "d", "p")
 
 	const subs = 4
@@ -431,7 +431,7 @@ func TestBackgroundTaskManySubscribers(t *testing.T) {
 
 // Subscribing an unknown task id reports false rather than panicking.
 func TestSubscribeUnknownTask(t *testing.T) {
-	ag := New(llm.New("http://unused", "k"), "m", 100, "sys")
+	ag := New(testBackend("http://unused", "k"), "m", 100, "sys")
 	if ag.Tasks().Subscribe("task-999", Events{}) {
 		t.Fatal("Subscribe on an unknown id should report false")
 	}
@@ -448,7 +448,7 @@ func TestBackgroundTaskUsageRollsIntoParent(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	ag := New(llm.New(srv.URL, "k"), "m", 100, "sys")
+	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
 	task := ag.StartBackground(context.Background(), "d", "p")
 	select {
 	case <-task.Done:
@@ -509,7 +509,7 @@ func TestBroadcastBlockingSubscriberCannotDeadlock(t *testing.T) {
 	t.Cleanup(func() { close(release) }) // before srv.Close so the handler unwinds first
 	defer srv.Close()
 
-	ag := New(llm.New(srv.URL, "k"), "m", 100, "sys")
+	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
 	task := ag.StartBackground(context.Background(), "probe", "p")
 
 	inCallback := make(chan struct{})

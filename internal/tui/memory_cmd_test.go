@@ -8,15 +8,15 @@ import (
 
 	"github.com/charmbracelet/x/ansi"
 
-	"github.com/context-labs/whip/internal/memory"
+	"github.com/sacca97/ghg/internal/memory"
 )
 
 // The feature end-to-end: remember writes a markdown bullet to
-// ~/.whip/memory.md, the next turn's system prompt injects it, /memory lists
+// ~/.ghg/memory.md, the next turn's system prompt injects it, /memory lists
 // it, and deleting by number stops the injection.
 func TestMemoryEndToEnd(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("WHIP_HOME", home)
+	t.Setenv("GHG_HOME", home)
 
 	m := compactCmdModel()
 
@@ -39,7 +39,7 @@ func TestMemoryEndToEnd(t *testing.T) {
 		t.Fatal(out)
 	}
 
-	// 2. it's a plain markdown bullet in ~/.whip/memory.md
+	// 2. it's a plain markdown bullet in ~/.ghg/memory.md
 	data, err := os.ReadFile(filepath.Join(home, "memory.md"))
 	if err != nil {
 		t.Fatal(err)
@@ -84,7 +84,7 @@ func TestMemoryEndToEnd(t *testing.T) {
 // while that session is active.
 func TestSessionMemoryScope(t *testing.T) {
 	home := t.TempDir()
-	t.Setenv("WHIP_HOME", home)
+	t.Setenv("GHG_HOME", home)
 
 	m := compactCmdModel()
 	m.agent.SetSessionID("sess1")

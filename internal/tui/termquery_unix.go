@@ -26,14 +26,7 @@ func queryTerminalBackground(tty *os.File, inTmux bool) (light bool, ok bool) {
 	if !isForegroundFd(fd) {
 		return false, false
 	}
-	// query the background color (OSC 11), then a cursor-position report (CSI
-	// 6n) as a guaranteed terminator so a terminal that ignores OSC 11 still
-	// unblocks the read.
-	query := "\x1b]11;?\x1b\\" + "\x1b[6n"
-	if inTmux {
-		// DCS passthrough: wrap the query, doubling every ESC in the payload.
-		query = "\x1bPtmux;" + strings.ReplaceAll(query, "\x1b", "\x1b\x1b") + "\x1b\\"
-	}
+	query := terminalBackgroundQuery(inTmux)
 
 	// put the tty in raw-ish mode (no echo, non-canonical) for the query
 	old, err := unix.IoctlGetTermios(fd, ioctlReadTermios)
@@ -82,6 +75,20 @@ func queryTerminalBackground(tty *os.File, inTmux bool) (light bool, ok bool) {
 		}
 	}
 	return false, false
+}
+
+func terminalBackgroundQuery(inTmux bool) string {
+	// Query the background color (OSC 11). The read below has a deadline, so a
+	// terminal that ignores OSC 11 still fails closed without needing a second
+	// cursor-position query. Sending CSI 6n here would leave its ESC[<row>;<col>R
+	// response queued when the OSC reply arrives first; the shell would then
+	// print that response after ghg exits.
+	query := "\x1b]11;?\x1b\\"
+	if inTmux {
+		// DCS passthrough: wrap the query, doubling every ESC in the payload.
+		query = "\x1bPtmux;" + strings.ReplaceAll(query, "\x1b", "\x1b\x1b") + "\x1b\\"
+	}
+	return query
 }
 
 // parseOSCBg parses an OSC 11 payload ("rgb:rrrr/gggg/bbbb" or "#rrggbb") and

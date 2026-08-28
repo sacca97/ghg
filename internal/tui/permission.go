@@ -6,8 +6,8 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/context-labs/whip/internal/config"
-	"github.com/context-labs/whip/internal/tools"
+	"github.com/sacca97/ghg/internal/config"
+	"github.com/sacca97/ghg/internal/tools"
 )
 
 // Permission prompts: when the agent is about to run a gated tool (bash,
@@ -17,8 +17,7 @@ import (
 // Reject takes a free-text redirect back to the model.
 //
 // The gate runs on a tool goroutine; the dialog runs on the UI thread. They
-// meet on a channel: the gate sends a request, the UI answers it. This is
-// the turn-pausing modal computer.go's consent hook was waiting for.
+// meet on a channel: the gate sends a request, the UI answers it.
 
 // permRequest is the gate→UI half; the answer comes back on reply.
 type permRequest struct {

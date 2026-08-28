@@ -3,7 +3,7 @@ package tui
 import (
 	"testing"
 
-	"github.com/context-labs/whip/internal/config"
+	"github.com/sacca97/ghg/internal/config"
 )
 
 // Mouse capture defaults ON (wheel scroll + clicks work) using click/wheel-only

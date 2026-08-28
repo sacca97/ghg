@@ -5,14 +5,14 @@ import (
 	"os"
 	"strings"
 
-	"github.com/context-labs/whip/internal/config"
+	"github.com/sacca97/ghg/internal/config"
 )
 
 const goalMetToken = "GOAL_MET"
 
 // goalMaxRounds resolves the goal-loop round cap: per-project override
-// (~/.whip/projects.json, keyed by cwd) beats the global default
-// (goalMaxRounds in ~/.whip/config.json), which falls back to
+// (~/.ghg/projects.json, keyed by cwd) beats the global default
+// (goalMaxRounds in ~/.ghg/config.json), which falls back to
 // config.DefaultGoalMaxRounds. Set either with /goal rounds.
 func (m *model) goalMaxRounds() int {
 	if wd, err := os.Getwd(); err == nil {

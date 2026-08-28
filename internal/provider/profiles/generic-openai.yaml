@@ -1,0 +1,19 @@
+schema: 1
+id: generic-openai
+display_name: Generic OpenAI-compatible
+protocol: openai-chat-completions
+base_url: https://api.openai.com/v1
+auth:
+  kind: bearer
+  header: Authorization
+  env_var: OPENAI_API_KEY
+docs:
+  keys_url: https://platform.openai.com/api-keys
+default_headers: {}
+catalog:
+  kind: openai-models
+capabilities:
+  tools: true
+  vision: true
+  thinking: true
+  prompt_cache: provider

@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/context-labs/whip/internal/lsp"
+	"github.com/sacca97/ghg/internal/lsp"
 )
 
 // Headless /lsp command coverage: status rows for configured servers.

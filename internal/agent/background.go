@@ -9,8 +9,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-
-	"github.com/context-labs/whip/internal/tools"
 )
 
 // TaskStatus is the lifecycle of a background subagent.
@@ -218,20 +216,22 @@ func (a *Agent) StartBackground(ctx context.Context, description, prompt string)
 	}
 
 	go func() {
-		sub := New(a.Client, a.Model, a.MaxTokens, subagentPrompt())
-		sub.Effort = a.Effort
-		sub.ContextLimit = a.ContextLimit
-		sub.Tools = tools.All()
-		report, err := sub.Turn(taskCtx, prompt, FanIn(a.bg.emitter(id), Events{OnUsage: a.AddUsage}))
+		sub, err := a.newSubagent(taskCtx, "tiny")
 		status := TaskDone
-		text := report
-		switch {
-		case err != nil && taskCtx.Err() == context.Canceled:
-			status, text = TaskCancelled, "cancelled"
-		case err != nil:
-			status, text = TaskError, err.Error()
+		text := ""
+		if err == nil {
+			report, err := sub.Turn(taskCtx, prompt, FanIn(a.bg.emitter(id), Events{OnUsage: a.AddUsage}))
+			text = report
+			switch {
+			case err != nil && taskCtx.Err() == context.Canceled:
+				status, text = TaskCancelled, "cancelled"
+			case err != nil:
+				status, text = TaskError, err.Error()
+			}
+			a.bg.settle(id, status, text)
+		} else {
+			a.bg.settle(id, TaskError, err.Error())
 		}
-		a.bg.settle(id, status, text)
 		// subscribers stop here; late events after settle go nowhere (Subscribe
 		// rejects non-running tasks, and settled state is visible via List/Get)
 		a.bg.mu.Lock()
@@ -282,6 +282,13 @@ func (r *taskRegistry) emitter(id string) Events {
 			r.broadcast(id, func(e Events) {
 				if e.OnToolStart != nil {
 					e.OnToolStart(tcID, n, a)
+				}
+			})
+		},
+		OnToolOutput: func(tcID, output string) {
+			r.broadcast(id, func(e Events) {
+				if e.OnToolOutput != nil {
+					e.OnToolOutput(tcID, output)
 				}
 			})
 		},

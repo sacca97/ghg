@@ -6,7 +6,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/x/ansi"
-	"github.com/context-labs/whip/internal/llm"
+	"github.com/sacca97/ghg/internal/llm"
 )
 
 // ctrl+k clears the conversation exactly as if /clear ran — messages reset to

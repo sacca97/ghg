@@ -4,8 +4,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/context-labs/whip/internal/agent"
-	"github.com/context-labs/whip/internal/llm"
+	"github.com/charmbracelet/x/ansi"
+
+	"github.com/sacca97/ghg/internal/agent"
+	"github.com/sacca97/ghg/internal/llm"
 )
 
 func TestFmtTok(t *testing.T) {
@@ -19,10 +21,11 @@ func TestFmtTok(t *testing.T) {
 	}
 }
 
-// The always-on header shows model, effort, and session token usage.
-func TestHeaderShowsUsage(t *testing.T) {
+// Context size and route controls live in the bottom status bar; the header is
+// reserved for the app identity and loaded-skill count.
+func TestHeaderKeepsContextInStatus(t *testing.T) {
 	m := compactCmdModel()
-	m.agent = agent.New(llm.New("https://x", "k"), "kimi-k3-fast", 100, "sys")
+	m.agent = agent.New(testBackend("https://x", "k"), "kimi-k3-fast", 100, "sys")
 	m.agent.ContextLimit = 100000
 	m.follow = true
 	m.agent.AddUsage(llm.Usage{PromptTokens: 12345, CompletionTokens: 678})
@@ -32,24 +35,67 @@ func TestHeaderShowsUsage(t *testing.T) {
 			CachedTokens int `json:"cached_tokens"`
 		}{CachedTokens: 4000},
 	})
-	m.width = 200 // wide enough for the full usage block (header truncates the tail)
+	m.width = 200 // wide enough for the full status context block
 	head := strings.SplitN(m.View(), "\n", 2)[0]
-	for _, want := range []string{"kimi-k3-fast", "⚡ off", "12.3k in", "4.0k cached", "678 out", "% ctx"} {
-		if !strings.Contains(head, want) {
-			t.Errorf("header missing %q: %q", want, head)
+	for _, unwanted := range []string{"12.3k", "4.0k", "678", "ctx", "tok"} {
+		if strings.Contains(head, unwanted) {
+			t.Errorf("header should not contain context details %q: %q", unwanted, head)
 		}
+	}
+	status := m.statusView()
+	if !strings.Contains(status, "ctx 0/100.0k") {
+		t.Errorf("status missing context size: %q", status)
+	}
+	for _, unwanted := range []string{"↓", "↑", "tok", "12.3k", "4.0k", "678"} {
+		if strings.Contains(status, unwanted) {
+			t.Errorf("status should not contain request token usage %q: %q", unwanted, status)
+		}
+	}
+	if strings.Contains(head, "⚡") || strings.Contains(head, "kimi-k3-fast") || strings.Contains(head, shortCWD()) {
+		t.Errorf("header should not repeat the route or working directory: %q", head)
 	}
 }
 
-// No usage reported yet: the header omits the token block entirely.
-func TestHeaderOmitsUsageUntilReported(t *testing.T) {
+func TestHeaderContainsOnlyAppAndSkillCount(t *testing.T) {
+	m := compactCmdModel()
+	m.skillsLoaded = 33
+	m.goal = "finish the release"
+	m.follow = false
+	m.width = 120
+
+	head := strings.SplitN(ansi.Strip(m.View()), "\n", 2)[0]
+	if got, want := strings.TrimSpace(head), "ghg · skills: 33 loaded"; got != want {
+		t.Fatalf("header = %q, want exactly %q", got, want)
+	}
+}
+
+func TestHeaderShowsLoadedSkillCount(t *testing.T) {
+	m := compactCmdModel()
+	m.skillsLoaded = 33
+	head := strings.SplitN(m.View(), "\n", 2)[0]
+	if !strings.Contains(head, " ghg · skills: 33 loaded") {
+		t.Fatalf("header should show the loaded skill count next to ghg: %q", head)
+	}
+}
+
+// The header omits the context block entirely and leaves route details to the
+// bottom status line.
+func TestHeaderOmitsContext(t *testing.T) {
 	m := compactCmdModel()
 	m.width = 120
 	head := strings.SplitN(m.View(), "\n", 2)[0]
 	if strings.Contains(head, "⣿") {
-		t.Errorf("no usage should mean no token block: %q", head)
+		t.Errorf("header should not contain a context block: %q", head)
 	}
-	if !strings.Contains(head, "⚡ off") || !strings.Contains(head, "kimi-k3-fast") {
-		t.Errorf("model and effort always show: %q", head)
+	if strings.Contains(head, "⚡") || strings.Contains(head, "kimi-k3-fast") {
+		t.Errorf("header should omit effort and route controls: %q", head)
+	}
+}
+
+func TestHeaderOmitsEffortControl(t *testing.T) {
+	m := compactCmdModel()
+	head := strings.SplitN(m.View(), "\n", 2)[0]
+	if strings.Contains(head, "⚡") || strings.Contains(head, "effort") {
+		t.Fatalf("header should not render a reasoning control: %q", head)
 	}
 }

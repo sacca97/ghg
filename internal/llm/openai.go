@@ -1,4 +1,5 @@
-// Package llm is a minimal streaming client for OpenAI-compatible chat completions APIs.
+// Package llm contains provider-neutral messages plus streaming clients for
+// the compiled wire adapters.
 package llm
 
 import (
@@ -15,6 +16,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/sacca97/ghg/internal/artifact"
 )
 
 // Message is one chat message. Content is a string; ToolCalls set on assistant
@@ -27,12 +30,20 @@ type Message struct {
 	Parts      []ContentPart `json:"-"`
 	ToolCalls  []ToolCall    `json:"tool_calls,omitempty"`
 	ToolCallID string        `json:"tool_call_id,omitempty"`
+	// ProviderBlocks preserves opaque provider-native assistant blocks that
+	// must be replayed unchanged on a later turn. Anthropic uses this for
+	// thinking, redacted-thinking, and tool-use blocks whose signatures are
+	// part of the provider's conversation protocol.
+	ProviderBlocks []json.RawMessage `json:"provider_blocks,omitempty"`
+	// StopReason is provider metadata retained with the assembled response.
+	// It is not sent back as a message field; the owning adapter consumes it.
+	StopReason string `json:"stop_reason,omitempty"`
 	// Name is the function name on role "tool" messages. OpenAI ignores it,
 	// but Moonshot/Kimi requires it ("tool messages need a resolvable tool
 	// name") — without it every tool-using turn 400s.
 	Name string `json:"name,omitempty"`
 	// Authored marks a user message the human actually typed and submitted, as
-	// opposed to one whip injected on their behalf (steered background-task
+	// opposed to one ghg injected on their behalf (steered background-task
 	// results, goal-check continuations). Internal only — never sent to the
 	// provider. Used so input-history recall cycles only real submissions.
 	Authored bool `json:"authored,omitempty"`
@@ -53,6 +64,15 @@ type Message struct {
 	// RewoundFrom notes that this message replaced an earlier clipped one
 	// (rewind + resubmit). Internal only — never sent to the provider.
 	RewoundFrom string `json:"rewound_from,omitempty"`
+	// Artifact points to retained evidence for a bounded tool result. Internal
+	// only — stripAuthored clears it before provider serialization.
+	Artifact *artifact.Ref `json:"artifact,omitempty"`
+	// ExitCode is the best-effort tool execution status for persisted views.
+	// Internal only — it is not part of a provider tool message.
+	ExitCode int `json:"exit_code,omitempty"`
+	// Source identifies the integration that produced a tool result. Internal
+	// only; provider requests receive the rendered content, not this field.
+	Source string `json:"source,omitempty"`
 }
 
 // ContentPart is one element of a multimodal user message: either text or an
@@ -107,16 +127,21 @@ func ImagePart(ext string, data []byte) ContentPart {
 // fields are omitempty and cleared by stripAuthored before a provider request,
 // so they only ever appear in the persisted session store.
 type messageWire struct {
-	Role        string     `json:"role"`
-	Content     any        `json:"content"`
-	ToolCalls   []ToolCall `json:"tool_calls,omitempty"`
-	ToolCallID  string     `json:"tool_call_id,omitempty"`
-	Name        string     `json:"name,omitempty"`
-	Authored    bool       `json:"authored,omitempty"`
-	SentAt      *time.Time `json:"sent_at,omitempty"`
-	Usage       *Usage     `json:"usage,omitempty"`
-	Model       string     `json:"model,omitempty"`
-	RewoundFrom string     `json:"rewound_from,omitempty"`
+	Role           string            `json:"role"`
+	Content        any               `json:"content"`
+	ToolCalls      []ToolCall        `json:"tool_calls,omitempty"`
+	ToolCallID     string            `json:"tool_call_id,omitempty"`
+	ProviderBlocks []json.RawMessage `json:"provider_blocks,omitempty"`
+	StopReason     string            `json:"stop_reason,omitempty"`
+	Name           string            `json:"name,omitempty"`
+	Authored       bool              `json:"authored,omitempty"`
+	SentAt         *time.Time        `json:"sent_at,omitempty"`
+	Usage          *Usage            `json:"usage,omitempty"`
+	Model          string            `json:"model,omitempty"`
+	RewoundFrom    string            `json:"rewound_from,omitempty"`
+	Artifact       *artifact.Ref     `json:"artifact,omitempty"`
+	ExitCode       int               `json:"exit_code,omitempty"`
+	Source         string            `json:"source,omitempty"`
 }
 
 // MarshalJSON sends Content as a plain string for text-only messages and as a
@@ -124,8 +149,9 @@ type messageWire struct {
 func (m Message) MarshalJSON() ([]byte, error) {
 	w := messageWire{
 		Role: m.Role, Content: m.Content, ToolCalls: m.ToolCalls, ToolCallID: m.ToolCallID,
-		Name: m.Name, Authored: m.Authored, SentAt: m.SentAt, Usage: m.Usage,
-		Model: m.Model, RewoundFrom: m.RewoundFrom,
+		ProviderBlocks: m.ProviderBlocks, StopReason: m.StopReason, Name: m.Name,
+		Authored: m.Authored, SentAt: m.SentAt, Usage: m.Usage,
+		Model: m.Model, RewoundFrom: m.RewoundFrom, Artifact: m.Artifact, ExitCode: m.ExitCode, Source: m.Source,
 	}
 	if len(m.Parts) > 0 {
 		parts := m.Parts
@@ -148,7 +174,11 @@ func (m *Message) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	m.Role, m.ToolCalls, m.ToolCallID, m.Name = raw.Role, raw.ToolCalls, raw.ToolCallID, raw.Name
+	m.ProviderBlocks, m.StopReason = raw.ProviderBlocks, raw.StopReason
 	m.Authored, m.SentAt, m.Usage, m.Model, m.RewoundFrom = raw.Authored, raw.SentAt, raw.Usage, raw.Model, raw.RewoundFrom
+	m.Artifact, m.ExitCode, m.Source = raw.Artifact, raw.ExitCode, raw.Source
+	m.Content = ""
+	m.Parts = nil
 	if len(raw.Content) == 0 {
 		return nil
 	}
@@ -173,7 +203,7 @@ func (m *Message) UnmarshalJSON(data []byte) error {
 }
 
 // ToolCall is a model-requested tool invocation. DurationMs and ExitCode are
-// whip-internal execution bookkeeping (never sent to the provider): how long
+// ghg-internal execution bookkeeping (never sent to the provider): how long
 // the tool ran and how it finished, for a future /tools perf view.
 type ToolCall struct {
 	ID       string `json:"id"`
@@ -187,11 +217,32 @@ type ToolCall struct {
 }
 
 // stripAuthored returns a copy of msgs with the internal Authored marker and
-// SentAt timestamp cleared — they're whip-local bookkeeping (input-history
+// SentAt timestamp cleared — they're ghg-local bookkeeping (input-history
 // recall, the rewind picker) and must never reach the provider. It copies
 // because req.Messages typically aliases the caller's conversation slice,
 // which must keep the fields for storage/recall.
 func stripAuthored(msgs []Message) []Message {
+	return stripAuthoredWithBlocks(msgs, false)
+}
+
+// stripAuthoredPreserveBlocks clears ghg bookkeeping while retaining
+// provider-native blocks for the adapter that owns them. The generic OpenAI
+// serializer uses stripAuthored so one provider's opaque blocks never leak to
+// another provider.
+func stripAuthoredPreserveBlocks(msgs []Message) []Message {
+	out := stripAuthoredWithBlocks(msgs, true)
+	// Anthropic represents tool failures with tool_result.is_error. ExitCode
+	// is still ghg metadata and is consumed only while this adapter builds
+	// that block; it is never serialized directly.
+	for i := range out {
+		if msgs[i].Role == "tool" {
+			out[i].ExitCode = msgs[i].ExitCode
+		}
+	}
+	return out
+}
+
+func stripAuthoredWithBlocks(msgs []Message, preserveBlocks bool) []Message {
 	out := make([]Message, len(msgs))
 	copy(out, msgs)
 	for i := range out {
@@ -200,6 +251,13 @@ func stripAuthored(msgs []Message) []Message {
 		out[i].Usage = nil
 		out[i].Model = ""
 		out[i].RewoundFrom = ""
+		out[i].Artifact = nil
+		out[i].ExitCode = 0
+		out[i].Source = ""
+		out[i].StopReason = ""
+		if !preserveBlocks {
+			out[i].ProviderBlocks = nil
+		}
 		for j := range out[i].ToolCalls {
 			out[i].ToolCalls[j].DurationMs = 0
 			out[i].ToolCalls[j].ExitCode = 0
@@ -319,6 +377,13 @@ type Client struct {
 	BaseURL string
 	APIKey  string
 	HTTP    *http.Client
+	// Headers are static profile headers applied to every request. The map is
+	// copied by the backend factory so callers can safely reuse their config.
+	Headers map[string]string
+	// AuthKind controls how APIKey is sent: empty/bearer uses an Authorization
+	// Bearer header, header sends the key as-is, and none sends no key.
+	AuthKind   string
+	AuthHeader string
 	// MaxRetries caps retries of transient request failures. 0 uses
 	// DefaultMaxAttempts; 1 disables retries (a single attempt).
 	MaxRetries int
@@ -343,26 +408,121 @@ func New(baseURL, apiKey string) *Client {
 	}
 }
 
-// Request is a chat completions request.
+func (c *Client) httpClient() *http.Client {
+	if c.HTTP != nil {
+		return c.HTTP
+	}
+	return http.DefaultClient
+}
+
+func (c *Client) setRequestHeaders(hr *http.Request) error {
+	return applyRequestHeaders(hr, c.Headers, c.APIKey, c.AuthKind, c.AuthHeader)
+}
+
+// applyRequestHeaders applies the profile-derived static headers and auth
+// policy shared by the compiled wire adapters.
+func applyRequestHeaders(hr *http.Request, headers map[string]string, apiKey, authKind, authHeader string) error {
+	for name, value := range headers {
+		hr.Header.Set(name, value)
+	}
+	kind := authKind
+	if kind == "" {
+		kind = "bearer"
+	}
+	if kind == "none" || apiKey == "" {
+		if kind != "bearer" && kind != "header" && kind != "none" {
+			return fmt.Errorf("llm: unsupported auth kind %q", authKind)
+		}
+		return nil
+	}
+	header := authHeader
+	if header == "" {
+		header = "Authorization"
+	}
+	switch kind {
+	case "bearer":
+		hr.Header.Set(header, "Bearer "+apiKey)
+	case "header":
+		hr.Header.Set(header, apiKey)
+	default:
+		return fmt.Errorf("llm: unsupported auth kind %q", authKind)
+	}
+	return nil
+}
+
+// Request is a provider-neutral assistant request. Wire-only transport flags
+// such as stream and stream_options are added by the selected adapter.
 type Request struct {
 	Model           string    `json:"model"`
 	Messages        []Message `json:"messages"`
 	Tools           []Tool    `json:"tools,omitempty"`
 	MaxTokens       int       `json:"max_tokens,omitempty"`
 	ReasoningEffort string    `json:"reasoning_effort,omitempty"`
-	Stream          bool      `json:"stream"`
-	StreamOptions   *struct {
+	// ReasoningEnabled is an internal capability signal. Adapters lower it to
+	// their protocol-specific toggle field; it must never be sent verbatim.
+	ReasoningEnabled *bool `json:"-"`
+}
+
+// openAIRequest is the OpenAI wire shape for a provider-neutral Request.
+// Stream controls transport behavior and therefore belongs to the adapter,
+// not to the request passed between the agent and a Backend.
+type openAIRequest struct {
+	Model           string    `json:"model"`
+	Messages        []Message `json:"messages"`
+	Tools           []Tool    `json:"tools,omitempty"`
+	MaxTokens       int       `json:"max_tokens,omitempty"`
+	ReasoningEffort string    `json:"reasoning_effort,omitempty"`
+	Thinking        *struct {
+		Type string `json:"type"`
+	} `json:"thinking,omitempty"`
+	Stream        bool `json:"stream"`
+	StreamOptions *struct {
 		IncludeUsage bool `json:"include_usage"`
 	} `json:"stream_options,omitempty"`
 }
 
+func newOpenAIRequest(req Request, stream bool) openAIRequest {
+	messages := stripAuthored(req.Messages)
+	if stream {
+		messages = repairToolHistory(messages)
+	}
+	wire := openAIRequest{
+		Model:           req.Model,
+		Messages:        messages,
+		Tools:           req.Tools,
+		MaxTokens:       req.MaxTokens,
+		ReasoningEffort: req.ReasoningEffort,
+		Stream:          stream,
+	}
+	if req.ReasoningEnabled != nil {
+		typ := "disabled"
+		if *req.ReasoningEnabled {
+			typ = "enabled"
+		}
+		wire.Thinking = &struct {
+			Type string `json:"type"`
+		}{Type: typ}
+	}
+	if stream {
+		wire.StreamOptions = &struct {
+			IncludeUsage bool `json:"include_usage"`
+		}{IncludeUsage: true}
+	}
+	return wire
+}
+
 // Usage is the token accounting the provider reports for one request
 // (prompt = input, completion = output). CachedTokens counts the slice of
-// the prompt served from the provider's prompt cache. Providers that omit
-// usage leave all fields zero — the session totals just skip those calls.
+// the prompt served from the provider's prompt cache, while
+// CacheCreationTokens records provider-reported cache writes. Providers that
+// omit usage leave all fields zero — the session totals just skip those calls.
 type Usage struct {
 	PromptTokens     int `json:"prompt_tokens"`
 	CompletionTokens int `json:"completion_tokens"`
+	// CacheCreationTokens is provider-reported prompt-cache write usage. The
+	// existing Cached method continues to expose cache reads for cost/status
+	// accounting; providers without cache-write reporting leave this zero.
+	CacheCreationTokens int `json:"cache_creation_tokens,omitempty"`
 	// PromptTokensDetails nests the cache hit count (OpenAI-compatible).
 	PromptTokensDetails *struct {
 		CachedTokens int `json:"cached_tokens"`
@@ -501,6 +661,9 @@ var contextLimitMarkers = []string{
 	"context_length_exceeded", // Anthropic / OpenAI error.code
 	"maximum context length",  // OpenAI plain-text message
 	"prompt_too_long",         // Anthropic error.type variant
+	"prompt is too long",      // Anthropic invalid_request_error message
+	"context window",          // provider-friendly context overflow wording
+	"model_context_window_exceeded",
 }
 
 // IsContextLimit reports whether err is a context-length-exceeded style
@@ -556,7 +719,7 @@ func (mi ModelInfo) SupportsVision() bool {
 }
 
 // Pricing is the provider's per-token USD rates as decimal strings
-// (inference.net / OpenRouter shape). Nil Pricing on ModelInfo means the
+// (OpenAI-compatible catalog shape). Nil Pricing on ModelInfo means the
 // provider doesn't advertise prices.
 type Pricing struct {
 	Prompt         string `json:"prompt"`
@@ -593,8 +756,10 @@ func (c *Client) Models(ctx context.Context) ([]ModelInfo, error) {
 	if err != nil {
 		return nil, err
 	}
-	hr.Header.Set("Authorization", "Bearer "+c.APIKey)
-	resp, err := c.HTTP.Do(hr)
+	if err := c.setRequestHeaders(hr); err != nil {
+		return nil, err
+	}
+	resp, err := c.httpClient().Do(hr)
 	if err != nil {
 		return nil, err
 	}
@@ -612,6 +777,24 @@ func (c *Client) Models(ctx context.Context) ([]ModelInfo, error) {
 	return list.Data, nil
 }
 
+// Probe performs one authenticated chat-completions request with a real model
+// id and a one-token output bound. An empty modelID uses a stable OpenAI model
+// for profiles that do not expose a catalog.
+func (c *Client) Probe(ctx context.Context, modelID string) error {
+	body, err := json.Marshal(openAIRequest{
+		Model: probeModel(modelID, authProbeModel),
+		Messages: []Message{{
+			Role:    "user",
+			Content: "ghg authentication probe",
+		}},
+		MaxTokens: 1,
+	})
+	if err != nil {
+		return err
+	}
+	return authenticatedProbe(ctx, c.httpClient(), c.BaseURL+"/chat/completions", body, c.setRequestHeaders)
+}
+
 // Stream sends the request and invokes onText for each content delta and
 // onThink for each reasoning_content delta (both may be nil). It returns the
 // final assistant message (with any accumulated tool calls) plus the usage
@@ -624,24 +807,26 @@ func (c *Client) Models(ctx context.Context) ([]ModelInfo, error) {
 // message server-side; nothing in the request messages is mutated by a failed
 // attempt, so retrying is idempotent.
 func (c *Client) Stream(ctx context.Context, req Request, onText, onThink func(string)) (Message, Usage, error) {
-	req.Stream = true
-	req.StreamOptions = &struct {
-		IncludeUsage bool `json:"include_usage"`
-	}{IncludeUsage: true}
-	req.Messages = repairToolHistory(stripAuthored(req.Messages))
-	body, err := json.Marshal(req)
+	return c.stream(ctx, req, EventSink{OnText: onText, OnThink: onThink, OnRetry: c.OnRetry})
+}
+
+// stream is the request-local event-sink implementation used by the
+// provider-neutral OpenAI adapter. Unlike Client.OnRetry, the sink is not
+// shared mutable state and is safe for concurrent backend calls.
+func (c *Client) stream(ctx context.Context, req Request, sink EventSink) (Message, Usage, error) {
+	body, err := json.Marshal(newOpenAIRequest(req, true))
 	if err != nil {
 		return Message{}, Usage{}, err
 	}
 	var last error
 	for attempt := 1; attempt <= c.attempts(); attempt++ {
 		emitted := false // true once any visible delta reached the caller
-		wrapText, wrapThink := onText, onThink
-		if onText != nil {
-			wrapText = func(s string) { emitted = true; onText(s) }
+		wrapText, wrapThink := sink.OnText, sink.OnThink
+		if sink.OnText != nil {
+			wrapText = func(s string) { emitted = true; sink.OnText(s) }
 		}
-		if onThink != nil {
-			wrapThink = func(s string) { emitted = true; onThink(s) }
+		if sink.OnThink != nil {
+			wrapThink = func(s string) { emitted = true; sink.OnThink(s) }
 		}
 		msg, usage, err := c.streamOnce(ctx, body, wrapText, wrapThink)
 		if err == nil {
@@ -653,8 +838,8 @@ func (c *Client) Stream(ctx context.Context, req Request, onText, onThink func(s
 			break
 		}
 		delay := backoff(attempt)
-		if c.OnRetry != nil {
-			c.OnRetry(RetryEvent{Attempt: attempt, Max: c.attempts(), Delay: delay, Err: err})
+		if sink.OnRetry != nil {
+			sink.OnRetry(RetryEvent{Attempt: attempt, Max: c.attempts(), Delay: delay, Err: err})
 		}
 		if serr := sleep(ctx, delay); serr != nil {
 			return Message{}, Usage{}, serr
@@ -672,7 +857,9 @@ func (c *Client) streamOnce(ctx context.Context, body []byte, onText, onThink fu
 		return Message{}, Usage{}, err
 	}
 	hr.Header.Set("Content-Type", "application/json")
-	hr.Header.Set("Authorization", "Bearer "+c.APIKey)
+	if err := c.setRequestHeaders(hr); err != nil {
+		return Message{}, Usage{}, err
+	}
 	resp, err := c.HTTP.Do(hr)
 	if err != nil {
 		return Message{}, Usage{}, err
@@ -761,69 +948,89 @@ func (c *Client) streamOnce(ctx context.Context, body []byte, onText, onThink fu
 // summary call, where streaming would just add UI noise for a one-shot
 // synthesis.
 func (c *Client) Complete(ctx context.Context, req Request) (string, Usage, error) {
-	req.Stream = false
-	req.Messages = stripAuthored(req.Messages)
-	body, err := json.Marshal(req)
+	msg, usage, err := c.complete(ctx, req, EventSink{OnRetry: c.OnRetry})
+	return msg.TextContent(), usage, err
+}
+
+// complete is the request-local completion implementation used by the
+// provider-neutral OpenAI adapter.
+func (c *Client) complete(ctx context.Context, req Request, sink EventSink) (Message, Usage, error) {
+	body, err := json.Marshal(newOpenAIRequest(req, false))
 	if err != nil {
-		return "", Usage{}, err
+		return Message{}, Usage{}, err
 	}
 	var last error
 	for attempt := 1; attempt <= c.attempts(); attempt++ {
-		var text string
+		var msg Message
 		var usage Usage
-		text, usage, err = c.completeOnce(ctx, body)
+		msg, usage, err = c.completeOnce(ctx, body)
 		if err == nil {
-			return text, usage, nil
+			return msg, usage, nil
 		}
 		last = err
 		if !retryable(err) || attempt == c.attempts() {
 			break
 		}
 		delay := backoff(attempt)
-		if c.OnRetry != nil {
-			c.OnRetry(RetryEvent{Attempt: attempt, Max: c.attempts(), Delay: delay, Err: err})
+		if sink.OnRetry != nil {
+			sink.OnRetry(RetryEvent{Attempt: attempt, Max: c.attempts(), Delay: delay, Err: err})
 		}
 		if serr := sleep(ctx, delay); serr != nil {
-			return "", Usage{}, serr
+			return Message{}, Usage{}, serr
 		}
 	}
-	return "", Usage{}, last
+	return Message{}, Usage{}, last
 }
 
 // completeOnce performs one non-streaming request attempt.
-func (c *Client) completeOnce(ctx context.Context, body []byte) (string, Usage, error) {
+func (c *Client) completeOnce(ctx context.Context, body []byte) (Message, Usage, error) {
 	hr, err := http.NewRequestWithContext(ctx, "POST", c.BaseURL+"/chat/completions", bytes.NewReader(body))
 	if err != nil {
-		return "", Usage{}, err
+		return Message{}, Usage{}, err
 	}
 	hr.Header.Set("Content-Type", "application/json")
-	hr.Header.Set("Authorization", "Bearer "+c.APIKey)
+	if err := c.setRequestHeaders(hr); err != nil {
+		return Message{}, Usage{}, err
+	}
 	resp, err := c.HTTP.Do(hr)
 	if err != nil {
-		return "", Usage{}, err
+		return Message{}, Usage{}, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
-		return "", Usage{}, &HTTPError{Status: resp.Status, Body: strings.TrimSpace(string(b))}
+		return Message{}, Usage{}, &HTTPError{Status: resp.Status, Body: strings.TrimSpace(string(b))}
 	}
 	var out struct {
 		Choices []struct {
 			Message struct {
-				Content string `json:"content"`
+				Role      string     `json:"role"`
+				Content   string     `json:"content"`
+				ToolCalls []ToolCall `json:"tool_calls"`
 			} `json:"message"`
+			FinishReason string `json:"finish_reason"`
 		} `json:"choices"`
 		Usage *Usage `json:"usage"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return "", Usage{}, err
+		return Message{}, Usage{}, err
 	}
 	if len(out.Choices) == 0 {
-		return "", Usage{}, fmt.Errorf("no choices in completion response")
+		return Message{}, Usage{}, fmt.Errorf("no choices in completion response")
 	}
 	var usage Usage
 	if out.Usage != nil {
 		usage = *out.Usage
 	}
-	return out.Choices[0].Message.Content, usage, nil
+	choice := out.Choices[0]
+	role := choice.Message.Role
+	if role == "" {
+		role = "assistant"
+	}
+	return Message{
+		Role:       role,
+		Content:    choice.Message.Content,
+		ToolCalls:  choice.Message.ToolCalls,
+		StopReason: choice.FinishReason,
+	}, usage, nil
 }

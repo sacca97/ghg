@@ -47,6 +47,10 @@ func (p *namePrompt) maskedValue(v string) string {
 
 // forkCommand implements /fork [name].
 func (m *model) forkCommand(arg string) {
+	if m.agent == nil {
+		m.append(m.degradedProviderNote())
+		return
+	}
 	if m.store == nil {
 		m.append(errStyle.Render("no session store"))
 		return
@@ -85,6 +89,10 @@ func (m *model) openForkPrompt(cut int, picker bool, suggest ...string) {
 // fork copies the history through conversation index cut (inclusive) into a
 // new session and switches to it.
 func (m *model) fork(cut int, title string) {
+	if m.agent == nil {
+		m.append(m.degradedProviderNote())
+		return
+	}
 	title = strings.TrimSpace(title)
 	if title == "" {
 		m.append(errStyle.Render("fork needs a name"))

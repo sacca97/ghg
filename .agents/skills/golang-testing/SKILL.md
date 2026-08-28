@@ -1,6 +1,6 @@
 ---
 name: golang-testing
-description: "Production-ready Golang tests — table-driven, testify suites/mocks, parallel tests, fuzzing, fixtures, goleak leak detection, snapshots, coverage, integration tests. Use when writing/reviewing Go tests, choosing an approach, test CI, or debugging flakes. Testify: golang-stretchr-testify."
+description: "Production-ready Golang tests — table-driven, parallel tests, fuzzing, fixtures, goleak leak detection, snapshots, coverage, integration tests. Use when writing/reviewing Go tests, choosing an approach, test CI, or debugging flakes. This repo is stdlib-only: no testify."
 user-invocable: true
 license: MIT
 compatibility: Designed for Claude Code, Codex or similar harness, and for projects using Golang.
@@ -449,7 +449,7 @@ Many test best practices are enforced automatically by linters: `thelper`, `para
 
 ## Cross-References
 
-- -> See `samber/cc-skills-golang@golang-stretchr-testify` skill for detailed testify API (assert, require, mock, suite)
+- -> See `samber/cc-skills-golang@golang-stretchr-testify` (upstream skill, not installed here) skill for detailed testify API (assert, require, mock, suite)
 - -> See `samber/cc-skills-golang@golang-database` skill (testing.md) for database integration test patterns
 - -> See `samber/cc-skills-golang@golang-concurrency` skill for goroutine leak detection with goleak
 - -> See `samber/cc-skills-golang@golang-continuous-integration` skill for CI test configuration and GitHub Actions workflows

@@ -4,7 +4,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/context-labs/whip/internal/llm"
+	"github.com/sacca97/ghg/internal/llm"
 )
 
 func seeded(t *testing.T) (*Store, string) {

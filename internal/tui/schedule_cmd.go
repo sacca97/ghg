@@ -8,7 +8,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/context-labs/whip/internal/schedule"
+	"github.com/sacca97/ghg/internal/schedule"
 )
 
 // The wakeup channel: a 5s ticker checks the session's scheduled tasks and
@@ -30,7 +30,7 @@ func scheduleTick() tea.Cmd {
 // each tick; a busy agent defers the fire to the next one (grid stays
 // anchored, so a defer doesn't drift the schedule).
 func (m *model) fireDueSchedules() tea.Cmd {
-	if m.store == nil || m.sessionID == "" || m.busy {
+	if m.agent == nil || m.store == nil || m.sessionID == "" || m.busy {
 		return nil
 	}
 	now := time.Now()

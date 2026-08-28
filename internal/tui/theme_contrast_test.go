@@ -63,7 +63,7 @@ func sgrFG(s string) int {
 }
 
 // ansiLuminance approximates perceived luminance (0-1) of an xterm-256 color
-// index: 0-15 standard palette, 16-231 cube, 232-255 grayscale ramp.
+// index: 0-15 standard settings, 16-231 cube, 232-255 grayscale ramp.
 func ansiLuminance(n int) float64 {
 	if n < 0 {
 		return -1
@@ -179,16 +179,16 @@ func ansiColorToRGB(n int, light bool) color.RGBA {
 //	go test ./internal/tui/ -run TestThemeProbeImages
 func TestThemeProbeImages(t *testing.T) {
 	const cellW, cellH, cols = 8, 14, 72
-	sample := "I found the bug and **fixed** it.\n\n1. isolate `HOME` in tests\n2. add a `WHIP_HOME` override\n\n```go\nos.Setenv(\"WHIP_HOME\", dir)\n```\n\n| file | change |\n|---|---|\n| config.go | Dir() override |"
+	sample := "I found the bug and **fixed** it.\n\n1. isolate `HOME` in tests\n2. add a `GHG_HOME` override\n\n```go\nos.Setenv(\"GHG_HOME\", dir)\n```\n\n| file | change |\n|---|---|\n| config.go | Dir() override |"
 	for _, light := range []bool{false, true} {
 		SetLightTheme(light)
 		lines := strings.Split(renderMarkdown(sample, cols-4), "\n")
 		img := image.NewRGBA(image.Rect(0, 0, cols*cellW, (len(lines)+2)*cellH))
 		bg := color.RGBA{30, 30, 34, 255}
-		name := "/tmp/whip-theme-dark.png"
+		name := "/tmp/ghg-theme-dark.png"
 		if light {
 			bg = color.RGBA{255, 255, 255, 255}
-			name = "/tmp/whip-theme-light.png"
+			name = "/tmp/ghg-theme-light.png"
 		}
 		for y := 0; y < img.Bounds().Dy(); y++ {
 			for x := 0; x < img.Bounds().Dx(); x++ {

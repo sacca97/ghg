@@ -31,14 +31,21 @@ func completionTable() []cand {
 // execNow lists commands the menu runs immediately on enter (they act
 // sensibly with no arguments); others insert themselves for arguments.
 var execNow = map[string]bool{
-	"/clear": true, "/compact": true, "/computer-use": true, "/computer": true, "/context-doctor": true, "/effort": true, "/goal": true, "/goal-from-context": true, "/help": true,
-	"/mcp": true, "/model": true, "/mouse": true, "/pwd": true, "/quit": true, "/report": true, "/resume": true, "/tasks": true,
+	"/clear": true, "/compact": true, "/context-doctor": true, "/effort": true, "/goal": true, "/goal-from-context": true, "/help": true,
+	"/execute": true, "/mcp": true, "/model": true, "/mouse": true, "/pwd": true, "/quit": true, "/report": true, "/resume": true, "/tasks": true,
 }
 
 // completions splits val into an untouched head and candidates for its last
 // token: slash commands, /model or /effort arguments, $skills, or filesystem
 // paths. nil efforts uses the default /effort candidates.
 func completions(val string, models, providers, skillCands, efforts []cand) (head string, cands []cand) {
+	return completionsWithAuth(val, models, providers, providers, skillCands, efforts)
+}
+
+// completionsWithAuth is the model-aware completion path used by the live
+// TUI. Keeping the original completions signature preserves the small,
+// provider-agnostic test seam while auth candidates come from profile IDs.
+func completionsWithAuth(val string, models, providers, authProviders, skillCands, efforts []cand) (head string, cands []cand) {
 	if efforts == nil {
 		efforts = effortCands
 	}
@@ -48,6 +55,8 @@ func completions(val string, models, providers, skillCands, efforts []cand) (hea
 	switch {
 	case strings.HasPrefix(val, "/") && len(fields) == 0:
 		cands = filterPrefix(commands, token)
+	case len(fields) == 1 && fields[0] == "/auth":
+		cands = filterPrefix(authProviders, token)
 	case len(fields) == 1 && fields[0] == "/model":
 		cands = filterFuzzy(append([]cand{{"refresh", "refetch provider model catalogs"}}, models...), token)
 	case len(fields) == 2 && fields[0] == "/model" && fields[1] != "refresh":

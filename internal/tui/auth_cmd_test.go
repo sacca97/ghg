@@ -2,32 +2,49 @@ package tui
 
 import (
 	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/context-labs/whip/internal/agent"
-	"github.com/context-labs/whip/internal/config"
-	"github.com/context-labs/whip/internal/llm"
+	"github.com/sacca97/ghg/internal/agent"
+	"github.com/sacca97/ghg/internal/auth"
+	"github.com/sacca97/ghg/internal/config"
+	"github.com/sacca97/ghg/internal/llm"
+	"github.com/sacca97/ghg/internal/provider"
 )
 
 func authTestModel(t *testing.T) *model {
 	t.Helper()
-	t.Setenv("WHIP_HOME", t.TempDir())
+	home := t.TempDir()
+	t.Setenv("GHG_HOME", home)
 	cfg, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	profiles, err := provider.Load(provider.LoadOptions{UserDir: filepath.Join(home, "providers")})
 	if err != nil {
 		t.Fatal(err)
 	}
 	m := &model{
 		input:    newInput(),
 		cfg:      cfg,
+		profiles: profiles,
 		queueSel: -1,
 	}
 	m.width = 80
 	m.input.SetWidth(m.width - 2)
 	return m
+}
+
+func authResolved(t *testing.T, m *model, id string) provider.Resolved {
+	t.Helper()
+	resolved, err := auth.ResolveProfile(m.profiles, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resolved
 }
 
 // transcriptText concatenates every appended block's text for assertions.
@@ -39,114 +56,334 @@ func (m *model) transcriptText() string {
 	return sb.String()
 }
 
-func TestAuthCommandUsageAndUnknownProvider(t *testing.T) {
+func TestAuthCommandListsProfilesAndStatus(t *testing.T) {
 	m := authTestModel(t)
-	m.authCommand(nil)
-	m.authCommand([]string{"anthropic"})
-	out := m.transcriptText()
-	if !strings.Contains(out, "usage: /auth openrouter") {
-		t.Errorf("bare /auth should print usage:\n%s", out)
+	resolved := authResolved(t, m, "generic-openai")
+	if err := m.cfg.UpsertProviderKey("generic-openai", resolved, "sk-generic", false); err != nil {
+		t.Fatal(err)
 	}
-	if !strings.Contains(out, "unknown provider anthropic") {
-		t.Errorf("unknown provider should be rejected:\n%s", out)
+
+	m.authCommand(nil)
+	out := m.transcriptText()
+	if !strings.Contains(out, "provider profiles:") || !strings.Contains(out, "anthropic") {
+		t.Fatalf("bare /auth should list profile IDs:\n%s", out)
+	}
+	if !strings.Contains(out, "generic-openai") || !strings.Contains(out, "configured") {
+		t.Fatalf("configured profile should be marked:\n%s", out)
+	}
+	if strings.Contains(out, "sk-generic") {
+		t.Fatal("profile listing leaked a key")
+	}
+}
+
+func TestAuthCommandUnknownProviderListsAvailable(t *testing.T) {
+	m := authTestModel(t)
+	m.authCommand([]string{"not-a-profile"})
+	out := m.transcriptText()
+	if !strings.Contains(out, "unknown provider") || !strings.Contains(out, "anthropic") {
+		t.Fatalf("unknown profile should list available IDs:\n%s", out)
+	}
+}
+
+func TestAuthCommandRejectsAuthNone(t *testing.T) {
+	m := authTestModel(t)
+	resolved := authResolved(t, m, "generic-openai")
+	resolved.Auth.Kind = provider.AuthNone
+	m.applyAuthResult(authResultMsg{name: "generic-openai", profile: resolved, key: "sk-nope"})
+	if !strings.Contains(m.transcriptText(), "takes no API key") {
+		t.Fatalf("auth:none result should be refused:\n%s", m.transcriptText())
 	}
 }
 
 func TestAuthCommandBareOpensMaskedPrompt(t *testing.T) {
 	m := authTestModel(t)
-	m.authCommand([]string{"openrouter"})
+	m.authCommand([]string{"anthropic"})
 	if m.namePrompt == nil {
-		t.Fatal("bare /auth openrouter should open the key prompt")
+		t.Fatal("bare /auth <id> should open the key prompt")
 	}
 	if !m.namePrompt.mask {
 		t.Error("key prompt must mask input")
 	}
-	if got := m.namePrompt.maskedValue("sk-or-secret"); strings.Contains(got, "secret") {
+	if !strings.Contains(m.namePrompt.label, "Anthropic") {
+		t.Errorf("prompt should use profile display name: %q", m.namePrompt.label)
+	}
+	if got := m.namePrompt.maskedValue("sk-anthropic-secret"); strings.Contains(got, "secret") {
 		t.Errorf("masked render leaked the key: %q", got)
 	}
-	if got := m.namePrompt.maskedValue("sk-or-secret"); got != strings.Repeat("•", len("sk-or-secret")) {
-		t.Errorf("mask should be one bullet per rune, got %q", got)
-	}
 
-	// esc cancels: prompt closes, nothing was configured.
 	m.closeNamePrompt()
 	if m.namePrompt != nil {
 		t.Error("esc should close the prompt")
 	}
-	if m.cfg.OpenRouterConfigured() {
-		t.Error("cancelled prompt must not configure the provider")
+	if m.cfg.AnyProviderConfigured() {
+		t.Error("cancelled prompt must not configure a provider")
 	}
 }
 
-func TestAuthResultGoodKeyConfiguresAndRefreshes(t *testing.T) {
+func TestAuthResultGoodKeyConfiguresAndSeedsOnlyOnLivePath(t *testing.T) {
 	m := authTestModel(t)
-
-	// prog == nil, so applyAuthResult is driven directly (the goroutine
-	// dispatch in authOpenRouter is a no-op without a running program).
+	resolved := authResolved(t, m, "generic-openai")
 	m.applyAuthResult(authResultMsg{
-		key:    "sk-or-good",
-		models: []llm.ModelInfo{{ID: "openai/gpt-5", ContextLength: 400000, InputModalities: []string{"text", "image"}}},
+		name:      "generic-openai",
+		profile:   resolved,
+		key:       "sk-generic-good",
+		validated: true,
+		models:    []llm.ModelInfo{{ID: "gpt-test", ContextLength: 128000, InputModalities: []string{"text", "image"}}},
 	})
 
-	if !m.cfg.OpenRouterConfigured() {
+	p, ok := m.cfg.Providers["generic-openai"]
+	if !ok {
 		t.Fatal("provider should be configured after a good auth")
 	}
-	if got := m.cfg.Providers["openrouter"].APIKey; got != "sk-or-good" {
-		t.Errorf("literal key not stored: %q", got)
+	if p.APIKey != "sk-generic-good" || p.Profile != "generic-openai" {
+		t.Errorf("literal profile key not stored: %+v", p)
 	}
-	// Catalog seeding is a live-runtime side effect (guarded on m.prog); the
-	// dispatch-level test asserts the config + transcript, not the cache.
 	if cats := config.LoadCatalogs(); len(cats) != 0 {
-		t.Error("dispatch-level auth must not write the on-disk catalog cache")
+		t.Error("dispatch-level auth must not write the live catalog cache")
 	}
 	out := m.transcriptText()
-	if !strings.Contains(out, "openrouter configured") {
+	if !strings.Contains(out, "generic-openai configured") {
 		t.Errorf("success should be reported:\n%s", out)
 	}
-	if strings.Contains(out, "sk-or-good") {
+	if strings.Contains(out, "sk-generic-good") {
 		t.Error("the key must never appear in the transcript")
+	}
+}
+
+func TestAuthResultColdStartUsesFastRole(t *testing.T) {
+	m := authTestModel(t)
+	resolved := authResolved(t, m, "generic-openai")
+	legacyDefault := m.cfg.DefaultModel
+	m.cfg.Models = map[string]config.Model{
+		"fast-model": {Providers: []string{"generic-openai"}, Context: 128000},
+	}
+	m.cfg.Roles = map[string]config.RoleConfig{
+		config.RoleFast: {Provider: "generic-openai", Model: "fast-model"},
+	}
+
+	m.applyAuthResult(authResultMsg{
+		name:      "generic-openai",
+		profile:   resolved,
+		key:       "sk-fast",
+		validated: true,
+	})
+
+	if m.agent == nil {
+		t.Fatal("auth should promote a cold TUI to an agent")
+	}
+	if m.agent.Role != config.RoleFast || m.modelName != "fast-model" || m.provName != "generic-openai" {
+		t.Fatalf("cold auth route = role %q, model %q, provider %q; want fast-model @ generic-openai", m.agent.Role, m.modelName, m.provName)
+	}
+	if m.cfg.DefaultModel != legacyDefault {
+		t.Fatalf("role-driven auth should not replace legacy defaultModel, got %q (want %q)", m.cfg.DefaultModel, legacyDefault)
 	}
 }
 
 func TestAuthResultBadKeyWritesNothing(t *testing.T) {
 	m := authTestModel(t)
-	m.applyAuthResult(authResultMsg{err: errors.New("401 invalid key")})
+	m.applyAuthResult(authResultMsg{
+		name: "generic-openai",
+		err:  errors.New("provider \"generic-openai\" validation failed: 401 invalid key"),
+	})
 
-	if m.cfg.OpenRouterConfigured() {
-		t.Error("a rejected key must not configure the provider")
+	if m.cfg.AnyProviderConfigured() {
+		t.Error("a rejected key must not configure a provider")
 	}
 	if cats := config.LoadCatalogs(); len(cats) != 0 {
 		t.Error("a rejected key must not write the catalog")
 	}
-	out := m.transcriptText()
-	if !strings.Contains(out, "rejected") {
-		t.Errorf("failure should be reported:\n%s", out)
+	if !strings.Contains(m.transcriptText(), "rejected") {
+		t.Errorf("failure should be reported:\n%s", m.transcriptText())
+	}
+}
+
+func TestAuthResultUnvalidatedRequiresConfirmation(t *testing.T) {
+	m := authTestModel(t)
+	resolved := authResolved(t, m, "generic-openai")
+	m.applyAuthResult(authResultMsg{
+		name:        "generic-openai",
+		profile:     resolved,
+		key:         "sk-unvalidated",
+		unvalidated: true,
+	})
+	if m.cfg.AnyProviderConfigured() {
+		t.Fatal("unvalidated key must not be saved before confirmation")
+	}
+	if !strings.Contains(m.transcriptText(), "key not stored") {
+		t.Fatalf("nil-program test should decline unvalidated storage:\n%s", m.transcriptText())
+	}
+
+	m.applyAuthResult(authResultMsg{
+		name:        "generic-openai",
+		profile:     resolved,
+		key:         "sk-unvalidated",
+		unvalidated: true,
+		confirmed:   true,
+	})
+	if got := m.cfg.Providers["generic-openai"].APIKey; got != "sk-unvalidated" {
+		t.Fatalf("confirmed unvalidated key not saved: %q", got)
 	}
 }
 
 func TestAuthResultRekeysLiveSession(t *testing.T) {
 	m := authTestModel(t)
-	m.cfg.UpsertOpenRouter("sk-or-old", false)
-	if err := m.cfg.Save(); err != nil {
+	resolved := authResolved(t, m, "generic-openai")
+	if err := m.cfg.UpsertProviderKey("generic-openai", resolved, "sk-generic-old", false); err != nil {
 		t.Fatal(err)
 	}
-	// Session currently routed through openrouter with a config-entry model.
-	m.cfg.Models["gpt-5"] = config.Model{Providers: []string{"openrouter"}, ID: "openai/gpt-5", Context: 400000}
-	m.modelName, m.provName = "gpt-5", "openrouter"
-	ag, _, _, err := buildAgent(m.cfg, m.modelName, m.provName, "sys")
+	m.cfg.Models["gpt-test"] = config.Model{Providers: []string{"generic-openai"}, ID: "gpt-test", Context: 128000}
+	m.modelName, m.provName = "gpt-test", "generic-openai"
+	ag, _, _, err := buildAgentWithProfiles(m.cfg, m.modelName, m.provName, "sys", m.profiles)
 	if err != nil {
 		t.Fatal(err)
 	}
 	m.agent = ag
 	m.agent.Messages = append(m.agent.Messages, llm.Message{Role: "user", Content: "hi", Authored: true})
 
-	m.applyAuthResult(authResultMsg{key: "sk-or-new", models: []llm.ModelInfo{{ID: "openai/gpt-5", ContextLength: 400000}}})
+	m.applyAuthResult(authResultMsg{
+		name:      "generic-openai",
+		profile:   resolved,
+		key:       "sk-generic-new",
+		validated: true,
+	})
 
-	if m.agent.Client.APIKey != "sk-or-new" {
-		t.Error("live agent should be rebuilt with the new key")
+	if got := m.cfg.Providers["generic-openai"].Key(); got != "sk-generic-new" {
+		t.Errorf("live provider should be rebuilt with the new key, got %q", got)
 	}
 	if len(m.agent.Messages) != 2 || m.agent.Messages[1].Content != "hi" {
 		t.Error("history must survive the hot-swap")
+	}
+}
+
+func TestBuildAgentWithProfilesOptionalDegradesOnlyForMissingCredentials(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("GHG_HOME", t.TempDir())
+	t.Setenv("INFERENCE_API_KEY", "")
+	profiles, err := provider.Load(provider.LoadOptions{UserDir: filepath.Join(t.TempDir(), "providers")})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := config.Default()
+	ag, modelName, providerName, err := buildAgentWithProfilesOptional(cfg, "", "", "sys", profiles)
+	if err != nil {
+		t.Fatalf("missing key should be a degraded start: %v", err)
+	}
+	if ag != nil || modelName != cfg.DefaultModel || providerName != "inference" {
+		t.Fatalf("unexpected degraded route: agent=%v model=%q provider=%q", ag, modelName, providerName)
+	}
+
+	if _, _, _, err := buildAgentWithProfilesOptional(cfg, "does-not-exist", "", "sys", profiles); err == nil {
+		t.Fatal("an explicit unknown model must remain a hard error")
+	}
+
+	const missingEnv = "GHG_TEST_MISSING_PROVIDER_KEY"
+	t.Setenv(missingEnv, "")
+	broken := &config.Config{
+		DefaultModel: "m",
+		Providers: map[string]config.Provider{
+			"p": {Profile: "generic-openai", BaseURL: "https://example.test/v1", API: provider.ProtocolOpenAIChatCompletions, APIKey: "$" + missingEnv},
+		},
+		Models: map[string]config.Model{
+			"m": {Providers: []string{"p"}, ID: "m"},
+		},
+	}
+	if _, _, _, err := buildAgentWithProfilesOptional(broken, "", "", "sys", profiles); err == nil || !strings.Contains(err.Error(), missingEnv) {
+		t.Fatalf("broken secret reference must remain a hard error naming the reference: %v", err)
+	}
+}
+
+func TestColdTUICommandsRemainSafeAndActionable(t *testing.T) {
+	m := authTestModel(t)
+	m.agent = nil
+	m.modelName = m.cfg.DefaultModel
+	m.provName = "inference"
+	m.width, m.height = 80, 24
+
+	note := m.degradedProviderNote()
+	if note != "No provider has been configured — run /auth" {
+		t.Fatalf("degraded note should be short and actionable: %q", note)
+	}
+	m.startupReport()
+	if !strings.Contains(m.transcriptText(), note) {
+		t.Fatalf("startup should report the degraded path:\n%s", m.transcriptText())
+	}
+
+	for _, command := range []string{
+		"/help",
+		"/auth",
+		"/model",
+		"/context-doctor",
+		"/goal",
+		"/goal draft",
+		"/goal clear",
+		"/goal-from-context",
+		"/effort low",
+		"/compact",
+		"/compact retry",
+		"/compact log",
+		"/tasks",
+		"/tasks missing",
+		"/fork",
+		"/resume missing",
+		"/clear",
+	} {
+		m.command(command)
+		if m.busy {
+			t.Fatalf("cold command %q unexpectedly started work", command)
+		}
+	}
+
+	m.openPalette()
+	if got := m.View(); got == "" {
+		t.Fatal("cold settings should render")
+	}
+	m.settings = nil
+	m.openPaletteOn("reasoning effort")
+	if got := m.View(); got == "" {
+		t.Fatal("cold reasoning panel should render")
+	}
+	m.paletteKey(tea.KeyMsg{Type: tea.KeyEnter})
+
+	m.submit("a turn without credentials")
+	if m.busy {
+		t.Fatal("cold submission must not set busy")
+	}
+	if !strings.Contains(m.transcriptText(), "No provider has been configured — run /auth") {
+		t.Fatalf("cold submission should repeat the onboarding note:\n%s", m.transcriptText())
+	}
+	if _, cmd := m.Update(tea.WindowSizeMsg{Width: 80, Height: 24}); cmd != nil {
+		// Window sizing is synchronous for a headless model; a non-nil command
+		// would still be harmless, but the assertion keeps this path explicit.
+		_ = cmd
+	}
+	if got := m.View(); got == "" {
+		t.Fatal("cold TUI should remain renderable")
+	}
+}
+
+func TestAuthResultPromotesColdTUIToFirstAgent(t *testing.T) {
+	m := authTestModel(t)
+	m.agent = nil
+	m.modelName = m.cfg.DefaultModel
+	m.provName = "inference"
+	resolved := authResolved(t, m, "generic-openai")
+
+	m.applyAuthResult(authResultMsg{
+		name:      "generic-openai",
+		profile:   resolved,
+		key:       "sk-first-agent",
+		validated: true,
+	})
+	if m.agent == nil {
+		t.Fatal("successful auth should create the first live agent")
+	}
+	if m.provName != "generic-openai" || m.modelName != m.cfg.DefaultModel {
+		t.Fatalf("first agent should use the authenticated route: %q @ %q", m.modelName, m.provName)
+	}
+	if m.cfg.DefaultProvider != "generic-openai" {
+		t.Fatalf("first auth should make the selected provider the next-start route, got %q", m.cfg.DefaultProvider)
 	}
 }
 
@@ -156,47 +393,43 @@ func TestAuthResultRekeysLiveSession(t *testing.T) {
 func TestAuthKeyNeverLeaksIntoHistoryOrQueue(t *testing.T) {
 	m := authTestModel(t)
 
-	// Idle submit of an inline key: runs the command, skips history.
-	m.input.SetValue("/auth openrouter sk-or-idle")
+	m.input.SetValue("/auth generic-openai sk-generic-idle")
 	tm, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	m = tm.(*model)
 	for _, h := range m.hist {
-		if strings.Contains(h, "sk-or-idle") {
+		if strings.Contains(h, "sk-generic-idle") {
 			t.Fatalf("idle submit recorded a key in history: %v", m.hist)
 		}
 	}
 
-	// Busy submit: /auth must run immediately (busyCmd), not queue the key
-	// as a message for the model, and skip history too.
 	m.busy = true
-	m.input.SetValue("/auth openrouter sk-or-busy")
+	m.input.SetValue("/auth generic-openai sk-generic-busy")
 	tm, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	m = tm.(*model)
 	m.busy = false
 	for _, q := range m.queue {
-		if strings.Contains(q, "sk-or-busy") {
+		if strings.Contains(q, "sk-generic-busy") {
 			t.Fatalf("busy submit queued a key as a chat message: %v", m.queue)
 		}
 	}
 	for _, h := range m.hist {
-		if strings.Contains(h, "sk-or-busy") {
+		if strings.Contains(h, "sk-generic-busy") {
 			t.Fatalf("busy submit recorded a key in history: %v", m.hist)
 		}
 	}
-	if !busyCmd("/auth openrouter sk-or-x") {
+	if !busyCmd("/auth generic-openai sk-generic-x") {
 		t.Error("/auth must be a busyCmd — queueing an inline key sends it to the model")
 	}
 
-	// Masked prompt: esc cancels without the esc-esc draft stash recording.
-	m.authCommand([]string{"openrouter"})
-	m.input.SetValue("sk-or-masked")
+	m.authCommand([]string{"anthropic"})
+	m.input.SetValue("sk-anthropic-masked")
 	tm, _ = m.Update(tea.KeyMsg{Type: tea.KeyEsc})
 	m = tm.(*model)
 	if m.namePrompt != nil {
 		t.Fatal("esc should close the masked prompt")
 	}
 	for _, h := range m.hist {
-		if strings.Contains(h, "sk-or-masked") {
+		if strings.Contains(h, "sk-anthropic-masked") {
 			t.Fatalf("masked prompt cancel recorded a key in history: %v", m.hist)
 		}
 	}
@@ -205,15 +438,38 @@ func TestAuthKeyNeverLeaksIntoHistoryOrQueue(t *testing.T) {
 	}
 }
 
+func TestAuthCompletionUsesProfileIDs(t *testing.T) {
+	m := authTestModel(t)
+	_, cands := completionsWithAuth("/auth an", nil, nil, m.authProviderCands(), nil, nil)
+	if len(cands) != 1 || cands[0].Text != "anthropic" {
+		t.Fatalf("auth completion should use profile IDs: %+v", cands)
+	}
+}
+
+// The masked render shows the bullet mask with the textarea's prompt, never
+// the key.
+func TestAuthMaskedRender(t *testing.T) {
+	m := authTestModel(t)
+	m.agent = &agent.Agent{}
+	m.authCommand([]string{"anthropic"})
+	m.input.SetValue("sk-anthropic-hidden")
+	out := m.View()
+	if strings.Contains(out, "sk-anthropic-hidden") {
+		t.Fatalf("masked prompt leaked the key into the view")
+	}
+	if !strings.Contains(out, "┃ "+strings.Repeat("•", len("sk-anthropic-hidden"))) {
+		t.Errorf("masked prompt should render bullets after the prompt:\n%s", out)
+	}
+}
+
 // catalogLites carries context/output caps, reasoning efforts, vision
-// modalities, and pricing from the provider's /models into the cache shape;
-// a nil Pricing stays a zero-rated entry (callers hide $0 costs).
+// modalities, and pricing from the provider's /models into the cache shape.
 func TestCatalogLites(t *testing.T) {
 	lites := catalogLites([]llm.ModelInfo{
-		{ID: "openai/gpt-5", ContextLength: 400000, MaxCompletionTokens: 128000,
+		{ID: "gpt-test", ContextLength: 400000, MaxCompletionTokens: 128000,
 			ReasoningEfforts: []string{"low", "high"}, InputModalities: []string{"text", "image"},
 			Pricing: &llm.Pricing{Prompt: "0.00000125", Completion: "0.00001", InputCacheRead: "0.000000125"}},
-		{ID: "meta/llama-4", ContextLength: 131072}, // no pricing, text-only
+		{ID: "text-only", ContextLength: 131072},
 	})
 	if len(lites) != 2 {
 		t.Fatalf("want 2 lites, got %d", len(lites))
@@ -230,86 +486,5 @@ func TestCatalogLites(t *testing.T) {
 	}
 	if b := lites[1]; b.InPrice != 0 || b.OutPrice != 0 || len(b.InputModalities) != 0 {
 		t.Errorf("pricing-less model should stay zero-rated: %+v", b)
-	}
-}
-
-// The masked render shows the bullet mask with the textarea's prompt, never
-// the key.
-func TestAuthMaskedRender(t *testing.T) {
-	m := authTestModel(t)
-	m.agent = &agent.Agent{} // View reads usage off the agent
-	m.authCommand([]string{"openrouter"})
-	m.input.SetValue("sk-or-hidden")
-	out := m.View()
-	if strings.Contains(out, "sk-or-hidden") {
-		t.Fatalf("masked prompt leaked the key into the view")
-	}
-	if !strings.Contains(out, "┃ "+strings.Repeat("•", len("sk-or-hidden"))) {
-		t.Errorf("masked prompt should render bullets after the prompt:\n%s", out)
-	}
-}
-
-// The user-visible promise: after auth, the openrouter provider entry plus
-// its seeded catalog make every advertised model appear in the /model picker
-// with its capabilities — no per-model config. (The HTTP fetch/validate half
-// is covered with an httptest server in cmd/whip; this pins the TUI half:
-// applyAuthResult's seeded state flowing into the picker.)
-func TestAuthMakesCatalogModelsPickable(t *testing.T) {
-	m := authTestModel(t)
-	m.cfg.UpsertOpenRouter("sk-or-live", false)
-	if err := m.cfg.Save(); err != nil {
-		t.Fatal(err)
-	}
-	// What applyAuthResult seeds on the live path (guarded on m.prog).
-	if err := config.SaveCatalogs(map[string]config.Catalog{
-		"openrouter": {
-			FetchedAt: time.Now(),
-			BaseURL:   config.OpenRouterBaseURL,
-			Models: catalogLites([]llm.ModelInfo{
-				{ID: "openai/gpt-5", ContextLength: 400000, InputModalities: []string{"text", "image"}},
-				{ID: "anthropic/claude-sonnet-4.5", ContextLength: 1000000, InputModalities: []string{"text"}},
-			}),
-		},
-	}); err != nil {
-		t.Fatal(err)
-	}
-
-	m.openModelPicker()
-	if m.mpicker == nil {
-		t.Fatal("picker should open on a non-empty catalog")
-	}
-	byModel := map[string]modelItem{}
-	for _, it := range m.mpicker.items {
-		byModel[it.model] = it
-	}
-	gpt, ok := byModel["openai/gpt-5"]
-	if !ok {
-		names := make([]string, 0, len(m.mpicker.items))
-		for _, it := range m.mpicker.items {
-			names = append(names, it.model+"@"+it.provider)
-		}
-		t.Fatalf("openai/gpt-5 missing from picker; items: %v", names)
-	}
-	if gpt.provider != "openrouter" || !gpt.fromCatalog {
-		t.Errorf("catalog model should route to openrouter and be marked (new): %+v", gpt)
-	}
-	if _, ok := byModel["anthropic/claude-sonnet-4.5"]; !ok {
-		t.Error("every advertised catalog model should be pickable, not just one")
-	}
-
-	// And the picked model resolves + builds an agent through the catalog —
-	// the actual switch a user makes next.
-	ag, name, prov, err := buildAgent(m.cfg, "openai/gpt-5", "openrouter", "sys")
-	if err != nil {
-		t.Fatalf("catalog model should build an agent: %v", err)
-	}
-	if name != "openai/gpt-5" || prov != "openrouter" {
-		t.Errorf("route should stay on openrouter: %q @ %q", name, prov)
-	}
-	if ag.ContextLimit != 400000 {
-		t.Errorf("context window should come from the catalog: %d", ag.ContextLimit)
-	}
-	if ag.Client.APIKey != "sk-or-live" {
-		t.Error("agent should carry the authed key")
 	}
 }

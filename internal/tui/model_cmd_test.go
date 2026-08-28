@@ -5,8 +5,8 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/context-labs/whip/internal/agent"
-	"github.com/context-labs/whip/internal/config"
+	"github.com/sacca97/ghg/internal/agent"
+	"github.com/sacca97/ghg/internal/config"
 )
 
 func modelCmdModel() *model {
@@ -49,33 +49,41 @@ func TestModelBareEnterOpensPicker(t *testing.T) {
 	}
 	tm, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	m = tm.(*model)
-	if m.mpicker == nil {
-		t.Fatalf("/model + enter should open the model picker; input=%q LineCount=%d", m.input.Value(), m.input.LineCount())
+	if m.settings == nil || m.settings.top() == nil || m.settings.top().kind != panelRole {
+		t.Fatalf("/model + enter should open the role picker; input=%q LineCount=%d", m.input.Value(), m.input.LineCount())
 	}
 	if m.input.Value() != "" || m.input.LineCount() != 1 {
 		t.Errorf("enter must not leave a newline in the input: value=%q LineCount=%d", m.input.Value(), m.input.LineCount())
 	}
 }
 
-// The ctrl+p palette's first suggestion is Model; enter drills into its
-// interactive panel without leaving the palette.
+// The ctrl+p settings's first suggestion is Model; enter drills into its
+// interactive panel without leaving the settings.
 func TestModelPaletteEnterOpensPicker(t *testing.T) {
 	m := modelCmdModel()
 	tm, _ := m.key(tea.KeyMsg{Type: tea.KeyCtrlP})
 	m = tm.(*model)
-	if m.palette == nil {
-		t.Fatal("ctrl+p should open the command palette")
+	if m.settings == nil {
+		t.Fatal("ctrl+p should open the command settings")
 	}
-	if len(m.palette.items) == 0 || m.palette.items[0].title != "Model" {
-		t.Fatalf("first suggestion should be Model, got %+v", m.palette.items)
+	if len(m.settings.items) == 0 || m.settings.items[0].title != "Model" {
+		t.Fatalf("first suggestion should be Model, got %+v", m.settings.items)
 	}
 	tm, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	m = tm.(*model)
-	pp := m.palette.top()
-	if pp == nil || pp.kind != panelModel {
-		t.Fatalf("palette Model + enter should push the model panel; input=%q", m.input.Value())
+	pp := m.settings.top()
+	if pp == nil || pp.kind != panelRole {
+		t.Fatalf("settings Model + enter should push the model-role panel; input=%q", m.input.Value())
 	}
-	if len(pp.items) == 0 {
+	if len(pp.list) != 4 || pp.list[1] != "plan" {
+		t.Fatalf("model-role panel should list default, plan, fast, tiny: %+v", pp.list)
+	}
+	tm, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = tm.(*model)
+	if pp := m.settings.top(); pp == nil || pp.kind != panelModel {
+		t.Fatal("selecting a role should open its model panel")
+	}
+	if len(m.settings.top().items) == 0 {
 		t.Fatal("model panel should list the configured routes")
 	}
 }

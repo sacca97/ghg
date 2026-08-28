@@ -64,15 +64,25 @@ attributable to one path. Reads don't lock. The why and the Go idiom:
 
 Context is a budget, and the loop spends it deliberately:
 
-- **Proactive** — `maybeCompact` runs before each request once the estimated
-  token count crosses a percent of the advertised window (default 50%,
-  `compactPct` in config, slidable ←/→ in the ctrl+p palette).
+- **Proactive** — `maybeCompact` runs before each request once the latest
+  successful request's provider-reported context size (`PromptTokens +
+  CompletionTokens`) crosses a percent of the advertised window (default 50%,
+  `compactPct` in config, slidable ←/→ in the ctrl+p settings). It is zero
+  until the first successful response.
 - **Reactive** — a provider context-limit error triggers one compaction +
   retry.
 
 `compact()` keeps the system prompt plus a recent tail, and is
 **orphan-safe**: a tail that begins with a `tool`-role message walks back to
 its owning assistant message, so no tool result references an erased call ID.
+
+Tool results are structured before this boundary. The summary ledger records
+bounded arguments/output, exit status, duration, and artifact metadata; the
+derived prompt carries a metadata-only manifest for references cited by the
+summary or kept tail. A recent result that exceeds the remaining token budget
+is shrunk deterministically without dropping its artifact id, while the raw
+SQLite message log remains available for resume, retry, audit, and
+`artifact_read`.
 
 ```mermaid
 flowchart TB

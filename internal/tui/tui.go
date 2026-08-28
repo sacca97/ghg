@@ -1,4 +1,4 @@
-// Package tui is whip's interactive bubbletea session (fullscreen alt-screen).
+// Package tui is ghg's interactive Bubble Tea session.
 package tui
 
 import (
@@ -7,11 +7,13 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/charmbracelet/bubbles/key"
@@ -21,21 +23,22 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
-	"github.com/context-labs/whip/internal/agent"
-	"github.com/context-labs/whip/internal/browser"
-	"github.com/context-labs/whip/internal/computer"
-	"github.com/context-labs/whip/internal/config"
-	"github.com/context-labs/whip/internal/llm"
-	"github.com/context-labs/whip/internal/lsp"
-	"github.com/context-labs/whip/internal/mcp"
-	"github.com/context-labs/whip/internal/memory"
-	"github.com/context-labs/whip/internal/session"
-	"github.com/context-labs/whip/internal/skills"
-	"github.com/context-labs/whip/internal/tools"
-	"github.com/context-labs/whip/internal/tools/bashrun"
+	"github.com/sacca97/ghg/internal/agent"
+	"github.com/sacca97/ghg/internal/artifact"
+	"github.com/sacca97/ghg/internal/config"
+	"github.com/sacca97/ghg/internal/llm"
+	"github.com/sacca97/ghg/internal/lsp"
+	"github.com/sacca97/ghg/internal/mcp"
+	"github.com/sacca97/ghg/internal/memory"
+	"github.com/sacca97/ghg/internal/provider"
+	"github.com/sacca97/ghg/internal/session"
+	"github.com/sacca97/ghg/internal/skills"
+	"github.com/sacca97/ghg/internal/tools"
+	"github.com/sacca97/ghg/internal/tools/bashrun"
 
 	"github.com/charmbracelet/x/ansi"
 	"github.com/muesli/termenv"
+	"golang.org/x/term"
 )
 
 // UI styles use AdaptiveColor so they stay legible on both dark and light
@@ -54,6 +57,7 @@ var (
 // messages sent from the agent goroutine
 type textMsg string
 type toolStartMsg struct{ id, name, args string }
+type toolOutputMsg struct{ id, output string }
 type toolEndMsg struct{ id, name, result string }
 type steeredMsg string
 
@@ -61,6 +65,11 @@ type steeredMsg string
 // /goal-from-context goroutine to the Update loop.
 type goalFromContextMsg struct {
 	goal string
+	err  error
+}
+
+type planProposalMsg struct {
+	plan agent.Plan
 	err  error
 }
 
@@ -134,14 +143,15 @@ type model struct {
 	menu         *menu
 	picker       *picker
 	mpicker      *modelPicker
-	palette      *palette // ctrl+p command palette (modal dialog)
+	settings     *settings // ctrl+p settings
 	cancel       context.CancelFunc
 	prog         *tea.Program
 
-	store     *session.Store
-	sessionID string
-	saved     int            // messages already persisted (index into agent.Messages)
-	snapshots map[int]string // workspace snapshot ref per turn-start index (mirrors the snapshots table)
+	store         *session.Store
+	sessionID     string
+	saved         int            // messages already persisted (index into agent.Messages)
+	snapshots     map[int]string // workspace snapshot ref per turn-start index (mirrors the snapshots table)
+	artifactStore *artifact.Store
 
 	hist     []string         // submitted inputs, for up/down recall
 	pasteBuf string           // held paste text for the [Pasted ~N lines] placeholder (config collapsePaste)
@@ -157,23 +167,33 @@ type model struct {
 	interrupt1 bool     // first ctrl+c pressed while busy; second cancels
 	quit1      bool     // first ctrl+c pressed while idle; second quits (armed briefly)
 
-	goal       string // active /goal; the loop continues until GOAL_MET
-	goalRounds int    // continuation turns spent on the current goal
-	titled     bool   // an auto-title has been attempted for this session
+	goal         string      // active /goal; the loop continues until GOAL_MET
+	goalRounds   int         // continuation turns spent on the current goal
+	titled       bool        // an auto-title has been attempted for this session
+	proposedPlan *agent.Plan // latest /plan result, waiting for /execute
+	mode         string      // user-visible operating mode: plan or execute
 
-	mouseOn      bool   // runtime mouse-capture state (toggle with /mouse)
-	themeHow     string // how auto theme detection resolved (env var, OSC query, …) — captured at startup/theme change for /report; never re-queried
-	compactModel string // config model name for compaction summaries; "" = the built-in default
-	compactProv  string
-	effortX      int                       // screen column where the clickable ⚡ effort control starts
-	catalogs     map[string]config.Catalog // provider model lists (capabilities)
-	mcpMgr       *mcp.Manager              // MCP server connections; nil when none configured
-	mcpSeen      map[string]bool           // servers whose first settle was announced
-	lspMgr       *lsp.Manager              // LSP diagnostics source for write/edit tool output
+	mouseOn       bool   // runtime mouse-capture state (toggle with /mouse)
+	themeHow      string // how auto theme detection resolved (env var, OSC query, …) — captured at startup/theme change for /report; never re-queried
+	compactModel  string // config model name for compaction summaries; "" = the built-in default
+	compactProv   string
+	statusModelX  int                       // screen column where the bottom model control starts
+	statusModelW  int                       // visible width of the bottom model control
+	statusEffortX int                       // screen column where the bottom effort control starts
+	statusEffortW int                       // visible width of the bottom effort control
+	statusModeX   int                       // screen column where the bottom mode control starts
+	statusModeW   int                       // visible width of the bottom mode control
+	catalogs      map[string]config.Catalog // provider model lists (capabilities)
+	profiles      provider.Profiles         // embedded/user/trusted-project provider metadata
+	definitions   map[string]agent.Definition
+	mcpMgr        *mcp.Manager    // MCP server connections; nil when none configured
+	mcpSeen       map[string]bool // servers whose first settle was announced
+	lspMgr        *lsp.Manager    // LSP diagnostics source for write/edit tool output
 	// skillScan is the skills discovery seam (skills.Scan over DefaultDirs in
 	// the real model): a field so the context doctor can be tested against
 	// temp-dir skills instead of whatever the test machine happens to have.
-	skillScan func() []skills.Skill
+	skillScan    func() []skills.Skill
+	skillsLoaded int
 
 	irunner *interactiveRunner // installed on tools.InteractiveBash at startup
 	iactive *interactive       // in-flight interactive command; nil when idle
@@ -195,7 +215,7 @@ type model struct {
 	namePrompt *namePrompt // inline text prompt (fork naming, /rename)
 }
 
-// picker is the /resume session browser. metas is newest-first; the list is
+// picker is the /resume session picker. metas is newest-first; the list is
 // rendered oldest-at-top so newest sits at the bottom.
 type picker struct {
 	metas    []session.Meta
@@ -203,11 +223,11 @@ type picker struct {
 	previews map[string][2]string // id -> last user, last assistant
 }
 
-// newInput builds the prompt textarea with whip's keybindings and styling.
+// newInput builds the prompt textarea with ghg's keybindings and styling.
 // Newlines come from ctrl+j / shift+enter / alt+enter; plain enter submits.
 func newInput() textarea.Model {
 	ti := textarea.New()
-	ti.Placeholder = "Ask whip anything… (/ for commands, tab completes)"
+	ti.Placeholder = "Ask ghg anything… (/ for commands, tab completes, ctrl+p for settings)"
 	ti.Prompt = "┃ "
 	ti.SetHeight(1)
 	ti.MaxHeight = 24 // input grows with content up to this many lines
@@ -233,16 +253,47 @@ func newInput() textarea.Model {
 // Run starts the interactive session. It returns the id of the session that
 // was active on exit ("" if nothing was said).
 func Run(cfg *config.Config, modelName, provName, sysPrompt, resumeID string, cautious bool) (string, error) {
-	// Trust gate first: before whip reads a single file, ask whether this
+	// Trust gate first: before ghg reads a single file, ask whether this
 	// folder's contents may steer the model. Persisted per absolute path in
-	// ~/.whip/trusted.json (claude-code's per-project trust dialog).
+	// ~/.ghg/trusted.json (claude-code's per-project trust dialog).
 	if ok, err := checkTrust(); err != nil {
 		return "", err
 	} else if !ok {
 		return "", fmt.Errorf("folder not trusted")
 	}
+	// main builds the prompt before this gate on a first run. Add the project
+	// instructions now that the user has explicitly trusted the folder; the
+	// marker keeps already-trusted launches from appending the block twice.
+	if wd, wdErr := os.Getwd(); wdErr == nil && !strings.Contains(sysPrompt, "<project_instructions>") {
+		if project := config.ProjectInstructions(wd, true); project != "" {
+			sysPrompt += "\n\n" + project
+		}
+	}
 
-	ag, mn, pn, err := buildAgent(cfg, modelName, provName, sysPrompt)
+	profiles, err := provider.Load(provider.LoadOptions{ProjectTrusted: true})
+	if err != nil {
+		return "", err
+	}
+	definitions, err := agent.LoadAgentDefinitions(agent.DefinitionLoadOptions{ProjectTrusted: true})
+	if err != nil {
+		return "", err
+	}
+	// The interactive TUI can start in a degraded state so the user can use
+	// /auth to configure the first provider. The strict builder remains used by
+	// all headless/explicit agent paths, so missing credentials still fail fast
+	// there.
+	var ag *agent.Agent
+	var mn, pn string
+	if modelName == "" && provName == "" {
+		// A fresh interactive session is an acting session. The fast role may
+		// be absent; ResolveRole then falls back through default to the legacy
+		// defaultModel/defaultProvider route.
+		ag, mn, pn, err = buildAgentForModeWithProfilesOptional(cfg, config.ModeActing, sysPrompt, profiles)
+	} else {
+		// An explicit -m/-p selection remains an explicit route and wins over
+		// role defaults.
+		ag, mn, pn, err = buildAgentWithProfilesOptional(cfg, modelName, provName, sysPrompt, profiles)
+	}
 	if err != nil {
 		return "", err
 	}
@@ -251,16 +302,18 @@ func Run(cfg *config.Config, modelName, provName, sysPrompt, resumeID string, ca
 
 	// default on: "" (config never set / pre-feature file) means medium, not
 	// off; an explicit "off" in the file is honored
-	ag.Effort = cfg.DefaultEffort
-	if ag.Effort == "" {
-		ag.Effort = "medium"
+	if ag != nil {
+		ag.Effort = cfg.DefaultEffort
+		if ag.Effort == "" {
+			ag.Effort = "medium"
+		}
 	}
 	// Mouse capture ON by default so the wheel scrolls the transcript viewport
-	// and ⚡/tool clicks work — but only wheel+click reporting (?1000), NOT
+	// and status/tool clicks work — but only wheel+click reporting (?1000), NOT
 	// cell-motion (?1002). With capture off, tmux's WheelUpPane binding sees
 	// mouse_any_flag=0 and runs 'copy-mode -e', scrolling tmux's own scrollback
 	// instead of the transcript. We don't report motion, so drags aren't sent
-	// to whip; the tmux drag override (applyTmuxMouseFix) routes MouseDrag1Pane
+	// to ghg; the tmux drag override (applyTmuxMouseFix) routes MouseDrag1Pane
 	// to copy-mode so plain drag-to-copy keeps working. Explicit config wins.
 	mouseOn := true
 	if cfg.Mouse != nil {
@@ -273,15 +326,19 @@ func Run(cfg *config.Config, modelName, provName, sysPrompt, resumeID string, ca
 	m := &model{
 		cfg: cfg, agent: ag, modelName: mn, provName: pn, sysPrompt: sysPrompt,
 		input: ti, spin: spinner.New(spinner.WithSpinner(spinner.Dot)), follow: true, saved: 1,
-		catalogs: config.LoadCatalogs(), mouseOn: mouseOn, now: time.Now, showThinking: showThinking,
+		catalogs: config.LoadCatalogs(), profiles: profiles, definitions: definitions, mouseOn: mouseOn, now: time.Now, showThinking: showThinking,
 		compactModel: cfg.CompactModel, compactProv: cfg.CompactProvider,
+		mode:      uiModeExecute,
 		skillScan: func() []skills.Skill { return skills.Scan(skills.DefaultDirs()...) },
 	}
+	m.initArtifacts()
 	m.applyCompactModel()
-	m.agent.CompactThreshold = compactThresholdFor(cfg)
+	if m.agent != nil {
+		m.agent.CompactThreshold = compactThresholdFor(cfg)
+	}
 	m.wireTasks() // redraw the UI when background subagents start/settle
 
-	// MCP: merge whip's own config with imported claude (.mcp.json) and codex
+	// MCP: merge ghg's own config with imported claude (.mcp.json) and codex
 	// (~/.codex/config.toml) servers — gated by the mcpImport policy, whose
 	// blocked entries stay visible in /mcp — then kick concurrent connects in
 	// the background. Tool calls block on that server's first settle only, so a
@@ -299,13 +356,17 @@ func Run(cfg *config.Config, modelName, provName, sysPrompt, resumeID string, ca
 			// The closure reads m.agent at call time: resume/model-switch
 			// replace the agent, and wireTasks re-points the manager at it.
 			m.mcpMgr.SetOnChange(func() {
-				m.agent.SetMCPTools(m.mcpMgr.Tools())
+				if m.agent != nil {
+					m.agent.SetMCPTools(m.mcpMgr.Tools())
+				}
 				if m.prog != nil { // nil in headless tests
 					m.prog.Send(mcpStatusMsg{})
 				}
 			})
 			m.mcpMgr.Start(context.Background())
-			ag.SetMCPTools(m.mcpMgr.Tools())
+			if m.agent != nil {
+				ag.SetMCPTools(m.mcpMgr.Tools())
+			}
 			for src, derr := range mcpErrs {
 				m.append(errStyle.Render(fmt.Sprintf("mcp: %s: %s", src, derr)))
 			}
@@ -317,9 +378,6 @@ func Run(cfg *config.Config, modelName, provName, sysPrompt, resumeID string, ca
 		m.lspMgr = lsp.NewManager(lsp.FromConfigMap(cfg.LSPServers))
 		tools.LSP = m.lspMgr
 	}
-	// computer-use: the per-app consent prompt — installed once, here, where
-	// the model exists (buildAgent is package-level and has no m).
-	tools.ComputerApprover = m.computerConsent
 	// Permission prompts are opt-in (--cautious); without it tools run free.
 	if cautious {
 		m.installPermGate()
@@ -327,6 +385,8 @@ func Run(cfg *config.Config, modelName, provName, sysPrompt, resumeID string, ca
 	if dir, derr := config.Dir(); derr == nil {
 		if st, serr := session.Open(dir + "/sessions.db"); serr == nil {
 			m.store = st
+			m.configureArtifactAgent(m.agent)
+			m.wireTasks()
 			defer func() { _ = st.Close() }()
 			// Seed input recall with user messages from ALL sessions (every
 			// folder), so ↑ cycles global history, not just this session's.
@@ -344,6 +404,9 @@ func Run(cfg *config.Config, modelName, provName, sysPrompt, resumeID string, ca
 		}
 	}
 	if resumeID != "" {
+		if m.agent == nil {
+			return "", fmt.Errorf("cannot resume without a configured provider; run ghg without --resume and use /auth first")
+		}
 		if m.store == nil {
 			return "", fmt.Errorf("cannot resume: session store unavailable")
 		}
@@ -353,23 +416,36 @@ func Run(cfg *config.Config, modelName, provName, sysPrompt, resumeID string, ca
 	}
 	m.startupReport()
 
-	// Inline rendering (no alt-screen): the transcript lives in the normal
-	// terminal scrollback, so terminal scrollback owns history. Mouse capture
-	// is ON but wheel+click only (?1000, no motion ?1002): the wheel scrolls
-	// the viewport (capture off → tmux eats it into copy-mode), ⚡ clicks work,
-	// and a plain drag selects/copies natively (no motion reporting means the
-	// terminal/tmux keeps drag-selection; we never see the drag bytes).
+	// Use the alternate screen for the interactive surface. Bubble Tea restores
+	// the caller's original screen when p.Run returns, so the transcript and
+	// status chrome cannot remain as an inline frame after exit. The viewport
+	// still owns chat scrolling while the TUI is active.
 	//
-	// We do NOT use tea.WithMouseCellMotion + an output filter: piping the
-	// program output through a non-TTY makes bubbletea skip terminal-size
-	// detection (ttyOutput becomes nil → no WindowSizeMsg → width/height stay
-	// 0 and the whole layout collapses). Instead we keep the real TTY as the
-	// output and enable click/wheel reporting directly on it.
-	opts := []tea.ProgramOption{}
+	// Mouse capture is ON but wheel+click only (?1000, no motion ?1002): the
+	// wheel scrolls the viewport (capture off → tmux eats it into copy-mode),
+	// status clicks work, and a plain drag selects/copies natively (no motion
+	// reporting means the terminal/tmux keeps drag-selection; we never see the
+	// drag bytes). We keep the real TTY as the output and enable click/wheel
+	// reporting directly on it so Bubble Tea still receives terminal sizing.
+	opts := []tea.ProgramOption{tea.WithoutSignalHandler(), tea.WithAltScreen()}
 	if m.mouseOn {
 		enableClickWheelMouse(os.Stdout)
 		applyTmuxMouseFix()
 	}
+	// Bubble Tea restores raw input and the alternate screen itself. This
+	// cleanup covers the separate click/wheel mode we enable directly because
+	// we intentionally do not use tea.WithMouseCellMotion (it captures drag
+	// motion and breaks native terminal selection). Keep it idempotent for
+	// startup failures and the normal return path.
+	var mouseCleanupOnce sync.Once
+	cleanupMouse := func() {
+		mouseCleanupOnce.Do(func() {
+			if m.mouseOn {
+				disableClickWheelMouse(os.Stdout)
+			}
+		})
+	}
+	defer cleanupMouse()
 	// pick the glamour style that matches the pick/detection resolution;
 	// keep how detection resolved so /report can name the source
 	m.themeHow = m.applyTheme(cfg.Theme)
@@ -383,6 +459,14 @@ func Run(cfg *config.Config, modelName, provName, sysPrompt, resumeID string, ca
 	}
 	p := tea.NewProgram(m, opts...)
 	m.prog = p
+	// Bubble Tea normally restores raw mode on every exit path. Keep a second
+	// snapshot of the caller's tty as a last-resort guard: ghg also manages
+	// mouse escape sequences outside Bubble Tea, and a startup/shutdown error
+	// must never leave the parent shell without its original interrupt mode.
+	restoreTTY := captureTTYState()
+	if restoreTTY != nil {
+		defer restoreTTY()
+	}
 	// install the interactive bash runner so the agent's bash tool can hand
 	// sudo/ssh-style prompts to the user with a 15s inactivity timeout.
 	m.irunner = newInteractiveRunner(p)
@@ -390,11 +474,16 @@ func Run(cfg *config.Config, modelName, provName, sysPrompt, resumeID string, ca
 	go m.fetchCatalogs(false)
 	go func() { p.Send(cfgSyncTick{}) }()     // start the config watcher
 	go func() { p.Send(scheduleTickMsg{}) }() // start the wakeup channel
+	// Bubble Tea's signal handler stops listening after the first SIGINT. That
+	// is incompatible with ghg's deliberate double-ctrl+c exit confirmation:
+	// a second signal can otherwise take the process down before the cleanup
+	// defer runs. Keep one owner for SIGINT/SIGTERM and feed SIGINT through the
+	// same model path as a raw ctrl+c key.
+	stopSignals := forwardSignals(p)
+	defer stopSignals()
 	_, err = p.Run()
-	// The UI has exited (quit, /quit, or a signal). We enabled click/wheel mouse
-	// reporting directly on the TTY (bubbletea doesn't manage it), so release it.
-	if m.mouseOn {
-		disableClickWheelMouse(os.Stdout)
+	if restoreTTY != nil {
+		restoreTTY()
 	}
 	// Shut MCP servers down first (graceful: stdin close → SIGTERM → SIGKILL)
 	// so a clean stdio server never becomes a KillAll target.
@@ -407,27 +496,26 @@ func Run(cfg *config.Config, modelName, provName, sysPrompt, resumeID string, ca
 		tools.LSP = nil
 	}
 	// Make sure no agent-spawned child process (a server the model started, a
-	// watcher, a daemon) outlives whip. KillAll SIGKILLs every tracked process
+	// watcher, a daemon) outlives ghg. KillAll SIGKILLs every tracked process
 	// group and waits for them.
 	bashrun.KillAll()
+	cleanupMouse()
 	return m.sessionID, err
 }
 
-// startupReport prints one block naming what whip loaded — skills (with
+// startupReport prints one block naming what ghg loaded — skills (with
 // validation warnings, pi's [Skill conflicts] lesson: a silently truncated or
 // unparseable SKILL.md is a broken skill the user never learns about) and MCP
 // servers — plus degraded-mode notices. Skipped on resume (the transcript
 // already carries the past).
 func (m *model) startupReport() {
 	sk, problems := skills.ScanDetailed(skills.DefaultDirs()...)
+	m.skillsLoaded = len(sk)
 	var b strings.Builder
 	var warned bool
 
 	line := func(format string, args ...any) {
 		fmt.Fprintf(&b, format+"\n", args...)
-	}
-	if len(sk) > 0 {
-		line("skills: %d loaded", len(sk))
 	}
 	for _, s := range sk {
 		if s.Warning != "" {
@@ -459,6 +547,10 @@ func (m *model) startupReport() {
 			line("mcp: %s", strings.Join(parts, " · "))
 		}
 	}
+	if m.agent == nil {
+		line(m.degradedProviderNote())
+		warned = true
+	}
 	if b.Len() == 0 {
 		return
 	}
@@ -470,11 +562,27 @@ func (m *model) startupReport() {
 	}
 }
 
+// degradedProviderNote is the short actionable message shown when the TUI can
+// open but no usable provider credential is available.
+func (m *model) degradedProviderNote() string {
+	return "No provider has been configured — run /auth"
+}
+
+// requireAgent keeps agent-dependent commands harmless during the cold TUI
+// state. The note is deliberately the same onboarding hint shown at startup.
+func (m *model) requireAgent() bool {
+	if m.agent != nil {
+		return true
+	}
+	m.append(m.degradedProviderNote())
+	return false
+}
+
 // enableClickWheelMouse turns on click+wheel mouse reporting (?1000) with SGR
 // coordinates (?1006), WITHOUT motion reporting (?1002/?1003). Writing directly
 // to the real TTY keeps bubbletea's output a terminal so terminal-size detection
 // still works (unlike piping output through an os.Pipe). With ?1000 the wheel
-// and clicks reach whip, but drags are not reported, so the terminal/tmux keeps
+// and clicks reach ghg, but drags are not reported, so the terminal/tmux keeps
 // native drag-selection for copy.
 func enableClickWheelMouse(w *os.File) {
 	fmt.Fprint(w, "\x1b[?1006h\x1b[?1000h")
@@ -485,13 +593,82 @@ func disableClickWheelMouse(w *os.File) {
 	fmt.Fprint(w, "\x1b[?1000l\x1b[?1006l")
 }
 
-// applyTmuxMouseFix makes plain drag-to-copy work inside tmux while whip
+// forwardSignals keeps signal handling alive for the whole TUI lifetime. A
+// signal.Notify channel is intentionally buffered so a rapid double press is
+// not lost while the first key is being processed by Bubble Tea.
+func forwardSignals(p *tea.Program) func() {
+	signals := make(chan os.Signal, 2)
+	done := make(chan struct{})
+	var stopOnce sync.Once
+	var wg sync.WaitGroup
+
+	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-done:
+				return
+			case sig := <-signals:
+				if sig == os.Interrupt {
+					p.Send(tea.KeyMsg{Type: tea.KeyCtrlC})
+				} else {
+					p.Quit()
+				}
+			}
+		}
+	}()
+
+	return func() {
+		stopOnce.Do(func() {
+			signal.Stop(signals)
+			close(done)
+			wg.Wait()
+		})
+	}
+}
+
+// captureTTYState returns a best-effort restore function for the terminal that
+// owns the interactive session. Bubble Tea already does this internally; the
+// extra snapshot protects the parent shell if startup or shutdown fails before
+// Bubble Tea can restore its raw-mode state.
+func captureTTYState() func() {
+	fd := int(os.Stdin.Fd())
+	var closeTTY func()
+	if !term.IsTerminal(fd) {
+		tty, err := os.Open("/dev/tty")
+		if err != nil {
+			return nil
+		}
+		fd = int(tty.Fd())
+		closeTTY = func() { _ = tty.Close() }
+	}
+	state, err := term.GetState(fd)
+	if err != nil {
+		if closeTTY != nil {
+			closeTTY()
+		}
+		return nil
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			_ = term.Restore(fd, state)
+			if closeTTY != nil {
+				closeTTY()
+			}
+		})
+	}
+}
+
+// applyTmuxMouseFix makes plain drag-to-copy work inside tmux while ghg
 // captures the mouse for wheel/clicks. tmux's default MouseDrag1Pane binding
 // checks mouse_any_flag (set by our ?1000) and forwards the drag to the app,
 // which ignores it — so no highlight ever starts. Rebinding it to copy-mode -M
 // (only when the pane isn't already in a mode and isn't full mouse-tracking)
 // makes the drag open tmux copy-mode selection instead, restoring drag-to-copy.
-// Wheel still reaches whip: WheelUpPane stays bound to send -M. No-op outside
+// Wheel still reaches ghg: WheelUpPane stays bound to send -M. No-op outside
 // tmux or if tmux isn't available.
 func applyTmuxMouseFix() {
 	if os.Getenv("TMUX") == "" {
@@ -506,25 +683,13 @@ func applyTmuxMouseFix() {
 
 // catalogLites converts llm model records into the catalog-cache shape.
 func catalogLites(infos []llm.ModelInfo) []config.ModelInfoLite {
-	lites := make([]config.ModelInfoLite, len(infos))
-	for i, mi := range infos {
-		lites[i] = config.ModelInfoLite{
-			ID:                  mi.ID,
-			ContextLength:       mi.ContextLength,
-			MaxCompletionTokens: mi.MaxCompletionTokens,
-			ReasoningEfforts:    mi.ReasoningEfforts,
-			InputModalities:     mi.InputModalities,
-		}
-		if mi.Pricing != nil {
-			lites[i].InPrice, lites[i].OutPrice, lites[i].CacheReadPrice = mi.Pricing.Rates()
-		}
-	}
-	return lites
+	return config.ModelInfoLites(infos)
 }
 
-// fetchCatalogs refreshes each provider's cached model list in the background
-// and sends the merged result to the UI. force bypasses the 24h TTL
-// (/model refresh) so newly announced models appear immediately.
+// fetchCatalogs refreshes each provider's cached model list in the background,
+// enriches missing context and reasoning metadata from models.dev, and sends
+// the merged result to the UI. force bypasses both catalog TTLs (/model refresh)
+// so newly announced models and metadata appear immediately.
 func (m *model) fetchCatalogs(force bool) {
 	cats := config.LoadCatalogs()
 	if cats == nil { // defensive; LoadCatalogs already returns non-nil
@@ -532,27 +697,94 @@ func (m *model) fetchCatalogs(force bool) {
 	}
 	dirty := false
 	for name, prov := range m.cfg.Providers {
-		if c, ok := cats[name]; ok && !force && !c.Stale() && c.BaseURL == prov.BaseURL {
+		resolved, resolveErr := m.profiles.Resolve(provider.Instance{
+			Name: name, Profile: prov.Profile, BaseURL: prov.BaseURL, Protocol: prov.API,
+		})
+		if resolveErr != nil {
+			config.LogEvent("catalog.fetch", name+" skipped: "+resolveErr.Error())
 			continue
 		}
-		key, keyErr := prov.ResolveKey()
-		if keyErr != nil {
-			config.LogEvent("catalog.fetch", name+" skipped: "+keyErr.Error())
+		// Catalog adapters are capability-driven. Static/none catalogs and
+		// protocols without a compiled discovery adapter remain usable for
+		// configured models; they simply do not trigger a GET /models here.
+		if resolved.Catalog.Kind != provider.CatalogOpenAIModels && resolved.Catalog.Kind != provider.CatalogAnthropicModels {
 			continue
 		}
-		if key == "" {
+		if c, ok := cats[name]; ok && !force && !c.Stale() && c.BaseURL == resolved.BaseURL {
+			continue
+		}
+		key := ""
+		if resolved.RequiresAPIKey() {
+			var keyErr error
+			key, keyErr = prov.ResolveKey()
+			if keyErr != nil {
+				config.LogEvent("catalog.fetch", name+" skipped: "+keyErr.Error())
+				continue
+			}
+			if key == "" {
+				// A cold TUI is allowed to run without credentials so /auth can
+				// repair it in place. Do not turn its background catalog refresh
+				// into an unauthenticated request or a noisy retry loop.
+				continue
+			}
+		}
+		backend, backendErr := llm.NewBackend(llm.BackendConfig{
+			Protocol:   llm.Protocol(resolved.Protocol),
+			BaseURL:    resolved.BaseURL,
+			APIKey:     key,
+			Headers:    resolved.DefaultHeaders,
+			AuthKind:   resolved.Auth.Kind,
+			AuthHeader: resolved.Auth.Header,
+			MaxRetries: m.cfg.MaxRetries,
+		})
+		if backendErr != nil {
+			config.LogEvent("catalog.fetch", name+" skipped: "+backendErr.Error())
+			continue
+		}
+		catalogBackend, ok := backend.(llm.CatalogBackend)
+		if !ok {
 			continue
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		infos, err := llm.New(prov.BaseURL, key).Models(ctx)
+		infos, err := catalogBackend.Models(ctx)
 		cancel()
 		if err != nil {
 			config.LogEvent("catalog.fetch", name+" failed: "+err.Error())
 			continue // keep any stale cache
 		}
 		config.LogEvent("catalog.fetch", fmt.Sprintf("%s ok: %d models", name, len(infos)))
-		cats[name] = config.Catalog{FetchedAt: time.Now(), BaseURL: prov.BaseURL, Models: catalogLites(infos)}
+		cats[name] = config.Catalog{FetchedAt: time.Now(), BaseURL: resolved.BaseURL, Models: catalogLites(infos)}
 		dirty = true
+	}
+	metadata := config.LoadModelsDev()
+	wanted := m.modelsDevWanted(cats)
+	needsMetadata := force || metadata.Stale() || metadata.Version < 5
+	if !needsMetadata {
+		for id := range wanted {
+			if !metadata.HasModel(id) {
+				needsMetadata = true
+				break
+			}
+		}
+	}
+	if m.prog != nil && len(wanted) > 0 && needsMetadata {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		fresh, err := config.FetchModelsDev(ctx, wanted)
+		cancel()
+		if err != nil {
+			config.LogEvent("catalog.metadata", "models.dev failed: "+err.Error())
+		} else {
+			metadata = fresh
+			if err := config.SaveModelsDev(metadata); err != nil {
+				config.LogEvent("catalog.metadata", "models.dev cache write failed: "+err.Error())
+			}
+		}
+	}
+	for name, cat := range cats {
+		if enriched, changed := enrichCatalogMetadata(cat, metadata, m.modelsDevProviderIDs(name)); changed {
+			cats[name] = enriched
+			dirty = true
+		}
 	}
 	if dirty {
 		_ = config.SaveCatalogs(cats) // best-effort; the TUI still gets the fresh data
@@ -578,10 +810,11 @@ func (m *model) resume(id string) error {
 	if ag, mn, pn, err := buildAgent(m.cfg, meta.Model, meta.Provider, m.sysPrompt); err == nil {
 		m.agent, m.modelName, m.provName = ag, mn, pn
 	} else {
-		m.agent = agent.New(m.agent.Client, m.agent.Model, m.agent.MaxTokens, m.sysPrompt)
+		m.agent = agent.New(m.agent.Backend, m.agent.Model, m.agent.MaxTokens, m.sysPrompt)
 		m.agent.ModelName, m.agent.Provider = m.modelName, m.provName
 		m.agent.ContextLimit = m.contextLimitFor(m.provName, m.agent.Model)
 	}
+	m.configureArtifactAgent(m.agent)
 	m.applyCompactModel()
 	m.agent.CompactThreshold = compactThresholdFor(m.cfg)
 	m.wireTasks()
@@ -595,7 +828,7 @@ func (m *model) resume(id string) error {
 		for _, st := range tasks {
 			status := agent.TaskStatus(st.Status)
 			if status == agent.TaskRunning {
-				status, st.Report = agent.TaskError, "interrupted — whip exited before this subagent finished"
+				status, st.Report = agent.TaskError, "interrupted — ghg exited before this subagent finished"
 			}
 			m.agent.RestoreTask(agent.BackgroundTask{
 				ID: st.ID, Description: st.Description, Prompt: st.Prompt,
@@ -658,6 +891,7 @@ func (m *model) resume(id string) error {
 	m.blocks = nil
 	m.msgBlock = nil
 	m.future = nil // a different session's tail isn't this session's redo
+	m.proposedPlan = nil
 	m.goal = meta.Goal
 	m.goalRounds = 0
 	m.append(dimStyle.Render(fmt.Sprintf("resumed %s · %s · %s @ %s", meta.ID, meta.Title, m.modelName, m.provName)))
@@ -719,11 +953,12 @@ func (m *model) seedTranscript(msgs []llm.Message, base int) {
 // session's bookkeeping (goal, effort) — the effort stamp is what a resume
 // restores, so it runs even when no new messages landed.
 func (m *model) persist() {
-	if m.store == nil {
+	if m.store == nil || m.agent == nil {
 		return
 	}
+	msgs := m.agent.MessagesSnapshot()
 	if m.sessionID == "" {
-		if len(m.agent.Messages) <= m.saved {
+		if len(msgs) <= m.saved {
 			return // nothing new to say; don't create an empty session row
 		}
 		id, err := m.store.Create(cwd(), m.modelName, m.provName)
@@ -746,21 +981,21 @@ func (m *model) persist() {
 	if u := m.agent.Usage(); u.PromptTokens > 0 || u.CompletionTokens > 0 {
 		_ = m.store.SetUsage(m.sessionID, u.PromptTokens, u.Cached(), u.CompletionTokens)
 	}
-	if len(m.agent.Messages) <= m.saved {
+	if len(msgs) <= m.saved {
 		return
 	}
-	if err := m.store.Save(m.sessionID, m.saved, m.agent.Messages, m.modelName, m.provName); err != nil {
+	if err := m.store.Save(m.sessionID, m.saved, msgs, m.modelName, m.provName); err != nil {
 		config.LogEvent("session.save", "FAILED id="+m.sessionID+": "+err.Error())
 		m.append(errStyle.Render("session save failed: " + err.Error()))
 		return
 	}
-	m.saved = len(m.agent.Messages)
+	m.saved = len(msgs)
 }
 
 // setTheme switches the color scheme ("light"/"dark"/"auto") live and
 // persists the pick to the global config: markdown re-renders under the new
 // glamour style and every AdaptiveColor UI style follows lipgloss. A theme
-// file change in ANOTHER running whip session is picked up live via
+// file change in ANOTHER running ghg session is picked up live via
 // syncThemeMsg.
 func (m *model) setTheme(theme string) {
 	if theme != "light" && theme != "dark" {
@@ -784,18 +1019,13 @@ func (m *model) setTheme(theme string) {
 		m.append(errStyle.Render("config save failed: " + err.Error()))
 	}
 	m.refreshVP() // re-render the transcript under the new scheme
-	if theme == "auto" {
-		m.append(dimStyle.Render(fmt.Sprintf("◐ theme: %s (auto: %s)", CurrentTheme(), how)))
-	} else {
-		m.append(dimStyle.Render("◐ theme: " + CurrentTheme()))
-	}
 }
 
 // applyTheme points rendering at a scheme WITHOUT persisting: auto re-detects
 // (re-reading the terminal background so switching dark→auto can't stay dark),
 // explicit picks override detection directly. Called by setTheme, startup, and
 // the config watcher. how (only meaningful for auto) names the detection
-// source so a wrong pick is diagnosable in the transcript note.
+// source for /report.
 func (m *model) applyTheme(theme string) (how string) {
 	switch theme {
 	case "light":
@@ -820,6 +1050,9 @@ func (m *model) applyTheme(theme string) (how string) {
 // level) use resetEffort instead so a quiet reconciliation never rewrites
 // the user's chosen global default.
 func (m *model) setEffort(lv string) {
+	if m.agent == nil {
+		return
+	}
 	m.agent.Effort = lv
 	m.cfg.DefaultEffort = lv
 	if err := m.cfg.Save(); err != nil {
@@ -832,6 +1065,9 @@ func (m *model) setEffort(lv string) {
 
 // resetEffort applies a level without touching the global default.
 func (m *model) resetEffort(lv string) {
+	if m.agent == nil {
+		return
+	}
 	m.agent.Effort = lv
 	if m.store != nil && m.sessionID != "" {
 		_ = m.store.SetEffort(m.sessionID, lv)
@@ -847,9 +1083,142 @@ func (m *model) setGoal(goal string) {
 	}
 }
 
+func artifactsDisabled(cfg *config.Config) bool {
+	return cfg != nil && cfg.Artifacts != nil && cfg.Artifacts.Enabled != nil && !*cfg.Artifacts.Enabled
+}
+
+// initArtifacts creates the persistent payload store once for the process.
+// The session index is attached later, after sessions.db opens; the agent can
+// still use its live message slice for references created before the first
+// persist.
+func (m *model) initArtifacts() {
+	if artifactsDisabled(m.cfg) {
+		if m.agent != nil {
+			m.agent.ArtifactsDisabled = true
+		}
+		return
+	}
+	dir, err := config.Dir()
+	if err != nil {
+		config.LogEvent("artifact.open", "home failed: "+err.Error())
+		return
+	}
+	maxBytes := artifact.DefaultMaxBytes
+	if m.cfg.Artifacts != nil && m.cfg.Artifacts.MaxBytes > 0 {
+		maxBytes = m.cfg.Artifacts.MaxBytes
+	}
+	store, err := artifact.NewWithLimit(filepath.Join(dir, "artifacts"), maxBytes)
+	if err != nil {
+		config.LogEvent("artifact.open", "FAILED: "+err.Error())
+		m.append(errStyle.Render("artifacts disabled: " + err.Error()))
+		return
+	}
+	m.artifactStore = store
+	m.configureArtifactAgent(m.agent)
+}
+
+func (m *model) configureArtifactAgent(ag *agent.Agent) {
+	if ag == nil {
+		return
+	}
+	ag.ArtifactStore = m.artifactStore
+	ag.ArtifactCatalog = m.store
+	ag.ArtifactsDisabled = artifactsDisabled(m.cfg)
+	if !ag.ArtifactsDisabled {
+		ag.ArtifactWriter = m.artifactStore
+	} else {
+		ag.ArtifactWriter = nil
+	}
+	m.configureAgentRoles(ag)
+}
+
+// configureAgentRoles gives delegated foreground and background tasks the
+// same profile-aware construction path as the main session. The task tool
+// asks for the tiny role; an absent role follows the config resolver's normal
+// default/legacy fallback.
+func (m *model) configureAgentRoles(ag *agent.Agent) {
+	if ag == nil || m.cfg == nil {
+		return
+	}
+	ag.SubagentFactory = func(_ context.Context, role, systemPrompt string) (*agent.Agent, error) {
+		sub, _, _, err := buildAgentForRoleWithProfiles(m.cfg, role, systemPrompt, m.profiles)
+		return sub, err
+	}
+}
+
 func buildAgent(cfg *config.Config, modelName, provName, sysPrompt string) (*agent.Agent, string, string, error) {
+	wd, err := os.Getwd()
+	if err != nil {
+		return nil, "", "", fmt.Errorf("provider profiles: current directory: %w", err)
+	}
+	profiles, err := provider.Load(provider.LoadOptions{ProjectTrusted: config.Trusted(wd)})
+	if err != nil {
+		return nil, "", "", err
+	}
+	return buildAgentWithProfiles(cfg, modelName, provName, sysPrompt, profiles)
+}
+
+func buildAgentWithProfiles(cfg *config.Config, modelName, provName, sysPrompt string, profiles provider.Profiles) (*agent.Agent, string, string, error) {
+	return buildAgentWithProfilesMode(cfg, modelName, provName, sysPrompt, profiles, false)
+}
+
+// buildAgentWithProfilesOptional is the interactive-only variant. It returns
+// a nil agent when the selected profile simply has no credential yet, while
+// preserving hard errors for unknown routes, broken secret references, bad
+// profiles, and invalid backend configuration.
+func buildAgentWithProfilesOptional(cfg *config.Config, modelName, provName, sysPrompt string, profiles provider.Profiles) (*agent.Agent, string, string, error) {
+	return buildAgentWithProfilesMode(cfg, modelName, provName, sysPrompt, profiles, true)
+}
+
+func buildAgentForRoleWithProfiles(cfg *config.Config, role, sysPrompt string, profiles provider.Profiles) (*agent.Agent, string, string, error) {
+	return buildAgentForRoleWithProfilesMode(cfg, role, sysPrompt, profiles, false)
+}
+
+func buildAgentForRoleWithProfilesOptional(cfg *config.Config, role, sysPrompt string, profiles provider.Profiles) (*agent.Agent, string, string, error) {
+	return buildAgentForRoleWithProfilesMode(cfg, role, sysPrompt, profiles, true)
+}
+
+func buildAgentForModeWithProfiles(cfg *config.Config, mode, sysPrompt string, profiles provider.Profiles) (*agent.Agent, string, string, error) {
+	return buildAgentForRoleWithProfiles(cfg, config.RoleForMode(mode), sysPrompt, profiles)
+}
+
+func buildAgentForModeWithProfilesOptional(cfg *config.Config, mode, sysPrompt string, profiles provider.Profiles) (*agent.Agent, string, string, error) {
+	return buildAgentForRoleWithProfilesOptional(cfg, config.RoleForMode(mode), sysPrompt, profiles)
+}
+
+func buildAgentForRoleWithProfilesMode(cfg *config.Config, role, sysPrompt string, profiles provider.Profiles, allowMissingKey bool) (*agent.Agent, string, string, error) {
+	target, err := cfg.ResolveRole(role)
+	if err != nil {
+		// An entirely empty config is the interactive cold-start state. Keep
+		// it usable for /auth, while an invalid configured role remains fatal.
+		if allowMissingKey && len(cfg.Providers) == 0 && len(cfg.Models) == 0 && len(cfg.Roles) == 0 {
+			return nil, cfg.DefaultModel, cfg.DefaultProvider, nil
+		}
+		return nil, "", "", err
+	}
+	ag, modelName, provName, err := buildAgentWithProfilesMode(cfg, target.Model, target.Provider, sysPrompt, profiles, allowMissingKey)
+	if ag != nil {
+		ag.Role = target.Role
+	}
+	return ag, modelName, provName, err
+}
+
+func buildAgentWithProfilesMode(cfg *config.Config, modelName, provName, sysPrompt string, profiles provider.Profiles, allowMissingKey bool) (*agent.Agent, string, string, error) {
+	requestedModel, requestedProvider := modelName, provName
 	prov, mdl, apiID, err := cfg.Resolve(modelName, provName)
 	if err != nil {
+		// A provider-less config is an unconfigured cold-start state. Other
+		// resolution failures remain hard errors so typos and broken routing
+		// cannot be mistaken for an invitation to configure a key.
+		if allowMissingKey && len(cfg.Providers) == 0 && requestedModel == "" && requestedProvider == "" {
+			if modelName == "" {
+				modelName = cfg.DefaultModel
+			}
+			if provName == "" {
+				provName = cfg.DefaultProvider
+			}
+			return nil, modelName, provName, nil
+		}
 		return nil, "", "", err
 	}
 	if modelName == "" {
@@ -861,22 +1230,40 @@ func buildAgent(cfg *config.Config, modelName, provName, sysPrompt string) (*age
 			provName = mdl.Providers[0]
 		}
 	}
-	key, keyErr := prov.ResolveKey()
-	if keyErr != nil {
-		return nil, "", "", keyErr
+	resolved, err := profiles.ResolveModel(provider.Instance{
+		Name: provName, Profile: prov.Profile, BaseURL: prov.BaseURL, Protocol: prov.API,
+	}, apiID)
+	if err != nil {
+		return nil, "", "", err
 	}
-	if key == "" {
-		return nil, "", "", fmt.Errorf("no API key for provider %q (set apiKey/apiKeyEnv in ~/.whip/config.json)", provName)
+	key := ""
+	if resolved.RequiresAPIKey() {
+		key, err = prov.ResolveKey()
+		if err != nil {
+			return nil, "", "", err
+		}
+		if key == "" {
+			if allowMissingKey {
+				return nil, modelName, provName, nil
+			}
+			return nil, "", "", fmt.Errorf("no API key for provider %q (set apiKey/apiKeyEnv in ~/.ghg/config.json)", provName)
+		}
 	}
 	// Two distinct limits:
-	//   - ContextLimit: the input window (provider's context_length, else the
-	//     config's context). Drives the header % and proactive compaction.
+	//   - ContextLimit: the input window (provider's context_length, then the
+	//     config's context, then models.dev). Drives the context status and
+	//     proactive compaction.
 	//   - MaxTokens: the OUTPUT cap sent as max_tokens. Priority: config maxOut
 	//     → provider's max_completion_tokens → config context (last resort).
 	cat, hasCat := config.LoadCatalogs()[provName]
 	ctxLimit := mdl.ContextWindow()
 	if hasCat {
 		if n := cat.ContextLength(apiID); n > 0 {
+			ctxLimit = n
+		}
+	}
+	if ctxLimit <= 0 {
+		if n := config.LoadModelsDev().ContextLength(apiID, modelsDevProviderIDs(resolved, provName)...); n > 0 {
 			ctxLimit = n
 		}
 	}
@@ -887,47 +1274,35 @@ func buildAgent(cfg *config.Config, modelName, provName, sysPrompt string) (*age
 	if maxOut <= 0 {
 		maxOut = ctxLimit // generous default; provider clamps if it's too high
 	}
-	client := llm.New(prov.BaseURL, key)
-	client.MaxRetries = cfg.MaxRetries
-	ag := agent.New(client, apiID, maxOut, sysPrompt)
+	protocol := resolved.Protocol
+	if strings.TrimSpace(mdl.API) != "" {
+		protocol = strings.TrimSpace(mdl.API)
+	}
+	backend, err := llm.NewBackend(llm.BackendConfig{
+		Protocol:   llm.Protocol(protocol),
+		BaseURL:    resolved.BaseURL,
+		APIKey:     key,
+		Headers:    resolved.DefaultHeaders,
+		AuthKind:   resolved.Auth.Kind,
+		AuthHeader: resolved.Auth.Header,
+		MaxRetries: cfg.MaxRetries,
+	})
+	if err != nil {
+		return nil, "", "", err
+	}
+	ag := agent.New(backend, apiID, maxOut, sysPrompt)
 	ag.ModelName, ag.Provider = modelName, provName
+	ag.Role = config.RoleDefault
 	ag.ContextLimit = ctxLimit
-	// Native browser subsystem: install the shared manager once; screenshots
-	// steer back into the conversation as image parts on vision models.
-	ag.BrowserDisabled = cfg.Browser.Enabled != nil && !*cfg.Browser.Enabled
-	// Computer-use: per-app consent policy from config; the consent prompt is
-	// installed below (the model never touches an unapproved app silently).
-	ag.ComputerDisabled = cfg.Computer.Enabled != nil && !*cfg.Computer.Enabled
-	if !ag.ComputerDisabled {
-		defaultDeny := cfg.Computer.DefaultDeny != nil && *cfg.Computer.DefaultDeny // default: allow-all
-		tools.ComputerPolicy = computer.NewPolicy(cfg.Computer.Allow, cfg.Computer.Deny, defaultDeny)
+	if hasCat {
+		if info := cat.Find(apiID); info != nil {
+			ag.ReasoningToggle = info.ReasoningToggle
+		}
 	}
-	if !ag.BrowserDisabled && tools.Browser == nil {
-		mode := browser.ModeLive
-		switch cfg.Browser.Mode {
-		case "dedicated":
-			mode = browser.ModeDedicated
-		case "headless":
-			mode = browser.ModeHeadless
-		case "extension":
-			mode = browser.ModeExtension
+	if !ag.ReasoningToggle {
+		if info, ok := config.LoadModelsDev().ReasoningFor(apiID, modelsDevProviderIDs(resolved, provName)...); ok {
+			ag.ReasoningToggle = info.Toggle
 		}
-		tools.Browser = browser.NewManager(mode)
-		if cfg.Browser.CDPURL != "" {
-			_ = os.Setenv("WHIP_CDP_URL", cfg.Browser.CDPURL)
-		}
-		browser.AllowPrivateURLs = cfg.Browser.AllowPrivateURLs
-	}
-	if modelSupportsVision(cfg, modelName, apiID, config.LoadCatalogs(), provName) {
-		tools.ScreenshotSink = func(jpegs [][]byte) {
-			var parts []llm.ContentPart
-			for _, j := range jpegs {
-				parts = append(parts, llm.ImagePart("jpg", j))
-			}
-			ag.SteerImages("browser_exec screenshots attached:", parts)
-		}
-	} else {
-		tools.ScreenshotSink = nil
 	}
 	return ag, modelName, provName, nil
 }
@@ -968,6 +1343,7 @@ type block struct {
 	toolID      string
 	toolRunning bool
 	toolFailed  bool
+	toolOutput  string // latest accumulated snapshot while the call is running
 	// y0/y1 are the block's line range in the last rendered content (set by
 	// refreshVP); used to map a mouse click to the block under it.
 	y0, y1 int
@@ -1029,7 +1405,13 @@ func (b block) render(width int) string {
 		// While running, the verb line shows in full. On completion the same
 		// block collapses in place to one line (red on failure); ctrl+e expands.
 		if b.toolRunning || b.expanded {
-			return wrap(b.text, width)
+			out := b.text
+			if b.toolRunning && b.toolOutput != "" {
+				if tail := toolOutputTail(b.toolOutput, 3); tail != "" {
+					out += "\n" + dimStyle.Render("  "+strings.ReplaceAll(tail, "\n", "\n  "))
+				}
+			}
+			return wrap(out, width)
 		}
 		line := ansi.Truncate(b.text, width, "…")
 		if b.toolFailed {
@@ -1039,6 +1421,20 @@ func (b block) render(width int) string {
 	default:
 		return wrap(b.text, width)
 	}
+}
+
+// toolOutputTail keeps a running row useful without turning every output
+// snapshot into a second transcript. The completed tool result remains the
+// authoritative, expandable block below it.
+func toolOutputTail(output string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	lines := strings.Split(strings.TrimRight(output, "\n"), "\n")
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+	return strings.TrimSpace(strings.Join(lines, "\n"))
 }
 
 // expand toggles a tool block and returns whether it changed.
@@ -1095,7 +1491,7 @@ func (m *model) refreshVP() {
 	for i := range m.blocks {
 		if i > 0 {
 			b.WriteString("\n\n") // blank line between blocks
-			line += 2
+			line++                // the two newlines create one blank row
 		}
 		r := m.blocks[i].renderAt(width)
 		m.blocks[i].y0 = line
@@ -1123,32 +1519,37 @@ func (m *model) contentPad() int {
 	return max(m.vp.Height-h, 0)
 }
 
-// viewportView renders the transcript viewport and drops the dead rows at its
-// bottom. The viewport always renders its full allocated height (lipgloss
-// Height pads it out), and the content is bottom-anchored — padding goes on
-// top — so when the transcript is shorter than the viewport the unused rows
-// would otherwise render as a gap between the last message and the input box.
+// viewportView renders the transcript viewport at its full allocated height.
+// The content is bottom-anchored — padding goes on top — so a short transcript
+// still ends directly above the input. Keeping the height fixed is important:
+// when scrolling lands on a blank separator, trimming it would move the input
+// and status box, so scrolling never moves the stable tail.
+// inputRule is the one-row divider between the transcript (plus its
+// ephemeral spinner/queue rows) and the input box, so the thing you type into
+// is visually separate from the thing you read. It replaces what used to be a
+// bare blank line, so it costs no extra row — layout()'s chrome already counts
+// exactly one row here.
+//
+// While an interactive bash command owns the terminal the input box is hidden,
+// and a rule with nothing under it reads as a stray line, so that case keeps
+// the blank row instead.
+func (m *model) inputRule() string {
+	if m.iactive != nil {
+		return ""
+	}
+	w := min(max(m.width, 0), maxRuleWidth)
+	if w == 0 {
+		return ""
+	}
+	return dimStyle.Render(strings.Repeat("─", w))
+}
+
+// maxRuleWidth caps the divider so a very wide terminal doesn't draw a line
+// across the whole desk; the transcript is the thing to follow, not the rule.
+const maxRuleWidth = 120
+
 func (m *model) viewportView() string {
-	s := sanitizeView(m.vp.View())
-	lines := strings.Split(s, "\n")
-	last := len(lines) - 1
-	for last >= 0 && strings.TrimSpace(ansi.Strip(lines[last])) == "" {
-		last--
-	}
-	lines = lines[:last+1]
-	// Also drop the top padding rows so the transcript bottom-anchors: when
-	// the input box grows (ctrl+j), the tail of the buffer — input rows,
-	// status line — must stay on the SAME screen rows. bubbletea's inline
-	// renderer skips re-painting a row whose text matches the previous frame,
-	// and that cache is only correct for rows that never shift; padding on
-	// top makes the whole transcript shift, but the interactive tail stays
-	// put (its own height didn't change), so a blank pad row can no longer
-	// alias onto an input row and eat its content.
-	first := 0
-	for first < len(lines) && strings.TrimSpace(ansi.Strip(lines[first])) == "" {
-		first++
-	}
-	return strings.Join(lines[first:], "\n")
+	return sanitizeView(m.vp.View())
 }
 
 func (m *model) Init() tea.Cmd {
@@ -1160,6 +1561,26 @@ func onOff(b bool) string {
 		return "on"
 	}
 	return "off"
+}
+
+// scrollMouseWheel advances one terminal row per vertical wheel event. The
+// viewport widget defaults to three rows, which makes the transcript feel
+// jumpy in terminals that report a wheel event for each detent. Handling the
+// vertical path here also works for zero-value viewports used by headless
+// tests, before Bubble's lazy viewport initialization has run.
+func scrollMouseWheel(vp *viewport.Model, msg tea.MouseMsg) bool {
+	if vp == nil || msg.Action != tea.MouseActionPress || msg.Shift {
+		return false
+	}
+	switch msg.Button {
+	case tea.MouseButtonWheelUp:
+		vp.ScrollUp(1)
+	case tea.MouseButtonWheelDown:
+		vp.ScrollDown(1)
+	default:
+		return false
+	}
+	return true
 }
 
 // fmtTok renders a token count compactly: 12.3k, 1.2M, 134 raw under 1000.
@@ -1193,7 +1614,7 @@ func cwd() string {
 // detectColorScheme figures out whether the terminal background is light and
 // calls SetLightTheme so markdown renders with a matching (high-contrast)
 // glamour style. Priority:
-//  1. WHIP_THEME=light|dark (explicit env override)
+//  1. GHG_THEME=light|dark (explicit env override)
 //  2. COLORFGBG (set by many terminals; last field is the bg color index)
 //  3. an OSC 11 background query on /dev/tty with a short timeout
 //  4. default: dark (the safe assumption for coding terminals)
@@ -1207,19 +1628,19 @@ func detectColorScheme() string {
 		SetLightTheme(light)                  // glamour markdown style
 		lipgloss.SetHasDarkBackground(!light) // AdaptiveColor picks
 	}
-	switch strings.ToLower(os.Getenv("WHIP_THEME")) {
+	switch strings.ToLower(os.Getenv("GHG_THEME")) {
 	case "light":
 		setScheme(true)
-		return "WHIP_THEME"
+		return "GHG_THEME"
 	case "dark":
 		setScheme(false)
-		return "WHIP_THEME"
+		return "GHG_THEME"
 	}
 	if v := os.Getenv("COLORFGBG"); v != "" {
 		if i := strings.LastIndex(v, ";"); i >= 0 {
 			var bg int
 			if _, err := fmt.Sscanf(v[i+1:], "%d", &bg); err == nil {
-				// standard palette: 0-6 dark, 7+ light (15 = white)
+				// standard settings: 0-6 dark, 7+ light (15 = white)
 				setScheme(bg == 7 || bg >= 8)
 				return "COLORFGBG"
 			}
@@ -1318,7 +1739,18 @@ func (m *model) growInput() {
 // growing the input box with its content so the whole prompt stays visible.
 func (m *model) layout() {
 	m.growInput()
-	chrome := 4 + m.input.Height() // header + tips + blanks + input + bottom pad
+	// Rows View() spends outside the viewport, counted against m.height. Get
+	// this wrong and the frame overflows the terminal: a too-tall frame makes
+	// the terminal scroll on every repaint, which reads as "mouse scroll is
+	// broken" — the wheel moves the viewport while the repaint shoves the
+	// whole frame the other way.
+	//   1 header · 1 separator above the input · input.Height() ·
+	//   1 blank + the three-row status box
+	// The old two-line ctrl+p hint is no longer rendered in View().
+	chrome := 6 + m.input.Height()
+	if m.quit1 || m.escClr || (m.esc1 && m.rew == nil && m.namePrompt == nil) {
+		chrome++ // an armed-hint line renders under the input
+	}
 	if m.iactive != nil {
 		// input box is hidden while a command has the terminal; drop its height
 		// and the leading blank line View inserts before it.
@@ -1400,7 +1832,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case titleMsg:
 		// only fill a title still at its auto placeholder (a /rename wins)
-		if m.store != nil && m.sessionID != "" {
+		if m.agent != nil && m.store != nil && m.sessionID != "" {
 			if meta, _, err := m.store.Load(m.sessionID); err == nil {
 				first := ""
 				for _, msg := range m.agent.Messages {
@@ -1431,22 +1863,36 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.Shift {
 			return m, nil
 		}
-		// clicking the ⚡ control in the header cycles reasoning effort
-		if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft &&
-			msg.Y == 0 && msg.X >= m.effortX {
-			m.setEffort(nextEffort(m.effortsFor(), m.agent.Effort))
-			return m, nil
+		// The middle row of the bottom status box owns the model, effort, and mode
+		// controls, so clicks there must not fall through to transcript scrolling.
+		if m.settings == nil && m.picker == nil && m.mpicker == nil && m.taskVP == nil &&
+			m.height > 0 && msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft && msg.Y == statusInfoRow(m.height) {
+			if m.statusModelW > 0 && msg.X >= m.statusModelX && msg.X < m.statusModelX+m.statusModelW {
+				m.cycleStatusModel()
+				return m, nil
+			}
+			if m.statusEffortW > 0 && msg.X >= m.statusEffortX && msg.X < m.statusEffortX+m.statusEffortW {
+				if m.agent != nil {
+					m.setEffort(nextEffort(m.effortsFor(), m.agent.Effort))
+				}
+				return m, nil
+			}
+			if m.statusModeW > 0 && msg.X >= m.statusModeX && msg.X < m.statusModeX+m.statusModeW {
+				m.cycleStatusMode()
+				return m, nil
+			}
 		}
 		if m.taskVP != nil {
 			// the open task pane owns the free area: wheel scrolls it
-			if msg.Button == tea.MouseButtonWheelUp || msg.Button == tea.MouseButtonWheelDown {
-				var cmd tea.Cmd
-				m.taskVP.vp, cmd = m.taskVP.vp.Update(msg)
-				return m, cmd
+			if scrollMouseWheel(&m.taskVP.vp, msg) {
+				return m, nil
 			}
 			return m, nil
 		}
-		if m.picker == nil && m.mpicker == nil && m.palette == nil {
+		if m.settings != nil {
+			return m.paletteMouse(msg)
+		}
+		if m.picker == nil && m.mpicker == nil && m.settings == nil {
 			// dock rows sit just above the input box: click selects/opens,
 			// wheel scrolls the selection through the strip
 			if top, n := m.dockTop(), len(m.dockTasks()); n > 0 && msg.Y >= top && msg.Y < top+n {
@@ -1476,7 +1922,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			// click on a collapsed tool result expands it (and vice versa)
 			if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft &&
-				msg.Y > 1 && m.palette == nil {
+				msg.Y > 1 && m.settings == nil {
 				row := m.vp.YOffset + msg.Y - 2 // viewport starts 2 rows below the header
 				if pad := m.contentPad(); row < pad {
 					row = -1 // top padding: above the first block
@@ -1489,6 +1935,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						return m, nil
 					}
 				}
+			}
+			if scrollMouseWheel(&m.vp, msg) {
+				m.follow = m.vp.AtBottom()
+				return m, nil
 			}
 			var cmd tea.Cmd
 			m.vp, cmd = m.vp.Update(msg)
@@ -1524,20 +1974,24 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case toolStartMsg:
 		m.flushThink()
 		m.flushCurrent()
-		args := msg.args
-		if msg.name == "browser_exec" || msg.name == "computer_exec" {
-			// Surface the step label (the code's first # comment) as the row
-			// text instead of raw JSON — the model writes it for the user.
-			if label := browserStepLabel(msg.args); label != "" {
-				args = label
-			}
-		}
 		// a running row: icon + present-participle verb + full args (the
 		// command being run is always fully visible). On toolEndMsg the same
 		// block collapses in place to one line.
-		row := toolStyle.Render("⚒ "+toolVerb(msg.name)+" ") + dimStyle.Render(args)
+		row := toolStyle.Render("⚒ "+toolVerb(msg.name)+" ") + dimStyle.Render(msg.args)
 		m.blocks = append(m.blocks, block{kind: blockToolRun, text: row, toolID: msg.id, toolRunning: true})
 		m.refreshVP()
+		return m, nil
+
+	case toolOutputMsg:
+		for i := len(m.blocks) - 1; i >= 0; i-- {
+			b := &m.blocks[i]
+			if b.kind == blockToolRun && b.toolRunning && b.toolID == msg.id {
+				b.toolOutput = msg.output
+				b.stale = true
+				m.refreshVP()
+				break
+			}
+		}
 		return m, nil
 
 	case toolEndMsg:
@@ -1551,6 +2005,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if b.kind == blockToolRun && b.toolRunning && b.toolID == msg.id {
 				b.toolRunning = false
 				b.toolFailed = strings.HasPrefix(msg.result, "Error:")
+				b.toolOutput = ""
 				b.text = toolStyle.Render("⚒ "+msg.name+" ") + dimStyle.Render(firstLine(msg.result))
 				b.stale = true
 				break
@@ -1658,6 +2113,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case planProposalMsg:
+		return m.finishPlanProposal(msg)
+
 	case compactMsg:
 		// compaction lands between turns: record it as an event and note it
 		// inline. The raw message log stays on disk — Load derives the
@@ -1684,7 +2142,15 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.append(dimStyle.Render(fmt.Sprintf("◎ compacted — summarized %d msgs, %d kept · raw history preserved", msg.took, msg.kept)))
 			m.future = nil   // compaction rewrote history; stale redo entries would resurrect it
 			m.msgBlock = nil // indices no longer match; rebuilt as blocks stream in
-			m.persist()      // append the new (compacted) rows; raw rows stay
+			// The compacted prompt is a derived view. Align the local save
+			// cursor with that view once a session already owns the raw rows;
+			// Store.Save then appends later messages to the raw SQLite tail.
+			// With no session yet, leave saved at its initial value so the
+			// turn-complete persist still creates and saves the conversation.
+			if m.agent != nil && m.store != nil && m.sessionID != "" {
+				m.saved = len(m.agent.MessagesSnapshot())
+			}
+			m.persist() // append the new (compacted) rows; raw rows stay
 		}
 		return m, nil
 
@@ -1703,7 +2169,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil && !canceled {
 			m.append(errStyle.Render("error: " + msg.err.Error()))
 		} else if canceled {
-			m.append(dimStyle.Render("(interrupted — any running tool calls will be recorded as interrupted; whip can retry them next turn)"))
+			m.append(dimStyle.Render("(interrupted — any running tool calls will be recorded as interrupted; ghg can retry them next turn)"))
 		}
 		m.persist()
 		switch {
@@ -1777,7 +2243,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case taskUpdateMsg:
 		// a background subagent started or settled; the dock shows it. An
 		// open view of a settled task reloads from the stored report.
-		if m.taskVP != nil {
+		if m.agent != nil && m.taskVP != nil {
 			if t, ok := m.agent.Tasks().Get(m.taskVP.id); ok && t.Status != agent.TaskRunning && m.taskVP.live {
 				m.openTask(m.taskVP.id) // reseed with the final report
 			} else {
@@ -1859,6 +2325,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, cmd
 
 	case scheduleTickMsg:
+		if m.agent == nil {
+			return m, scheduleTick()
+		}
 		return m, tea.Batch(scheduleTick(), m.fireDueSchedules())
 	}
 
@@ -1878,7 +2347,7 @@ func (m *model) key(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.permKey(msg)
 		return m, nil
 	}
-	if m.palette != nil {
+	if m.settings != nil {
 		return m.paletteKey(msg)
 	}
 	if m.rew != nil {
@@ -2149,7 +2618,7 @@ func (m *model) key(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.lastUp = m.nowFn()
-		if msg.Type == tea.KeyCtrlP { // command palette (opencode-style modal)
+		if msg.Type == tea.KeyCtrlP { // command settings (opencode-style modal)
 			m.openPalette()
 			return m, nil
 		}
@@ -2185,7 +2654,7 @@ func (m *model) key(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.menu != nil {
 			c := m.menu.cands[m.menu.idx]
 			// a bare command previewed by tab cycling runs immediately, same
-			// as picking it with arrows + enter (one-keystroke palette)
+			// as picking it with arrows + enter (one-keystroke settings)
 			if m.menu.cyc && m.menu.head == "" && execNow[c.Text] {
 				m.menu = nil
 				m.input.Reset()
@@ -2318,9 +2787,8 @@ func (m *model) nowFn() time.Time {
 	return time.Now()
 }
 
-// busyStats renders the busy line's live counters: elapsed time since the
-// turn started, session tokens so far, and the share of the advertised
-// context window. Returns "" when idle (turnStart zero).
+// busyStats renders the busy line's elapsed time. Token totals belong only in
+// the persistent bottom status bar. Returns "" when idle (turnStart zero).
 func (m *model) busyStats() string {
 	if m.turnStart.IsZero() {
 		return ""
@@ -2330,14 +2798,7 @@ func (m *model) busyStats() string {
 		d = 0
 	}
 	elapsed := d.Round(time.Second)
-	stats := fmt.Sprintf(" %d:%02d", int(elapsed.Minutes()), int(elapsed.Seconds())%60)
-	if u := m.agent.Usage(); u.PromptTokens > 0 || u.CompletionTokens > 0 {
-		stats += fmt.Sprintf(" · %s tok", fmtTok(u.PromptTokens+u.CompletionTokens))
-	}
-	if m.agent.ContextLimit > 0 {
-		stats += fmt.Sprintf(" · %d%%", agent.EstimateTokens(m.agent.Messages)*100/m.agent.ContextLimit)
-	}
-	return stats
+	return fmt.Sprintf(" %d:%02d", int(elapsed.Minutes()), int(elapsed.Seconds())%60)
 }
 
 // histPrev/histNext recall submitted inputs with the arrow keys.
@@ -2384,19 +2845,52 @@ func (m *model) cursorOnLastLine() bool {
 	return li.RowOffset >= li.Height-1
 }
 
-// contextLimitFor returns the advertised context window for a model id on a
-// provider, from the cached /models catalog (0 when unknown).
+// contextLimitFor returns the context window for a model id on a provider.
+// Provider catalogs win, followed by explicit config, then models.dev.
 func (m *model) contextLimitFor(provName, apiID string) int {
 	if cat, ok := m.catalogs[provName]; ok {
-		return cat.ContextLength(apiID)
+		if n := cat.ContextLength(apiID); n > 0 {
+			return n
+		}
+	}
+	modelName := m.modelName
+	if modelName == "" && m.agent != nil {
+		modelName = m.agent.Model
+	}
+	if m.cfg != nil {
+		if mdl, ok := m.cfg.Models[modelName]; ok {
+			if n := mdl.ContextWindow(); n > 0 {
+				return n
+			}
+		}
+	}
+	if n := config.LoadModelsDev().ContextLength(apiID, m.modelsDevProviderIDs(provName)...); n > 0 {
+		return n
 	}
 	return 0
+}
+
+// contextStatus renders the latest provider-reported request size and, when
+// known, the current model's advertised context window. It starts at zero
+// until an assistant response reports usage.
+func (m *model) contextStatus() string {
+	if m.agent == nil {
+		return "ctx 0"
+	}
+	used := m.agent.ContextTokens()
+	if m.agent.ContextLimit <= 0 {
+		return "ctx " + fmtTok(used)
+	}
+	return fmt.Sprintf("ctx %s/%s", fmtTok(used), fmtTok(m.agent.ContextLimit))
 }
 
 // sessionCost returns the session's cumulative USD spend at the current
 // model's advertised rates; ok is false when the provider's catalog has no
 // pricing for the model, in which case the status line hides the segment.
 func (m *model) sessionCost() (float64, bool) {
+	if m.agent == nil {
+		return 0, false
+	}
 	cat, ok := m.catalogs[m.provName]
 	if !ok {
 		return 0, false
@@ -2420,28 +2914,79 @@ func compactThresholdFor(cfg *config.Config) float64 {
 }
 
 // applyCompactModel points the agent's compaction summary call at the
-// configured compaction model/provider. An empty m.compactModel means the
-// built-in default (config.DefaultCompactModel); when it isn't in the user's
-// config — or a picked entry is bad or unreachable — the override clears and
-// compaction falls back to the conversation's own model.
+// configured compaction model/provider. An explicit compactModel remains a
+// per-session override. Otherwise a configured tiny role is selected; a
+// legacy config without roles keeps the built-in compaction model for
+// backwards compatibility. A bad optional route falls back to the
+// conversation's own model.
 func (m *model) applyCompactModel() {
-	m.agent.CompactClient, m.agent.CompactModel = nil, ""
-	cm := m.compactModel
-	if cm == "" {
-		cm = config.DefaultCompactModel
+	if m.agent == nil {
+		return
 	}
-	prov, _, apiID, err := m.cfg.Resolve(cm, m.compactProv)
+	m.agent.CompactBackend, m.agent.CompactModel = nil, ""
+	cm := m.compactModel
+	cp := m.compactProv
+	if cm == "" {
+		if cp == "" && len(m.cfg.Roles) > 0 {
+			target, roleErr := m.cfg.ResolveRole(config.RoleTiny)
+			if roleErr != nil {
+				m.append(errStyle.Render("tiny role: " + roleErr.Error() + " — using current model"))
+				return
+			}
+			cm, cp = target.Model, target.Provider
+		}
+		if cm == "" {
+			cm = m.defaultCompactModelName()
+		}
+	}
+	prov, mdl, apiID, err := m.cfg.Resolve(cm, cp)
 	if err != nil {
 		if m.compactModel != "" { // a picked model failing is worth a note; a missing default isn't
 			m.append(errStyle.Render("compaction model: " + err.Error() + " — using current model"))
 		}
 		return
 	}
-	key, keyErr := prov.ResolveKey()
-	if keyErr == nil && key != "" {
-		m.agent.CompactClient = llm.New(prov.BaseURL, key)
-		m.agent.CompactClient.MaxRetries = m.cfg.MaxRetries
-		m.agent.CompactModel = apiID
+	provName := cp
+	if provName == "" {
+		provName = m.cfg.DefaultProvider
+		if provName == "" && len(mdl.Providers) > 0 {
+			provName = mdl.Providers[0]
+		}
+	}
+	resolved, resolveErr := m.profiles.ResolveModel(provider.Instance{
+		Name: provName, Profile: prov.Profile, BaseURL: prov.BaseURL, Protocol: prov.API,
+	}, apiID)
+	if resolveErr != nil {
+		if m.compactModel != "" {
+			m.append(errStyle.Render("compaction model: " + resolveErr.Error() + " — using current model"))
+		}
+		return
+	}
+	key := ""
+	var keyErr error
+	if resolved.RequiresAPIKey() {
+		key, keyErr = prov.ResolveKey()
+	}
+	if !resolved.RequiresAPIKey() || (keyErr == nil && key != "") {
+		protocol := resolved.Protocol
+		if strings.TrimSpace(mdl.API) != "" {
+			protocol = strings.TrimSpace(mdl.API)
+		}
+		backend, backendErr := llm.NewBackend(llm.BackendConfig{
+			Protocol:   llm.Protocol(protocol),
+			BaseURL:    resolved.BaseURL,
+			APIKey:     key,
+			Headers:    resolved.DefaultHeaders,
+			AuthKind:   resolved.Auth.Kind,
+			AuthHeader: resolved.Auth.Header,
+			MaxRetries: m.cfg.MaxRetries,
+		})
+		if backendErr == nil {
+			m.agent.CompactBackend = backend
+			m.agent.CompactModel = apiID
+		} else if m.compactModel != "" {
+			m.append(errStyle.Render("compaction model: " + backendErr.Error() + " — using current model"))
+		}
 	} else if m.compactModel != "" {
 		if keyErr != nil {
 			m.append(errStyle.Render("compaction model: " + keyErr.Error() + " — using current model"))
@@ -2451,10 +2996,22 @@ func (m *model) applyCompactModel() {
 	}
 }
 
+func (m *model) defaultCompactModelName() string {
+	if m.cfg != nil && len(m.cfg.Roles) > 0 {
+		if target, err := m.cfg.ResolveRole(config.RoleTiny); err == nil && target.Model != "" {
+			return target.Model
+		}
+	}
+	return config.DefaultCompactModel
+}
+
 // wireTasks makes the active agent's background-task registry nudge the UI on
 // every start/settle. OnChange runs on the worker goroutine, so it only sends
 // a message (never touches UI state directly).
 func (m *model) wireTasks() {
+	if m.agent == nil {
+		return
+	}
 	// Persist every start/settle to the session store so --resume can restore
 	// the dock. Headless-safe (no prog needed). The session id comes in as an
 	// argument — published via SetSessionID — so this worker-goroutine
@@ -2490,19 +3047,11 @@ func (m *model) wireTasks() {
 	}
 }
 
-// runningTasks counts background subagents still in flight (for the header badge).
-func (m *model) runningTasks() int {
-	n := 0
-	for _, t := range m.agent.Tasks().List() {
-		if t.Status == agent.TaskRunning {
-			n++
-		}
-	}
-	return n
-}
-
 // tasksView renders the background-subagent list for /tasks.
 func (m *model) tasksView() string {
+	if m.agent == nil {
+		return dimStyle.Render("(no provider configured — run /auth first)")
+	}
 	tasks := m.agent.Tasks().List()
 	if len(tasks) == 0 {
 		return dimStyle.Render("(no background subagents)")
@@ -2543,11 +3092,22 @@ func (m *model) switchModel(name, prov string) {
 		m.append(errStyle.Render(err.Error()))
 		return
 	}
-	ag.Effort = m.agent.Effort
-	ag.Messages = append(ag.Messages, m.agent.Messages[1:]...) // carry history
-	ag.CompactClient, ag.CompactModel = m.agent.CompactClient, m.agent.CompactModel
-	ag.CompactThreshold = m.agent.CompactThreshold
+	ag.ReasoningToggle = m.reasoningToggleFor(pn, ag.Model)
+	if m.agent != nil {
+		ag.Effort = m.agent.Effort
+		ag.Messages = append(ag.Messages, m.agent.Messages[1:]...) // carry history
+		ag.CompactBackend, ag.CompactModel = m.agent.CompactBackend, m.agent.CompactModel
+		ag.CompactThreshold = m.agent.CompactThreshold
+	} else {
+		ag.Effort = m.cfg.DefaultEffort
+		if ag.Effort == "" {
+			ag.Effort = "medium"
+		}
+		ag.CompactThreshold = compactThresholdFor(m.cfg)
+	}
 	m.agent, m.modelName, m.provName = ag, mn, pn
+	m.configureArtifactAgent(m.agent)
+	m.applyCompactModel()
 	m.wireTasks()
 	if !contains(m.effortsFor(), ag.Effort) {
 		m.resetEffort("") // the new model doesn't support the current level
@@ -2556,10 +3116,9 @@ func (m *model) switchModel(name, prov string) {
 	if err := m.cfg.Save(); err != nil {
 		m.append(errStyle.Render("config save failed: " + err.Error()))
 	}
-	m.append(dimStyle.Render("→ " + mn + " @ " + pn))
 }
 
-// pickerKey handles keys while the /resume browser is open.
+// pickerKey handles keys while the /resume picker is open.
 func (m *model) pickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	p := m.picker
 	switch msg.Type {
@@ -2593,7 +3152,7 @@ func (p *picker) loadPreview(store *session.Store) {
 	}
 }
 
-// openPicker starts the /resume browser on recent sessions.
+// openPicker starts the /resume picker on recent sessions.
 func (m *model) openPicker() {
 	if m.store == nil {
 		m.append(errStyle.Render("session store unavailable"))
@@ -2616,7 +3175,7 @@ func (m *model) openPicker() {
 // frozen into a cycle set and the first is previewed, so tab always inserts
 // text — a single match completes outright, several cycle with preview.
 func (m *model) openMenu() {
-	head, cands := completions(m.input.Value(), m.modelCands(), m.providerCands(), m.skillCands(), effortCandsFor(m.effortsFor()))
+	head, cands := completionsWithAuth(m.input.Value(), m.modelCands(), m.providerCands(), m.authProviderCands(), m.skillCands(), effortCandsFor(m.effortsFor()))
 	if len(cands) == 0 {
 		return
 	}
@@ -2636,7 +3195,7 @@ func (m *model) refreshMenu() {
 	val := m.input.Value()
 	token := val[strings.LastIndexByte(val, ' ')+1:]
 	if strings.HasPrefix(val, "/") || strings.HasPrefix(token, "@") || strings.HasPrefix(token, "$") {
-		head, cands := completions(val, m.modelCands(), m.providerCands(), m.skillCands(), effortCandsFor(m.effortsFor()))
+		head, cands := completionsWithAuth(val, m.modelCands(), m.providerCands(), m.authProviderCands(), m.skillCands(), effortCandsFor(m.effortsFor()))
 		if len(cands) > 0 {
 			idx := 0
 			if m.menu != nil && m.menu.idx < len(cands) && m.menu.frozen == nil {
@@ -2705,13 +3264,20 @@ func (m *model) accept() bool {
 }
 
 func (m *model) modelCands() []cand {
-	out := make([]cand, 0, len(m.cfg.Models))
+	available := make(map[string]bool)
+	for _, it := range m.availableModelItems() {
+		available[it.model] = true
+	}
+	out := make([]cand, 0, len(available))
 	for name, mdl := range m.cfg.Models {
+		if !available[name] {
+			continue
+		}
 		out = append(out, cand{name, "via " + strings.Join(mdl.Providers, ", ")})
 	}
 	// catalog-advertised models are usable without a config entry (catalog
 	// fallback in Resolve); offer them in completion too
-	for _, it := range buildModelItems(m.cfg) {
+	for _, it := range m.availableModelItems() {
 		if it.fromCatalog {
 			out = append(out, cand{it.model, "via " + it.provider + " (catalog)"})
 		}
@@ -2723,6 +3289,25 @@ func (m *model) providerCands() []cand {
 	out := make([]cand, 0, len(m.cfg.Providers))
 	for name, p := range m.cfg.Providers {
 		out = append(out, cand{name, p.BaseURL})
+	}
+	return out
+}
+
+func (m *model) authProviderCands() []cand {
+	ids := m.profiles.IDs()
+	out := make([]cand, 0, len(ids))
+	for _, id := range ids {
+		profile, ok := m.profiles.Lookup(id)
+		if !ok {
+			continue
+		}
+		status := "not configured"
+		if profile.Auth.Kind == provider.AuthNone {
+			status = "no key required"
+		} else if m.authConfigured(id) {
+			status = "configured"
+		}
+		out = append(out, cand{id, profile.DisplayName + " — " + status})
 	}
 	return out
 }
@@ -2754,7 +3339,9 @@ func (m *model) prepareTurn(text string) (string, []llm.ContentPart) {
 		sys += m.mcpMgr.InstructionsBlock()
 	}
 	sys += memory.PromptBlock(memory.Installation(), memory.Session(m.sessionID))
-	m.agent.Messages[0].Content = sys
+	if m.agent != nil && len(m.agent.Messages) > 0 {
+		m.agent.Messages[0].Content = sys
+	}
 	expanded := expandMentions(expandSkills(text, sk))
 	if !m.supportsVision() {
 		// text-only model: leave @image tags as pointer notes (from
@@ -2770,7 +3357,11 @@ func (m *model) prepareTurn(text string) (string, []llm.ContentPart) {
 // advertised input_modalities entry (from /models, cached in the catalog)
 // wins; otherwise the config's per-model vision flag decides (default false).
 func (m *model) supportsVision() bool {
-	return modelSupportsVision(m.cfg, m.modelName, m.agent.Model, m.catalogs, m.provName)
+	modelID := m.modelName
+	if m.agent != nil {
+		modelID = m.agent.Model
+	}
+	return modelSupportsVision(m.cfg, m.modelName, modelID, m.catalogs, m.provName)
 }
 
 // modelSupportsVision is supportsVision lifted off the TUI model so
@@ -2845,14 +3436,13 @@ func (m *model) appendThink(s string) {
 
 // flushThink moves any in-flight partial reasoning line into the transcript
 // and ends the current thinking segment.
-// toggleThinking flips reasoning-token display (ctrl+o / palette) and persists
+// toggleThinking flips reasoning-token display (ctrl+o / settings) and persists
 // the choice to the global config, like /mouse does.
 func (m *model) toggleThinking() {
 	m.setThinking(!m.showThinking)
-	m.append(dimStyle.Render("◌ thinking tokens: " + onOff(m.showThinking)))
 }
 
-// setThinking applies the state without the transcript note (palette ←/→
+// setThinking applies the state without the transcript note (settings ←/→
 // steppers call this); it still persists.
 func (m *model) setThinking(on bool) {
 	m.showThinking = on
@@ -2914,13 +3504,16 @@ func (m *model) submit(text string) (tea.Model, tea.Cmd) {
 	return m.submitTurn(text, true)
 }
 
-// submitGoal sends a whip-injected goal-continuation; not a typed submission,
+// submitGoal sends a ghg-injected goal-continuation; not a typed submission,
 // so it must not appear in up-arrow input history.
 func (m *model) submitGoal(text string) (tea.Model, tea.Cmd) {
 	return m.submitTurn(text, false)
 }
 
 func (m *model) submitTurn(text string, authored bool) (tea.Model, tea.Cmd) {
+	if !m.requireAgent() {
+		return m, nil
+	}
 	m.busy = true
 	m.turnStart = m.nowFn()
 	prepared, parts := m.prepareTurn(text)
@@ -3007,7 +3600,8 @@ func (m *model) submitTurn(text string, authored bool) (tea.Model, tea.Cmd) {
 				flush()
 				send(toolStartMsg{id, n, a})
 			},
-			OnToolEnd: func(id, n, r string) { send(toolEndMsg{id, n, r}) },
+			OnToolOutput: func(id, output string) { send(toolOutputMsg{id, output}) },
+			OnToolEnd:    func(id, n, r string) { send(toolEndMsg{id, n, r}) },
 			OnSteer: func(s string) {
 				flush()
 				send(steeredMsg(s))
@@ -3048,11 +3642,10 @@ func (m *model) submitTurn(text string, authored bool) (tea.Model, tea.Cmd) {
 	return m, m.spin.Tick
 }
 
-// busyCmd reports whether a slash command is safe to run while a turn is in
-// flight. These adjust settings or views only — they never touch
-// Agent.Messages, busy, or the session — so they run immediately instead of
-// being queued as messages (queued text is submitted to the model verbatim
-// after the turn ends).
+// busyCmd reports whether a slash command should be handled immediately while
+// a turn is in flight. Settings/views are safe; /plan and /execute also need
+// to report their busy state themselves rather than being queued as literal
+// chat text (queued text is submitted to the model verbatim after the turn).
 func busyCmd(text string) bool {
 	fields := strings.Fields(text)
 	if len(fields) == 0 {
@@ -3060,6 +3653,8 @@ func busyCmd(text string) bool {
 	}
 	switch fields[0] {
 	case "/help", "/theme", "/mouse", "/effort", "/tasks", "/cd", "/pwd", "/report":
+		return true
+	case "/plan", "/execute": // handled immediately so a slash command is not sent as chat text
 		return true
 	case "/auth": // must run now even while busy: an inline key queued as a chat message would be sent to the model
 		return true
@@ -3071,6 +3666,9 @@ func busyCmd(text string) bool {
 
 func (m *model) command(text string) (tea.Model, tea.Cmd) {
 	fields := strings.Fields(text)
+	if len(fields) == 0 {
+		return m, nil
+	}
 	switch fields[0] {
 	case "/quit", "/exit", "/q":
 		return m, tea.Quit
@@ -3079,11 +3677,15 @@ func (m *model) command(text string) (tea.Model, tea.Cmd) {
 			m.append(dimStyle.Render("(busy — /clear after this turn)"))
 			return m, nil
 		}
+		if !m.requireAgent() {
+			return m, nil
+		}
 		m.agent.Messages = m.agent.Messages[:1] // keep system prompt
 		m.agent.ResetUsage()                    // zero the status line's spend counters
 		m.blocks = nil
 		m.msgBlock = nil
-		m.future = nil   // no redo across a cleared conversation
+		m.future = nil // no redo across a cleared conversation
+		m.proposedPlan = nil
 		m.setGoal("")    // clear before detaching so the old session's goal is dropped too
 		m.sessionID = "" // next turn starts a fresh session
 		m.agent.Tasks().SetSessionID("")
@@ -3111,6 +3713,9 @@ func (m *model) command(text string) (tea.Model, tea.Cmd) {
 		}
 		if m.busy {
 			m.append(dimStyle.Render("(busy — /compact will land after this turn)"))
+			return m, nil
+		}
+		if !m.requireAgent() {
 			return m, nil
 		}
 		m.busy = true
@@ -3168,14 +3773,27 @@ func (m *model) command(text string) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case "/mouse":
-		m.mouseOn = !m.mouseOn
-		cfg := m.cfg
-		b := m.mouseOn
-		cfg.Mouse = &b
-		if err := cfg.Save(); err != nil {
-			m.append(errStyle.Render("config save failed: " + err.Error()))
+		next := !m.mouseOn
+		if len(fields) > 1 {
+			switch strings.ToLower(fields[1]) {
+			case "on":
+				next = true
+			case "off":
+				next = false
+			default:
+				m.append(errStyle.Render("usage: /mouse [on|off]"))
+				return m, nil
+			}
 		}
-		m.append(dimStyle.Render("mouse capture: " + onOff(m.mouseOn) + " (on = wheel scroll + ⚡ clicks, the default, drag to select/copy; off = native drag-to-copy, but tmux captures the wheel)"))
+		m.mouseOn = next
+		cfg := m.cfg
+		if cfg != nil {
+			b := m.mouseOn
+			cfg.Mouse = &b
+			if err := cfg.Save(); err != nil {
+				m.append(errStyle.Render("config save failed: " + err.Error()))
+			}
+		}
 		// We manage click/wheel reporting directly (no motion ?1002), so toggle
 		// the escape ourselves rather than tea.EnableMouseCellMotion (which would
 		// turn motion back on and break native drag-to-copy).
@@ -3187,8 +3805,11 @@ func (m *model) command(text string) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 	case "/effort":
-		levels := m.effortsFor()
 		if len(fields) > 1 {
+			if !m.requireAgent() {
+				return m, nil
+			}
+			levels := m.effortsFor()
 			lv, ok := parseEffort(levels, fields[1])
 			if !ok {
 				names := make([]string, len(levels))
@@ -3199,11 +3820,13 @@ func (m *model) command(text string) (tea.Model, tea.Cmd) {
 				break
 			}
 			m.setEffort(lv)
-			m.append(dimStyle.Render("⚡ effort: " + effortLabel(m.agent.Effort)))
 		} else {
 			m.openPaletteOn("reasoning effort") // bare: open the level selector
 		}
 	case "/goal-from-context":
+		if !m.requireAgent() {
+			return m, nil
+		}
 		if m.busy {
 			m.append(dimStyle.Render("(busy — /goal-from-context after this turn)"))
 			return m, nil
@@ -3236,13 +3859,16 @@ func (m *model) command(text string) (tea.Model, tea.Cmd) {
 		m.cancel = cancel
 		prompt := agent.BuildGoalFromContextPrompt(tail)
 		formulate := func() (string, error) {
-			goal, usage, err := ag.Client.Complete(ctx, llm.Request{
-				Model:     ag.Model,
-				MaxTokens: 8192,
-				Messages:  []llm.Message{{Role: "user", Content: prompt}},
+			reasoningEffort, reasoningEnabled := ag.ReasoningRequest()
+			message, usage, err := ag.Backend.Complete(ctx, llm.Request{
+				Model:            ag.Model,
+				MaxTokens:        8192,
+				Messages:         []llm.Message{{Role: "user", Content: prompt}},
+				ReasoningEffort:  reasoningEffort,
+				ReasoningEnabled: reasoningEnabled,
 			})
 			ag.AddUsage(usage) // the formulation call is session spend too
-			return goal, err
+			return message.TextContent(), err
 		}
 		if p == nil {
 			// headless (tests): run inline on the caller's goroutine — with
@@ -3272,9 +3898,10 @@ func (m *model) command(text string) (tea.Model, tea.Cmd) {
 			p.Send(goalFromContextMsg{goal: goal, err: err})
 		}()
 		return m, m.spin.Tick
-	case "/computer-use", "/computer":
-		m.computerUseCommand(fields[1:], text)
-		return m, nil
+	case "/plan":
+		return m.planCommand(text)
+	case "/execute":
+		return m.executeCommand(text)
 	case "/goal":
 		switch {
 		case len(fields) == 1:
@@ -3289,6 +3916,9 @@ func (m *model) command(text string) (tea.Model, tea.Cmd) {
 		case fields[1] == "rounds":
 			m.goalRoundsCommand(fields[2:])
 		case fields[1] == "resume":
+			if !m.requireAgent() {
+				break
+			}
 			if m.goal == "" {
 				m.append(errStyle.Render("no goal to resume — set one with /goal <text>"))
 				break
@@ -3297,6 +3927,9 @@ func (m *model) command(text string) (tea.Model, tea.Cmd) {
 			m.append(dimStyle.Render("◎ resuming goal: " + m.goal))
 			return m.submitGoal(goalContinuePrompt(m.goal))
 		default:
+			if !m.requireAgent() {
+				break
+			}
 			goal := strings.TrimSpace(strings.TrimPrefix(text, "/goal"))
 			m.setGoal(goal)
 			m.append(dimStyle.Render("◎ goal set: " + goal))
@@ -3317,6 +3950,9 @@ func (m *model) command(text string) (tea.Model, tea.Cmd) {
 		m.renameCommand(strings.TrimSpace(strings.TrimPrefix(text, "/rename")))
 		return m, nil
 	case "/resume":
+		if !m.requireAgent() {
+			break
+		}
 		if m.busy {
 			m.append(dimStyle.Render("(busy — /resume after this turn)"))
 			return m, nil
@@ -3375,6 +4011,13 @@ func (m *model) command(text string) (tea.Model, tea.Cmd) {
 // compactCommand handles "/compact <args…>": off restores the built-in
 // default compaction model, "<model> [provider]" selects one (persisted).
 func (m *model) compactCommand(args []string) {
+	if len(args) == 0 {
+		return
+	}
+	if m.agent == nil {
+		m.append(m.degradedProviderNote())
+		return
+	}
 	if args[0] == "off" {
 		m.compactModel, m.compactProv = "", ""
 		m.applyCompactModel()
@@ -3382,7 +4025,6 @@ func (m *model) compactCommand(args []string) {
 		if err := m.cfg.Save(); err != nil {
 			m.append(errStyle.Render("config save failed: " + err.Error()))
 		}
-		m.append(dimStyle.Render("◎ compaction model: default (" + config.DefaultCompactModel + ")"))
 		return
 	}
 	if _, ok := m.cfg.Models[args[0]]; !ok {
@@ -3403,18 +4045,14 @@ func (m *model) compactCommand(args []string) {
 	if err := m.cfg.Save(); err != nil {
 		m.append(errStyle.Render("config save failed: " + err.Error()))
 	}
-	prov := m.compactProv
-	if prov == "" {
-		if mdl := m.cfg.Models[m.compactModel]; len(mdl.Providers) > 0 {
-			prov = mdl.Providers[0]
-		}
-	}
-	m.append(dimStyle.Render("◎ compaction model: " + m.compactModel + " @ " + prov))
 }
 
 // compactPct returns the live threshold percent (the default when unset).
 // cfg.CompactPct is the authoritative value; the agent's float is derived.
 func (m *model) compactPct() int {
+	if m.cfg == nil {
+		return config.DefaultCompactPct
+	}
 	pct := m.cfg.CompactPct
 	if pct == 0 {
 		pct = config.DefaultCompactPct
@@ -3424,9 +4062,13 @@ func (m *model) compactPct() int {
 
 // setCompactPct applies a compaction-threshold percent (clamped 10–90): the
 // agent compacts proactively once the estimated context use crosses it.
-// Persisted as the new default. Palette-driven, so no transcript note — the
+// Persisted as the new default. settings-driven, so no transcript note — the
 // row's [NN%] badge is the feedback (same as the effort/theme steppers).
 func (m *model) setCompactPct(pct int) {
+	if m.agent == nil {
+		m.append(m.degradedProviderNote())
+		return
+	}
 	pct = min(max(pct, 10), 90)
 	m.agent.CompactThreshold = float64(pct) / 100
 	m.cfg.CompactPct = pct
@@ -3447,40 +4089,12 @@ func (m *model) currentView() string {
 
 func (m *model) View() string {
 	var b strings.Builder
-	left := fmt.Sprintf(" whip · %s @ %s · %s", m.modelName, m.provName, cwd())
-	if m.goal != "" {
-		left += " · ◎ " + truncLine(m.goal, 40)
+	left := fmt.Sprintf(" ghg · skills: %d loaded", m.skillsLoaded)
+	if m.width > 0 {
+		left = ansi.Truncate(left, m.width, "…")
 	}
-	if !m.follow {
-		left += fmt.Sprintf(" · ↑ %d%%", int(m.vp.ScrollPercent()*100))
-	}
-	// session token usage, provider-reported: in (cached of it) / out, then
-	// the share of the advertised context window the conversation occupies
-	u := m.agent.Usage()
-	if u.PromptTokens > 0 || u.CompletionTokens > 0 {
-		left += fmt.Sprintf(" · ⣿ %s in", fmtTok(u.PromptTokens))
-		if c := u.Cached(); c > 0 {
-			left += fmt.Sprintf(" (%s cached)", fmtTok(c))
-		}
-		left += fmt.Sprintf(" · %s out", fmtTok(u.CompletionTokens))
-	}
-	if m.agent.ContextLimit > 0 {
-		left += fmt.Sprintf(" · %d%% ctx", agent.EstimateTokens(m.agent.Messages)*100/m.agent.ContextLimit)
-	}
-	// running background subagents get a badge; /tasks lists them
-	if n := m.runningTasks(); n > 0 {
-		left += fmt.Sprintf(" · ⚙ %d sub", n)
-	}
-	// right-aligned clickable effort control; ◌ marks thinking display
-	right := "⚡ " + effortLabel(m.agent.Effort) + " "
-	if m.showThinking {
-		right = "◌ on  " + right
-	}
-	m.effortX = max(m.width-len(right)-1, 0) // ⚡ renders 2 cells wide
-	left = truncLine(left, max(m.width-len(right)-2, 0))
-	pad := max(m.width-len(left)-len(right)-1, 1)
-	b.WriteString(dimStyle.Render(left+strings.Repeat(" ", pad)) + toolStyle.Render(right) + "\n")
-	if m.palette != nil {
+	b.WriteString(dimStyle.Render(left) + "\n")
+	if m.settings != nil {
 		b.WriteString(m.paletteView())
 		return b.String()
 	}
@@ -3496,10 +4110,7 @@ func (m *model) View() string {
 		b.WriteString(m.taskViewView())
 		return b.String()
 	}
-	// One compact hint up top — the full roster lives behind the ctrl+p palette
 	// and the /help command. The bottom hint covers the busy/interactive states.
-	tips := "`ctrl+p` commands"
-	b.WriteString(dimStyle.Render(tips) + "\n\n")
 	b.WriteString(m.viewportView() + "\n")
 	if m.curThink != "" {
 		b.WriteString("\n" + m.thinkView() + "\n")
@@ -3538,7 +4149,7 @@ func (m *model) View() string {
 			b.WriteString(line + "\n")
 		}
 	}
-	b.WriteString("\n")
+	b.WriteString(m.inputRule() + "\n")
 	// the persistent background-subagent strip sits just above the input box
 	if dock := m.tasksDock(); dock != "" {
 		b.WriteString(dock + "\n")
@@ -3573,29 +4184,207 @@ func (m *model) View() string {
 	if m.menu != nil {
 		b.WriteString("\n" + m.menuView())
 	}
-	b.WriteString("\n\n" + m.statusView()) // persistent status line, with a blank line above
+	b.WriteString("\n\n" + m.statusView()) // persistent status box, with a blank line above
 	return b.String()
 }
 
-// statusView renders the always-on status line below the input: current
-// directory, model (effort), provider, and session token spend. It mirrors
-// the header's data but stays put while the transcript scrolls, so the four
-// facts are always visible no matter where the viewport sits.
+const (
+	statusBoxRows     = 3
+	statusCellPadding = 1
+)
+
+// statusInfoRow is the middle row of the three-row status box.
+func statusInfoRow(height int) int {
+	return height - statusBoxRows + 1
+}
+
+type statusField struct {
+	text  string
+	width int
+}
+
+// statusView renders the always-on status box below the input. The model,
+// effort, and mode fields are interactive hitboxes; the rest is session
+// context that stays put while the transcript scrolls.
 func (m *model) statusView() string {
 	model := m.modelName
-	if e := effortLabel(m.agent.Effort); e != "off" {
-		model += " (" + e + ")"
-	}
-	u := m.agent.Usage()
-	spend := fmt.Sprintf("%s/%s tok", fmtTok(u.PromptTokens), fmtTok(u.CompletionTokens))
-	if c := u.Cached(); c > 0 {
-		spend = fmt.Sprintf("%s(%s)/%s tok", fmtTok(u.PromptTokens), fmtTok(c), fmtTok(u.CompletionTokens))
-	}
+	contextSize := m.contextStatus()
 	if cost, ok := m.sessionCost(); ok {
-		spend += " · " + fmtCost(cost)
+		contextSize += " · " + fmtCost(cost)
 	}
-	line := fmt.Sprintf(" %s   %s   %s   %s", shortCWD(), model, m.provName, spend)
-	return dimStyle.Render(truncLine(line, max(m.width, 0)))
+	mode := m.uiMode()
+	effort := "(" + effortLabel(m.currentEffort()) + ")"
+	folder := shortCWD()
+	fields := []statusField{
+		{text: folder, width: ansi.StringWidth(folder)},
+		{text: model, width: m.statusModelSlotWidth()},
+		{text: effort, width: ansi.StringWidth(effort)},
+		{text: mode, width: ansi.StringWidth(mode)},
+		{text: m.provName, width: ansi.StringWidth(m.provName)},
+		{text: contextSize, width: ansi.StringWidth(contextSize)},
+	}
+	padding := statusCellPadding
+	if m.width > 0 && statusFieldsWidth(fields, padding) > m.width {
+		// Drop cell padding before truncating any content. This keeps the full
+		// route and the context size visible in ordinary narrow terminals.
+		padding = 0
+	}
+	if m.width > 0 {
+		shrinkStatusFields(fields, max(m.width-statusFieldsOverhead(len(fields), padding), 0))
+	}
+	row, starts := renderStatusBox(fields, padding, m.width)
+	m.statusModelX, m.statusModelW = 0, 0
+	m.statusEffortX, m.statusEffortW = 0, 0
+	m.statusModeX, m.statusModeW = 0, 0
+	if len(starts) > 1 && statusFieldFits(starts[1], fields[1].width, m.width) {
+		m.statusModelX, m.statusModelW = starts[1], fields[1].width
+	}
+	if len(starts) > 2 && statusFieldFits(starts[2], fields[2].width, m.width) {
+		m.statusEffortX, m.statusEffortW = starts[2], fields[2].width
+	}
+	if len(starts) > 3 && statusFieldFits(starts[3], fields[3].width, m.width) {
+		m.statusModeX, m.statusModeW = starts[3], fields[3].width
+	}
+	return dimStyle.Render(row)
+}
+
+func statusFieldFits(start, fieldWidth, boxWidth int) bool {
+	if start < 1 || fieldWidth <= 0 {
+		return false
+	}
+	if boxWidth <= 0 {
+		return true
+	}
+	return start+fieldWidth <= boxWidth-1
+}
+
+func statusSegment(s string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	w := ansi.StringWidth(s)
+	if w < width {
+		return s + strings.Repeat(" ", width-w)
+	}
+	if w > width {
+		return ansi.Truncate(s, width, "…")
+	}
+	return s
+}
+
+func (m *model) statusModelSlotWidth() int {
+	modelW := ansi.StringWidth(m.modelName)
+	for _, role := range []string{config.RoleSmart, config.RoleDefault, config.RoleFast, config.RoleTiny} {
+		target, err := m.roleRoute(role)
+		if err != nil {
+			continue
+		}
+		modelW = max(modelW, ansi.StringWidth(target.Model))
+	}
+	return modelW
+}
+
+func statusFieldsOverhead(n, padding int) int {
+	if n == 0 {
+		return 0
+	}
+	return 2 + 2*padding*n + n - 1 // outer borders, cell padding, separators
+}
+
+func statusFieldsWidth(fields []statusField, padding int) int {
+	total := statusFieldsOverhead(len(fields), padding)
+	for _, field := range fields {
+		total += field.width
+	}
+	return total
+}
+
+// shrinkStatusFields preserves the controls and context size by shortening
+// lower-priority context fields first when the terminal cannot fit the box.
+func shrinkStatusFields(fields []statusField, available int) {
+	if total := statusFieldsContentWidth(fields); total > available {
+		remaining := total - available
+		// Folder and provider are context; the model slot follows them. Keep
+		// effort, mode, and context size intact for as long as the terminal permits.
+		for _, i := range []int{0, 4, 1, 2, 3, 5} {
+			if remaining == 0 {
+				break
+			}
+			minWidth := 0
+			if i == 2 || i == 3 {
+				minWidth = 1
+			}
+			cut := min(fields[i].width-minWidth, remaining)
+			if cut <= 0 {
+				continue
+			}
+			fields[i].width -= cut
+			remaining -= cut
+		}
+	}
+}
+
+func statusFieldsContentWidth(fields []statusField) int {
+	total := 0
+	for _, field := range fields {
+		total += field.width
+	}
+	return total
+}
+
+// renderStatusBox returns the three rows and the content start column for
+// every field. The starts are screen columns, including the left border.
+func renderStatusBox(fields []statusField, padding, width int) (string, []int) {
+	starts := make([]int, len(fields))
+	var row strings.Builder
+	row.WriteString("│")
+	column := 1
+	for i, field := range fields {
+		row.WriteString(strings.Repeat(" ", padding))
+		column += padding
+		starts[i] = column
+		row.WriteString(statusSegment(field.text, field.width))
+		column += field.width
+		row.WriteString(strings.Repeat(" ", padding))
+		column += padding
+		if i < len(fields)-1 {
+			row.WriteString("│")
+			column++
+		}
+	}
+	if width > 0 {
+		if width < 2 {
+			short := ansi.Truncate(row.String(), width, "…")
+			return short + "\n" + short + "\n" + short, starts
+		}
+		if target := width - 1; column < target {
+			row.WriteString(strings.Repeat(" ", target-column))
+			column = target
+		}
+	}
+	row.WriteString("│")
+	boxWidth := column + 1
+	rowText := row.String()
+	if width > 0 {
+		switch {
+		case width == 1:
+			return "┌\n│\n└", nil
+		case boxWidth > width:
+			inner := strings.TrimSuffix(strings.TrimPrefix(rowText, "│"), "│")
+			inner = ansi.Truncate(inner, width-2, "")
+			if gap := width - 2 - ansi.StringWidth(inner); gap > 0 {
+				inner += strings.Repeat(" ", gap)
+			}
+			rowText = "│" + inner + "│"
+			boxWidth = width
+		case boxWidth < width:
+			rowText += strings.Repeat(" ", width-boxWidth)
+			boxWidth = width
+		}
+	}
+	top := "┌" + strings.Repeat("─", boxWidth-2) + "┐"
+	bottom := "└" + strings.Repeat("─", boxWidth-2) + "┘"
+	return top + "\n" + rowText + "\n" + bottom, starts
 }
 
 // shortCWD renders the working directory compactly for the status line: the
@@ -3615,7 +4404,7 @@ func shortCWD() string {
 
 const previewLines = 5
 
-// pickerView renders the /resume browser: oldest at top, newest at bottom,
+// pickerView renders the /resume picker: oldest at top, newest at bottom,
 // the selected session expanded with previews of its last exchange.
 func (m *model) pickerView() string {
 	p := m.picker

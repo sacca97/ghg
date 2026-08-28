@@ -6,8 +6,8 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/context-labs/whip/internal/llm"
-	"github.com/context-labs/whip/internal/skills"
+	"github.com/sacca97/ghg/internal/llm"
+	"github.com/sacca97/ghg/internal/skills"
 )
 
 // expandSkills appends an invocation note for $skill-name tokens (codex-style).

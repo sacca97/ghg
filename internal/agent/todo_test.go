@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/context-labs/whip/internal/llm"
+	"github.com/sacca97/ghg/internal/llm"
 )
 
 func callTodowrite(t *testing.T, a *Agent, todosJSON string) string {
@@ -86,7 +86,7 @@ func TestTodowriteEndToEnd(t *testing.T) {
 	})
 	defer srv.Close()
 
-	a := New(llm.New(srv.URL, "k"), "m", 100, "sys")
+	a := New(testBackend(srv.URL, "k"), "m", 100, "sys")
 	callTodowrite(t, a, `{"todos":[
 		{"content":"read the code","status":"completed"},
 		{"content":"write tests","status":"in_progress"}]}`)

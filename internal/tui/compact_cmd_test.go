@@ -7,16 +7,17 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
-	"github.com/context-labs/whip/internal/agent"
-	"github.com/context-labs/whip/internal/config"
-	"github.com/context-labs/whip/internal/llm"
+	"github.com/sacca97/ghg/internal/agent"
+	"github.com/sacca97/ghg/internal/config"
+	"github.com/sacca97/ghg/internal/provider"
 )
 
 func compactCmdModel() *model {
 	// NOTE: any test that drives setEffort/switchModel/compactCommand writes
-	// through cfg.Save(); TestMain points WHIP_HOME at a scratch dir so
-	// those writes can never reach the real ~/.whip/config.json.
+	// through cfg.Save(); TestMain points GHG_HOME at a scratch dir so
+	// those writes can never reach the real ~/.ghg/config.json.
 	// serve the compaction summary so a bare /compact completes in-test
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`{"choices":[{"message":{"content":"sim"}}]}`))
@@ -24,7 +25,7 @@ func compactCmdModel() *model {
 	m := &model{
 		input:   newInput(),
 		mouseOn: true, // matches the Run() default (wheel scroll + native drag-copy)
-		agent:   agent.New(llm.New(srv.URL, "k"), "kimi-k3-fast", 100, "sys"),
+		agent:   agent.New(testBackend(srv.URL, "k"), "kimi-k3-fast", 100, "sys"),
 		cfg: &config.Config{
 			DefaultModel: "kimi-k3-fast",
 			Providers:    map[string]config.Provider{"inference": {BaseURL: "https://x", APIKey: "k"}},
@@ -49,38 +50,39 @@ func compactCmdModel() *model {
 }
 
 // Regression guard for the config corruption bug: running a persistence
-// command from a test must write under the isolated WHIP_HOME, never the
-// user's real ~/.whip.
+// command from a test must write under the isolated GHG_HOME, never the
+// user's real ~/.ghg.
 func TestCompactCommandNeverTouchesRealHome(t *testing.T) {
 	m := compactCmdModel()
 	m.compactCommand([]string{"glm-5.2-fast"}) // triggers cfg.Save()
-	dir := os.Getenv("WHIP_HOME")
-	if dir == "" || dir == filepath.Join(os.Getenv("HOME"), ".whip") {
-		t.Fatalf("tests must run with an isolated WHIP_HOME, got %q", dir)
+	dir := os.Getenv("GHG_HOME")
+	if dir == "" || dir == filepath.Join(os.Getenv("HOME"), ".ghg") {
+		t.Fatalf("tests must run with an isolated GHG_HOME, got %q", dir)
 	}
 	if _, err := os.Stat(filepath.Join(dir, "config.json")); err != nil {
-		t.Fatalf("expected the save to land under WHIP_HOME: %v", err)
+		t.Fatalf("expected the save to land under GHG_HOME: %v", err)
 	}
 }
 
 func TestCompactCommandSelectsModel(t *testing.T) {
 	m := compactCmdModel()
+	blocks := len(m.blocks)
 	m.compactCommand([]string{"glm-5.2-fast"})
 	if m.compactModel != "glm-5.2-fast" || m.compactProv != "" {
 		t.Fatalf("compact model state: %q @ %q", m.compactModel, m.compactProv)
 	}
-	if m.agent.CompactModel != "glm-5.2-fast" || m.agent.CompactClient == nil {
+	if m.agent.CompactModel != "glm-5.2-fast" || m.agent.CompactBackend == nil {
 		t.Fatalf("agent should summarize with glm-5.2-fast on its own client")
 	}
 	if m.cfg.CompactModel != "glm-5.2-fast" {
 		t.Fatalf("config should persist the pick, got %q", m.cfg.CompactModel)
 	}
 	m.compactCommand([]string{"off"})
-	if m.compactModel != "" || m.agent.CompactModel != config.DefaultCompactModel || m.agent.CompactClient == nil {
+	if m.compactModel != "" || m.agent.CompactModel != config.DefaultCompactModel || m.agent.CompactBackend == nil {
 		t.Fatalf("off should restore the default compaction model: %q", m.compactModel)
 	}
-	if !strings.Contains(m.blocks[len(m.blocks)-1].text, "default ("+config.DefaultCompactModel+")") {
-		t.Fatalf("off should note the default, got %v", m.blocks[len(m.blocks)-1].text)
+	if len(m.blocks) != blocks {
+		t.Fatalf("successful compaction model changes should not append routine notes, got %v", m.blocks)
 	}
 }
 
@@ -89,8 +91,19 @@ func TestCompactCommandSelectsModel(t *testing.T) {
 func TestCompactModelEmptyResolvesDefault(t *testing.T) {
 	m := compactCmdModel()
 	m.applyCompactModel()
-	if m.agent.CompactModel != config.DefaultCompactModel || m.agent.CompactClient == nil {
+	if m.agent.CompactModel != config.DefaultCompactModel || m.agent.CompactBackend == nil {
 		t.Fatalf("empty compactModel should resolve the default, got %q", m.agent.CompactModel)
+	}
+}
+
+func TestCompactModelUsesTinyRole(t *testing.T) {
+	m := compactCmdModel()
+	m.cfg.Roles = map[string]config.RoleConfig{
+		config.RoleTiny: {Model: "glm-5.2-fast", Provider: "inference"},
+	}
+	m.applyCompactModel()
+	if m.agent.CompactModel != "glm-5.2-fast" || m.agent.CompactBackend == nil {
+		t.Fatalf("tiny role should provide the compaction route, got %q / %T", m.agent.CompactModel, m.agent.CompactBackend)
 	}
 }
 
@@ -101,7 +114,7 @@ func TestCompactModelDefaultFallsBack(t *testing.T) {
 	delete(m.cfg.Models, config.DefaultCompactModel)
 	blocks := len(m.blocks)
 	m.applyCompactModel()
-	if m.agent.CompactClient != nil || m.agent.CompactModel != "" {
+	if m.agent.CompactBackend != nil || m.agent.CompactModel != "" {
 		t.Fatal("unresolvable default should fall back to the current model")
 	}
 	if len(m.blocks) != blocks {
@@ -135,6 +148,40 @@ func TestContextLimitFromCatalog(t *testing.T) {
 	m.updateCatalogs(cats)
 	if m.agent.ContextLimit != 262144 {
 		t.Fatalf("agent limit should follow the catalog, got %d", m.agent.ContextLimit)
+	}
+}
+
+func TestContextLimitFallsBackToModelsDev(t *testing.T) {
+	t.Setenv("GHG_HOME", t.TempDir())
+	if err := config.SaveModelsDev(config.ModelsDevCache{
+		FetchedAt: time.Now(),
+		Providers: map[string]map[string]int{"opencode": {"grok-4": 131072}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	profiles, err := provider.Load(provider.LoadOptions{UserDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := &model{
+		cfg: &config.Config{
+			Providers: map[string]config.Provider{"opencode": {Profile: "opencode"}},
+		},
+		profiles:  profiles,
+		modelName: "grok-4",
+		provName:  "opencode",
+		catalogs: map[string]config.Catalog{
+			"opencode": {Models: []config.ModelInfoLite{{ID: "grok-4"}}},
+		},
+	}
+	if got := m.contextLimitFor("opencode", "grok-4"); got != 131072 {
+		t.Fatalf("models.dev context = %d, want 131072", got)
+	}
+
+	// Provider metadata remains authoritative when it is present.
+	m.catalogs["opencode"] = config.Catalog{Models: []config.ModelInfoLite{{ID: "grok-4", ContextLength: 262144}}}
+	if got := m.contextLimitFor("opencode", "grok-4"); got != 262144 {
+		t.Fatalf("provider context = %d, want 262144", got)
 	}
 }
 

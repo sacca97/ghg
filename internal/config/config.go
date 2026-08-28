@@ -1,4 +1,4 @@
-// Package config loads and saves whip's JSONC configuration from ~/.whip.
+// Package config loads and saves ghg's JSONC configuration from ~/.ghg.
 package config
 
 import (
@@ -12,8 +12,9 @@ import (
 // Provider is an API endpoint that can serve models.
 type Provider struct {
 	Name      string `json:"name,omitempty"`
+	Profile   string `json:"profile,omitempty"` // reusable YAML profile; empty keeps legacy anonymous behavior
 	BaseURL   string `json:"baseUrl"`
-	API       string `json:"api"`              // "openai-completions" is the only supported value for now
+	API       string `json:"api"`              // legacy protocol selector; profiles use canonical protocol names
 	APIKey    string `json:"apiKey,omitempty"` // literal key or a secret reference ("$VAR"/"${VAR}"/"!cmd"); apiKeyEnv is another option
 	APIKeyEnv string `json:"apiKeyEnv,omitempty"`
 }
@@ -45,7 +46,8 @@ func (p Provider) ResolveKey() (string, error) {
 		return k, nil
 	}
 	// ponytail: special-case fallback to the inf CLI's stored key; generalize to apiKeyFile if more providers need it
-	if strings.Contains(p.BaseURL, "api.inference.net") {
+	// when the profile or legacy URL identifies the built-in default service.
+	if p.Profile == "inference" || strings.Contains(p.BaseURL, "api.inference.net") {
 		return infKey(), nil
 	}
 	return "", nil
@@ -79,6 +81,10 @@ type Model struct {
 	Name      string   `json:"name,omitempty"`
 	Providers []string `json:"providers"`    // provider keys, first is the default
 	ID        string   `json:"id,omitempty"` // model id sent to the API; defaults to the map key
+	// API overrides a profile route for this model. It is useful as an escape
+	// hatch when a provider announces a model before its profile route table is
+	// updated.
+	API string `json:"api,omitempty"`
 	// Context is the model's context window (max INPUT tokens). The provider's
 	// /models context_length overrides it when advertised; this is the fallback
 	// and the value shown for providers that don't report one.
@@ -106,7 +112,7 @@ func (m Model) ContextWindow() int {
 }
 
 // DefaultCompactModel is the built-in compaction-model default: the
-// deepseek-v4-flash route wired into the default inference.net config. An
+// deepseek-v4-flash route wired into the built-in default config. An
 // empty compactModel resolves to this at apply time, falling back to the
 // conversation's model when it's not in the user's config.
 const DefaultCompactModel = "deepseek-v4-flash-0731"
@@ -116,73 +122,45 @@ const DefaultCompactModel = "deepseek-v4-flash-0731"
 // 50% keeps compaction deterministic instead of letting the context bloat.
 const DefaultCompactPct = 50
 
-// Config is the root of ~/.whip/config.json (JSONC: comments allowed).
+// Config is the root of ~/.ghg/config.json (JSONC: comments allowed).
 type Config struct {
-	DefaultModel    string              `json:"defaultModel"`
-	DefaultProvider string              `json:"defaultProvider,omitempty"` // override the model's first provider
-	DefaultEffort   string              `json:"defaultEffort,omitempty"`   // reasoning effort for new sessions: "", "low", "medium", "high"
-	CompactModel    string              `json:"compactModel,omitempty"`    // model for compaction summaries; "" = the built-in default
-	CompactProvider string              `json:"compactProvider,omitempty"` // provider for the compaction model; "" = the model's default routing
-	CompactPct      int                 `json:"compactPct,omitempty"`      // compact at this % of the context window; 0 = DefaultCompactPct
-	Theme           string              `json:"theme,omitempty"`           // "light", "dark", or "" (auto-detect at startup)
-	Mouse           *bool               `json:"mouse,omitempty"`           // false disables capture so native terminal selection works
-	Thinking        *bool               `json:"thinking,omitempty"`        // nil defaults to on; false hides reasoning tokens (ctrl+o)
-	CollapsePaste   *bool               `json:"collapsePaste,omitempty"`   // nil/false: pastes land verbatim; true collapses ≥3-line pastes into a [Pasted ~N lines] placeholder
-	GoalMaxRounds   int                 `json:"goalMaxRounds,omitempty"`   // global goal-loop round cap; 0 = DefaultGoalMaxRounds; projects.json may override per folder
-	MaxRetries      int                 `json:"maxRetries,omitempty"`      // attempts per provider request on transient failures (429/5xx/network); 0 = llm.DefaultMaxAttempts, 1 = no retries
-	Providers       map[string]Provider `json:"providers"`
-	Models          map[string]Model    `json:"models"`
-	// MCPServers is whip's own MCP server block (whip-native shape; see
+	DefaultModel    string                `json:"defaultModel"`
+	DefaultProvider string                `json:"defaultProvider,omitempty"` // override the model's first provider
+	DefaultEffort   string                `json:"defaultEffort,omitempty"`   // reasoning effort for new sessions: "", "low", "medium", "high"
+	CompactModel    string                `json:"compactModel,omitempty"`    // model for compaction summaries; "" = the built-in default
+	CompactProvider string                `json:"compactProvider,omitempty"` // provider for the compaction model; "" = the model's default routing
+	CompactPct      int                   `json:"compactPct,omitempty"`      // compact at this % of the context window; 0 = DefaultCompactPct
+	Theme           string                `json:"theme,omitempty"`           // "light", "dark", or "" (auto-detect at startup)
+	Mouse           *bool                 `json:"mouse,omitempty"`           // false disables capture so native terminal selection works
+	Thinking        *bool                 `json:"thinking,omitempty"`        // nil defaults to on; false hides reasoning tokens (ctrl+o)
+	CollapsePaste   *bool                 `json:"collapsePaste,omitempty"`   // nil/false: pastes land verbatim; true collapses ≥3-line pastes into a [Pasted ~N lines] placeholder
+	GoalMaxRounds   int                   `json:"goalMaxRounds,omitempty"`   // global goal-loop round cap; 0 = DefaultGoalMaxRounds; projects.json may override per folder
+	MaxRetries      int                   `json:"maxRetries,omitempty"`      // attempts per provider request on transient failures (429/5xx/network); 0 = llm.DefaultMaxAttempts, 1 = no retries
+	Artifacts       *ArtifactConfig       `json:"artifacts,omitempty"`       // bounded tool-result persistence; nil/enabled nil uses defaults
+	Providers       map[string]Provider   `json:"providers"`
+	Models          map[string]Model      `json:"models"`
+	Roles           map[string]RoleConfig `json:"roles,omitempty"`
+	// MCPServers is ghg's own MCP server block (ghg-native shape; see
 	// internal/mcp.ServerConfig for the normalized semantics). On load it is
-	// merged over imported claude/codex configs: whip always wins per name.
+	// merged over imported claude/codex configs: ghg always wins per name.
 	MCPServers map[string]MCPServer `json:"mcp,omitempty"`
-	// MCPImport gates which imported MCP server definitions whip picks up
+	// MCPImport gates which imported MCP server definitions ghg picks up
 	// (claude-style .mcp.json, codex-style ~/.codex/config.toml). nil imports
 	// both sources, preserving the pre-gating behavior.
 	MCPImport *MCPImport `json:"mcpImport,omitempty"`
-	// LSPServers is whip's own LSP server block (whip-native shape; see
+	// LSPServers is ghg's own LSP server block (ghg-native shape; see
 	// internal/lsp.FromConfigMap for the merge semantics). Entries extend or
 	// disable the built-in registry (gopls).
 	LSPServers map[string]LSPServer `json:"lsp,omitempty"`
-	// Browser configures the native browser subsystem (internal/browser).
-	Browser BrowserConfig `json:"browser,omitempty"`
-	// Computer configures computer-use (internal/computer): which apps
-	// computer_exec may drive.
-	Computer ComputerConfig `json:"computer,omitempty"`
 }
 
-// ComputerConfig gates computer_exec per app (codex's per-bundle-id model).
-type ComputerConfig struct {
-	// Allow lists app names/bundle ids approved without prompting
-	// (e.g. ["Google Chrome", "com.google.Chrome"]).
-	Allow []string `json:"allow,omitempty"`
-	// Deny lists apps never drivable (wins over allow).
-	Deny []string `json:"deny,omitempty"`
-	// DefaultDeny, when true, gates unlisted apps behind approval. Default
-	// is false — allow-all, and users build blocklists via `deny` (or
-	// /computer-use deny <app> in-session).
-	DefaultDeny *bool `json:"defaultDeny,omitempty"`
-	// Enabled false hides computer_exec entirely.
-	Enabled *bool `json:"enabled,omitempty"`
-}
-
-// BrowserConfig controls browser_exec: which Chrome to drive and the
-// private-address policy for non-live backends.
-type BrowserConfig struct {
-	// Mode: "live" (attach to the user's running Chrome, default),
-	// "dedicated" (whip-owned profile), "headless", or "extension" (drive
-	// the user's real logged-in tab through the whip extension — the only
-	// way onto the default profile on Chrome ≥ 136).
-	Mode string `json:"mode,omitempty"`
-	// CDPURL attaches live mode to an explicit DevTools endpoint instead of
-	// the profile scan (http:// or ws://).
-	CDPURL string `json:"cdpUrl,omitempty"`
-	// AllowPrivateURLs permits private/LAN targets on dedicated/headless
-	// backends (default false; live mode is always exempt — the user's own
-	// browser on their own network).
-	AllowPrivateURLs bool `json:"allowPrivateUrls,omitempty"`
-	// Enabled false hides the browser_exec tool entirely.
-	Enabled *bool `json:"enabled,omitempty"`
+// ArtifactConfig controls durable tool-result evidence. Persistence is on by
+// default; Enabled is a pointer so an explicit false is distinguishable from
+// an older config that has no artifacts block. MaxBytes is the per-result
+// stored-payload ceiling and falls back to the artifact package default.
+type ArtifactConfig struct {
+	Enabled  *bool `json:"enabled,omitempty"`
+	MaxBytes int64 `json:"maxBytes,omitempty"`
 }
 
 // LSPServer is the config-file form of an LSP server entry. It mirrors
@@ -195,7 +173,7 @@ type LSPServer struct {
 	Enabled     *bool             `json:"enabled,omitempty"`
 }
 
-// MCPImport selects which claude/codex MCP server definitions whip imports.
+// MCPImport selects which claude/codex MCP server definitions ghg imports.
 // A nil source entry (or nil Enabled) leaves that source on. Example:
 //
 //	"mcpImport": {
@@ -229,18 +207,18 @@ type MCPServer struct {
 	ToolTimeout    int               `json:"toolTimeout,omitempty"`
 }
 
-// Dir returns the whip home directory (~/.whip), creating it if needed.
-// WHIP_HOME overrides the location — used by tests to keep fixture writes
+// Dir returns the ghg home directory (~/.ghg), creating it if needed.
+// GHG_HOME overrides the location — used by tests to keep fixture writes
 // far away from the real config.
 func Dir() (string, error) {
-	if d := os.Getenv("WHIP_HOME"); d != "" {
+	if d := os.Getenv("GHG_HOME"); d != "" {
 		return d, os.MkdirAll(d, 0o700)
 	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", err
 	}
-	dir := filepath.Join(home, ".whip")
+	dir := filepath.Join(home, ".ghg")
 	return dir, os.MkdirAll(dir, 0o700)
 }
 
@@ -260,7 +238,7 @@ func (c *Config) fingerprint() string {
 		len(c.Providers), len(c.Models), c.DefaultModel, c.CompactModel)
 }
 
-// Load reads ~/.whip/config.json, writing a default config on first run. The
+// Load reads ~/.ghg/config.json, writing a default config on first run. The
 // file is JSONC: comments and trailing commas are allowed.
 func Load() (*Config, error) {
 	p, err := path()
@@ -280,6 +258,10 @@ func Load() (*Config, error) {
 	if err := parseJSONC(data, &cfg); err != nil {
 		logf("config.load", "PARSE FAILURE %s: %v (%d bytes)", p, err, len(data))
 		return nil, fmt.Errorf("parse %s: %w", p, err)
+	}
+	if err := cfg.ValidateRoles(); err != nil {
+		logf("config.load", "ROLE VALIDATION FAILURE %s: %v", p, err)
+		return nil, fmt.Errorf("validate %s: %w", p, err)
 	}
 	// Recover from a clobbered/empty config: no providers and no models is
 	// never a usable state, so prefer the backup, else regenerate defaults —
@@ -311,12 +293,15 @@ func Load() (*Config, error) {
 	return &cfg, nil
 }
 
-// Save writes the config back to ~/.whip/config.json. The write is atomic
+// Save writes the config back to ~/.ghg/config.json. The write is atomic
 // (temp file + rename) and the previous contents are kept in config.json.bak.
 // As a safety net, Save refuses to overwrite an existing healthy config (one
 // with providers/models) with a structurally empty one — that path has only
 // ever been reached by a bug, never intentionally.
 func (c *Config) Save() error {
+	if err := c.ValidateRoles(); err != nil {
+		return err
+	}
 	p, err := path()
 	if err != nil {
 		return err
@@ -366,10 +351,11 @@ func marshalConfig(c *Config) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	header := "// whip configuration — JSONC: comments and trailing commas are allowed.\n" +
-		"// providers: declare each API endpoint once. models: route each model to one or\n" +
+	header := "// ghg configuration — JSONC: comments and trailing commas are allowed.\n" +
+		"// providers: declare each API endpoint once; optional profile selects non-secret YAML metadata.\n" +
+		"// models: route each model to one or\n" +
 		"// more providers (first is the default). defaultModel/defaultProvider pick the route.\n" +
-		"// mcp: whip's own MCP servers; mcpImport: gate claude/codex imports, e.g.\n" +
+		"// mcp: ghg's own MCP servers; mcpImport: gate claude/codex imports, e.g.\n" +
 		"//   \"mcpImport\": { \"codex\": { \"enabled\": true, \"exclude\": [\"node_repl\"] } }\n"
 	out := append([]byte(header), body...)
 	return append(out, '\n'), nil
@@ -469,14 +455,15 @@ func keys[V any](m map[string]V) string {
 	return s
 }
 
-// Default returns the first-run config, wired for inference.net.
+// Default returns the first-run config, wired for the built-in default service.
 func Default() *Config {
 	return &Config{
 		DefaultModel: "kimi-k3-fast",
 		CompactModel: DefaultCompactModel,
 		Providers: map[string]Provider{
 			"inference": {
-				Name:      "Inference.net",
+				Name:      "Inference",
+				Profile:   "inference",
 				BaseURL:   "https://api.inference.net/v1",
 				API:       "openai-completions",
 				APIKeyEnv: "INFERENCE_API_KEY",

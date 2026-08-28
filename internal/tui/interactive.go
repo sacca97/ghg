@@ -5,7 +5,7 @@
 // the command in a PTY (via bashrun), streams its output into the transcript,
 // shows a countdown when the command goes quiet (likely awaiting input), and
 // forwards the user's keystrokes to the PTY. After 15s of no input the command
-// is killed so whip never hangs — the property that motivated this change.
+// is killed so ghg never hangs — the property that motivated this change.
 //
 // Run executes on the agent goroutine; it talks to the TUI by sending tea
 // messages (interactiveStartMsg / interactiveOutMsg / interactiveAwaitMsg /
@@ -22,8 +22,8 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/context-labs/whip/internal/tools"
-	"github.com/context-labs/whip/internal/tools/bashrun"
+	"github.com/sacca97/ghg/internal/tools"
+	"github.com/sacca97/ghg/internal/tools/bashrun"
 )
 
 // interactive is the UI-thread state for one in-flight interactive command.
@@ -135,7 +135,7 @@ func (m *model) iactiveKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.sendKeys([]byte(arrowBytes(msg.Type)))
 		return m, nil
 	case tea.KeyCtrlJ:
-		// ctrl+j is whip's newline key; in passthrough, behave like enter so
+		// ctrl+j is ghg's newline key; in passthrough, behave like enter so
 		// the user's muscle memory still "submits" a prompt answer.
 		m.sendKeys([]byte("\r"))
 		return m, nil

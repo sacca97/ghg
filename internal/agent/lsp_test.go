@@ -10,8 +10,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/context-labs/whip/internal/llm"
-	"github.com/context-labs/whip/internal/tools"
+	"github.com/sacca97/ghg/internal/llm"
+	"github.com/sacca97/ghg/internal/tools"
 )
 
 // TestLSPDiagnosticsReachModel pins the end-to-end flow: the model calls
@@ -48,7 +48,7 @@ func TestLSPDiagnosticsReachModel(t *testing.T) {
 	tools.LSP = stubWaiter{block: "\n\n<diagnostics file=\"" + target + "\">\nERROR [2:3] undefined: foo\n</diagnostics>"}
 	defer func() { tools.LSP = nil }()
 
-	ag := New(llm.New(srv.URL, "k"), "m", 100, "sys")
+	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
 	if _, err := ag.Turn(context.Background(), "write the file", Events{}); err != nil {
 		t.Fatal(err)
 	}

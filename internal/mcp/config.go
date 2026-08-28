@@ -1,12 +1,12 @@
-// Package mcp implements whip's Model Context Protocol support: a client that
+// Package mcp implements ghg's Model Context Protocol support: a client that
 // connects to configured MCP servers (stdio and streamable HTTP) and exposes
-// their tools to the agent loop, plus a server (`whip mcp serve`) exposing
-// whip's own tools.
+// their tools to the agent loop, plus a server (`ghg mcp serve`) exposing
+// ghg's own tools.
 //
 // Configuration is backwards compatible with claude-style (.mcp.json project
 // files) and codex-style (~/.codex/config.toml [mcp_servers]) formats; both
-// are normalized into ServerConfig and merged with whip's own "mcp" block in
-// ~/.whip/config.json, which always wins on name conflicts.
+// are normalized into ServerConfig and merged with ghg's own "mcp" block in
+// ~/.ghg/config.json, which always wins on name conflicts.
 package mcp
 
 import (
@@ -18,18 +18,18 @@ import (
 	"strings"
 	"time"
 
-	"github.com/context-labs/whip/internal/config"
+	"github.com/sacca97/ghg/internal/config"
 )
 
-// ServerConfig is whip's normalized MCP server definition. Claude-style
+// ServerConfig is ghg's normalized MCP server definition. Claude-style
 // (type: stdio/http/sse, command+args+env, url+headers) and codex-style
 // (command/args/headers/startup_timeout_sec) entries both parse into this
 // shape. A server is stdio when Command is set, remote when URL is set.
 type ServerConfig struct {
 	// stdio
 	Command []string          `json:"command,omitempty"` // argv: program + arguments
-	Env     map[string]string `json:"env,omitempty"`     // extra env (layered over whip's own environment)
-	Cwd     string            `json:"cwd,omitempty"`     // working directory; "" = whip's cwd
+	Env     map[string]string `json:"env,omitempty"`     // extra env (layered over ghg's own environment)
+	Cwd     string            `json:"cwd,omitempty"`     // working directory; "" = ghg's cwd
 	// remote
 	URL     string            `json:"url,omitempty"`
 	Headers map[string]string `json:"headers,omitempty"`
@@ -40,7 +40,7 @@ type ServerConfig struct {
 	ToolTimeout    int    `json:"toolTimeout,omitempty"`    // seconds per tool call (default 60)
 
 	// Source is the config file this server came from (".mcp.json",
-	// "~/.codex/config.toml", "~/.whip/config.json"). Set by discovery for
+	// "~/.codex/config.toml", "~/.ghg/config.json"). Set by discovery for
 	// display (a failed server should point at the file to fix); never
 	// persisted.
 	Source string `json:"-"`
@@ -130,24 +130,24 @@ func ParseToolName(name string) (srvKey, tool string, ok bool) {
 	return srvKey, tool, true
 }
 
-// Merge combines server configs by name: whip's own config wins whole-entry
+// Merge combines server configs by name: ghg's own config wins whole-entry
 // over codex, which wins over a project's .mcp.json. No field-level merging —
 // predictable, and matches how claude/codex treat their own scopes.
-func Merge(whip, codex, claude map[string]ServerConfig) map[string]ServerConfig {
-	out := make(map[string]ServerConfig, len(whip)+len(codex)+len(claude))
+func Merge(ghgCfg, codex, claude map[string]ServerConfig) map[string]ServerConfig {
+	out := make(map[string]ServerConfig, len(ghgCfg)+len(codex)+len(claude))
 	for name, cfg := range claude {
 		out[name] = cfg
 	}
 	for name, cfg := range codex {
 		out[name] = cfg
 	}
-	for name, cfg := range whip {
+	for name, cfg := range ghgCfg {
 		out[name] = cfg
 	}
 	return out
 }
 
-// ImportPolicy selects which imported (non-whip) server definitions whip
+// ImportPolicy selects which imported (non-ghg) server definitions ghg
 // picks up. The zero value imports both sources with no name filtering —
 // the pre-gating behavior. ImportPolicyFrom converts the config-file block.
 type ImportPolicy struct {
@@ -211,11 +211,11 @@ func (p ImportSourcePolicy) Admits(name string) bool {
 
 // Filtered is the discovery result when an ImportPolicy is applied: Merged is
 // what the manager connects to; Blocked holds the servers the policy filtered
-// out, forced disabled with a note so they stay visible (/mcp, whip mcp
-// list) instead of vanishing silently. Blocked never shadows a whip entry of
+// out, forced disabled with a note so they stay visible (/mcp, ghg mcp
+// list) instead of vanishing silently. Blocked never shadows a ghg entry of
 // the same name. Sources attributes every discovered name (merged or
-// blocked) to the file that contributes/would contribute it ("whip",
-// ".mcp.json", or "codex") — codex wins over claude, whip over both. Each
+// blocked) to the file that contributes/would contribute it ("ghg",
+// ".mcp.json", or "codex") — codex wins over claude, ghg over both. Each
 // merged/blocked ServerConfig also carries its Source file path so a failed
 // server can point at the file to fix.
 type Filtered struct {
@@ -235,8 +235,8 @@ func setSource(src map[string]ServerConfig, path string) {
 
 // LoadMergedFiltered discovers server configs like LoadMerged, then applies
 // the import policy: filtered-out claude/codex entries land in Blocked as
-// disabled+noted copies. whipCfg entries always pass through.
-func LoadMergedFiltered(cwd string, whipCfg map[string]ServerConfig, policy ImportPolicy) Filtered {
+// disabled+noted copies. ghgCfg entries always pass through.
+func LoadMergedFiltered(cwd string, ghgCfg map[string]ServerConfig, policy ImportPolicy) Filtered {
 	errs := map[string]error{}
 	claudePath := filepath.Join(cwd, ".mcp.json")
 	claude, err := LoadClaude(claudePath)
@@ -250,13 +250,13 @@ func LoadMergedFiltered(cwd string, whipCfg map[string]ServerConfig, policy Impo
 	}
 	setSource(claude, claudePath)
 	setSource(codex, codexPath)
-	setSource(whipCfg, whipConfigPath())
+	setSource(ghgCfg, ghgConfigPath())
 	blocked := map[string]ServerConfig{}
 	split := func(src map[string]ServerConfig, p ImportSourcePolicy) map[string]ServerConfig {
 		kept := make(map[string]ServerConfig, len(src))
 		for name, c := range src {
 			if !p.Admits(name) {
-				if _, owned := whipCfg[name]; !owned { // whip always wins; no ghost row
+				if _, owned := ghgCfg[name]; !owned { // ghg always wins; no ghost row
 					off := false
 					c.Enabled = &off
 					if c.Note != "" { // keep an existing import note (e.g. legacy sse)
@@ -274,9 +274,9 @@ func LoadMergedFiltered(cwd string, whipCfg map[string]ServerConfig, policy Impo
 	}
 	claudeKept := split(claude, policy.Claude)
 	codexKept := split(codex, policy.Codex)
-	sources := make(map[string]string, len(whipCfg)+len(codex)+len(claude))
-	for name := range whipCfg {
-		sources[name] = "whip"
+	sources := make(map[string]string, len(ghgCfg)+len(codex)+len(claude))
+	for name := range ghgCfg {
+		sources[name] = "ghg"
 	}
 	for name := range claude {
 		sources[name] = ".mcp.json"
@@ -285,7 +285,7 @@ func LoadMergedFiltered(cwd string, whipCfg map[string]ServerConfig, policy Impo
 		sources[name] = "codex"
 	}
 	return Filtered{
-		Merged:  Merge(whipCfg, codexKept, claudeKept),
+		Merged:  Merge(ghgCfg, codexKept, claudeKept),
 		Blocked: blocked,
 		Sources: sources,
 		Errs:    errs,
@@ -294,12 +294,12 @@ func LoadMergedFiltered(cwd string, whipCfg map[string]ServerConfig, policy Impo
 
 // LoadMerged discovers MCP server configs from all supported sources and
 // merges them: the project .mcp.json in cwd (claude-style), the codex config,
-// then whip's own config on top. cwd is the project directory; whipCfg may
+// then ghg's own config on top. cwd is the project directory; ghgCfg may
 // be nil. Discovery failures (unreadable/unparseable files) are reported in
 // errs, keyed by source path, and never abort the merge. No import policy is
 // applied — both sources are imported wholesale.
-func LoadMerged(cwd string, whipCfg map[string]ServerConfig) (map[string]ServerConfig, map[string]error) {
-	f := LoadMergedFiltered(cwd, whipCfg, ImportPolicyFrom(nil))
+func LoadMerged(cwd string, ghgCfg map[string]ServerConfig) (map[string]ServerConfig, map[string]error) {
+	f := LoadMergedFiltered(cwd, ghgCfg, ImportPolicyFrom(nil))
 	return f.Merged, f.Errs
 }
 
@@ -307,10 +307,10 @@ func LoadMerged(cwd string, whipCfg map[string]ServerConfig) (map[string]ServerC
 // A variable so tests can point it at fixtures.
 var CodexPath = defaultCodexPath
 
-// whipConfigPath is whip's own config file location (~/.whip/config.json) —
+// ghgConfigPath is ghg's own config file location (~/.ghg/config.json) —
 // the source of any server from the config's "mcp" block. Best-effort: ""
 // when the home dir isn't resolvable.
-func whipConfigPath() string {
+func ghgConfigPath() string {
 	dir, err := config.Dir()
 	if err != nil {
 		return ""
@@ -318,7 +318,7 @@ func whipConfigPath() string {
 	return filepath.Join(dir, "config.json")
 }
 
-// FromConfigMap converts whip's config-file MCP block (identical field
+// FromConfigMap converts ghg's config-file MCP block (identical field
 // shape, defined in internal/config to keep that package a leaf) into
 // normalized server configs.
 func FromConfigMap(in map[string]config.MCPServer) map[string]ServerConfig {

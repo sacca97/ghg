@@ -6,16 +6,16 @@ Branch: TBD
 
 1. **Persist background tasks** in the session store so `--resume`/`/resume`
    restores the dock list. Tasks found in `running` state on disk are restored
-   as `error` ("interrupted — whip exited"): a process exit kills in-flight
+   as `error` ("interrupted — harness exited"): a process exit kills in-flight
    subagents, so a persisted running row always means that.
-2. **Rename the user-facing term** task → subagent: dock strip, palette row,
+2. **Rename the user-facing term** task → subagent: dock strip, settings row,
    header badge, hints, `/tasks` help text. The command stays `/tasks`;
    internal Go names (`BackgroundTask`, `taskRegistry`, `task-N` IDs, the
    `task` tool name the model calls) are unchanged.
 
 ## Goal
 
-- `whip --resume <id>` shows the session's background subagents in the dock
+- `harness --resume <id>` shows the session's background subagents in the dock
   and `/tasks`, with their final reports viewable (enter opens the detail
   view for settled tasks).
 - Users read "subagent" everywhere they'd previously read "task".
@@ -47,12 +47,12 @@ Surfaces: `internal/session/session.go` (new table + CRUD), `internal/agent`
   registry (no goroutine, no Steer), giving it a fresh Done channel already
   closed so waiters don't block.
 - **TUI resume()**: after rebuilding the agent, `store.LoadTasks(id)` →
-  convert to `agent.BackgroundTask` (running→error "interrupted — whip
+  convert to `agent.BackgroundTask` (running→error "interrupted — harness
   exited", fresh closed `Done`) → `RestoreTask` each. `--resume` and `/resume`
   both flow through `m.resume(id)` — one site.
 - **Naming pass** (tui only): dock hint "⚙ subagents — …", dock header badge
-  "⚙ N sub", `/tasks` view heading "background subagents", palette row "MCP
-  servers" stays but the "Resume session"-adjacent row… the palette has no
+  "⚙ N sub", `/tasks` view heading "background subagents", settings row "MCP
+  servers" stays but the "Resume session"-adjacent row… the settings has no
   tasks row; update `/help` text, `complete.go` description, empty-state
   "(no background subagents)", task-view footer. Tool result strings in
   `agent/task.go` ("Started background task %s") stay — they speak to the

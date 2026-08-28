@@ -7,7 +7,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/context-labs/whip/internal/config"
+	"github.com/sacca97/ghg/internal/config"
 )
 
 // cfgSyncMsg carries a freshly observed config-file state into the update

@@ -1,6 +1,6 @@
 ---
 name: golang-cli
-description: "Golang CLI development — command structure, flags, config layering, exit codes, I/O, signals, shell completion, validation, testing. Use when building or reviewing a Go CLI or code using cobra, viper, urfave/cli. Cobra → `golang-spf13-cobra`; viper → `golang-spf13-viper`."
+description: "Golang CLI development — command structure, flags, config layering, exit codes, I/O, signals, shell completion, validation, testing. Use when building or reviewing a Go CLI. This repo hand-rolls flag parsing; the cobra/viper examples in this skill's assets are reference only."
 user-invocable: true
 license: MIT
 compatibility: Designed for Claude Code, Codex or similar harness, and for projects using Golang.
@@ -204,4 +204,4 @@ Use `cmd.OutOrStdout()` and `cmd.ErrOrStderr()` in commands (instead of `os.Stdo
 
 ## Related Skills
 
-See `samber/cc-skills-golang@golang-project-layout`, `samber/cc-skills-golang@golang-dependency-injection`, `samber/cc-skills-golang@golang-testing`, `samber/cc-skills-golang@golang-design-patterns` skills.
+See `samber/cc-skills-golang@golang-project-layout`, `samber/cc-skills-golang@golang-dependency-injection` (upstream skill, not installed here), `samber/cc-skills-golang@golang-testing`, `samber/cc-skills-golang@golang-design-patterns` skills.

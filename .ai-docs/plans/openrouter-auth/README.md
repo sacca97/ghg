@@ -1,4 +1,7 @@
-# OpenRouter auth: `whip auth openrouter` + `/auth openrouter`
+# OpenRouter auth: `harness auth openrouter` + `/auth openrouter`
+
+> Superseded by [Generalized profile authentication](../generalized-auth/README.md).
+> Kept as the historical OpenRouter-specific design and shipped implementation record.
 
 Branch: main (working tree)
 
@@ -6,17 +9,17 @@ Branch: main (working tree)
 
 One command takes a user from an OpenRouter API key to a fully wired
 provider: key validated live against OpenRouter, `openrouter` provider
-upserted into `~/.whip/config.json`, and the model catalog pre-fetched into
-`~/.whip/models.json` so `/model` immediately lists every OpenRouter model
+upserted into `~/.harness/config.json`, and the model catalog pre-fetched into
+`~/.harness/models.json` so `/model` immediately lists every OpenRouter model
 (catalog-model resolution means **no per-model config entries are needed**).
 
 ## Goal
 
-- `whip auth openrouter [key]` — CLI: masked prompt (or arg / `OPENROUTER_API_KEY`
+- `harness auth openrouter [key]` — CLI: masked prompt (or arg / `OPENROUTER_API_KEY`
   env passthrough for scripting) → validate → save → prefetch catalog.
 - `/auth openrouter` — same flow inside the TUI (key entered via the normal
   input box, masked), then a live catalog refresh.
-- Docs: how to use an OpenRouter key with whip (docs/models-providers.md,
+- Docs: how to use an OpenRouter key with harness (docs/models-providers.md,
   features.md, /help).
 
 ## Non-goals
@@ -25,7 +28,7 @@ upserted into `~/.whip/config.json`, and the model catalog pre-fetched into
   for v1).
 - Per-model config generation for the ~300 OpenRouter models (catalog
   resolution already covers it — that's the whole point of catalogs).
-- Generic `whip auth <any-provider>` framework (ponytail: generalize when a
+- Generic `harness auth <any-provider>` framework (ponytail: generalize when a
   second provider wants an auth command).
 - Anthropic-native API flavor.
 
@@ -37,7 +40,7 @@ OpenRouter is OpenAI-compatible (`https://openrouter.ai/api/v1` +
 internal/llm/openai.go). So the entire feature is key capture + config
 upsert + catalog prefetch.
 
-Key storage decision: whip has no `"$VAR"` value resolution yet (roadmap
+Key storage decision: harness has no `"$VAR"` value resolution yet (roadmap
 unchecked), so `apiKeyEnv` requires the env var to exist at runtime. Flow:
 
 1. `--env` flag (or interactive prompt): write `apiKeyEnv:
@@ -50,15 +53,15 @@ unchecked), so `apiKeyEnv` requires the env var to exist at runtime. Flow:
 
 - `internal/config/openrouter.go` (new): `UpsertOpenRouter(cfg, key, useEnv)`,
   `OpenRouterBaseURL` const. Pure-ish config manipulation, unit-testable.
-- `cmd/whip/auth.go` (new): `authCLI(args)` subcommand, dispatched from
-  main.go like `mcp`/`browser`. Validate via `llm.New(base, key).Models(ctx)`,
+- `cmd/harness/auth.go` (new): `authCLI(args)` subcommand, dispatched from
+  main.go like `mcp`. Validate via `llm.New(base, key).Models(ctx)`,
   then config load → upsert → Save → catalog prefetch via the same
   `llm.Client.Models` → `config.SaveCatalogs`.
 - `internal/tui/auth_cmd.go` (new): `/auth openrouter [key]` in the
   `command()` switch; bare form swaps the input box into a masked
   one-shot prompt (textarea EchoMode=EchoPassword) that on submit completes
   the flow instead of starting a turn. Kick `m.fetchCatalogs(true)` after.
-- Tests: `internal/config/openrouter_test.go`, `cmd/whip/auth_test.go`
+- Tests: `internal/config/openrouter_test.go`, `cmd/harness/auth_test.go`
   (httptest fake OpenRouter), `internal/tui/auth_cmd_test.go` (dispatch-level).
 - Docs: `docs/models-providers.md` OpenRouter section, `docs/features.md`
   entry, `/help` line, docs/README.md config mention if needed.
@@ -82,7 +85,7 @@ unchecked), so `apiKeyEnv` requires the env var to exist at runtime. Flow:
 ## Test plan
 
 - httptest server faking GET /models (401 on bad key, 200 with a small list
-  on good) → authCLI end-to-end against WHIP_HOME fixture: config has the
+  on good) → authCLI end-to-end against HARNESS_HOME fixture: config has the
   provider, models.json has the catalog.
 - Upsert idempotence: second run replaces the key, keeps other
   providers/models.
@@ -94,7 +97,7 @@ unchecked), so `apiKeyEnv` requires the env var to exist at runtime. Flow:
 
 - [x] Explore config/llm/tui surfaces
 - [x] config.UpsertOpenRouter + tests
-- [x] cmd/whip/auth.go CLI + tests
+- [x] cmd/harness/auth.go CLI + tests
 - [x] /auth TUI command + masked prompt + tests
 - [x] docs (models-providers, features, /help, README)
 - [x] task check + adversarial pass
@@ -115,7 +118,7 @@ unchecked), so `apiKeyEnv` requires the env var to exist at runtime. Flow:
 - **Test isolation**: catalog seeding + the background `fetchCatalogs(true)`
   are guarded on `m.prog != nil` so driving the command directly in tests
   writes no cache and spawns no network (this was the source of a real
-  ~/.whip/models.json pollution bug caught by TestPaletteModelPanelPreviewsLive).
+  ~/.harness/models.json pollution bug caught by TestPaletteModelPanelPreviewsLive).
 - go.mod: `golang.org/x/term` promoted from indirect to direct (masked CLI
   prompt). One line; no new dependency.
 - Pre-existing unrelated race in `TestScheduleFiresWakeup` (reproduces on a

@@ -5,10 +5,10 @@ import (
 	"testing"
 )
 
-// catalogFixture isolates WHIP_HOME and seeds one cached provider catalog.
+// catalogFixture isolates GHG_HOME and seeds one cached provider catalog.
 func catalogFixture(t *testing.T, prov string, models ...ModelInfoLite) {
 	t.Helper()
-	t.Setenv("WHIP_HOME", t.TempDir())
+	t.Setenv("GHG_HOME", t.TempDir())
 	if err := SaveCatalogs(map[string]Catalog{prov: {Models: models}}); err != nil {
 		t.Fatal(err)
 	}
@@ -72,7 +72,7 @@ func TestResolveCatalogFallbackVision(t *testing.T) {
 // A model id advertised by several providers without a pinned provider errors
 // naming the candidates; pinning with a provider disambiguates.
 func TestResolveCatalogFallbackAmbiguous(t *testing.T) {
-	t.Setenv("WHIP_HOME", t.TempDir())
+	t.Setenv("GHG_HOME", t.TempDir())
 	if err := SaveCatalogs(map[string]Catalog{
 		"alpha": {Models: []ModelInfoLite{{ID: "shared-model", ContextLength: 1000}}},
 		"beta":  {Models: []ModelInfoLite{{ID: "shared-model", ContextLength: 2000}}},

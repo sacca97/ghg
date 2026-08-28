@@ -3,7 +3,7 @@ package tui
 import (
 	"testing"
 
-	"github.com/context-labs/whip/internal/config"
+	"github.com/sacca97/ghg/internal/config"
 )
 
 func TestBuildModelItems(t *testing.T) {
@@ -37,6 +37,15 @@ func TestBuildModelItems(t *testing.T) {
 	}
 	if got := buildModelItems(&config.Config{}); len(got) != 0 {
 		t.Fatalf("empty config: %+v", got)
+	}
+}
+
+func TestModelItemLabelUsesProviderFirstFormat(t *testing.T) {
+	if got := modelItemLabel(modelItem{provider: "openai", model: "gpt-5"}); got != "openai/gpt-5" {
+		t.Fatalf("model label = %q, want openai/gpt-5", got)
+	}
+	if got := modelItemLabel(modelItem{provider: "opencode", model: "grok-4", fromCatalog: true, unavailable: true, unavailableReason: "no adapter"}); got != "opencode/grok-4 (new) (unsupported: no adapter)" {
+		t.Fatalf("annotated model label = %q", got)
 	}
 }
 

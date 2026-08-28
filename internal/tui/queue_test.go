@@ -12,9 +12,9 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/x/ansi"
 
-	"github.com/context-labs/whip/internal/agent"
-	"github.com/context-labs/whip/internal/config"
-	"github.com/context-labs/whip/internal/llm"
+	"github.com/sacca97/ghg/internal/agent"
+	"github.com/sacca97/ghg/internal/config"
+	"github.com/sacca97/ghg/internal/llm"
 )
 
 // busyQueueModel builds a model that is busy with a populated queue.
@@ -167,8 +167,10 @@ func TestEnterWhileBusyRunsSettingsCommand(t *testing.T) {
 	if m.agent.Effort != "high" {
 		t.Fatalf("effort should have changed to high, got %q", m.agent.Effort)
 	}
-	if len(m.blocks) == 0 {
-		t.Fatal("the confirmation note should land in the transcript")
+	for _, b := range m.blocks {
+		if strings.Contains(b.text, "⚡ effort:") {
+			t.Fatalf("effort changes should not append routine notes, got %v", m.blocks)
+		}
 	}
 	if m.hist[len(m.hist)-1] != "/effort high" {
 		t.Fatalf("the command should be in history: %v", m.hist)
@@ -243,8 +245,8 @@ func TestEscDoesNotInterruptWhenIdle(t *testing.T) {
 
 // stubLLM answers chat completions with an immediate empty SSE stream so a
 // drained queue can submit without touching the network.
-func stubLLM() *llm.Client {
-	return &llm.Client{
+func stubLLM() llm.Backend {
+	return llm.NewOpenAIBackend(&llm.Client{
 		HTTP: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
 			return &http.Response{
 				StatusCode: http.StatusOK,
@@ -252,7 +254,7 @@ func stubLLM() *llm.Client {
 				Body:       io.NopCloser(strings.NewReader("data: [DONE]\n\n")),
 			}, nil
 		})},
-	}
+	})
 }
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -266,7 +268,7 @@ func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { retu
 // queued message submits as the next turn.
 func TestEmptyEnterSteerDrainsQueue(t *testing.T) {
 	m := busyQueueModel()
-	m.agent.Client = stubLLM()
+	m.agent.Backend = stubLLM()
 	m.agent.Messages = []llm.Message{{Role: "system", Content: "sys"}}
 
 	// first enter while busy: the typed message queues
@@ -317,7 +319,7 @@ func hasUserMsg(t *testing.T, m *model, content string) bool {
 // (agent.go's post-tool `return ctx.Err()` path).
 func TestEmptyEnterSteerDrainsQueueOnSentinel(t *testing.T) {
 	m := busyQueueModel()
-	m.agent.Client = stubLLM()
+	m.agent.Backend = stubLLM()
 	m.agent.Messages = []llm.Message{{Role: "system", Content: "sys"}}
 	m.queue = []string{"follow up"}
 
@@ -338,7 +340,7 @@ func TestEmptyEnterSteerDrainsQueueOnSentinel(t *testing.T) {
 func TestEmptyEnterIdleDrainsStuckQueue(t *testing.T) {
 	m := busyQueueModel("stranded")
 	m.busy = false // idle — the turn already ended without draining
-	m.agent.Client = stubLLM()
+	m.agent.Backend = stubLLM()
 	m.agent.Messages = []llm.Message{{Role: "system", Content: "sys"}}
 
 	m = press(t, m, tea.KeyMsg{Type: tea.KeyEnter})

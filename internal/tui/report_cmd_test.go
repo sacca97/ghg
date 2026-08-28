@@ -6,7 +6,7 @@ import (
 	"testing"
 )
 
-// TestEnvReportCollectsWhitelist: the bundle names the whip/terminal/system
+// TestEnvReportCollectsWhitelist: the bundle names the ghg/terminal/system
 // facts and reads the whitelisted env vars.
 func TestEnvReportCollectsWhitelist(t *testing.T) {
 	t.Setenv("TERM", "xterm-256color")
@@ -32,7 +32,7 @@ func TestEnvReportCollectsWhitelist(t *testing.T) {
 		got[row.key] = row.val
 	}
 	want := map[string]string{
-		"whip":         "1.4.0-test",
+		"ghg":          "1.4.0-test",
 		"model":        "gpt-5",
 		"provider":     "openai",
 		"TERM":         "xterm-256color",
@@ -117,15 +117,15 @@ func TestReportSnippetFenced(t *testing.T) {
 	if strings.ContainsRune(r.snippet, 0x1b) {
 		t.Error("snippet contains ESC — hyperlinks/styling must not leak into the paste form")
 	}
-	if !strings.Contains(r.snippet, "whip ") || !strings.Contains(r.snippet, "model") || !strings.Contains(r.snippet, "m1") {
+	if !strings.Contains(r.snippet, "ghg ") || !strings.Contains(r.snippet, "model") || !strings.Contains(r.snippet, "m1") {
 		t.Errorf("snippet missing rows:\n%s", r.snippet)
 	}
 }
 
-// TestIssueURL: the link targets the whip repo's new-issue page, round-trips
+// TestIssueURL: the link targets the ghg repo's new-issue page, round-trips
 // through url.Parse, and its body carries the skeleton plus the env bundle.
 func TestIssueURL(t *testing.T) {
-	snippet := "```\nwhip 1.2.3\nTERM xterm\n```"
+	snippet := "```\nghg 1.2.3\nTERM xterm\n```"
 	link := issueURL(snippet)
 	u, err := url.Parse(link)
 	if err != nil {

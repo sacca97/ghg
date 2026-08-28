@@ -27,29 +27,29 @@ func TestLightThemeRendersDarkText(t *testing.T) {
 	}
 }
 
-// WHIP_THEME overrides detection.
+// GHG_THEME overrides detection.
 func TestThemeOverride(t *testing.T) {
-	t.Setenv("WHIP_THEME", "light")
+	t.Setenv("GHG_THEME", "light")
 	detectColorScheme()
 	mdMu.Lock()
 	light := mdLight
 	mdMu.Unlock()
 	if !light {
-		t.Fatal("WHIP_THEME=light should select the light style")
+		t.Fatal("GHG_THEME=light should select the light style")
 	}
-	t.Setenv("WHIP_THEME", "dark")
+	t.Setenv("GHG_THEME", "dark")
 	detectColorScheme()
 	mdMu.Lock()
 	light = mdLight
 	mdMu.Unlock()
 	if light {
-		t.Fatal("WHIP_THEME=dark should select the dark style")
+		t.Fatal("GHG_THEME=dark should select the dark style")
 	}
 }
 
-// COLORFGBG is honored when WHIP_THEME is unset.
+// COLORFGBG is honored when GHG_THEME is unset.
 func TestColorFGBGDetection(t *testing.T) {
-	t.Setenv("WHIP_THEME", "")
+	t.Setenv("GHG_THEME", "")
 	t.Setenv("COLORFGBG", "0;15") // dark fg on white bg
 	detectColorScheme()
 	mdMu.Lock()
@@ -88,6 +88,18 @@ func TestParseOSCBg(t *testing.T) {
 	for _, c := range cases {
 		if got := parseOSCBg(c.payload); got != c.light {
 			t.Errorf("parseOSCBg(%q) = %v, want %v", c.payload, got, c.light)
+		}
+	}
+}
+
+func TestTerminalBackgroundQueryDoesNotLeakCursorReport(t *testing.T) {
+	for _, inTmux := range []bool{false, true} {
+		query := terminalBackgroundQuery(inTmux)
+		if strings.Contains(query, "\x1b[6n") {
+			t.Errorf("inTmux=%v: background query must not request a cursor report: %q", inTmux, query)
+		}
+		if !strings.Contains(query, "\x1b]11;?") {
+			t.Errorf("inTmux=%v: background query must contain OSC 11 probe: %q", inTmux, query)
 		}
 	}
 }

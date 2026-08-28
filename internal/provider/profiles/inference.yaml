@@ -1,0 +1,17 @@
+schema: 1
+id: inference
+display_name: Inference
+protocol: openai-chat-completions
+base_url: https://api.inference.net/v1
+auth:
+  kind: bearer
+  header: Authorization
+  env_var: INFERENCE_API_KEY
+default_headers: {}
+catalog:
+  kind: openai-models
+capabilities:
+  tools: true
+  vision: true
+  thinking: true
+  prompt_cache: provider

@@ -7,10 +7,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/context-labs/whip/internal/agent"
-	"github.com/context-labs/whip/internal/config"
-	"github.com/context-labs/whip/internal/llm"
-	"github.com/context-labs/whip/internal/skills"
+	"github.com/sacca97/ghg/internal/agent"
+	"github.com/sacca97/ghg/internal/config"
+	"github.com/sacca97/ghg/internal/llm"
+	"github.com/sacca97/ghg/internal/skills"
 )
 
 func TestExpandMentions(t *testing.T) {
@@ -87,13 +87,13 @@ func TestPrepareTurnReloadsSkillsEveryTurn(t *testing.T) {
 	old, _ := os.Getwd()
 	os.Chdir(dir)
 	defer os.Chdir(old)
-	t.Setenv("HOME", t.TempDir()) // isolate ~/.whip/skills
+	t.Setenv("HOME", t.TempDir()) // isolate ~/.ghg/skills
 
 	os.MkdirAll(filepath.Join(dir, ".agents/skills/demo"), 0o755)
 	os.WriteFile(filepath.Join(dir, ".agents/skills/demo/SKILL.md"),
 		[]byte("---\nname: demo\ndescription: live demo skill\n---\n"), 0o644)
 
-	m := &model{agent: agent.New(llm.New("http://unused", "k"), "m", 1, "overwritten"), sysPrompt: "BASE"}
+	m := &model{agent: agent.New(testBackend("http://unused", "k"), "m", 1, "overwritten"), sysPrompt: "BASE"}
 	out, _ := m.prepareTurn("use $demo now")
 	sys := m.agent.Messages[0].Content
 	if !strings.HasPrefix(sys, "BASE") || !strings.Contains(sys, "<name>demo</name>") || !strings.Contains(sys, "<description>live demo skill</description>") {
@@ -170,7 +170,7 @@ func TestMessageMultimodalRoundTrip(t *testing.T) {
 // input_modalities entry wins over config; config's vision flag is the default.
 func TestSupportsVisionGate(t *testing.T) {
 	newModel := func(visionCfg bool, catalog *config.Catalog) *model {
-		ag := agent.New(llm.New("http://unused", "k"), "m", 1, "sys")
+		ag := agent.New(testBackend("http://unused", "k"), "m", 1, "sys")
 		ag.Model = "some-model"
 		m := &model{
 			agent:     ag,
@@ -219,7 +219,7 @@ func TestPrepareTurnVisionGate(t *testing.T) {
 		t.Fatal(err)
 	}
 	build := func(vision bool) *model {
-		ag := agent.New(llm.New("http://unused", "k"), "m", 1, "sys")
+		ag := agent.New(testBackend("http://unused", "k"), "m", 1, "sys")
 		ag.Model = "m"
 		return &model{
 			agent:     ag,

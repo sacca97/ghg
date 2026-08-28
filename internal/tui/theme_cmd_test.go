@@ -7,7 +7,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/x/ansi"
 
-	"github.com/context-labs/whip/internal/config"
+	"github.com/sacca97/ghg/internal/config"
 )
 
 // /theme light must switch markdown rendering to the light style (dark text
@@ -41,15 +41,15 @@ func TestThemeCommandSwitchesRendering(t *testing.T) {
 	m.setTheme("dark") // leave tests in dark default
 }
 
-// bare /theme opens the theme switcher (palette panel) instead of toggling
+// bare /theme opens the theme switcher (settings panel) instead of toggling
 // blindly — the whole point is to see the choices.
 func TestThemeBareOpensSwitcher(t *testing.T) {
 	m := compactCmdModel()
 	m.command("/theme")
-	if m.palette == nil {
-		t.Fatal("bare /theme should open the palette")
+	if m.settings == nil {
+		t.Fatal("bare /theme should open the settings")
 	}
-	pp := m.palette.top()
+	pp := m.settings.top()
 	if pp == nil || pp.kind != panelTheme {
 		t.Fatalf("expected the theme panel, got %+v", pp)
 	}
@@ -66,9 +66,9 @@ func TestThemeBareOpensSwitcher(t *testing.T) {
 		t.Fatalf("selecting light in the switcher should apply it, got %q", CurrentTheme())
 	}
 	// the switcher came from /theme, not ctrl+p: commit-and-close, don't
-	// strand the user on a palette root they never opened
-	if m.palette != nil {
-		t.Fatal("enter in a directly-opened switcher should close the palette")
+	// strand the user on a settings root they never opened
+	if m.settings != nil {
+		t.Fatal("enter in a directly-opened switcher should close the settings")
 	}
 	m.setTheme("dark")    // leave dark default for other tests
 	setSchemeOverride("") // theme state is process-global: restore detection mode

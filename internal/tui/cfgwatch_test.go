@@ -3,11 +3,10 @@ package tui
 import (
 	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
-	"github.com/context-labs/whip/internal/config"
+	"github.com/sacca97/ghg/internal/config"
 )
 
 // /theme auto must resolve from the ACTUAL detected terminal background, not
@@ -15,8 +14,8 @@ import (
 // to stay dark because SetLightTheme mutated detection state).
 func TestThemeAutoResolvesFromDetection(t *testing.T) {
 	m := compactCmdModel()
-	t.Setenv("WHIP_THEME", "light") // stub detection: the terminal bg is light
-	m.setTheme("dark")              // user overrides to dark
+	t.Setenv("GHG_THEME", "light") // stub detection: the terminal bg is light
+	m.setTheme("dark")             // user overrides to dark
 	if CurrentTheme() != "dark" {
 		t.Fatalf("explicit dark should win, got %q", CurrentTheme())
 	}
@@ -28,20 +27,14 @@ func TestThemeAutoResolvesFromDetection(t *testing.T) {
 	SetLightTheme(false)
 }
 
-// The auto transcript note names the detection source so a wrong pick is
-// diagnosable; explicit picks don't claim a source.
-func TestThemeAutoNoteNamesSource(t *testing.T) {
+// Theme changes do not add a routine confirmation block; the detection source
+// remains available through /report.
+func TestThemeAutoDoesNotAppendTranscriptNote(t *testing.T) {
 	m := compactCmdModel()
-	t.Setenv("WHIP_THEME", "dark")
+	t.Setenv("GHG_THEME", "dark")
 	m.setTheme("auto")
-	var note string
-	for _, b := range m.blocks {
-		if strings.Contains(b.text, "◐ theme:") {
-			note = b.text
-		}
-	}
-	if !strings.Contains(note, "(auto: WHIP_THEME)") {
-		t.Fatalf("auto note should name the detection source, got %q", note)
+	if len(m.blocks) != 0 {
+		t.Fatalf("theme changes should not append routine notes, got %v", m.blocks)
 	}
 	setSchemeOverride("")
 	SetLightTheme(false)
@@ -51,7 +44,7 @@ func TestThemeAutoNoteNamesSource(t *testing.T) {
 // within a poll tick, repainting without a terminal resize.
 func TestConfigSyncAppliesThemeFromFile(t *testing.T) {
 	dir := t.TempDir()
-	t.Setenv("WHIP_HOME", dir)
+	t.Setenv("GHG_HOME", dir)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -126,7 +119,7 @@ func TestThemeAutoUnpinsSync(t *testing.T) {
 // refreshed to that save's mod time) don't echo back as syncs.
 func TestConfigSyncIgnoresOwnSaves(t *testing.T) {
 	dir := t.TempDir()
-	t.Setenv("WHIP_HOME", dir)
+	t.Setenv("GHG_HOME", dir)
 	m := compactCmdModel()
 	if err := m.cfg.Save(); err != nil { // baseline write
 		t.Fatal(err)

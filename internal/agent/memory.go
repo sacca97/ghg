@@ -5,21 +5,34 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/context-labs/whip/internal/llm"
-	"github.com/context-labs/whip/internal/memory"
-	"github.com/context-labs/whip/internal/tools"
+	"github.com/sacca97/ghg/internal/llm"
+	"github.com/sacca97/ghg/internal/memory"
+	"github.com/sacca97/ghg/internal/tools"
 )
 
 // SessionID scopes the memory tools' per-session file. Set by the TUI once a
 // session exists; "" leaves only the installation scope.
-func (a *Agent) SetSessionID(id string) { a.sessionID = id }
+func (a *Agent) SetSessionID(id string) {
+	if id == "" {
+		a.sessionID.Store(nil)
+		return
+	}
+	a.sessionID.Store(&id)
+}
+
+func (a *Agent) currentSessionID() string {
+	if p := a.sessionID.Load(); p != nil {
+		return *p
+	}
+	return ""
+}
 
 // memoryTools registers remember/forget. Both scopes are plain markdown files
 // the user can edit by hand; forget strikes an entry ("- [x]") instead of
 // deleting so the file keeps an audit trail.
 func memoryTools(a *Agent) []tools.Tool {
 	scopes := func() (installation, session memory.Scope) {
-		return memory.Installation(), memory.Session(a.sessionID)
+		return memory.Installation(), memory.Session(a.currentSessionID())
 	}
 	resolve := func(name string) (memory.Scope, error) {
 		inst, sess := scopes()

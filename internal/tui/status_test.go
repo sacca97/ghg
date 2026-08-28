@@ -2,14 +2,18 @@ package tui
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
-	"github.com/context-labs/whip/internal/agent"
-	"github.com/context-labs/whip/internal/config"
-	"github.com/context-labs/whip/internal/llm"
+	"github.com/charmbracelet/x/ansi"
+
+	"github.com/sacca97/ghg/internal/agent"
+	"github.com/sacca97/ghg/internal/config"
+	"github.com/sacca97/ghg/internal/llm"
 )
 
 // statusModel builds a model with an agent so statusView has data.
@@ -19,49 +23,186 @@ func statusModel() *model {
 	return m
 }
 
-// The status line always renders below the input with directory, model
-// (effort), provider, and session token spend — regardless of scroll or state.
+// The status box always renders below the input with directory, model,
+// mode, provider, and context size — regardless of scroll or state.
 func TestStatusLineAlwaysShown(t *testing.T) {
 	m := statusModel()
+	m.width = 120
 	m.modelName = "kimi-k3-fast"
 	m.provName = "inference"
 	m.agent.Effort = "high"
-	m.agent.AddUsage(llm.Usage{PromptTokens: 45230, CompletionTokens: 3120})
+	m.agent.ContextLimit = 128000
+	m.agent.Messages = []llm.Message{{Role: "system", Content: "system prompt"}}
 
 	v := m.View()
-	for _, want := range []string{"kimi-k3-fast (high)", "inference", "45.2k", "3.1k"} {
+	for _, want := range []string{"kimi-k3-fast", "(high)", "execute", "inference", "ctx 0/128.0k"} {
 		if !strings.Contains(v, want) {
-			t.Errorf("status line should show %q\n--- view tail ---\n%s", want, tailLines(v, 6))
+			t.Errorf("status box should show %q\n--- view tail ---\n%s", want, tailLines(v, 8))
 		}
 	}
 	// the directory is present (compacted to its last segments) — assert
 	// against the actual cwd via shortCWD, not a hardcoded checkout name:
 	// tests run from internal/tui regardless of the repo folder's name.
 	if dir := shortCWD(); !strings.Contains(v, dir) {
-		t.Errorf("status line should show the working directory %q\n%s", dir, tailLines(v, 6))
+		t.Errorf("status box should show the working directory %q\n%s", dir, tailLines(v, 8))
 	}
 }
 
-// With no usage yet the spend reads zero, and effort off drops the parens.
+func TestContextStatusUsesLatestReportedRequest(t *testing.T) {
+	m := statusModel()
+	m.agent.ContextLimit = 128000
+	m.agent.Messages = []llm.Message{
+		{Role: "system", Content: strings.Repeat("x", 40000)},
+		{Role: "assistant", Content: "first", Usage: &llm.Usage{PromptTokens: 100, CompletionTokens: 20}},
+		{Role: "user", Content: "next"},
+		{Role: "assistant", Content: "latest", Usage: &llm.Usage{PromptTokens: 300, CompletionTokens: 40}},
+	}
+
+	if got, want := m.contextStatus(), "ctx 340/128.0k"; got != want {
+		t.Fatalf("context status = %q, want %q", got, want)
+	}
+}
+
+func TestContextStatusStartsAtZeroWithoutReportedResponse(t *testing.T) {
+	m := statusModel()
+	m.agent.ContextLimit = 128000
+	m.agent.Messages = []llm.Message{{Role: "system", Content: strings.Repeat("x", 40000)}}
+
+	if got, want := m.contextStatus(), "ctx 0/128.0k"; got != want {
+		t.Fatalf("context status = %q, want %q", got, want)
+	}
+}
+
+// With no conversation yet the context reads zero, and effort remains a
+// separate control.
 func TestStatusLineDefaults(t *testing.T) {
 	m := statusModel()
+	m.width = 120
 	m.modelName = "m"
 	m.provName = "p"
 
 	v := m.View()
-	if !strings.Contains(v, "0/0 tok") {
-		t.Errorf("empty session should read 0/0 tok\n%s", tailLines(v, 6))
+	if !strings.Contains(v, "ctx 0") {
+		t.Errorf("empty session should read ctx 0\n%s", tailLines(v, 6))
 	}
-	if strings.Contains(v, "m (") {
-		t.Errorf("effort off should not add parens\n%s", tailLines(v, 6))
+	if !strings.Contains(v, "│ m │ (off) │ execute │") {
+		t.Errorf("effort off should remain a separate indicator\n%s", tailLines(v, 6))
 	}
-	if !strings.Contains(v, "  m   p  ") && !strings.Contains(v, " m   p ") {
-		t.Errorf("bare model and provider should appear\n%s", tailLines(v, 6))
+	if !strings.Contains(v, "│ m │ (off) │ execute │ p │") {
+		t.Errorf("model, mode, and provider should appear\n%s", tailLines(v, 6))
 	}
 }
 
-// Cached tokens surface in the spend segment.
-func TestStatusLineShowsCached(t *testing.T) {
+func TestStatusBoxHasBordersAndDelimiters(t *testing.T) {
+	m := statusModel()
+	m.width = 120
+	m.modelName = "model"
+	m.provName = "provider"
+
+	lines := strings.Split(ansi.Strip(m.statusView()), "\n")
+	if len(lines) != statusBoxRows {
+		t.Fatalf("status box should have %d rows, got %d: %q", statusBoxRows, len(lines), lines)
+	}
+	if !strings.HasPrefix(lines[0], "┌") || !strings.HasSuffix(lines[0], "┐") {
+		t.Errorf("top row should be bordered: %q", lines[0])
+	}
+	if !strings.HasPrefix(lines[1], "│") || !strings.HasSuffix(lines[1], "│") {
+		t.Errorf("content row should be bordered: %q", lines[1])
+	}
+	if !strings.HasPrefix(lines[2], "└") || !strings.HasSuffix(lines[2], "┘") {
+		t.Errorf("bottom row should be bordered: %q", lines[2])
+	}
+	if got := strings.Count(lines[1], "│"); got != 7 {
+		t.Errorf("content row should delimit all six cells, got %d vertical bars: %q", got, lines[1])
+	}
+	for i, line := range lines {
+		if got := ansi.StringWidth(line); got > m.width {
+			t.Errorf("status row %d is wider than terminal: %d > %d", i, got, m.width)
+		}
+	}
+}
+
+func TestBottomStatusHitboxMatchesRenderedRow(t *testing.T) {
+	m := statusModel()
+	tm, _ := m.Update(mkWinSize(100, 30))
+	m = tm.(*model)
+
+	lines := strings.Split(ansi.Strip(m.View()), "\n")
+	renderedRow := -1
+	for i, line := range lines {
+		if strings.Contains(line, "execute") && strings.Contains(line, "ctx") {
+			renderedRow = i
+			break
+		}
+	}
+	if renderedRow < 0 {
+		t.Fatalf("could not find the rendered status row:\n%s", m.View())
+	}
+	if renderedRow != statusInfoRow(m.height) {
+		t.Fatalf("status hitbox row=%d, rendered row=%d; the bottom controls would not receive clicks", statusInfoRow(m.height), renderedRow)
+	}
+}
+
+func TestStatusBoxFitsNarrowWidths(t *testing.T) {
+	for _, width := range []int{1, 2, 6, 10, 40} {
+		t.Run(fmt.Sprintf("width-%d", width), func(t *testing.T) {
+			m := statusModel()
+			m.width = width
+			lines := strings.Split(ansi.Strip(m.statusView()), "\n")
+			if len(lines) != statusBoxRows {
+				t.Fatalf("status box should have %d rows, got %d: %q", statusBoxRows, len(lines), lines)
+			}
+			for i, line := range lines {
+				if got := ansi.StringWidth(line); got > width {
+					t.Errorf("status row %d is wider than terminal: %d > %d (%q)", i, got, width, line)
+				}
+			}
+		})
+	}
+}
+
+func TestStatusModelSlotStaysFixedAcrossRoleChanges(t *testing.T) {
+	m := compactCmdModel()
+	m.width = 120
+	short := "short-model"
+	long := "a-deliberately-long-selected-model"
+	m.cfg.Roles = map[string]config.RoleConfig{
+		config.RoleDefault: {Model: short, Provider: "inference"},
+		config.RoleSmart:   {Model: long, Provider: "inference"},
+		config.RoleFast:    {Model: short, Provider: "inference"},
+		config.RoleTiny:    {Model: short, Provider: "inference"},
+	}
+	m.cfg.Models[short] = config.Model{Providers: []string{"inference"}}
+	m.cfg.Models[long] = config.Model{Providers: []string{"inference"}}
+
+	m.modelName = short
+	m.agent.Role = config.RoleDefault
+	_ = m.View()
+	effortX, modeX, modelW := m.statusEffortX, m.statusModeX, m.statusModelW
+	if modelW != len(long) {
+		t.Fatalf("model slot should reserve the longest selected role model: got %d, want %d", modelW, len(long))
+	}
+
+	m.modelName = long
+	m.agent.Role = config.RoleSmart
+	_ = m.View()
+	if m.statusEffortX != effortX || m.statusModeX != modeX || m.statusModelW != modelW {
+		t.Fatalf("following status controls moved with the model: short=(%d,%d,%d), long=(%d,%d,%d)", effortX, modeX, modelW, m.statusEffortX, m.statusModeX, m.statusModelW)
+	}
+
+	m.width = 40
+	_ = m.View()
+	if m.statusEffortW == 0 || m.statusModeW == 0 {
+		t.Fatalf("narrow status should retain effort and mode controls: effort=%d mode=%d", m.statusEffortW, m.statusModeW)
+	}
+	if m.statusModelW >= len(long) {
+		t.Fatalf("narrow status should truncate the model slot, got width %d", m.statusModelW)
+	}
+}
+
+// Request usage is no longer rendered in the status segment; context size is
+// the useful persistent value there instead.
+func TestStatusLineOmitsTokenUsage(t *testing.T) {
 	m := statusModel()
 	m.modelName = "m"
 	m.provName = "p"
@@ -71,12 +212,31 @@ func TestStatusLineShowsCached(t *testing.T) {
 	}{CachedTokens: 4000}
 	m.agent.AddUsage(u)
 
-	if got := m.statusView(); !strings.Contains(got, "10.0k(4.0k)/500 tok") {
-		t.Errorf("cached tokens should show in the spend: %q", got)
+	got := m.statusView()
+	if strings.ContainsAny(got, "↓↑") || strings.Contains(got, "tok") {
+		t.Errorf("status should no longer show directional token usage: %q", got)
+	}
+	if !strings.Contains(got, "ctx 0") {
+		t.Errorf("status should show context size instead: %q", got)
 	}
 }
 
-// The status line is the last content row before the bottom padding, sitting
+func TestBusyStatsLeavesTokenUsageToStatus(t *testing.T) {
+	m := statusModel()
+	m.turnStart = time.Unix(100, 0)
+	m.now = func() time.Time { return time.Unix(101, 0) }
+	m.agent.AddUsage(llm.Usage{PromptTokens: 12000, CompletionTokens: 800})
+
+	got := m.busyStats()
+	if strings.Contains(got, "tok") || strings.Contains(got, "%") || strings.Contains(got, "12.0k") {
+		t.Fatalf("busy line should not render token usage: %q", got)
+	}
+	if !strings.Contains(got, "0:01") {
+		t.Fatalf("busy line should retain elapsed time: %q", got)
+	}
+}
+
+// The status box is the last content rows before the bottom padding, sitting
 // below the input even when the esc/quit warnings or completion menu show.
 func TestStatusLineBelowInputAndWarnings(t *testing.T) {
 	m := statusModel()
@@ -88,41 +248,47 @@ func TestStatusLineBelowInputAndWarnings(t *testing.T) {
 	lines := strings.Split(strings.TrimRight(v, "\n"), "\n")
 	var inputRow, statusRow int
 	for i, l := range lines {
-		if strings.Contains(l, "Ask whip anything") {
+		if strings.Contains(l, "Ask ghg anything") {
 			inputRow = i
 		}
-		if strings.Contains(l, "0/0 tok") {
+		if strings.Contains(l, "ctx 0") {
 			statusRow = i
 		}
 	}
 	if statusRow <= inputRow {
-		t.Fatalf("status line should sit below the input (input=%d status=%d)\n%s", inputRow, statusRow, v)
+		t.Fatalf("status box should sit below the input (input=%d status=%d)\n%s", inputRow, statusRow, v)
 	}
 }
 
-// Exactly one blank line separates the status line from whatever is above it,
-// and the status line is the final row (no blank line below).
+// Exactly one blank line separates the status box from whatever is above it,
+// and the three-row box is the final content (no blank line below).
 func TestStatusLineSpacing(t *testing.T) {
 	m := statusModel()
+	m.width = 120
 	m.modelName = "m"
 	m.provName = "p"
 
 	lines := strings.Split(m.View(), "\n")
 	var statusRow = -1
 	for i, l := range lines {
-		if strings.Contains(l, "0/0 tok") {
+		if strings.Contains(l, "ctx 0") {
 			statusRow = i
 		}
 	}
 	if statusRow < 1 {
-		t.Fatalf("status line not found\n%s", m.View())
+		t.Fatalf("status box not found\n%s", m.View())
 	}
-	if lines[statusRow-1] != "" {
-		t.Errorf("want one blank line above the status line, got %q", lines[statusRow-1])
+	if lines[statusRow-2] != "" {
+		t.Errorf("want one blank line above the status box, got %q", lines[statusRow-2])
 	}
-	// the status line is the last row, with nothing below it
-	if statusRow != len(lines)-1 {
-		t.Errorf("status line should be the last row (row %d of %d lines)", statusRow, len(lines)-1)
+	for i, want := range []string{"┌", "│", "└"} {
+		if !strings.HasPrefix(ansi.Strip(lines[statusRow-1+i]), want) {
+			t.Errorf("status box row %d should start with %q, got %q", i, want, lines[statusRow-1+i])
+		}
+	}
+	// the bottom border is the last row, with nothing below it
+	if statusRow+1 != len(lines)-1 {
+		t.Errorf("status box should be the last rows (bottom row %d of %d lines)", statusRow+1, len(lines)-1)
 	}
 }
 
@@ -135,7 +301,7 @@ func tailLines(s string, n int) string {
 	return strings.Join(lines, "\n")
 }
 
-// Cost appears in the spend segment when the provider's catalog advertises
+// Cost appears in the context segment when the provider's catalog advertises
 // pricing for the current model, and is hidden otherwise.
 func TestStatusLineShowsCost(t *testing.T) {
 	m := statusModel()

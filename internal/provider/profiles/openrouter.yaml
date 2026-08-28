@@ -1,0 +1,19 @@
+schema: 1
+id: openrouter
+display_name: OpenRouter
+protocol: openai-chat-completions
+base_url: https://openrouter.ai/api/v1
+auth:
+  kind: bearer
+  header: Authorization
+  env_var: OPENROUTER_API_KEY
+docs:
+  keys_url: https://openrouter.ai/keys
+default_headers: {}
+catalog:
+  kind: openai-models
+capabilities:
+  tools: true
+  vision: true
+  thinking: true
+  prompt_cache: provider

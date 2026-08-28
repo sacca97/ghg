@@ -24,7 +24,7 @@ immediately submits it — kicking off the goal loop until `GOAL_MET`.
 
 ## Non-goals
 
-- No palette sub-panel (the existing Goal panel already edits/launches goals).
+- No settings sub-panel (the existing Goal panel already edits/launches goals).
 - No streaming for the formulation call (one-shot `Complete`, like compaction).
 - No changes to the goal loop itself (`goal.go`, `goalContinuePrompt`, rounds).
 

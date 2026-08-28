@@ -10,7 +10,7 @@ import (
 
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 
-	"github.com/context-labs/whip/internal/config"
+	"github.com/sacca97/ghg/internal/config"
 )
 
 func TestEnableDisableCycle(t *testing.T) {
@@ -142,20 +142,20 @@ func TestFlattenRemainingContentTypes(t *testing.T) {
 }
 
 func TestDefaultTransportResolvesHeaderSecrets(t *testing.T) {
-	t.Setenv("WHIP_MCP_SECRET_TEST", "resolved-token")
+	t.Setenv("GHG_MCP_SECRET_TEST", "resolved-token")
 
 	// References resolve at connect time; the config keeps the raw reference.
 	cfg := ServerConfig{URL: "https://mcp.example.com", Headers: map[string]string{
-		"Authorization": "${WHIP_MCP_SECRET_TEST}",
+		"Authorization": "${GHG_MCP_SECRET_TEST}",
 		"X-Cmd":         "!printf cmd-token",
 		"X-Literal":     "plain",
-		"X-Dropped":     "$WHIP_MCP_SECRET_UNSET",
+		"X-Dropped":     "$GHG_MCP_SECRET_UNSET",
 	}}
 	tr, err := defaultTransport(cfg, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Headers["Authorization"] != "${WHIP_MCP_SECRET_TEST}" {
+	if cfg.Headers["Authorization"] != "${GHG_MCP_SECRET_TEST}" {
 		t.Fatalf("config mutated: %q", cfg.Headers["Authorization"])
 	}
 	st, ok := tr.(*sdkmcp.StreamableClientTransport)

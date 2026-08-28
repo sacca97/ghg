@@ -31,7 +31,7 @@ When starting a new project, **ask the developer** what software architecture th
 
 ## Dependency Injection: Ask Next
 
-After settling on the architecture, **ask the developer** which dependency injection approach they want: manual constructor injection, or a DI library (samber/do, google/wire, uber-go/dig+fx), or none at all. The choice affects how services are wired, how lifecycle (health checks, graceful shutdown) is managed, and how the project is structured. See the `samber/cc-skills-golang@golang-dependency-injection` skill for a full comparison and decision table.
+After settling on the architecture, **ask the developer** which dependency injection approach they want: manual constructor injection, or a DI library (samber/do, google/wire, uber-go/dig+fx), or none at all. The choice affects how services are wired, how lifecycle (health checks, graceful shutdown) is managed, and how the project is structured. See the `samber/cc-skills-golang@golang-dependency-injection` (upstream skill, not installed here) skill for a full comparison and decision table.
 
 ## 12-Factor App
 
@@ -104,7 +104,7 @@ Use `go.work` when developing multiple related modules in a monorepo. See [works
 When starting a new Go project:
 
 - [ ] Confirm preferred software architecture (clean, hexagonal, DDD, flat, etc.)
-- [ ] Confirm preferred DI approach — see `samber/cc-skills-golang@golang-dependency-injection` skill
+- [ ] Confirm preferred DI approach — see `samber/cc-skills-golang@golang-dependency-injection` (upstream skill, not installed here) skill
 - [ ] Decide project type (CLI, library, service, monorepo)
 - [ ] Right-size the structure to the project scope
 - [ ] Choose module name (matches repo URL, lowercase, hyphens)
@@ -120,4 +120,4 @@ When starting a new Go project:
 
 ## Related Skills
 
-→ See `samber/cc-skills-golang@golang-cli` skill for CLI tool structure and Cobra/Viper patterns. → See `samber/cc-skills-golang@golang-dependency-injection` skill for DI approach comparison and wiring. → See `samber/cc-skills-golang@golang-lint` skill for golangci-lint configuration. → See `samber/cc-skills-golang@golang-continuous-integration` skill for CI/CD pipeline setup. → See `samber/cc-skills-golang@golang-design-patterns` skill for architectural patterns. → See `samber/cc-skills-golang@golang-refactoring` skill for safely moving or splitting existing code into the layout above via type-alias gradual code repair and staged PRs, without a big-bang break. → See `samber/cc-skills-golang@golang-how-to` skill's Configure mode for the always-load directive and optional `## Required Go skills` block written to the project's agent-config file (CLAUDE.md, AGENTS.md, or equivalent).
+→ See `samber/cc-skills-golang@golang-cli` skill for CLI tool structure and Cobra/Viper patterns. → See `samber/cc-skills-golang@golang-dependency-injection` (upstream skill, not installed here) skill for DI approach comparison and wiring. → See `samber/cc-skills-golang@golang-lint` skill for golangci-lint configuration. → See `samber/cc-skills-golang@golang-continuous-integration` skill for CI/CD pipeline setup. → See `samber/cc-skills-golang@golang-design-patterns` skill for architectural patterns. → See `samber/cc-skills-golang@golang-refactoring` skill for safely moving or splitting existing code into the layout above via type-alias gradual code repair and staged PRs, without a big-bang break. → See `samber/cc-skills-golang@golang-how-to` skill's Configure mode for the always-load directive and optional `## Required Go skills` block written to the project's agent-config file (CLAUDE.md, AGENTS.md, or equivalent).

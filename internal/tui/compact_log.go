@@ -28,6 +28,10 @@ func (m *model) rawCutoff(cutoff int) int {
 // raw log. This is the whole point of recording compactions as events: a bad
 // summary is inspectable (/compact log) and erasable without losing history.
 func (m *model) compactRetry() {
+	if m.agent == nil {
+		m.append(m.degradedProviderNote())
+		return
+	}
 	if m.store == nil || m.sessionID == "" {
 		m.append(dimStyle.Render("(no session to retry a compaction in)"))
 		return

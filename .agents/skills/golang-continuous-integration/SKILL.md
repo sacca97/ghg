@@ -240,7 +240,7 @@ The workflow runs parallel jobs, each scoped to a set of review areas and priori
 | `security` | Security, Dependencies | Blocking-first |
 | `quality-depth` | Tests, Performance, Observability, Modernize | Mixed |
 
-Additional skills that may be relevant depending on the project: `golang-cli`, `golang-context`, `golang-data-structures`, `golang-database`, `golang-dependency-injection`, or any library-specific skill.
+Additional skills that may be relevant depending on the project: `golang-cli`, `golang-context`, `golang-data-structures`, `golang-database`, `golang-dependency-injection` (upstream skill, not installed here), or any library-specific skill.
 
 The Claude Code GitHub App integration is configured via the `/install-github-app` command, which sets up the required API secrets.
 

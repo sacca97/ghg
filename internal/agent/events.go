@@ -1,6 +1,6 @@
 package agent
 
-import "github.com/context-labs/whip/internal/llm"
+import "github.com/sacca97/ghg/internal/llm"
 
 // FanIn multiplexes several Events values into one: every fired callback is
 // invoked on each source that implements it. A background worker runs its
@@ -30,6 +30,13 @@ func FanIn(evs ...Events) Events {
 				}
 			}
 		},
+		OnToolOutput: func(id, output string) {
+			for _, e := range evs {
+				if e.OnToolOutput != nil {
+					e.OnToolOutput(id, output)
+				}
+			}
+		},
 		OnToolEnd: func(id, name, result string) {
 			for _, e := range evs {
 				if e.OnToolEnd != nil {
@@ -55,6 +62,20 @@ func FanIn(evs ...Events) Events {
 			for _, e := range evs {
 				if e.OnUsage != nil {
 					e.OnUsage(u)
+				}
+			}
+		},
+		OnModelCallStart: func(call ModelCallStart) {
+			for _, e := range evs {
+				if e.OnModelCallStart != nil {
+					e.OnModelCallStart(call)
+				}
+			}
+		},
+		OnModelCallEnd: func(call ModelCallEnd) {
+			for _, e := range evs {
+				if e.OnModelCallEnd != nil {
+					e.OnModelCallEnd(call)
 				}
 			}
 		},

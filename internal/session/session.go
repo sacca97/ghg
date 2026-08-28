@@ -1,7 +1,8 @@
-// Package session persists chat histories in ~/.whip/sessions.db (SQLite).
+// Package session persists chat histories in ~/.ghg/sessions.db (SQLite).
 package session
 
 import (
+	"context"
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
@@ -13,7 +14,8 @@ import (
 
 	_ "modernc.org/sqlite"
 
-	"github.com/context-labs/whip/internal/llm"
+	"github.com/sacca97/ghg/internal/artifact"
+	"github.com/sacca97/ghg/internal/llm"
 )
 
 const schema = `
@@ -34,6 +36,26 @@ CREATE TABLE IF NOT EXISTS messages (
 	content    TEXT NOT NULL, -- llm.Message JSON
 	PRIMARY KEY (session_id, seq)
 );
+-- Artifact metadata is session-scoped. Payloads are immutable and shared by
+-- content hash; the message sequence is only the ownership/fork/rewind index.
+CREATE TABLE IF NOT EXISTS artifacts (
+	session_id    TEXT NOT NULL REFERENCES sessions(id),
+	message_seq   INTEGER NOT NULL,
+	id            TEXT NOT NULL,
+	tool_call_id  TEXT NOT NULL,
+	tool_name     TEXT NOT NULL,
+	media_type    TEXT NOT NULL DEFAULT '',
+	original_bytes INTEGER NOT NULL,
+	stored_bytes   INTEGER NOT NULL,
+	hash          TEXT NOT NULL,
+	path          TEXT NOT NULL,
+	complete      INTEGER NOT NULL,
+	metadata      TEXT NOT NULL DEFAULT '',
+	created_at    TEXT NOT NULL,
+	PRIMARY KEY (session_id, id, tool_call_id)
+);
+CREATE INDEX IF NOT EXISTS artifacts_session_seq ON artifacts(session_id, message_seq);
+CREATE INDEX IF NOT EXISTS artifacts_session_created ON artifacts(session_id, created_at);
 CREATE TABLE IF NOT EXISTS tasks (
 	session_id  TEXT NOT NULL REFERENCES sessions(id),
 	task_id     TEXT NOT NULL,
@@ -145,6 +167,9 @@ func Open(path string) (*Store, error) {
 	for _, c := range extraColumns {
 		_, _ = db.Exec(`ALTER TABLE sessions ADD COLUMN ` + c.def)
 	}
+	// The artifact table was introduced after the initial Phase 1 slice; keep
+	// databases created by that slice readable when metadata is added.
+	_, _ = db.Exec(`ALTER TABLE artifacts ADD COLUMN metadata TEXT NOT NULL DEFAULT ''`)
 	return &Store{db: db}, nil
 }
 
@@ -261,6 +286,21 @@ func (s *Store) Save(id string, from int, msgs []llm.Message, model, provider st
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	// Once a compaction event exists, Agent.Messages is a derived prompt view:
+	// its indexes no longer match the raw message sequence in SQLite. New
+	// messages must append after the raw tail instead of replacing an older
+	// row at the same derived index. The placeholder convention below keeps
+	// this compatible with callers that pass the old view as padding.
+	var compacted int
+	if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM compactions WHERE session_id=?)`, id).Scan(&compacted); err != nil {
+		return err
+	}
+	nextSeq := 0
+	if compacted != 0 {
+		if err := tx.QueryRow(`SELECT COALESCE(MAX(seq),0)+1 FROM messages WHERE session_id=?`, id).Scan(&nextSeq); err != nil {
+			return err
+		}
+	}
 	for i := from; i < len(msgs); i++ {
 		// Placeholder rows (zero-value messages the caller never meant to
 		// write, e.g. padding before a post-compaction tail) must not
@@ -268,13 +308,55 @@ func (s *Store) Save(id string, from int, msgs []llm.Message, model, provider st
 		if msgs[i].Role == "" {
 			continue
 		}
+		seq := i
+		if compacted != 0 {
+			seq = nextSeq
+			nextSeq++
+		}
+		// A re-save can replace a tool message with a version that no longer
+		// carries an artifact. Remove the old index rows before inserting the
+		// current message, while leaving payload files untouched.
+		if _, err := tx.Exec(`DELETE FROM artifacts WHERE session_id=? AND message_seq=?`, id, seq); err != nil {
+			return err
+		}
 		data, err := json.Marshal(msgs[i])
 		if err != nil {
 			return err
 		}
 		if _, err := tx.Exec(`INSERT OR REPLACE INTO messages (session_id, seq, role, content) VALUES (?,?,?,?)`,
-			id, i, msgs[i].Role, string(data)); err != nil {
+			id, seq, msgs[i].Role, string(data)); err != nil {
 			return err
+		}
+		if msgs[i].Artifact != nil {
+			ref := *msgs[i].Artifact
+			relPath, err := artifact.RelativePath(ref)
+			if err != nil {
+				return fmt.Errorf("message %d artifact: %w", seq, err)
+			}
+			complete := 0
+			if ref.Complete {
+				complete = 1
+			}
+			metadata := ""
+			if len(ref.Metadata) > 0 {
+				data, err := json.Marshal(ref.Metadata)
+				if err != nil {
+					return fmt.Errorf("message %d artifact metadata: %w", seq, err)
+				}
+				metadata = string(data)
+			}
+			toolName := msgs[i].Name
+			if toolName == "" {
+				toolName = msgs[i].Source
+			}
+			if _, err := tx.Exec(`INSERT OR REPLACE INTO artifacts
+				(session_id, message_seq, id, tool_call_id, tool_name, media_type,
+				 original_bytes, stored_bytes, hash, path, complete, metadata, created_at)
+				VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+				id, seq, ref.ID, msgs[i].ToolCallID, toolName, ref.MediaType,
+				ref.OriginalBytes, ref.StoredBytes, ref.Hash, relPath, complete, metadata, now()); err != nil {
+				return err
+			}
 		}
 	}
 	title := ""
@@ -286,6 +368,170 @@ func (s *Store) Save(id string, from int, msgs []llm.Message, model, provider st
 	}
 	if _, err := tx.Exec(`UPDATE sessions SET updated_at=?, model=?, provider=?, title=CASE WHEN title='' THEN ? ELSE title END WHERE id=?`,
 		now(), model, provider, title, id); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+const (
+	defaultArtifactListLimit = 100
+	maxArtifactListLimit     = 1000
+)
+
+// LookupArtifact returns one artifact reference only when it belongs to the
+// supplied session. The caller still reads the payload through artifact.Store,
+// which derives its path from the validated hash rather than this row's path.
+func (s *Store) LookupArtifact(ctx context.Context, sessionID, id string) (artifact.Metadata, error) {
+	if strings.TrimSpace(sessionID) == "" {
+		return artifact.Metadata{}, fmt.Errorf("session id is required")
+	}
+	if strings.TrimSpace(id) == "" {
+		return artifact.Metadata{}, fmt.Errorf("artifact id is required")
+	}
+	row := s.db.QueryRowContext(ctx, `SELECT session_id, message_seq, id, tool_call_id,
+		tool_name, media_type, original_bytes, stored_bytes, hash, path, complete, metadata, created_at
+		FROM artifacts WHERE session_id=? AND id=?
+		ORDER BY created_at DESC, message_seq DESC, tool_call_id LIMIT 1`, sessionID, id)
+	return scanArtifact(row)
+}
+
+// ListArtifacts returns a bounded, deterministic artifact catalog for one
+// session. Query matches stable text metadata only; it never searches payload
+// contents and never accepts a filesystem path.
+func (s *Store) ListArtifacts(ctx context.Context, sessionID string, filter artifact.Filter, limit int) ([]artifact.Metadata, error) {
+	if strings.TrimSpace(sessionID) == "" {
+		return nil, fmt.Errorf("session id is required")
+	}
+	if limit <= 0 {
+		limit = defaultArtifactListLimit
+	}
+	if limit > maxArtifactListLimit {
+		limit = maxArtifactListLimit
+	}
+	query := `SELECT session_id, message_seq, id, tool_call_id, tool_name,
+		media_type, original_bytes, stored_bytes, hash, path, complete, metadata, created_at
+		FROM artifacts WHERE session_id=?`
+	args := []any{sessionID}
+	if filter.ToolName != "" {
+		query += ` AND tool_name=?`
+		args = append(args, filter.ToolName)
+	}
+	if filter.ToolCallID != "" {
+		query += ` AND tool_call_id=?`
+		args = append(args, filter.ToolCallID)
+	}
+	if filter.Query != "" {
+		like := "%" + filter.Query + "%"
+		query += ` AND (id LIKE ? OR tool_call_id LIKE ? OR tool_name LIKE ? OR media_type LIKE ? OR metadata LIKE ?)`
+		args = append(args, like, like, like, like, like)
+	}
+	if !filter.Since.IsZero() {
+		query += ` AND created_at>=?`
+		args = append(args, filter.Since.UTC().Format(time.RFC3339))
+	}
+	if !filter.Until.IsZero() {
+		query += ` AND created_at<=?`
+		args = append(args, filter.Until.UTC().Format(time.RFC3339))
+	}
+	query += ` ORDER BY created_at DESC, message_seq DESC, id ASC, tool_call_id ASC LIMIT ?`
+	args = append(args, limit)
+	rows, err := s.db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	var out []artifact.Metadata
+	for rows.Next() {
+		meta, err := scanArtifact(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, meta)
+	}
+	return out, rows.Err()
+}
+
+type scanner interface {
+	Scan(dest ...any) error
+}
+
+func scanArtifact(row scanner) (artifact.Metadata, error) {
+	var (
+		meta     artifact.Metadata
+		complete int
+		metadata string
+		created  string
+	)
+	if err := row.Scan(&meta.SessionID, &meta.MessageSeq, &meta.ID, &meta.ToolCallID,
+		&meta.ToolName, &meta.MediaType, &meta.OriginalBytes, &meta.StoredBytes,
+		&meta.Hash, &meta.Path, &complete, &metadata, &created); err != nil {
+		return artifact.Metadata{}, err
+	}
+	meta.Complete = complete != 0
+	if metadata != "" {
+		if err := json.Unmarshal([]byte(metadata), &meta.Metadata); err != nil {
+			return artifact.Metadata{}, fmt.Errorf("parse artifact metadata: %w", err)
+		}
+	}
+	var err error
+	meta.CreatedAt, err = time.Parse(time.RFC3339, created)
+	if err != nil {
+		return artifact.Metadata{}, fmt.Errorf("parse artifact timestamp: %w", err)
+	}
+	return meta, nil
+}
+
+// ReferencedArtifactHashes returns the payload hashes still referenced by any
+// session row. Callers can pass the result to artifact.Store.GarbageCollect
+// after removing sessions; payload files are intentionally outside SQLite.
+func (s *Store) ReferencedArtifactHashes(ctx context.Context) (map[string]bool, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT hash FROM artifacts`)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	refs := map[string]bool{}
+	for rows.Next() {
+		var hash string
+		if err := rows.Scan(&hash); err != nil {
+			return nil, err
+		}
+		refs[hash] = true
+	}
+	return refs, rows.Err()
+}
+
+// GarbageCollectArtifacts removes unreferenced payloads after consulting this
+// session database for the complete set of live references. Keeping the
+// reference query and payload deletion in one helper makes the safe cleanup
+// sequence hard to accidentally reverse at a call site.
+func (s *Store) GarbageCollectArtifacts(ctx context.Context, payloads *artifact.Store, maxAge time.Duration, maxBytes int64) (int, error) {
+	if payloads == nil {
+		return 0, fmt.Errorf("artifact store is required")
+	}
+	referenced, err := s.ReferencedArtifactHashes(ctx)
+	if err != nil {
+		return 0, err
+	}
+	return payloads.GarbageCollect(ctx, referenced, maxAge, maxBytes)
+}
+
+// DeleteSession removes a session and its database-owned history. It does not
+// remove immutable payload files; run ReferencedArtifactHashes followed by
+// artifact.Store.GarbageCollect to reclaim payloads no longer referenced by
+// any session.
+func (s *Store) DeleteSession(id string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	for _, table := range []string{"artifacts", "messages", "tasks", "snapshots", "schedules", "compactions"} {
+		if _, err := tx.Exec(`DELETE FROM `+table+` WHERE session_id=?`, id); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec(`DELETE FROM sessions WHERE id=?`, id); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -315,24 +561,30 @@ func (s *Store) Load(idOrPrefix string) (Meta, []llm.Message, error) {
 	var count int
 	_ = s.db.QueryRow(`SELECT COUNT(*) FROM messages WHERE session_id=?`, meta.ID).Scan(&count)
 
-	mrows, err := s.db.Query(`SELECT content FROM messages WHERE session_id=? ORDER BY seq`, meta.ID)
+	mrows, err := s.db.Query(`SELECT seq, content FROM messages WHERE session_id=? ORDER BY seq`, meta.ID)
 	if err != nil {
 		return Meta{}, nil, err
 	}
 	defer func() { _ = mrows.Close() }()
-	msgs := make([]llm.Message, 0, count)
+	stored := make([]storedMessage, 0, count)
 	for mrows.Next() {
+		var seq int
 		var data string
-		if err := mrows.Scan(&data); err != nil {
+		if err := mrows.Scan(&seq, &data); err != nil {
 			return Meta{}, nil, err
 		}
 		var m llm.Message
 		if err := json.Unmarshal([]byte(data), &m); err != nil {
 			return Meta{}, nil, err
 		}
-		msgs = append(msgs, m)
+		stored = append(stored, storedMessage{seq: seq, msg: m})
 	}
-	return meta, answerDanglingToolCalls(applyCompaction(s.db, meta.ID, msgs)), mrows.Err()
+	return meta, answerDanglingToolCalls(applyCompactionRows(s.db, meta.ID, stored)), mrows.Err()
+}
+
+type storedMessage struct {
+	seq int
+	msg llm.Message
 }
 
 // applyCompaction derives the compacted view from the raw log: the latest
@@ -343,37 +595,57 @@ func (s *Store) Load(idOrPrefix string) (Meta, []llm.Message, error) {
 // ever applies to non-system rows. No event → the log loads verbatim. This is
 // what makes a compaction non-destructive: the event is metadata, the raw
 // rows are the history.
-func applyCompaction(db *sql.DB, sessionID string, msgs []llm.Message) []llm.Message {
+func applyCompactionRows(db *sql.DB, sessionID string, rows []storedMessage) []llm.Message {
 	var cutoff int
 	var summary string
 	err := db.QueryRow(`SELECT cutoff, summary FROM compactions WHERE session_id=? ORDER BY seq DESC LIMIT 1`,
 		sessionID).Scan(&cutoff, &summary)
-	if err != nil || cutoff <= 1 || cutoff > len(msgs) {
-		return msgs // no event, or one that post-dates the raw log
+	if err != nil || cutoff <= 0 {
+		return storedMessages(rows) // no event
 	}
-	// the fold point is the first raw (non-system) row at or past cutoff
-	fold := len(msgs)
-	for i := cutoff; i < len(msgs); i++ {
-		if msgs[i].Role != "system" {
+	// The cutoff is a raw SQLite sequence, not an index in the loaded slice.
+	// This matters because normal TUI saves omit the system prompt (seq 0),
+	// while a few low-level callers persist it for round-trip tests.
+	fold := len(rows)
+	for i, row := range rows {
+		if row.seq >= cutoff {
 			fold = i
 			break
 		}
 	}
-	out := make([]llm.Message, 0, len(msgs))
-	out = append(out, msgs[0],
-		llm.Message{Role: "system", Content: "Summary of the conversation so far:\n\n" + summary})
+	if fold == len(rows) && (len(rows) == 0 || rows[len(rows)-1].seq < cutoff) {
+		return storedMessages(rows) // the event post-dates the raw log
+	}
+	out := make([]llm.Message, 0, len(rows)+1)
+	start := 0
+	if len(rows) > 0 && rows[0].seq == 0 && rows[0].msg.Role == "system" {
+		out = append(out, rows[0].msg)
+		start = 1
+	}
+	out = append(out, llm.Message{Role: "system", Content: "Summary of the conversation so far:\n\n" + summary})
 	// keep the last derived summary before the fold (a second compaction's
 	// saved row — it summarizes history the new summary doesn't reach)
 	var prior []llm.Message
-	for i := 1; i < fold; i++ {
-		if msgs[i].Role == "system" {
-			prior = append(prior, msgs[i])
+	for i := start; i < fold; i++ {
+		if rows[i].msg.Role == "system" {
+			prior = append(prior, rows[i].msg)
 		}
 	}
 	if len(prior) > 0 {
 		out = append(out, prior[len(prior)-1])
 	}
-	return append(out, msgs[fold:]...)
+	for _, row := range rows[fold:] {
+		out = append(out, row.msg)
+	}
+	return out
+}
+
+func storedMessages(rows []storedMessage) []llm.Message {
+	msgs := make([]llm.Message, 0, len(rows))
+	for _, row := range rows {
+		msgs = append(msgs, row.msg)
+	}
+	return msgs
 }
 
 // answerDanglingToolCalls appends a synthetic error result for every
@@ -431,13 +703,33 @@ func (s *Store) Recent(n int) ([]Meta, error) {
 	return scanMetas(rows)
 }
 
+// MostRecentForCWD returns the newest session with persisted messages for cwd.
+// Empty sessions are deliberately excluded, matching Recent and the resume
+// picker: --continue should return something the user can actually resume.
+func (s *Store) MostRecentForCWD(cwd string) (Meta, error) {
+	rows, err := s.db.Query(`SELECT id, title, model, provider, cwd, goal, forked_from, fork_seq, tags, pinned, effort, usage_in, usage_cached, usage_out, updated_at FROM sessions
+		WHERE cwd=? AND EXISTS (SELECT 1 FROM messages WHERE session_id = sessions.id)
+		ORDER BY updated_at DESC, rowid DESC LIMIT 1`, cwd)
+	if err != nil {
+		return Meta{}, err
+	}
+	metas, err := scanMetas(rows)
+	if err != nil {
+		return Meta{}, err
+	}
+	if len(metas) == 0 {
+		return Meta{}, fmt.Errorf("no resumable session for working directory %q", cwd)
+	}
+	return metas[0], nil
+}
+
 // UserHistory returns user-message contents across ALL sessions (every folder),
 // newest first and de-duplicated, for up-arrow input recall. Order is by the
 // session's last activity then the message's position within it, so the most
 // recently typed input comes first. Only messages the human actually typed are
 // recalled: steered background-task
 // results and goal-continuation prompts are stored as role "user" too, but
-// they're injected by whip, not written by the user. Those carry Authored=false
+// they're injected by ghg, not written by the user. Those carry Authored=false
 // and are skipped; only Authored=true messages come back.
 func (s *Store) UserHistory(limit int) ([]string, error) {
 	rows, err := s.db.Query(`SELECT m.content FROM messages m
@@ -460,7 +752,7 @@ func (s *Store) UserHistory(limit int) ([]string, error) {
 			continue // skip malformed rows rather than fail the whole recall
 		}
 		if !msg.Authored {
-			continue // injected by whip (steered task result / goal prompt), not typed
+			continue // injected by ghg (steered task result / goal prompt), not typed
 		}
 		content := strings.TrimSpace(msg.TextContent())
 		if content == "" || seen[content] {
@@ -498,8 +790,18 @@ func (s *Store) LastExchange(id string) (user, assistant string) {
 // row is kept). Used after compaction rewrites history: the compacted
 // messages are smaller and re-seqenced from 0, so the old rows must go first.
 func (s *Store) ClearMessages(id string) error {
-	_, err := s.db.Exec(`DELETE FROM messages WHERE session_id=?`, id)
-	return err
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.Exec(`DELETE FROM messages WHERE session_id=?`, id); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM artifacts WHERE session_id=?`, id); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // DeleteFrom drops every stored message with seq >= from, plus the workspace
@@ -509,12 +811,21 @@ func (s *Store) ClearMessages(id string) error {
 // persisted). Used by rewind: the clipped tail is deleted from disk but kept
 // in memory for forward travel.
 func (s *Store) DeleteFrom(id string, from int) error {
-	_, err := s.db.Exec(`DELETE FROM messages WHERE session_id=? AND seq>=?`, id, from)
+	tx, err := s.db.Begin()
 	if err != nil {
 		return err
 	}
-	_, err = s.db.Exec(`DELETE FROM snapshots WHERE session_id=? AND seq>=?`, id, from)
-	return err
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.Exec(`DELETE FROM messages WHERE session_id=? AND seq>=?`, id, from); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM snapshots WHERE session_id=? AND seq>=?`, id, from); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM artifacts WHERE session_id=? AND message_seq>=?`, id, from); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 // SetSnapshot records the workspace snapshot ref for the turn starting at
@@ -701,8 +1012,65 @@ func (s *Store) Fork(srcID string, uptoSeq int, title string) (string, error) {
 			newID, srcID, uptoSeq); err != nil {
 			return "", err
 		}
+		artifactIDs, err := artifactIDsInMessages(tx, srcID, uptoSeq)
+		if err != nil {
+			return "", err
+		}
+		query := `INSERT INTO artifacts
+			(session_id, message_seq, id, tool_call_id, tool_name, media_type,
+			 original_bytes, stored_bytes, hash, path, complete, metadata, created_at)
+			SELECT ?, message_seq, id, tool_call_id, tool_name, media_type,
+			 original_bytes, stored_bytes, hash, path, complete, metadata, created_at
+			FROM artifacts WHERE session_id=? AND (message_seq <= ?`
+		args := []any{newID, srcID, uptoSeq}
+		if len(artifactIDs) > 0 {
+			placeholders := make([]string, len(artifactIDs))
+			for i, id := range artifactIDs {
+				placeholders[i] = "?"
+				args = append(args, id)
+			}
+			query += ` OR id IN (` + strings.Join(placeholders, ",") + ")"
+		}
+		query += ")"
+		if _, err := tx.Exec(query, args...); err != nil {
+			return "", err
+		}
+		// A full/raw fork should retain the derived prompt view. The payloads
+		// and raw messages are already copied above; copying only events whose
+		// cutoff is inside the branch keeps a partial fork independently
+		// loadable without inventing a new cutoff.
+		if _, err := tx.Exec(`INSERT INTO compactions (session_id, seq, cutoff, summary, created_at)
+			SELECT ?, seq, cutoff, summary, created_at FROM compactions
+			WHERE session_id=? AND cutoff<=?`, newID, srcID, uptoSeq); err != nil {
+			return "", err
+		}
 	}
 	return newID, tx.Commit()
+}
+
+func artifactIDsInMessages(tx *sql.Tx, sessionID string, uptoSeq int) ([]string, error) {
+	rows, err := tx.Query(`SELECT content FROM messages WHERE session_id=? AND seq<=?`, sessionID, uptoSeq)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	seen := map[string]bool{}
+	var ids []string
+	for rows.Next() {
+		var data string
+		if err := rows.Scan(&data); err != nil {
+			return nil, err
+		}
+		var msg llm.Message
+		if err := json.Unmarshal([]byte(data), &msg); err != nil || msg.Artifact == nil {
+			continue
+		}
+		if !seen[msg.Artifact.ID] {
+			seen[msg.Artifact.ID] = true
+			ids = append(ids, msg.Artifact.ID)
+		}
+	}
+	return ids, rows.Err()
 }
 
 // SetTags replaces a session's label set (comma-separated storage).

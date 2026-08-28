@@ -6,17 +6,16 @@
 // The default (non-interactive) path runs the command in a new session with no
 // controlling terminal, so a program that wants to read a password from /dev/tty
 // fails fast ("a terminal is required") instead of hanging indefinitely on
-// whip's terminal — which is what used to lock up the whole agent.
+// ghg's terminal — which is what used to lock up the whole agent.
 //
 // The interactive path runs the command in a PTY. Keystrokes the user types are
 // forwarded to the PTY and PTY output streams back to the caller. If the child
 // goes quiet for a while (likely waiting for input), the caller is told to show
 // a countdown; if input is still absent after the inactivity timeout, the
-// command is killed so whip never hangs forever.
+// command is killed so ghg never hangs forever.
 package bashrun
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -30,6 +29,8 @@ import (
 	"time"
 
 	"github.com/creack/pty"
+
+	"github.com/sacca97/ghg/internal/artifact"
 )
 
 // userShell resolves the user's login shell: $SHELL first, then the passwd
@@ -80,6 +81,73 @@ type Result struct {
 	Killed bool
 	// Interactive reports whether the interactive PTY path was used.
 	Interactive bool
+	// OriginalBytes is the total stdout/stderr byte count. Output is bounded
+	// to artifact.DefaultMaxBytes and may contain deterministic head/tail data.
+	OriginalBytes int64
+	// Complete is false when Output omitted the middle of a result.
+	Complete bool
+}
+
+// boundedCapture keeps command output inside a hard memory ceiling while
+// retaining deterministic head and tail slices after overflow. stdout and
+// stderr are merged in arrival order, as they were before the bound existed.
+type boundedCapture struct {
+	limit     int
+	total     int64
+	data      []byte
+	head      []byte
+	tail      []byte
+	truncated bool
+}
+
+func newBoundedCapture(limit int64) *boundedCapture {
+	if limit <= 0 {
+		limit = artifact.DefaultMaxBytes
+	}
+	return &boundedCapture{limit: int(limit)}
+}
+
+func (c *boundedCapture) Write(p []byte) (int, error) {
+	c.total += int64(len(p))
+	if c.truncated {
+		c.appendTail(p)
+		return len(p), nil
+	}
+	c.data = append(c.data, p...)
+	if len(c.data) <= c.limit {
+		return len(p), nil
+	}
+	c.truncated = true
+	headLen := c.limit / 2
+	if headLen > len(c.data) {
+		headLen = len(c.data)
+	}
+	c.head = append([]byte(nil), c.data[:headLen]...)
+	c.tail = append([]byte(nil), c.data[len(c.data)-(c.limit-headLen):]...)
+	c.data = nil
+	return len(p), nil
+}
+
+func (c *boundedCapture) appendTail(p []byte) {
+	tailLen := c.limit - c.limit/2
+	if len(p) >= tailLen {
+		c.tail = append(c.tail[:0], p[len(p)-tailLen:]...)
+		return
+	}
+	c.tail = append(c.tail, p...)
+	if len(c.tail) > tailLen {
+		c.tail = c.tail[len(c.tail)-tailLen:]
+	}
+}
+
+func (c *boundedCapture) String() string {
+	if !c.truncated {
+		return string(c.data)
+	}
+	data := make([]byte, 0, len(c.head)+len(c.tail))
+	data = append(data, c.head...)
+	data = append(data, c.tail...)
+	return string(data)
 }
 
 // Options configure a single run.
@@ -97,6 +165,10 @@ type Options struct {
 	// OnOutput streams PTY stdout/stderr deltas back to the caller (live
 	// transcript). Interactive only; safe to call from the run goroutine.
 	OnOutput func(chunk string)
+	// OnUpdate receives accumulated stdout/stderr snapshots at most once per
+	// 100ms while a command runs, plus a final changed snapshot. It is safe to
+	// call from the run-owned update goroutine.
+	OnUpdate func(snapshot string)
 	// OnAwaitInput is called once per second while the child is quiet and
 	// likely waiting for input; secLeft is the seconds remaining before the
 	// inactivity timeout fires. Interactive only.
@@ -129,13 +201,13 @@ func Run(ctx context.Context, opts Options) Result {
 	if opts.Interactive {
 		return runInteractive(ctx, cmd, opts)
 	}
-	return runPiped(ctx, cmd)
+	return runPiped(ctx, cmd, opts)
 }
 
 // runPiped runs the command with stdout/stderr captured, stdin wired to
 // /dev/null, and a fresh session with no controlling terminal. A program that
 // tries to open /dev/tty for a password fails fast rather than hanging on
-// whip's terminal.
+// ghg's terminal.
 //
 // The subtlety that justifies hand-rolling Start/Wait: a detached grandchild
 // (nohup, `sleep 30 &`, a daemonized server) inherits the stdout/stderr pipes
@@ -145,7 +217,7 @@ func Run(ctx context.Context, opts Options) Result {
 // our read ends the moment the process exits, so a lingering grandchild can't
 // stall us. (We don't get the grandchild's later output, which is correct —
 // it outlived the command.)
-func runPiped(ctx context.Context, cmd *exec.Cmd) Result {
+func runPiped(ctx context.Context, cmd *exec.Cmd, opts Options) Result {
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return Result{Exit: "pipe: " + err.Error()}
@@ -160,18 +232,18 @@ func runPiped(ctx context.Context, cmd *exec.Cmd) Result {
 	}
 	// Setsid gives the child a new session with no controlling terminal, so a
 	// program that insists on /dev/tty fails immediately instead of grabbing
-	// whip's terminal and blocking its input loop.
+	// ghg's terminal and blocking its input loop.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
 
 	if err := cmd.Start(); err != nil {
 		return Result{Exit: exitString(err)}
 	}
-	track(cmd) // register for KillAll on whip exit
+	track(cmd) // register for KillAll on ghg exit
 	defer untrack(cmd)
 
 	// Drain both pipes concurrently; the readers finish on pipe EOF (process
 	// exit) OR when we close them below after Wait returns.
-	var out bytes.Buffer
+	out := newBoundedCapture(artifact.DefaultMaxBytes)
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -192,6 +264,41 @@ func runPiped(ctx context.Context, cmd *exec.Cmd) Result {
 	}
 	go drain(stdout)
 	go drain(stderr)
+
+	// A command can be quiet from the model's perspective for minutes while it
+	// compiles or runs tests. Keep one notifier per invocation so parallel bash
+	// calls have isolated output and the callback never needs package globals.
+	var updateWG sync.WaitGroup
+	var updateDone chan struct{}
+	if opts.OnUpdate != nil {
+		updateDone = make(chan struct{})
+		updateWG.Add(1)
+		go func() {
+			defer updateWG.Done()
+			ticker := time.NewTicker(100 * time.Millisecond)
+			defer ticker.Stop()
+			last := ""
+			publish := func() {
+				mu.Lock()
+				snapshot := out.String()
+				mu.Unlock()
+				if snapshot == "" || snapshot == last {
+					return
+				}
+				last = snapshot
+				opts.OnUpdate(snapshot)
+			}
+			for {
+				select {
+				case <-ticker.C:
+					publish()
+				case <-updateDone:
+					publish()
+					return
+				}
+			}
+		}()
+	}
 	// Kill the process group if the run context is cancelled/times out.
 	watchDone := make(chan struct{})
 	defer close(watchDone)
@@ -211,8 +318,15 @@ func runPiped(ctx context.Context, cmd *exec.Cmd) Result {
 	_ = stdout.Close()
 	_ = stderr.Close()
 	wg.Wait()
+	if updateDone != nil {
+		close(updateDone)
+		updateWG.Wait()
+	}
 
-	res := Result{Output: out.String()}
+	mu.Lock()
+	output := out.String()
+	mu.Unlock()
+	res := Result{Output: output, OriginalBytes: out.total, Complete: !out.truncated}
 	if ctx.Err() == context.DeadlineExceeded {
 		res.TimedOut = true
 		res.Killed = true
@@ -244,10 +358,10 @@ func runInteractive(ctx context.Context, cmd *exec.Cmd, opts Options) Result {
 	if err != nil {
 		// Fall back to the safe non-interactive path; an interactive failure
 		// must never hang the agent.
-		return runPiped(ctx, cmd)
+		return runPiped(ctx, cmd, opts)
 	}
 	defer ptmx.Close()
-	track(cmd) // register for KillAll on whip exit
+	track(cmd) // register for KillAll on ghg exit
 	defer untrack(cmd)
 
 	// Kill the whole process group (bash + any children) on timeout/cancel so
@@ -262,7 +376,7 @@ func runInteractive(ctx context.Context, cmd *exec.Cmd, opts Options) Result {
 		stop()
 	}()
 
-	var buf bytes.Buffer
+	buf := newBoundedCapture(artifact.DefaultMaxBytes)
 	outCh := make(chan []byte, 16)
 
 	// Output pump: copy PTY -> caller + buffer; on read error the child has
@@ -336,7 +450,7 @@ func runInteractive(ctx context.Context, cmd *exec.Cmd, opts Options) Result {
 			// command exited). Wait for the child and return.
 			if !ok || chunk == nil {
 				waitErr := cmd.Wait()
-				res := Result{Output: buf.String(), Interactive: true}
+				res := Result{Output: buf.String(), Interactive: true, OriginalBytes: buf.total, Complete: !buf.truncated}
 				if ctx.Err() == context.DeadlineExceeded {
 					res.TimedOut = true
 					res.Killed = true
@@ -364,13 +478,15 @@ func runInteractive(ctx context.Context, cmd *exec.Cmd, opts Options) Result {
 				stop()
 				_ = cmd.Wait()
 				res := Result{
-					Output:      buf.String(),
-					Exit:        "timed out waiting for input",
-					Killed:      true,
-					Interactive: true,
+					Output:        buf.String(),
+					Exit:          "timed out waiting for input",
+					Killed:        true,
+					Interactive:   true,
+					OriginalBytes: buf.total,
+					Complete:      !buf.truncated,
 				}
 				res.Output += fmt.Sprintf(
-					"\n[whip: interactive command killed after %s with no input]",
+					"\n[ghg: interactive command killed after %s with no input]",
 					opts.InactivityTimeout.Round(time.Second),
 				)
 				return res
@@ -427,7 +543,7 @@ func openDevNull() *os.File {
 }
 
 // Registry of in-flight child processes so KillAll can guarantee none outlive
-// whip. track is called right after a successful Start; untrack after Wait.
+// ghg. track is called right after a successful Start; untrack after Wait.
 var (
 	trackMu sync.Mutex
 	tracked = map[int]*exec.Cmd{}
@@ -452,8 +568,8 @@ func untrack(cmd *exec.Cmd) {
 }
 
 // KillAll SIGKILLs every tracked child process group and waits briefly for
-// them to die. Called on whip exit so an agent-spawned server or watcher
-// never outlives the harness. Safe to call more than once.
+// them to die. Called on ghg exit so an agent-spawned server or watcher
+// never outlives the ghg. Safe to call more than once.
 func KillAll() {
 	trackMu.Lock()
 	procs := make([]*exec.Cmd, 0, len(tracked))

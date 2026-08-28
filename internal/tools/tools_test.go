@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -35,6 +36,10 @@ func TestToolRoundTrip(t *testing.T) {
 	if strings.TrimSpace(out) != "2\t2" {
 		t.Fatalf("edit not applied: %q", out)
 	}
+	readResult := ExecuteResult(context.Background(), All(), "read", json.RawMessage(fmt.Sprintf(`{"path":%q}`, f)))
+	if readResult.Source != "read" || !IsUntrusted(readResult) {
+		t.Fatalf("read result should carry its untrusted source: %+v", readResult)
+	}
 	// ambiguous edit must fail without replace_all
 	run(t, "write", fmt.Sprintf(`{"path":%q,"content":"x x"}`, f))
 	out = run(t, "edit", fmt.Sprintf(`{"path":%q,"old_string":"x","new_string":"y"}`, f))
@@ -51,9 +56,29 @@ func TestToolRoundTrip(t *testing.T) {
 	}
 }
 
+func TestReadConsumesAndBoundsAnOversizedSingleLine(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "long.txt")
+	content := strings.Repeat("x", int(maxArtifactBytes)+4096)
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	result := ExecuteResult(context.Background(), All(), "read", json.RawMessage(fmt.Sprintf(`{"path":%q}`, path)))
+	if result.Preview == "" || result.Source != "read" || !IsUntrusted(result) {
+		t.Fatalf("oversized read result = %+v", result)
+	}
+	if result.Complete || result.OriginalBytes <= int64(len(result.Retained)) {
+		t.Fatalf("oversized read should retain bounded head/tail: original=%d retained=%d complete=%t", result.OriginalBytes, len(result.Retained), result.Complete)
+	}
+	if int64(len(result.Retained)) > maxArtifactBytes {
+		t.Fatalf("retained read exceeded hard cap: %d", len(result.Retained))
+	}
+}
+
 func TestHelpersAndEdgeCases(t *testing.T) {
-	if len(Defs(All())) != 4 {
-		t.Fatal("expected 4 tool defs")
+	if len(Defs(All())) != 6 {
+		t.Fatal("expected 6 tool defs")
 	}
 	long := strings.Repeat("x", maxOutput+10)
 	if out := truncate(long); !strings.Contains(out, "truncated 10 bytes") {
@@ -111,7 +136,7 @@ func TestHelpersAndEdgeCases(t *testing.T) {
 
 	// Regression: a command that reads from /dev/tty (as sudo does for a
 	// password) must NOT hang the tool. pre-fix the tool used CombinedOutput
-	// with the child sharing whip's controlling terminal, so the read
+	// with the child sharing ghg's controlling terminal, so the read
 	// blocked until the 120s bash timeout. post-fix the child runs in a new
 	// session with no controlling tty and stdin tied to /dev/null, so the
 	// read fails immediately. We assert it returns well under the cap and

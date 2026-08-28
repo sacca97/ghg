@@ -50,12 +50,52 @@ func TestNonInteractiveCapture(t *testing.T) {
 	}
 }
 
+func TestNonInteractiveOnUpdateSnapshots(t *testing.T) {
+	var snapshots []string
+	res := Run(context.Background(), Options{
+		Command: `i=0; while [ "$i" -lt 4 ]; do echo "line-$i"; i=$((i+1)); sleep 0.12; done`,
+		Timeout: 5 * time.Second,
+		OnUpdate: func(snapshot string) {
+			snapshots = append(snapshots, snapshot)
+		},
+	})
+	if res.Exit != "" || res.TimedOut {
+		t.Fatalf("snapshot command failed: %+v", res)
+	}
+	if len(snapshots) < 2 {
+		t.Fatalf("expected multiple throttled snapshots, got %d: %q", len(snapshots), snapshots)
+	}
+	if !strings.Contains(snapshots[len(snapshots)-1], "line-3") {
+		t.Fatalf("final snapshot should contain the complete output: %q", snapshots[len(snapshots)-1])
+	}
+	if !strings.Contains(res.Output, "line-3") {
+		t.Fatalf("result should retain complete output: %q", res.Output)
+	}
+}
+
 // TestNonInteractiveEmpty reports "(no output)" normally handled by the caller,
 // here we just confirm output is empty and exit is clean.
 func TestNonInteractiveCleanExit(t *testing.T) {
 	res := Run(context.Background(), Options{Command: `true`})
 	if res.Output != "" || res.Exit != "" {
 		t.Fatalf("clean exit should be empty: %+v", res)
+	}
+}
+
+func TestNonInteractiveCaptureIsBounded(t *testing.T) {
+	const extra = 1024
+	res := Run(context.Background(), Options{
+		Command: `yes x | head -c 10486784`, // default ceiling + extra
+		Timeout: 10 * time.Second,
+	})
+	if res.OriginalBytes != 10485760+extra {
+		t.Fatalf("original byte count = %d, want %d", res.OriginalBytes, 10485760+extra)
+	}
+	if res.Complete {
+		t.Fatal("oversized command output should be marked incomplete")
+	}
+	if len(res.Output) > 10485760 {
+		t.Fatalf("captured output grew past hard limit: %d", len(res.Output))
 	}
 }
 

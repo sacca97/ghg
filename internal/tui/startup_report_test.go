@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/context-labs/whip/internal/mcp"
+	"github.com/sacca97/ghg/internal/mcp"
 )
 
 // TestStartupReportSkillsAndWarnings: the report names loaded skills, flags a
@@ -36,8 +36,15 @@ func TestStartupReportSkillsAndWarnings(t *testing.T) {
 		t.Fatal("no report rendered")
 	}
 	out := m.blocks[0].text
-	if !strings.Contains(out, "skills: 2 loaded") {
-		t.Errorf("missing loaded count:\n%s", out)
+	if m.skillsLoaded != 2 {
+		t.Errorf("loaded skill count: got %d, want 2", m.skillsLoaded)
+	}
+	if strings.Contains(out, "skills: 2 loaded") {
+		t.Errorf("loaded count should move to the header, not the startup report:\n%s", out)
+	}
+	head := strings.SplitN(m.View(), "\n", 2)[0]
+	if !strings.Contains(head, "skills: 2 loaded") {
+		t.Errorf("header missing loaded count: %q", head)
 	}
 	if !strings.Contains(out, "wordy") || !strings.Contains(out, "exceeds 1024") {
 		t.Errorf("missing truncation warning:\n%s", out)
@@ -69,7 +76,7 @@ func TestStartupReportSilent(t *testing.T) {
 	wd, _ := os.Getwd()
 	os.Chdir(dir)
 	defer os.Chdir(wd)
-	t.Setenv("HOME", t.TempDir()) // no ~/.whip/skills either
+	t.Setenv("HOME", t.TempDir()) // no ~/.ghg/skills either
 
 	m := tasksModel("http://unused")
 	m.startupReport()

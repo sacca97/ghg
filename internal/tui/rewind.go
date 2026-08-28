@@ -7,7 +7,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/context-labs/whip/internal/llm"
+	"github.com/sacca97/ghg/internal/llm"
 )
 
 // Rewind: double-esc while idle opens a picker over the conversation's
@@ -49,6 +49,9 @@ type rewindState struct {
 type escArmMsg struct{} // disarms the idle double-esc window
 
 func (m *model) rewindEntries() []rewindEntry {
+	if m.agent == nil {
+		return nil
+	}
 	var out []rewindEntry
 	for i, msg := range m.agent.Messages {
 		if msg.Role == "user" && msg.Authored {
@@ -116,6 +119,10 @@ func (m *model) scrollToMsg(msgIdx int) {
 }
 
 func (m *model) openRewind() {
+	if m.agent == nil {
+		m.append(m.degradedProviderNote())
+		return
+	}
 	entries := m.rewindEntries()
 	if len(entries) == 0 {
 		m.append(dimStyle.Render("(nothing to rewind to yet)"))
@@ -163,6 +170,9 @@ func (m *model) rewindKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 // the redo stack; the DB and transcript follow. Returns the authored user
 // text at the cut, if any, for restoring into the input.
 func (m *model) applyRewind(cut int) string {
+	if m.agent == nil {
+		return ""
+	}
 	cut = max(cut, 1) // keep the system prompt
 	base := len(m.agent.Messages)
 	restored, restoreErr := 0, error(nil)
@@ -220,6 +230,9 @@ func (m *model) applyRewind(cut int) string {
 
 // messageAt reads conversation index i across the live/redo boundary.
 func (m *model) messageAt(i int) llm.Message {
+	if m.agent == nil {
+		return llm.Message{}
+	}
 	if i < len(m.agent.Messages) {
 		return m.agent.Messages[i]
 	}
@@ -229,6 +242,11 @@ func (m *model) messageAt(i int) llm.Message {
 // rebuildTranscript resets the block list from agent.Messages (rewind moves
 // the boundary, so blocks beyond the cut must go).
 func (m *model) rebuildTranscript() {
+	if m.agent == nil {
+		m.blocks = nil
+		m.msgBlock = nil
+		return
+	}
 	m.blocks = nil
 	m.msgBlock = nil
 	m.seedTranscript(m.agent.Messages[1:], 1) // skip the system prompt

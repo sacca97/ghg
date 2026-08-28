@@ -7,13 +7,13 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/context-labs/whip/internal/config"
+	"github.com/sacca97/ghg/internal/config"
 )
 
 func pickerCfg() *config.Config {
 	return &config.Config{
 		DefaultModel: "kimi-k3-fast",
-		Providers:    map[string]config.Provider{"inference": {BaseURL: "https://api.inference.net/v1"}},
+		Providers:    map[string]config.Provider{"inference": {BaseURL: "https://catalog.example/v1", APIKey: "test-key"}},
 		Models: map[string]config.Model{
 			"kimi-k3-fast": {Providers: []string{"inference"}},
 		},
@@ -23,12 +23,12 @@ func pickerCfg() *config.Config {
 // Catalog-advertised models without a config entry appear after the
 // configured routes, marked fromCatalog; configured models never duplicate.
 func TestBuildModelItemsAppendsCatalogRoutes(t *testing.T) {
-	t.Setenv("WHIP_HOME", t.TempDir())
+	t.Setenv("GHG_HOME", t.TempDir())
 	cfg := pickerCfg()
 	if err := config.SaveCatalogs(map[string]config.Catalog{
 		"inference": {
 			FetchedAt: time.Now(),
-			BaseURL:   "https://api.inference.net/v1",
+			BaseURL:   "https://catalog.example/v1",
 			Models: []config.ModelInfoLite{
 				{ID: "kimi-k3-fast", ContextLength: 1048576}, // configured: skip
 				{ID: "deepseek-v4-pro", ContextLength: 1048576},
@@ -57,12 +57,12 @@ func TestBuildModelItemsAppendsCatalogRoutes(t *testing.T) {
 // The picker view marks catalog routes (new) and shows the stale hint when
 // the cache is past its TTL.
 func TestModelPickerViewMarksCatalogAndStale(t *testing.T) {
-	t.Setenv("WHIP_HOME", t.TempDir())
+	t.Setenv("GHG_HOME", t.TempDir())
 	cfg := pickerCfg()
 	if err := config.SaveCatalogs(map[string]config.Catalog{
 		"inference": {
 			FetchedAt: time.Now().Add(-48 * time.Hour), // past the 24h TTL
-			BaseURL:   "https://api.inference.net/v1",
+			BaseURL:   "https://catalog.example/v1",
 			Models:    []config.ModelInfoLite{{ID: "deepseek-v4-pro"}},
 		},
 	}); err != nil {
@@ -70,10 +70,16 @@ func TestModelPickerViewMarksCatalogAndStale(t *testing.T) {
 	}
 	m := &model{cfg: cfg, modelName: "kimi-k3-fast", provName: "inference"}
 	m.openModelPicker()
-	if m.mpicker == nil {
-		t.Fatal("picker should open")
+	if m.settings == nil || m.settings.top() == nil || m.settings.top().kind != panelRole {
+		t.Fatal("role picker should open")
 	}
-	view := m.modelPickerView()
+	// /model is role-first; open the currently highlighted role's model list.
+	tm, _ := m.paletteKey(tea.KeyMsg{Type: tea.KeyEnter})
+	m = tm.(*model)
+	if m.settings.top() == nil || m.settings.top().kind != panelModel {
+		t.Fatal("role picker should open a model panel")
+	}
+	view := m.paletteView()
 	if !strings.Contains(view, "(new)") {
 		t.Error("catalog routes should carry a (new) marker")
 	}
@@ -88,7 +94,7 @@ func TestModelPickerViewMarksCatalogAndStale(t *testing.T) {
 // Selecting a catalog route runs the normal switchModel path (which persists
 // the choice as the default on use).
 func TestModelPickerSelectsCatalogRoute(t *testing.T) {
-	t.Setenv("WHIP_HOME", t.TempDir())
+	t.Setenv("GHG_HOME", t.TempDir())
 	if err := config.SaveCatalogs(map[string]config.Catalog{
 		"inference": {
 			FetchedAt: time.Now(),
@@ -100,21 +106,33 @@ func TestModelPickerSelectsCatalogRoute(t *testing.T) {
 	}
 	m := compactCmdModel() // cfg providers carry an API key; switchModel needs it
 	m.openModelPicker()
-	p := m.mpicker
-	// walk to the catalog route
-	for p.idx < len(p.items)-1 && !p.items[p.idx].fromCatalog {
-		p.idx++
+	roles := m.settings.top()
+	if roles == nil || roles.kind != panelRole {
+		t.Fatal("role picker should open")
 	}
-	if !p.items[p.idx].fromCatalog {
+	for roles.list[roles.midx] != "default" {
+		tm, _ := m.paletteKey(tea.KeyMsg{Type: tea.KeyDown})
+		m = tm.(*model)
+		roles = m.settings.top()
+	}
+	tm, _ := m.paletteKey(tea.KeyMsg{Type: tea.KeyEnter})
+	m = tm.(*model)
+	p := m.settings.top()
+	for p.idx < len(p.items)-1 && !p.items[p.idx].fromCatalog {
+		tm, _ = m.paletteKey(tea.KeyMsg{Type: tea.KeyDown})
+		m = tm.(*model)
+		p = m.settings.top()
+	}
+	if p == nil || p.kind != panelModel || !p.items[p.idx].fromCatalog {
 		t.Fatal("no catalog route in picker")
 	}
-	tm, _ := m.modelPickerKey(tea.KeyMsg{Type: tea.KeyEnter})
+	tm, _ = m.paletteKey(tea.KeyMsg{Type: tea.KeyEnter})
 	m = tm.(*model)
 	if m.modelName != "deepseek-v4-pro" || m.provName != "inference" {
-		t.Fatalf("enter on a catalog route should switch models, got %s @ %s", m.modelName, m.provName)
+		t.Fatalf("enter on a catalog route should switch models, got %s/%s", m.provName, m.modelName)
 	}
-	if m.cfg.DefaultModel != "deepseek-v4-pro" {
-		t.Errorf("the switch should persist as the new default, got %q", m.cfg.DefaultModel)
+	if got := m.cfg.Roles[config.RoleDefault]; got.Model != "deepseek-v4-pro" || got.Provider != "inference" {
+		t.Errorf("the switch should persist as the default role, got %+v", got)
 	}
 	if _, ok := m.cfg.Models["deepseek-v4-pro"]; ok {
 		t.Error("catalog routes must not be written into cfg.Models")
@@ -125,7 +143,7 @@ func TestModelPickerSelectsCatalogRoute(t *testing.T) {
 // fixture's provider (BaseURL https://x, no DNS) fails its fetch, so the
 // seeded catalog must survive untouched — failure keeps the stale cache.
 func TestModelRefreshForcesRefetch(t *testing.T) {
-	t.Setenv("WHIP_HOME", t.TempDir())
+	t.Setenv("GHG_HOME", t.TempDir())
 	if err := config.SaveCatalogs(map[string]config.Catalog{
 		"inference": {FetchedAt: time.Now(), BaseURL: "https://x", Models: []config.ModelInfoLite{{ID: "seed"}}},
 	}); err != nil {
@@ -149,7 +167,7 @@ func TestModelRefreshForcesRefetch(t *testing.T) {
 
 // refresh is offered as a /model argument, alongside catalog-advertised models.
 func TestModelRefreshCompletion(t *testing.T) {
-	t.Setenv("WHIP_HOME", t.TempDir())
+	t.Setenv("GHG_HOME", t.TempDir())
 	if err := config.SaveCatalogs(map[string]config.Catalog{
 		"inference": {FetchedAt: time.Now(), BaseURL: "https://x",
 			Models: []config.ModelInfoLite{{ID: "catalog-only-model"}}},

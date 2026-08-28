@@ -8,24 +8,27 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/context-labs/whip/internal/config"
+	"github.com/sacca97/ghg/internal/config"
+	"github.com/sacca97/ghg/internal/llm"
+	"github.com/sacca97/ghg/internal/provider"
 )
 
-// dimNew marks catalog-advertised routes that have no config entry yet.
-const dimNew = "  (new)"
-
-// modelItem is one selectable model@provider route.
+// modelItem is one selectable provider/model route.
 type modelItem struct {
 	model    string
 	provider string
 	url      string
 	// fromCatalog marks routes advertised by the provider's /models catalog
-	// rather than configured in ~/.whip/config.json — rendered dim with a
+	// rather than configured in ~/.ghg/config.json — rendered dim with a
 	// (new) marker.
 	fromCatalog bool
+	// unavailable is set when the selected model resolves to a protocol with
+	// no compiled adapter. The picker can report that before a turn starts.
+	unavailable       bool
+	unavailableReason string
 }
 
-// modelPicker is the /model browser: models grouped, providers indented under them.
+// modelPicker is the /model picker: one selectable row per model/provider route.
 type modelPicker struct {
 	items      []modelItem
 	filtered   []modelItem // items matching query (nil == all)
@@ -149,6 +152,68 @@ func buildModelItems(cfg *config.Config) []modelItem {
 	return appendCatalogRoutes(items, cfg, config.LoadCatalogs())
 }
 
+// availableModelItems keeps settings and the direct model picker honest: a
+// route is listed only when its provider can actually authenticate it. The
+// model id is resolved before checking auth because a profile route may make a
+// particular model keyless even when the profile default requires one.
+func (m *model) availableModelItems() []modelItem {
+	if m == nil || m.cfg == nil {
+		return nil
+	}
+	all := buildModelItems(m.cfg)
+	items := make([]modelItem, 0, len(all))
+	for _, item := range all {
+		if m.modelRouteConfigured(item) {
+			items = append(items, item)
+		}
+	}
+	return items
+}
+
+func (m *model) modelRouteConfigured(item modelItem) bool {
+	prov, _, apiID, err := m.cfg.Resolve(item.model, item.provider)
+	if err != nil {
+		return false
+	}
+	resolved, err := m.profiles.ResolveModel(provider.Instance{
+		Name: item.provider, Profile: prov.Profile, BaseURL: prov.BaseURL, Protocol: prov.API,
+	}, apiID)
+	if err != nil {
+		return false
+	}
+	if !resolved.RequiresAPIKey() {
+		return true
+	}
+	key, err := prov.ResolveKey()
+	return err == nil && strings.TrimSpace(key) != ""
+}
+
+func annotateModelAvailability(cfg *config.Config, profiles provider.Profiles, items []modelItem) []modelItem {
+	for i := range items {
+		prov, mdl, apiID, err := cfg.Resolve(items[i].model, items[i].provider)
+		if err != nil {
+			continue
+		}
+		resolved, err := profiles.ResolveModel(provider.Instance{
+			Name: items[i].provider, Profile: prov.Profile, BaseURL: prov.BaseURL, Protocol: prov.API,
+		}, apiID)
+		if err != nil {
+			items[i].unavailable = true
+			items[i].unavailableReason = err.Error()
+			continue
+		}
+		protocol := resolved.Protocol
+		if strings.TrimSpace(mdl.API) != "" {
+			protocol = strings.TrimSpace(mdl.API)
+		}
+		if _, err := llm.NewBackend(llm.BackendConfig{Protocol: llm.Protocol(protocol), BaseURL: "http://127.0.0.1"}); err != nil {
+			items[i].unavailable = true
+			items[i].unavailableReason = err.Error()
+		}
+	}
+	return items
+}
+
 // appendCatalogRoutes adds one route per catalog-advertised model that has no
 // cfg.Models entry, sorted by model name. Configured models win: a catalog id
 // already in cfg.Models adds nothing.
@@ -194,19 +259,14 @@ func staleCatalogs(cfg *config.Config, cats map[string]config.Catalog) []string 
 }
 
 func (m *model) openModelPicker() {
-	items := buildModelItems(m.cfg)
+	items := m.availableModelItems()
 	if len(items) == 0 {
-		m.append(errStyle.Render("no models configured in ~/.whip/config.json"))
+		m.append(errStyle.Render("no models available from configured providers"))
 		return
 	}
-	mp := &modelPicker{items: items, staleHints: staleCatalogs(m.cfg, config.LoadCatalogs())}
-	for i, it := range items { // start on the active route
-		if it.model == m.modelName && it.provider == m.provName {
-			mp.idx = i
-			break
-		}
-	}
-	m.mpicker = mp
+	// /model and ctrl+p → Model intentionally share one role-first flow:
+	// choose default/plan/fast/tiny, then choose that role's provider/model.
+	m.openPaletteOn("Model")
 }
 
 func (m *model) modelPickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -235,6 +295,10 @@ func (m *model) modelPickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		it := v[p.idx]
 		m.mpicker = nil
+		if it.unavailable {
+			m.append(errStyle.Render("model unavailable: " + it.unavailableReason))
+			return m, nil
+		}
 		m.switchModel(it.model, it.provider)
 	case tea.KeyRunes, tea.KeySpace:
 		p.query += string(msg.Runes)
@@ -251,22 +315,13 @@ func (m *model) modelPickerView() string {
 	view := p.view()
 	var rows []string
 	rows = append(rows, "  "+botStyle.Render("/")+p.query+dimStyle.Render("▏"))
-	lastModel := ""
 	for i, it := range view {
-		heading := " " + it.model
-		if it.fromCatalog {
-			heading = dimStyle.Render(heading + dimNew)
-		}
-		if it.model != lastModel {
-			rows = append(rows, heading)
-			lastModel = it.model
-		}
 		cur := ""
 		if it.model == m.modelName && it.provider == m.provName {
 			cur = dimStyle.Render("  (current)")
 		}
-		line := fmt.Sprintf("%-12s  ", it.provider) + dimStyle.Render(it.url)
-		if it.fromCatalog {
+		line := modelItemLabel(it)
+		if it.fromCatalog || it.unavailable {
 			line = dimStyle.Render(line)
 		}
 		if i == p.idx {
@@ -296,4 +351,18 @@ func (m *model) modelPickerView() string {
 		rows = rows[start : start+avail]
 	}
 	return strings.Join(rows, "\n")
+}
+
+// modelItemLabel is the single display format used by every model selector.
+// Provider comes first so long model IDs do not obscure which endpoint will
+// receive the request.
+func modelItemLabel(it modelItem) string {
+	line := it.provider + "/" + it.model
+	if it.fromCatalog {
+		line += " (new)"
+	}
+	if it.unavailable {
+		line += " (unsupported: " + it.unavailableReason + ")"
+	}
+	return line
 }

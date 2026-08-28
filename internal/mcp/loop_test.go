@@ -9,10 +9,14 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/context-labs/whip/internal/agent"
-	"github.com/context-labs/whip/internal/llm"
-	"github.com/context-labs/whip/internal/tools"
+	"github.com/sacca97/ghg/internal/agent"
+	"github.com/sacca97/ghg/internal/llm"
+	"github.com/sacca97/ghg/internal/tools"
 )
+
+func testBackend(baseURL, apiKey string) llm.Backend {
+	return llm.NewOpenAIBackend(llm.New(baseURL, apiKey))
+}
 
 // TestAgentLoopWithMCPTool pins the full path: the model calls an MCP tool
 // by its mcp__ name, the manager executes it against a live server, and the
@@ -38,7 +42,9 @@ func TestAgentLoopWithMCPTool(t *testing.T) {
 			fmt.Fprint(w, `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"t1","type":"function","function":{"name":"mcp__docs__greet","arguments":"{\"name\":\"agent-loop\"}"}}]}}]}`+"\n\n")
 		default:
 			last := req.Messages[len(req.Messages)-1]
-			if last.Role != "tool" || last.ToolCallID != "t1" || last.Content != "hi agent-loop" {
+			if last.Role != "tool" || last.ToolCallID != "t1" ||
+				!strings.Contains(last.Content, "hi agent-loop") ||
+				!strings.Contains(last.Content, "<untrusted_tool_output") {
 				t.Errorf("MCP tool result not fed back: %+v", last)
 			}
 			fmt.Fprint(w, `data: {"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]}`+"\n\n")
@@ -47,7 +53,7 @@ func TestAgentLoopWithMCPTool(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	ag := agent.New(llm.New(srv.URL, "k"), "m", 100, "sys")
+	ag := agent.New(testBackend(srv.URL, "k"), "m", 100, "sys")
 	ag.Tools = append(tools.All(), m.Tools()...)
 
 	final, err := ag.Turn(context.Background(), "greet me", agent.Events{})
@@ -103,7 +109,7 @@ func TestAgentLoopDeadServerToolCallsReturnErrors(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	ag := agent.New(llm.New(srv.URL, "k"), "m", 100, "sys")
+	ag := agent.New(testBackend(srv.URL, "k"), "m", 100, "sys")
 	// Deliberately include a stale tool def for the dead server: disconnects
 	// mid-session leave defs behind until the next rebuild.
 	stale := tools.Tool{

@@ -1,0 +1,20 @@
+schema: 1
+id: anthropic
+display_name: Anthropic
+protocol: anthropic-messages
+base_url: https://api.anthropic.com/v1
+auth:
+  kind: header
+  header: x-api-key
+  env_var: ANTHROPIC_API_KEY
+docs:
+  keys_url: https://console.anthropic.com/settings/keys
+default_headers:
+  anthropic-version: "2023-06-01"
+catalog:
+  kind: anthropic-models
+capabilities:
+  tools: true
+  vision: true
+  thinking: true
+  prompt_cache: provider

@@ -1,16 +1,16 @@
-# MCP support: clean client + server for whip
+# MCP support: clean client + server for harness
 
 Branch: `mcp-support`
 
 ## What this does
 
-whip becomes an MCP client (stdio + streamable-HTTP servers) whose tools join
-the agent loop as first-class tools, and an MCP server (`whip mcp serve`)
-exposing whip's own read/bash/edit/write to other harnesses. Configuration is
+harness becomes an MCP client (stdio + streamable-HTTP servers) whose tools join
+the agent loop as first-class tools, and an MCP server (`harness mcp serve`)
+exposing harness's own read/bash/edit/write to other harnesses. Configuration is
 backwards compatible with both **claude-style** (`.mcp.json` project file,
 `type: stdio|http|sse`, `command/args/env/headers`) and **codex-style**
 (`~/.codex/config.toml` `[mcp_servers.*]`, `command/args/headers/startup_timeout_sec`)
-formats, normalized into whip's own `mcp` block in `~/.whip/config.json`,
+formats, normalized into harness's own `mcp` block in `~/.harness/config.json`,
 which remains the source of truth on conflict.
 
 ## Goal
@@ -63,10 +63,10 @@ past that, revisit.
 | Config | `internal/config/config.go` — `MCPServers map[string]config.MCPServer` field on `Config` (JSONC) |
 | Agent | `internal/agent/agent.go` — `Agent.Tools` already a slice; TUI appends `mgr.Tools()` after `agent.New`; no agent changes needed |
 | TUI | `internal/tui/tui.go` — `/mcp` case in `command()`, status rendering; `internal/tui/mcp.go` — status view + toggle/reconnect; startup kickoff in `Run` |
-| CLI | `cmd/whip/main.go` — `whip mcp add|list|remove|serve` subcommand |
+| CLI | `cmd/harness/main.go` — `harness mcp add|list|remove|serve` subcommand |
 | Process safety | `internal/mcp/manager.go` `Close()` called from `tui.Run` defer before `bashrun.KillAll`; stdio children get their own process group so close kills the tree |
 
-### Normalized config (whip-native, absorbs both styles)
+### Normalized config (harness-native, absorbs both styles)
 
 ```go
 // internal/mcp/config.go
@@ -86,14 +86,14 @@ type ServerConfig struct {
 func (c ServerConfig) Remote() bool { return c.URL != "" }
 ```
 
-Merge order (later = lower precedence, whip config always wins):
-`claude .mcp.json (cwd)` → `codex ~/.codex/config.toml` → whip `config.json mcp`.
-Same-name entries: whip's wins whole-entry (no field-level merge — predictable,
+Merge order (later = lower precedence, harness config always wins):
+`claude .mcp.json (cwd)` → `codex ~/.codex/config.toml` → harness `config.json mcp`.
+Same-name entries: harness's wins whole-entry (no field-level merge — predictable,
 and what codex/claude do between their own scopes).
 
 Name sanitization for tool names (opencode `catalog.ts:117`):
 `sanitize(s) = replace [^a-zA-Z0-9_-] with _`, tool name =
-`mcp_<san(server)>_<san(tool)>` — claude-code uses `mcp__server__tool`; whip
+`mcp_<san(server)>_<san(tool)>` — claude-code uses `mcp__server__tool`; harness
 uses single underscores (opencode-style) since our tool-name charset goes
 through providers that dislike long names; document the difference. Keep a
 `strings.HasPrefix(name, "mcp_")` check in `tools.Execute` path for mutation
@@ -127,7 +127,7 @@ func (m *Manager) Statuses() []Server // for /mcp
 ```
 
 - **Lazy-with-kickoff connect** (opencode connects eagerly in parallel and
-  caches defs — `index.ts` state init with `concurrency: unbounded`): whip
+  caches defs — `index.ts` state init with `concurrency: unbounded`): harness
   kicks connects in background at `tui.Run` startup; each server has a
   `ready chan struct{}` closed once on connect settle (success or failure) —
   the close-to-broadcast pattern from `BackgroundTask.Done`. A tool call
@@ -149,7 +149,7 @@ func (m *Manager) Statuses() []Server // for /mcp
   auto-reconnect with backoff`
 - Stdio children: `exec.Cmd.SysProcAttr.Setpgid = true`, tracked so `Close()`
   kills the group — opencode walks descendants with pgrep (`index.ts:420`);
-  whip's bashrun pattern (process-group kill) is the Go-native equivalent.
+  harness's bashrun pattern (process-group kill) is the Go-native equivalent.
 
 ### Config import (pure functions, fully unit-tested)
 
@@ -161,7 +161,7 @@ func ParseClaude(data []byte) (map[string]ServerConfig, error) // {"mcpServers":
 func ParseCodex(data []byte) (map[string]ServerConfig, error)  // [mcp_servers.NAME]
 
 // internal/mcp/config.go
-func Merge(whip, claude, codex map[string]ServerConfig) map[string]ServerConfig
+func Merge(harness, claude, codex map[string]ServerConfig) map[string]ServerConfig
 ```
 
 Claude field mapping: `type: stdio` (default when `command` present) +
@@ -175,15 +175,15 @@ Codex mapping: `command` (string or []string), `args`, `env`/`environment`,
 - `/mcp` — status table: `name  status  tools  detail` (connecting…/✓ N tools/
   ✗ err/disabled)
 - `/mcp <name> reconnect|enable|disable` — reconnect re-runs connect; disable
-  persists `Enabled: false` into whip config via guarded `Config.Save`
-- Header badge `mcp:N` when N servers ready? — skip, palette/dock already busy.
-  `/mcp` is enough. `// ponytail: palette panel`
+  persists `Enabled: false` into harness config via guarded `Config.Save`
+- Header badge `mcp:N` when N servers ready? — skip, settings/dock already busy.
+  `/mcp` is enough. `// ponytail: settings panel`
 
 ### CLI
 
-`whip mcp list` (merged view with source labels), `whip mcp add <name> --
-<cmd...>` / `--url`, `whip mcp remove <name>` — all write through
-`config.Save` (atomic + clobber guard). `whip mcp serve` runs the stdio
+`harness mcp list` (merged view with source labels), `harness mcp add <name> --
+<cmd...>` / `--url`, `harness mcp remove <name>` — all write through
+`config.Save` (atomic + clobber guard). `harness mcp serve` runs the stdio
 server (`serve.go`, ~60 lines with the SDK: wrap read/bash/edit/write,
 no `task`).
 
@@ -221,7 +221,7 @@ no `task`).
   "MCP" section
 - `docs/concurrency.md`: the per-server `ready chan struct{}` pattern if it
   teaches something new (it's `Done`-broadcast again — likely one line)
-- README: `whip mcp` CLI surface + config example
+- README: `harness mcp` CLI surface + config example
 
 ## Task breakdown (status)
 
@@ -229,7 +229,7 @@ no `task`).
 2. [x] Config plumbing: `Config.MCPServers`, load/merge in `tui.Run`
 3. [x] `manager.go` + integration tests (in-process SDK server)
 4. [x] TUI `/mcp` + startup kickoff + `Close` wiring
-5. [x] CLI `whip mcp` subcommands + `serve.go` (self-host test passes)
+5. [x] CLI `harness mcp` subcommands + `serve.go` (self-host test passes)
 6. [x] Docs (features.md section, roadmap entry, README snippet, concurrency.md §3)
 7. [x] `task check` + `go test -race ./...` green; adversarial review done + fixed
 
@@ -242,7 +242,7 @@ no `task`).
    never race the slice a request is reading.
 2. **`/mcp disable` on imported servers persisted a bare `{enabled:false}`**
    that shadowed the import and lost the command/url → the manager exposes
-   `Config(name)`; the toggle copies the full live definition into whip's
+   `Config(name)`; the toggle copies the full live definition into harness's
    config. Disable now also tears down the live session; `run` refuses
    reconnects on disabled servers.
 3. **TOML reader bugs** (escape-blind `#` comment stripping, `\`-before-quote,
@@ -283,7 +283,7 @@ no `task`).
 
 1. Import scope: `.mcp.json` + codex TOML auto-imported; `~/.claude.json` NOT
    (giant state file). ✓?
-2. `whip mcp serve` in v1. ✓?
+2. `harness mcp serve` in v1. ✓?
 3. Tool name prefix `mcp_server_tool` (single underscore) vs claude's
    `mcp__server__tool`. Chose single — ✓?
 4. MCP tool results: images flattened to placeholders, not vision-fed. ✓?

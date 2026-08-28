@@ -11,9 +11,9 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/context-labs/whip/internal/agent"
-	"github.com/context-labs/whip/internal/config"
-	"github.com/context-labs/whip/internal/llm"
+	"github.com/sacca97/ghg/internal/agent"
+	"github.com/sacca97/ghg/internal/config"
+	"github.com/sacca97/ghg/internal/llm"
 )
 
 func TestGoalHelpers(t *testing.T) {
@@ -139,7 +139,7 @@ func goalFromContextModelCapture(t *testing.T, status int, body string, capture 
 	}))
 	t.Cleanup(srv.Close)
 	m := compactCmdModel()
-	m.agent = agent.New(llm.New(srv.URL, "k"), "kimi-k3-fast", 100, "sys")
+	m.agent = agent.New(testBackend(srv.URL, "k"), "kimi-k3-fast", 100, "sys")
 	return m
 }
 

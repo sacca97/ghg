@@ -7,7 +7,7 @@ import (
 
 // registryEntry is the single source of truth for one slash command or
 // keybind action: its name, one-line hint, optional keybind, and category.
-// /help, the tab-completion table, and the ctrl+p palette all render from
+// /help, the tab-completion table, and the ctrl+p settings all render from
 // this registry, so adding a command is one entry and the three views can't
 // drift apart. The dispatch switch in (*model).command remains the actual
 // behavior — the registry is names+hints only.
@@ -18,16 +18,15 @@ type registryEntry struct {
 	Category string // Agent, Session, Display, App, Keys
 }
 
-// registry lists every user-facing slash command. Palette-only rows that
+// registry lists every user-facing slash command. settings-only rows that
 // don't dispatch through the switch (rewind, quit, thinking tokens) keep
-// their hint/keybind in palette.go as constants, so a keybind or description
+// their hint/keybind in settings.go as constants, so a keybind or description
 // still has exactly one home even when it's not a slash command.
 var registry = []registryEntry{
-	{Name: "/auth", Hint: "openrouter [key] — connect OpenRouter: validates the key, wires the provider, /model lists the whole catalog (bare = masked prompt; also: whip auth openrouter)", Category: "Agent"},
+	{Name: "/auth", Hint: "[provider] [key] — connect any profile (bare lists profiles; provider-only opens a masked prompt; also: ghg auth <provider>)", Category: "Agent"},
 	{Name: "/cd", Hint: "[dir] — change working directory (bare prints it)", Category: "Session"},
 	{Name: "/clear", Hint: "— reset conversation", Category: "Session"},
 	{Name: "/compact", Hint: "[model] [provider]|off — compact now, or pick the compaction model (off restores the default); retry undoes the last compaction, log lists them; compaction level: ctrl+p › Compaction level", Category: "Session"},
-	{Name: "/computer-use", Hint: "[task] — drive this Mac (apps, open Chrome, screen); also: allow|deny <app>", Category: "Agent"},
 	{Name: "/context-doctor", Hint: "— audit what a fresh session injects (skills, MCP, tool schemas) and its token cost", Category: "Session"},
 	{Name: "/effort", Hint: "[level] — reasoning effort: off·low·medium·high (bare opens selector)", Category: "Agent"},
 	{Name: "/fork", Hint: "[name] — copy the conversation into a new session (pick a point in the rewind picker with f)", Category: "Session"},
@@ -35,10 +34,11 @@ var registry = []registryEntry{
 	{Name: "/goal-from-context", Hint: "[n] — formulate a goal from the last n messages (default 8) and work until it's met", Category: "Session"},
 	{Name: "/help", Hint: "— show all commands and keybindings", Category: "App"},
 	{Name: "/mcp", Hint: "[name] [reconnect|enable|disable] — MCP servers: status, reconnect, toggle", Category: "Session"},
-	{Name: "/me", Hint: "— edit your standing instructions (~/.whip/me.md) in $EDITOR", Category: "Agent"},
+	{Name: "/me", Hint: "— edit your standing instructions (~/.ghg/me.md) in $EDITOR", Category: "Agent"},
 	{Name: "/memory", Hint: "[n] [session] — saved memories: list what's injected each turn, mark entry n done", Category: "Session"},
 	{Name: "/model", Hint: "<name> [provider] — switch model (any provider-catalog model works; refresh pulls new announcements)", Category: "Agent"},
-	{Name: "/mouse", Hint: "— toggle mouse capture (on = wheel scroll + clicks, drag to copy)", Category: "Display"},
+	{Name: "/mouse", Hint: "[on|off] — mouse capture (on = wheel scroll + clicks, drag to copy)", Category: "Display"},
+	{Name: "/plan", Hint: "<goal> — propose a structured plan with the smart model (run it with /execute)", Category: "Agent"},
 	{Name: "/pwd", Hint: "— print working directory", Category: "Session"},
 	{Name: "/quit", Hint: "— exit", Keybind: "ctrl+c ctrl+c", Category: "App"},
 	{Name: "/rename", Hint: "[title] — retitle this session", Category: "Session"},
@@ -47,6 +47,7 @@ var registry = []registryEntry{
 	{Name: "/schedule", Hint: "@every 10m|<@at time> <prompt> — schedule a wakeup turn; list | cancel <n>", Category: "Session"},
 	{Name: "/tasks", Hint: "[id] — background subagents: focus the dock, or open one subagent's live view", Keybind: "ctrl+t", Category: "Session"},
 	{Name: "/theme", Hint: "[light|dark|auto] — color scheme (bare opens the switcher)", Category: "Display"},
+	{Name: "/execute", Hint: "[plan] — execute the latest proposal or supplied plan with the fast model", Category: "Agent"},
 	{Name: "!cmd", Hint: "— run a shell command locally; output lands in the transcript and the conversation", Category: "App"},
 }
 
@@ -93,7 +94,7 @@ func (m *model) dispatches(name string) bool {
 	return true
 }
 
-// helpText renders /help from the registry plus the palette's keybind hints:
+// helpText renders /help from the registry plus the settings's keybind hints:
 // slash commands first (sorted), then the keybindings roster. Nothing here is
 // hand-maintained anymore — every line comes from one of the two tables.
 func helpText() string {

@@ -17,7 +17,7 @@ Branch: `rewind-fork-rename` — **SHIPPED** (working tree; task check + race gr
    rewind would drop it). The original session is untouched.
 3. **`/rename [title]`** — retitles the current session; bare prompts
    prefilled with the current title. Both prompts stash/restore the input
-   draft. Palette entries for all three; slash completion updated; /help
+   draft. settings entries for all three; slash completion updated; /help
    updated.
 
 ## Decisions recorded
@@ -28,7 +28,7 @@ Branch: `rewind-fork-rename` — **SHIPPED** (working tree; task check + race gr
   (The adversarial pass caught a `cut-1` data-loss bug here.)
 - Rewind is destructive in the DB; redo stack is in-memory only. Quitting
   while rewound leaves the DB at the rewound point. Deliberate.
-- `/fork`, `/rename`, palette rewind/fork/rename refuse while busy (fork
+- `/fork`, `/rename`, settings rewind/fork/rename refuse while busy (fork
   mid-turn would split the in-flight turn across two sessions).
 - Idle esc dismisses open UI first (menu/queue/dock/prompt); dismissal does
   NOT count toward the double-esc (stale-arm fix).
@@ -47,7 +47,7 @@ Branch: `rewind-fork-rename` — **SHIPPED** (working tree; task check + race gr
   renameCommand/rename
 - `internal/tui/tui.go` — double-esc case, msgBlock, prompt esc/enter,
   command cases, View strip + hints
-- `internal/tui/palette.go`, `internal/tui/complete.go` — entries + completion
+- `internal/tui/settings.go`, `internal/tui/complete.go` — entries + completion
 - Tests: `internal/session/fork_test.go`, `internal/tui/rewind_test.go`,
   `internal/tui/fork_test.go`
 
@@ -57,7 +57,7 @@ Branch: `rewind-fork-rename` — **SHIPPED** (working tree; task check + race gr
    fixed to `cut`, docs corrected, partial-rewind DB test added.
 2. Stale esc arm across modal dismissal — cleared on dismiss + test.
 3. namePrompt destroyed the input draft — stash/restore + test.
-4. fork/rename/palette entries not busy-gated — gated.
+4. fork/rename/settings entries not busy-gated — gated.
 5. Compaction while rewound left a stale redo stack — `future`/`msgBlock`
    cleared in compactMsg handler.
 6. Fork semantics settled: **copy keeps the selected message** (inclusive),

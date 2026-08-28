@@ -6,10 +6,10 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/context-labs/whip/internal/agent"
-	"github.com/context-labs/whip/internal/config"
-	"github.com/context-labs/whip/internal/llm"
-	"github.com/context-labs/whip/internal/session"
+	"github.com/sacca97/ghg/internal/agent"
+	"github.com/sacca97/ghg/internal/config"
+	"github.com/sacca97/ghg/internal/llm"
+	"github.com/sacca97/ghg/internal/session"
 )
 
 func TestEffortCycleAndParse(t *testing.T) {
@@ -49,9 +49,11 @@ func TestEffortsForAdvertisedLevels(t *testing.T) {
 		agent:    &agent.Agent{Model: "deepseek-v4-flash"},
 		catalogs: map[string]config.Catalog{
 			"inference": {Models: []config.ModelInfoLite{
-				{ID: "deepseek-v4-flash", ReasoningEfforts: []string{"low", "high", "max"}},
+				{ID: "deepseek-v4-flash", ReasoningEfforts: []string{"low", "high", "max"}, ReasoningToggle: true},
 				{ID: "claude-opus-5", ReasoningEfforts: []string{"none", "minimal", "low", "medium", "high", "xhigh", "max"}},
 				{ID: "gemini-3.5-flash"}, // no reasoning_efforts
+				{ID: "toggle-only", ReasoningKnown: true, ReasoningToggle: true},
+				{ID: "no-controls", ReasoningKnown: true},
 			}},
 		},
 	}
@@ -60,6 +62,11 @@ func TestEffortsForAdvertisedLevels(t *testing.T) {
 	}
 	if next := nextEffort(m.effortsFor(), "high"); next != "max" {
 		t.Fatalf("cycle should reach max: %q", next)
+	}
+	for _, e := range m.effortsFor() {
+		if e == "on" {
+			t.Fatal("a model with graded efforts should not add a duplicate on state")
+		}
 	}
 	if _, ok := parseEffort(m.effortsFor(), "medium"); ok {
 		t.Fatal("medium should be rejected for deepseek")
@@ -83,6 +90,15 @@ func TestEffortsForAdvertisedLevels(t *testing.T) {
 		t.Fatalf("gemini should fall back to defaults: %v", got)
 	}
 
+	m.agent.Model = "toggle-only"
+	if got := m.effortsFor(); len(got) != 2 || got[0] != "" || got[1] != "on" {
+		t.Fatalf("toggle-only model should expose off/on: %v", got)
+	}
+	m.agent.Model = "no-controls"
+	if got := m.effortsFor(); len(got) != 1 || got[0] != "" {
+		t.Fatalf("known model without controls should expose off only: %v", got)
+	}
+
 	// unknown provider → defaults
 	m.provName = "elsewhere"
 	if got := m.effortsFor(); len(got) != len(defaultEfforts) {
@@ -90,15 +106,15 @@ func TestEffortsForAdvertisedLevels(t *testing.T) {
 	}
 }
 
-// bare /effort opens the level selector (palette panel) so the user can
+// bare /effort opens the level selector (settings panel) so the user can
 // scroll ↑/↓ and pick — cycling blindly hides the choices.
 func TestEffortBareOpensSelector(t *testing.T) {
 	m := compactCmdModel()
 	m.command("/effort")
-	if m.palette == nil {
-		t.Fatal("bare /effort should open the palette")
+	if m.settings == nil {
+		t.Fatal("bare /effort should open the settings")
 	}
-	pp := m.palette.top()
+	pp := m.settings.top()
 	if pp == nil || pp.kind != panelEffort {
 		t.Fatalf("expected the effort panel, got %+v", pp)
 	}
@@ -114,9 +130,9 @@ func TestEffortBareOpensSelector(t *testing.T) {
 		t.Fatalf("selecting low in the selector should apply it, got %q", m.agent.Effort)
 	}
 	// the selector came from /effort, not ctrl+p: commit-and-close, don't
-	// strand the user on a palette root they never opened
-	if m.palette != nil {
-		t.Fatal("enter in a directly-opened selector should close the palette")
+	// strand the user on a settings root they never opened
+	if m.settings != nil {
+		t.Fatal("enter in a directly-opened selector should close the settings")
 	}
 }
 

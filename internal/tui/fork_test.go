@@ -7,9 +7,9 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/context-labs/whip/internal/agent"
-	"github.com/context-labs/whip/internal/llm"
-	"github.com/context-labs/whip/internal/session"
+	"github.com/sacca97/ghg/internal/agent"
+	"github.com/sacca97/ghg/internal/llm"
+	"github.com/sacca97/ghg/internal/session"
 )
 
 func forkModel(t *testing.T) *model {

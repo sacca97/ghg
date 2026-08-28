@@ -11,18 +11,18 @@ import (
 
 // /report — a bug-report bundle: one transcript block with a clickable OSC 8
 // link to a prefilled GitHub issue and a copy-pastable environment snippet.
-// The audience is someone (often not the whip developer) hitting a terminal
+// The audience is someone (often not the ghg developer) hitting a terminal
 // rendering problem — wrong colors, mangled glyphs, tmux weirdness — so the
 // bundle leads with theme + detection source and terminal identity. Strict
 // whitelist: only the env vars named below are read, never API keys/secrets,
 // never conversation content. Live-only: nothing is persisted or submitted;
 // the user clicks the link or pastes the snippet themselves.
 //
-// Version is the whip build version, set by cmd/whip (ldflags -X main.version)
+// Version is the ghg build version, set by cmd/ghg (ldflags -X main.version)
 // before tui.Run.
 var Version = "dev"
 
-const issueBase = "https://github.com/context-labs/whip/issues/new"
+const issueBase = "https://github.com/sacca97/ghg/issues/new"
 
 // envRow is one line of the bundle: an aligned key/value pair.
 type envRow struct {
@@ -48,8 +48,8 @@ func (m *model) envReport() envReport {
 		}
 	}
 
-	// whip
-	add("whip", Version)
+	// ghg
+	add("ghg", Version)
 	add("model", m.modelName)
 	add("provider", m.provName)
 	theme := CurrentTheme()

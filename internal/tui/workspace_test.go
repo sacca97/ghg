@@ -9,8 +9,8 @@ import (
 
 	"github.com/charmbracelet/x/ansi"
 
-	"github.com/context-labs/whip/internal/llm"
-	"github.com/context-labs/whip/internal/session"
+	"github.com/sacca97/ghg/internal/llm"
+	"github.com/sacca97/ghg/internal/session"
 )
 
 // Workspace rewind: a turn's file changes are captured as a git snapshot, and

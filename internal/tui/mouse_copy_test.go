@@ -1,7 +1,6 @@
 package tui
 
 import (
-	"strings"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -29,18 +28,13 @@ func TestShiftMousePassesThrough(t *testing.T) {
 	}
 }
 
-// /theme auto reports the detected scheme AND the source of the decision.
-func TestThemeAutoReportsSource(t *testing.T) {
+// Changing the theme updates rendering and config without adding a routine
+// confirmation block to the transcript.
+func TestThemeChangeDoesNotAppendTranscriptNote(t *testing.T) {
 	m := compactCmdModel()
 	m.setTheme("light")
 	m.command("/theme auto")
-	var note string
-	for _, b := range m.blocks {
-		if strings.Contains(b.text, "◐ theme:") {
-			note = b.text
-		}
-	}
-	if !strings.Contains(note, "(auto:") {
-		t.Fatalf("auto should report the detection source, got %q", note)
+	if len(m.blocks) != 0 {
+		t.Fatalf("theme changes should not append routine notes, got %v", m.blocks)
 	}
 }

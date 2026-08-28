@@ -11,7 +11,7 @@ Adds a local shell escape and directory commands to the TUI:
   collapsed tool-style block **and** in `Agent.Messages` as a user message
   (`$ <cmd>` + output), so the model can see it on the next turn (opencode
   `session.shell`, `prompt/index.tsx:1059`).
-- `/cd [dir]` changes whip's process working directory (`os.Chdir`); no arg
+- `/cd [dir]` changes harness's process working directory (`os.Chdir`); no arg
   prints it. `~` expands. Busy-safe.
 - `/pwd` prints the working directory. Busy-safe.
 
@@ -31,7 +31,7 @@ and the model sees the result so follow-up questions have context.
   pairing; a user-role message conveys the same content).
 - Interactive/PTY `!` commands (the agent's bash tool already has that path;
   `!` is for quick non-interactive checks).
-- Persisting cwd in the session (resume restores whip's launch cwd).
+- Persisting cwd in the session (resume restores harness's launch cwd).
 - `/cd` mid-*message*-queue semantics: `/cd` is busy-safe and runs immediately,
   so it never queues.
 
@@ -74,8 +74,8 @@ packages already expose everything needed.
   it takes an arg; bare inserts for editing. `/pwd` yes).
 - `// ponytail: directory-aware completion for /cd args` (mentionPathMatches
   covers files; dirs-only completion is a nicety).
-- Help text + palette? Help text yes; palette already has "Resume session"
-  etc. — skip palette (ponytail).
+- Help text + settings? Help text yes; settings already has "Resume session"
+  etc. — skip settings (ponytail).
 
 ### Docs
 
@@ -140,7 +140,7 @@ Findings and resolutions:
    only future spawns follow). Not gated on the bash lock (TUI can't reach
    agent fileLocks without a new export; documented instead).
 5. MEDIUM — /effort mid-turn field race on a.Effort: PRE-EXISTING via the
-   palette (ctrl+p has no busy guard); busyCmd widens exposure but doesn't
+   settings (ctrl+p has no busy guard); busyCmd widens exposure but doesn't
    introduce it. Left as-is; a fix is per-request field snapshots in turn.
 6. MEDIUM — busyCmd empty-fields panic guard added.
 7. MEDIUM — drain-loop double echo fixed (runShellQueued, echo=false);

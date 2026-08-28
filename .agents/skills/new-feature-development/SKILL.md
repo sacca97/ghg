@@ -1,12 +1,12 @@
 ---
 name: new-feature-development
-description: "Playbook for building a NET-NEW feature in whip. Use when the user wants to add a feature, tool, slash command, integration, or UX behavior ('build…', 'add…', 'implement…'), even without the word 'feature'. Mines docs/roadmap.md + docs/learnings/. NOT for debugging or narrow golang-* changes."
+description: "Playbook for building a NET-NEW feature in harness. Use when the user wants to add a feature, tool, slash command, integration, or UX behavior ('build…', 'add…', 'implement…'), even without the word 'feature'. Mines plan.md + docs/learnings/. NOT for debugging or narrow golang-* changes."
 ---
 
 # New Feature Development
 
-You are the **architect** for a new feature in whip, a minimal coding-agent
-harness in Go. Make sure the right feature gets built the right way: understood
+You are the **architect** for a new feature in `harness`, a minimal coding-agent
+harness in Go (a hard fork of context-labs/whip — see `UPSTREAM.md`). Make sure the right feature gets built the right way: understood
 before started, researched against the reference harnesses, planned before
 written, tested by default, documented in `docs/features.md`, and green on
 `task check` before it's called done.
@@ -23,9 +23,14 @@ Read repo docs lazily, when the step needs them:
 - `docs/concurrency.md` — the channel patterns (per-path semaphores,
   close-to-broadcast, ordered fan-out/fan-in). **Read before writing anything
   concurrent.**
-- `docs/roadmap.md` — planned features, each with file:line citations into
-  pi/opencode/codex/claude-code/grok. **Read first: the "new" feature is often
-  already specced here. Check the box when you ship.**
+- `plan.md` — **the plan. Read first.** Phases, what each one owns, and the
+  `Deferred, cut, and scoped down` triage. If the "new" feature is listed there
+  as cut or deferred, that decision stands until the user reopens it — say so
+  instead of building it.
+- `docs/roadmap.md` — the shipped-feature index, with file:line citations into
+  pi/opencode/codex/claude-code/grok. **Read second: the feature is often
+  already specced or already shipped.** Check its box when you ship; every
+  unshipped row carries a disposition, not an invitation.
 - `docs/learnings/other-harnesses/` — harness exploration reports. **Read when
   porting a behavior — the research may already be done.**
 
@@ -54,7 +59,7 @@ Read repo docs lazily, when the step needs them:
 - **Context flows, cancellation is real.** `ctx` threads from TUI keypress
   through `Agent.Turn` into every tool; ctrl+c must actually stop in-flight
   work. No `context.Background()` in library code.
-- **Config is guarded on write.** `~/.whip/config.json` writes are atomic
+- **Config is guarded on write.** `~/.harness/config.json` writes are atomic
   (tmp+rename, `.bak` kept) with a clobber-refusal guard. Never bare
   `os.WriteFile` persisted state.
 - **Docs are part of the diff.** A feature without its `docs/features.md`
@@ -79,7 +84,7 @@ without guessing.**
 
 ### 1. Mine the prior art
 
-Read `docs/roadmap.md` and `docs/learnings/` first. If porting harness behavior
+Read `plan.md`, `docs/roadmap.md` and `docs/learnings/` first. If porting harness behavior
 and the research isn't done, do it now: find the reference implementation (pi
 at `~/code/pi`, opencode under `~/code/coding-harnesses/`), understand *why*
 it's built that way, sketch the Go-native port. Cite findings in the plan — a
@@ -92,7 +97,7 @@ Read `docs/features.md` end to end. Non-negotiables:
 - **Five surfaces.** A new tool (`internal/tools` — a `Tool{Def, Run}` appended
   in `agent.New`; remember subagents get `tools.All()` too), agent-loop
   behavior (`internal/agent`), TUI interaction (`internal/tui` — a case in the
-  `command()` switch, palette panel, key handling, transcript block), config
+  `command()` switch, settings panel, key handling, transcript block), config
   (`internal/config`), or persistence (`internal/session` — SQLite;
   `Save(id, from, msgs)` writes incrementally). The plan names surfaces and
   files.
@@ -189,6 +194,8 @@ README only if the user-facing surface changed (flag, config key, command).
 
 - Building something `docs/features.md` or `docs/roadmap.md` already describes
   under another name — check the map first.
+- Building something `plan.md` lists as cut or deferred without the user
+  reopening it. Name the disposition and ask; do not quietly re-litigate it.
 - Transliterating TypeScript from pi/opencode instead of the Go-native shape.
 - A tool that aborts the loop on failure (return `"Error: …"` instead), or
   returns unbounded output with no truncation marker.

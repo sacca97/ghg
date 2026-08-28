@@ -24,8 +24,8 @@ import (
 	"os"
 	"strings"
 
-	"github.com/context-labs/whip/internal/tools"
-	"github.com/context-labs/whip/internal/tools/bashrun"
+	"github.com/sacca97/ghg/internal/tools"
+	"github.com/sacca97/ghg/internal/tools/bashrun"
 )
 
 // shellDoneMsg reports a finished `!` command: the transcript block and the
@@ -95,6 +95,10 @@ func shellExec(cmdLine string) string {
 func (m *model) applyShellDone(msg shellDoneMsg) {
 	// transcript: a tool-style block (collapsed preview, ctrl+e/click expand)
 	m.appendRaw(blockTool, msg.out)
+	if m.agent == nil {
+		m.append(dimStyle.Render("shell output kept local — configure a provider with /auth before sending it to the model"))
+		return
+	}
 
 	content := "$ " + msg.cmd + "\n" + msg.out
 	if m.busy {
@@ -109,9 +113,9 @@ func (m *model) applyShellDone(msg shellDoneMsg) {
 	m.persist()
 }
 
-// cdCommand changes whip's working directory for everything (bash tool,
+// cdCommand changes ghg's working directory for everything (bash tool,
 // relative read/write/edit paths, @ file index). Bare prints it. A command
-// already running under the old cwd keeps it (POSIX); whip's next spawns —
+// already running under the old cwd keeps it (POSIX); ghg's next spawns —
 // and the next session record — use the new one.
 func (m *model) cdCommand(arg string) {
 	if arg == "" {

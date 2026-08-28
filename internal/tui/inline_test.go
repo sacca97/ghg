@@ -5,12 +5,10 @@ import (
 	"testing"
 )
 
-// The transcript must render inline (no alt-screen) so native drag-to-copy
-// works everywhere: no alt-screen escape in the view, and the view still
-// assembles header + transcript + input. Mouse capture is ON by default for
-// wheel scroll + clicks (via click/wheel-only ?1000 reporting, no motion, so
-// drag-selection stays native); the model field reflects that default.
-func TestInlineRendering(t *testing.T) {
+// The view contains only application content; terminal control sequences are
+// owned by Run, which uses Bubble Tea's alternate-screen lifecycle. Mouse
+// capture remains ON by default for wheel scroll and clicks.
+func TestViewRendersTranscript(t *testing.T) {
 	m := compactCmdModel()
 	m.Update(mkWinSize(80, 30))
 	m.appendAssistant("hello **world**")
@@ -18,13 +16,12 @@ func TestInlineRendering(t *testing.T) {
 	if strings.Contains(v, "\x1b[?1049h") || strings.Contains(v, "\x1b[?47h") {
 		t.Fatal("view must not enter the alternate screen")
 	}
-	for _, want := range []string{"whip ·", "hello", "world"} {
+	for _, want := range []string{"ghg", "hello", "world"} {
 		if !strings.Contains(stripAll(v), want) {
 			t.Errorf("inline view missing %q", want)
 		}
 	}
-	// mouse capture on by default (wheel scroll); drag-copy stays native via
-	// click/wheel-only reporting (no motion), asserted by TestMouseDefaultsOn
+	// mouse capture on by default (wheel scroll and clicks)
 	if !m.mouseOn {
 		t.Fatal("mouse capture must default on for wheel scroll")
 	}

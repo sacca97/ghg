@@ -61,3 +61,31 @@ func TestToolRowFailureIsRed(t *testing.T) {
 		t.Fatalf("failed row should render the error, got %q", got)
 	}
 }
+
+func TestToolRowShowsLastThreeOutputLines(t *testing.T) {
+	m := compactCmdModel()
+	m.Update(mkWinSize(80, 24))
+	m.Update(toolStartMsg{id: "c1", name: "bash", args: `{"command":"go test ./..."}`})
+	m.Update(toolOutputMsg{id: "c1", output: "line-1\nline-2\nline-3\nline-4\n"})
+
+	var row *block
+	for i := range m.blocks {
+		if m.blocks[i].kind == blockToolRun {
+			row = &m.blocks[i]
+		}
+	}
+	if row == nil || !row.toolRunning {
+		t.Fatal("partial output should keep the tool row running")
+	}
+	got := ansi.Strip(row.render(m.width))
+	if strings.Contains(got, "line-1") || !strings.Contains(got, "line-2") ||
+		!strings.Contains(got, "line-3") || !strings.Contains(got, "line-4") {
+		t.Fatalf("running row should show only the last three lines, got %q", got)
+	}
+
+	m.Update(toolEndMsg{id: "c1", name: "bash", result: "done"})
+	got = ansi.Strip(m.blocks[len(m.blocks)-2].render(m.width))
+	if strings.Contains(got, "line-4") {
+		t.Fatalf("completion should collapse the running row, got %q", got)
+	}
+}

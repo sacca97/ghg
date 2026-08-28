@@ -19,7 +19,7 @@ import (
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/context-labs/whip/internal/agent"
+	"github.com/sacca97/ghg/internal/agent"
 )
 
 // taskEventMsg is one live event from an opened background task (OnText /
@@ -155,6 +155,9 @@ func (m *model) tasksDock() string {
 // the prompt, then the live event stream while the task runs, or the stored
 // report once it has settled.
 func (m *model) openTask(id string) {
+	if m.agent == nil {
+		return
+	}
 	t, ok := m.agent.Tasks().Get(id)
 	if !ok {
 		return
@@ -204,6 +207,10 @@ func (m *model) refreshTaskVP() {
 // to the pane, x cancels a running task, esc backs out to the main thread.
 func (m *model) taskViewKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	tv := m.taskVP
+	if tv == nil || m.agent == nil {
+		m.taskVP = nil
+		return m, nil
+	}
 	switch msg.Type {
 	case tea.KeyEsc:
 		m.taskVP = nil
@@ -227,6 +234,9 @@ func (m *model) taskViewKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 // taskViewView renders the open task pane full-screen, between the header
 // row and a footer hint (View's layout mirrors View's structure).
 func (m *model) taskViewView() string {
+	if m.agent == nil || m.taskVP == nil {
+		return dimStyle.Render("no provider configured — run /auth first")
+	}
 	t, ok := m.agent.Tasks().Get(m.taskVP.id)
 	status := "running"
 	if ok {

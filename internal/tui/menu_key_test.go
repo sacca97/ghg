@@ -18,8 +18,8 @@ func pressKey(m *model, kt tea.KeyType) *model {
 func TestTabCompletesSkillName(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
-	os.MkdirAll(filepath.Join(home, ".whip/skills/go-style"), 0o755)
-	os.WriteFile(filepath.Join(home, ".whip/skills/go-style/SKILL.md"),
+	os.MkdirAll(filepath.Join(home, ".ghg/skills/go-style"), 0o755)
+	os.WriteFile(filepath.Join(home, ".ghg/skills/go-style/SKILL.md"),
 		[]byte("---\nname: go-style\ndescription: d\n---\n"), 0o644)
 	m := modelCmdModel()
 	m = typeStr(t, m, "$go-sty")
@@ -89,8 +89,8 @@ func TestEnterCommitsTabCycle(t *testing.T) {
 		t.Fatalf("tab should preview /model first, got %q", m.input.Value())
 	}
 	m = pressKey(m, tea.KeyEnter)
-	if m.mpicker == nil {
-		t.Fatal("enter on tab-cycled /model should open the model picker")
+	if m.settings == nil || m.settings.top() == nil || m.settings.top().kind != panelRole {
+		t.Fatal("enter on tab-cycled /model should open the role picker")
 	}
 	if m.input.Value() != "" {
 		t.Fatalf("execNow clears the input, got %q", m.input.Value())

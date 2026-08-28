@@ -12,6 +12,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/sacca97/ghg/internal/artifact"
 )
 
 func sseServer(t *testing.T, lines ...string) *httptest.Server {
@@ -40,7 +42,10 @@ func TestStreamStripsAuthoredFlag(t *testing.T) {
 	defer srv.Close()
 
 	sent := time.Now()
-	msgs := []Message{{Role: "user", Content: "typed by me", Authored: true, SentAt: &sent}}
+	ref := &artifact.Ref{ID: "sha256:" + strings.Repeat("a", 64), Hash: strings.Repeat("a", 64), OriginalBytes: 2, StoredBytes: 2, Complete: true}
+	msgs := []Message{{Role: "user", Content: "typed by me", Authored: true, SentAt: &sent}, {
+		Role: "tool", Content: "preview", ToolCallID: "c1", Artifact: ref, ExitCode: 1, Source: "bash",
+	}}
 	if _, _, err := New(srv.URL, "test-key").Stream(context.Background(), Request{Model: "m", Messages: msgs}, nil, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -49,6 +54,11 @@ func TestStreamStripsAuthoredFlag(t *testing.T) {
 	}
 	if strings.Contains(string(body), "sent_at") {
 		t.Fatalf("SentAt timestamp leaked to provider: %s", body)
+	}
+	for _, field := range []string{"artifact", "exit_code", "source"} {
+		if strings.Contains(string(body), field) {
+			t.Fatalf("internal %s field leaked to provider: %s", field, body)
+		}
 	}
 }
 
@@ -221,6 +231,29 @@ func TestReasoningEffortSerialized(t *testing.T) {
 	}
 }
 
+func TestOpenAIReasoningToggleSerialized(t *testing.T) {
+	for _, want := range []string{"enabled", "disabled"} {
+		enabled := want == "enabled"
+		wire := newOpenAIRequest(Request{
+			Model:            "m",
+			ReasoningEnabled: &enabled,
+		}, false)
+		data, err := json.Marshal(wire)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got struct {
+			Thinking map[string]string `json:"thinking"`
+		}
+		if err := json.Unmarshal(data, &got); err != nil {
+			t.Fatal(err)
+		}
+		if got.Thinking["type"] != want {
+			t.Fatalf("toggle %q serialized as %s", want, data)
+		}
+	}
+}
+
 func TestComplete(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("Authorization"); got != "Bearer test-key" {
@@ -241,7 +274,9 @@ func TestComplete(t *testing.T) {
 }
 
 func TestCompleteStreamOmitted(t *testing.T) {
-	var req Request
+	var req struct {
+		Stream bool `json:"stream"`
+	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		json.NewDecoder(r.Body).Decode(&req)
 		w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
@@ -257,7 +292,12 @@ func TestCompleteStreamOmitted(t *testing.T) {
 }
 
 func TestStreamUsageParsed(t *testing.T) {
-	var reqSeen Request
+	var reqSeen struct {
+		Stream        bool `json:"stream"`
+		StreamOptions *struct {
+			IncludeUsage bool `json:"include_usage"`
+		} `json:"stream_options"`
+	}
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		json.NewDecoder(r.Body).Decode(&reqSeen)
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -316,7 +356,7 @@ func TestIsContextLimit(t *testing.T) {
 }
 
 func TestModelInfoPricingParsed(t *testing.T) {
-	// fixture mirrors inference.net's GET /models entry shape
+	// fixture mirrors an OpenAI-compatible GET /models entry shape
 	var mi ModelInfo
 	err := json.Unmarshal([]byte(`{"id":"claude-haiku-4-5","context_length":200000,
 		"pricing":{"prompt":"0.000001000000","completion":"0.000005000000","input_cache_read":"0.000000100000"}}`), &mi)

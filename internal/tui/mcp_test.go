@@ -9,11 +9,11 @@ import (
 
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 
-	"github.com/context-labs/whip/internal/agent"
-	"github.com/context-labs/whip/internal/config"
-	"github.com/context-labs/whip/internal/llm"
-	"github.com/context-labs/whip/internal/mcp"
-	"github.com/context-labs/whip/internal/tools"
+	"github.com/sacca97/ghg/internal/agent"
+	"github.com/sacca97/ghg/internal/config"
+	"github.com/sacca97/ghg/internal/llm"
+	"github.com/sacca97/ghg/internal/mcp"
+	"github.com/sacca97/ghg/internal/tools"
 )
 
 // mcpModel builds a headless model with an MCP manager over cfgs.
@@ -73,7 +73,7 @@ func TestMCPLiveServerEndToEnd(t *testing.T) {
 }
 
 func TestMCPTogglePersists(t *testing.T) {
-	t.Setenv("WHIP_HOME", t.TempDir())
+	t.Setenv("GHG_HOME", t.TempDir())
 	m := mcpModel(t, map[string]mcp.ServerConfig{"docs": {Command: []string{"docs"}}})
 	m.command("/mcp docs disable")
 	entry, ok := m.cfg.MCPServers["docs"]
@@ -108,7 +108,7 @@ func TestMCPSurvivesAgentSwap(t *testing.T) {
 
 	// Swap the agent (as resume/switchModel do) and fire OnChange.
 	old := m.agent
-	m.agent = agent.New(old.Client, old.Model, old.MaxTokens, "sys")
+	m.agent = agent.New(old.Backend, old.Model, old.MaxTokens, "sys")
 	m.mcpMgr.FireOnChangeForTest()
 	if !agHasTool(m.agent, "mcp__docs__greet") {
 		t.Fatal("post-swap OnChange must write to the new agent")

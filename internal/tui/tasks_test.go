@@ -13,11 +13,17 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 
-	"github.com/context-labs/whip/internal/agent"
-	"github.com/context-labs/whip/internal/config"
-	"github.com/context-labs/whip/internal/llm"
-	"github.com/context-labs/whip/internal/session"
+	"github.com/sacca97/ghg/internal/agent"
+	"github.com/sacca97/ghg/internal/config"
+	"github.com/sacca97/ghg/internal/llm"
+	"github.com/sacca97/ghg/internal/session"
 )
+
+func testBackend(baseURL, apiKey string) llm.Backend {
+	client := llm.New(baseURL, apiKey)
+	client.MaxRetries = 1
+	return llm.NewOpenAIBackend(client)
+}
 
 // sseTextServer serves every streaming chat request with a fixed text
 // response — enough for a background subagent's Turn to complete.
@@ -36,7 +42,7 @@ func sseTextServer(t *testing.T, body string) *httptest.Server {
 func tasksModel(url string) *model {
 	m := &model{
 		input:    newInput(),
-		agent:    agent.New(llm.New(url, "k"), "m", 100, "sys"),
+		agent:    agent.New(testBackend(url, "k"), "m", 100, "sys"),
 		queueSel: -1, // not navigating the queue (the zero value would arm esc's queue branch)
 	}
 	m.width, m.height = 80, 30
@@ -72,7 +78,7 @@ func TestResumeRestoresTasks(t *testing.T) {
 	m := tasksModelStore(t, srv.URL)
 
 	// a session with messages and two tasks: one settled, one "running" (the
-	// state a crashed whip leaves behind)
+	// state a crashed ghg leaves behind)
 	id, err := m.store.Create("/tmp", "m", "p")
 	if err != nil {
 		t.Fatal(err)
@@ -86,7 +92,7 @@ func TestResumeRestoresTasks(t *testing.T) {
 	m.store.SaveTask(id, session.Task{ID: "task-2", Description: "died mid-flight", Prompt: "p", Status: "running", StartedAt: start})
 
 	// fresh agent, like a new process
-	m.agent = agent.New(llm.New(srv.URL, "k"), "m", 100, "sys")
+	m.agent = agent.New(testBackend(srv.URL, "k"), "m", 100, "sys")
 	if err := m.resume(id); err != nil {
 		t.Fatal(err)
 	}
@@ -147,7 +153,7 @@ func TestResumeHistorySkipsUnauthoredMessages(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	m.agent = agent.New(llm.New(srv.URL, "k"), "m", 100, "sys")
+	m.agent = agent.New(testBackend(srv.URL, "k"), "m", 100, "sys")
 	if err := m.resume(id); err != nil {
 		t.Fatal(err)
 	}
@@ -431,7 +437,7 @@ func TestDockClickOpensClickedRow(t *testing.T) {
 	}
 }
 
-// While the palette is open it owns the screen; a click near the bottom must
+// While the settings is open it owns the screen; a click near the bottom must
 // not hit the dock hidden behind it.
 func TestDockClickIgnoredWhilePaletteOpen(t *testing.T) {
 	srv := sseTextServer(t, "ok")
@@ -447,7 +453,7 @@ func TestDockClickIgnoredWhilePaletteOpen(t *testing.T) {
 		Action: tea.MouseActionPress, Button: tea.MouseButtonLeft, Y: top,
 	})
 	if m2.(*model).taskVP != nil {
-		t.Fatal("a click while the palette is open must not open a dock task")
+		t.Fatal("a click while the settings is open must not open a dock task")
 	}
 }
 
@@ -530,7 +536,7 @@ func TestLayoutReservesDockHeight(t *testing.T) {
 	// and the dock renders on its own row above the input, not glued to it
 	v := stripAll(m.View())
 	di := strings.Index(v, "probe")
-	ii := strings.Index(v, "Ask whip")
+	ii := strings.Index(v, "Ask ghg")
 	if di < 0 || ii < 0 || di > ii {
 		t.Fatalf("dock must render above the input: dock@%d input@%d\n%s", di, ii, v)
 	}

@@ -8,8 +8,8 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"github.com/context-labs/whip/internal/config"
-	"github.com/context-labs/whip/internal/tools"
+	"github.com/sacca97/ghg/internal/config"
+	"github.com/sacca97/ghg/internal/tools"
 )
 
 func TestCommandRuleArity(t *testing.T) {
@@ -35,7 +35,7 @@ func TestCommandRuleArity(t *testing.T) {
 // The full gate path: an uncovered command blocks on the dialog; "allow
 // always" installs the arity rule and covers the next call without asking.
 func TestPermissionGateFlow(t *testing.T) {
-	t.Setenv("WHIP_HOME", t.TempDir())
+	t.Setenv("GHG_HOME", t.TempDir())
 	m := compactCmdModel()
 	m.perms = permRules{}
 

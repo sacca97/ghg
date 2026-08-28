@@ -1,6 +1,6 @@
 # Concurrency: where Go channels earn their keep
 
-whip's agent runs concurrent work — parallel tool calls, background
+ghg's agent runs concurrent work — parallel tool calls, background
 subagents, a streaming TUI — and the design leans on channels for the parts
 that are awkward in the reference harnesses (pi and opencode are TypeScript).
 This doc explains the two channel patterns and why they're idiomatic in Go.
@@ -13,6 +13,11 @@ References that motivated them:
   over a tool-call batch.
 - opencode `packages/core/src/background-job.ts` — a registry of `Deferred` /
   `Scope` / token for background subagents.
+
+Provider stream callbacks follow the same ownership rule: `llm.EventSink` is
+passed per backend call. A foreground turn and its background subagent can
+share one adapter without temporarily assigning a retry callback on the
+underlying client, so callback delivery has no shared-hook race.
 
 ## 1. Per-path file-mutation lock = a 1-capacity channel
 
@@ -140,11 +145,37 @@ applies twice per server: one channel for readiness, one for in-flight calls.
 
 `internal/tools/bashrun/bashrun.go` tracks every spawned child in a registry
 and `KillAll()` SIGKILLs the whole process group on exit, so an agent-started
-server never outlives whip. The non-interactive path closes its output pipes
+server never outlives ghg. The non-interactive path closes its output pipes
 on process exit so a detached grandchild (`sleep 30 &`, nohup) can't hang the
 agent waiting on pipe EOF.
 
-## 4. LSP diagnostic waiters = per-file channel closes
+## 4. Tool output snapshots = one callback per invocation
+
+The non-interactive bash runner drains stdout and stderr concurrently into one
+buffer. When a caller supplies `tools.WithOnUpdate(ctx, fn)`, the runner starts
+one ticker-owned notifier for that process: it snapshots the buffer at most
+every 100ms and flushes the final changed snapshot before returning. The
+callback travels in the call context, not a package global, so parallel bash
+calls cannot cross wires. `agent.runTools` attaches the tool id and the TUI
+turns each snapshot into a `toolOutputMsg`; only the UI goroutine changes the
+running row. No callback means no ticker or extra goroutine.
+
+## 5. Artifact capture = bounded ownership, then one catalog transaction
+
+Each tool-call worker owns its bounded capture and finishes writing the
+retained bytes before it invokes `OnToolEnd` or publishes the result back to
+the turn. `TextCapture` and the bash runner keep a fixed head/tail buffer while
+counting every byte, so a noisy process cannot grow memory with its output.
+The injected artifact writer is content-addressed and has no mutable package
+global; concurrent calls may deduplicate the same immutable payload safely.
+
+The session store writes a tool message and its artifact metadata in one
+SQLite transaction. Fork and rewind copy/delete references by message
+boundary, while garbage collection reads the complete reference set before
+deleting only unreferenced payloads. Artifact reads are bounded and session
+checked, so no worker receives a caller-supplied filesystem path.
+
+## 6. LSP diagnostic waiters = per-file channel closes
 
 `internal/lsp/manager.go` reuses close-to-broadcast for LSP push diagnostics:
 `write`/`edit` send `didOpen`/`didChange` with a document version, then wait

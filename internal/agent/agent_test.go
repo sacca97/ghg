@@ -8,12 +8,51 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
-	"github.com/context-labs/whip/internal/llm"
-	"github.com/context-labs/whip/internal/tools"
+	"github.com/sacca97/ghg/internal/artifact"
+	"github.com/sacca97/ghg/internal/llm"
+	"github.com/sacca97/ghg/internal/tools"
 )
+
+func TestReasoningRequestUsesToggleMetadata(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		effort     string
+		toggle     bool
+		wantEffort string
+		wantSet    bool
+		wantOn     bool
+	}{
+		{name: "graded", effort: "max", wantEffort: "max"},
+		{name: "toggle on", effort: "on", toggle: true, wantOn: true, wantSet: true},
+		{name: "toggle off", toggle: true, wantSet: true},
+		{name: "toggle graded", effort: "high", toggle: true, wantEffort: "high", wantOn: true, wantSet: true},
+		{name: "on without toggle", effort: "on"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			a := &Agent{Effort: tc.effort, ReasoningToggle: tc.toggle}
+			gotEffort, gotOn := a.ReasoningRequest()
+			if gotEffort != tc.wantEffort {
+				t.Fatalf("effort = %q, want %q", gotEffort, tc.wantEffort)
+			}
+			if (gotOn != nil) != tc.wantSet {
+				t.Fatalf("toggle presence = %v, want %v", gotOn != nil, tc.wantSet)
+			}
+			if gotOn != nil && *gotOn != tc.wantOn {
+				t.Fatalf("toggle value = %v, want %v", *gotOn, tc.wantOn)
+			}
+		})
+	}
+}
+
+func testBackend(baseURL, apiKey string) llm.Backend {
+	client := llm.New(baseURL, apiKey)
+	client.MaxRetries = 1
+	return llm.NewOpenAIBackend(client)
+}
 
 // server that answers with a tool call on the first request, text on the second
 func loopServer(t *testing.T) *httptest.Server {
@@ -53,7 +92,7 @@ func TestTurnLoop(t *testing.T) {
 	srv := loopServer(t)
 	defer srv.Close()
 
-	ag := New(llm.New(srv.URL, "k"), "m", 100, "sys")
+	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
 	ag.Tools = []tools.Tool{echoTool()}
 
 	var events []string
@@ -83,6 +122,80 @@ func TestTurnLoop(t *testing.T) {
 	}
 }
 
+func TestToolOutputCarriesCallID(t *testing.T) {
+	ag := New(testBackend("http://unused", "k"), "m", 100, "sys")
+	var ids []string
+	var snapshots []string
+	results := ag.runTools(context.Background(), []llm.ToolCall{{
+		ID: "bash-1",
+		Function: struct {
+			Name      string `json:"name"`
+			Arguments string `json:"arguments"`
+		}{Name: "bash", Arguments: `{"command":"printf 'first\\n'; sleep 0.15; printf 'second\\n'","timeout":2}`},
+	}}, Events{
+		OnToolOutput: func(id, output string) {
+			ids = append(ids, id)
+			snapshots = append(snapshots, output)
+		},
+	})
+	if len(results) != 1 || !strings.Contains(results[0], "second") {
+		t.Fatalf("tool result: %v", results)
+	}
+	if len(snapshots) == 0 {
+		t.Fatal("expected at least one partial tool-output snapshot")
+	}
+	for _, id := range ids {
+		if id != "bash-1" {
+			t.Fatalf("snapshot routed to %q, want bash-1", id)
+		}
+	}
+	if !strings.Contains(snapshots[len(snapshots)-1], "second") {
+		t.Fatalf("final snapshot missing output: %q", snapshots[len(snapshots)-1])
+	}
+}
+
+func TestParallelToolOutputStaysWithCall(t *testing.T) {
+	ag := New(testBackend("http://unused", "k"), "m", 100, "sys")
+	call := func(label string) llm.ToolCall {
+		return llm.ToolCall{
+			ID: label,
+			Function: struct {
+				Name      string `json:"name"`
+				Arguments string `json:"arguments"`
+			}{Name: "bash", Arguments: fmt.Sprintf(`{"command":"printf '%s-start\\n'; sleep 0.15; printf '%s-end\\n'","timeout":2}`, label, label)},
+		}
+	}
+	var mu sync.Mutex
+	seen := map[string][]string{}
+	ag.runTools(context.Background(), []llm.ToolCall{call("a"), call("b")}, Events{
+		OnToolOutput: func(id, output string) {
+			mu.Lock()
+			seen[id] = append(seen[id], output)
+			mu.Unlock()
+		},
+	})
+	for _, id := range []string{"a", "b"} {
+		mu.Lock()
+		outputs := append([]string(nil), seen[id]...)
+		mu.Unlock()
+		if len(outputs) == 0 {
+			t.Fatalf("no snapshots for call %s: %+v", id, seen)
+		}
+		if !strings.Contains(outputs[len(outputs)-1], id+"-end") {
+			t.Fatalf("call %s received the wrong final snapshot: %q", id, outputs[len(outputs)-1])
+		}
+		for _, output := range outputs {
+			other := "b"
+			if id == "b" {
+				other = "a"
+			}
+			if strings.Contains(output, other+"-start") || strings.Contains(output, other+"-end") {
+				t.Fatalf("call %s received call %s output: %q", id, other, output)
+			}
+		}
+	}
+}
+
 // Each assistant message records its token usage and which model produced it;
 // tool calls record their run time and exit status. All survive for per-turn
 // cost and perf views after the in-memory session totals are gone.
@@ -101,7 +214,7 @@ func TestTurnStampsUsageModelAndToolTiming(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	ag := New(llm.New(srv.URL, "k"), "kimi-k3-fast", 100, "sys")
+	ag := New(testBackend(srv.URL, "k"), "kimi-k3-fast", 100, "sys")
 	ag.Provider = "inference"
 	ag.Tools = []tools.Tool{echoTool()}
 
@@ -155,7 +268,7 @@ func TestInternalStampsStrippedFromRequest(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	ag := New(llm.New(srv.URL, "k"), "m", 100, "sys")
+	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
 	// pre-seed a message loaded from storage with all internal fields set
 	sent := time.Now()
 	u := llm.Usage{PromptTokens: 9}
@@ -181,7 +294,7 @@ func TestInternalStampsStrippedFromRequest(t *testing.T) {
 func TestTurnCancelled(t *testing.T) {
 	srv := loopServer(t)
 	defer srv.Close()
-	ag := New(llm.New(srv.URL, "k"), "m", 100, "sys")
+	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
 	ag.Tools = []tools.Tool{echoTool()}
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() { cancel() }()
@@ -196,7 +309,7 @@ func TestTurnAPIError(t *testing.T) {
 		http.Error(w, "nope", http.StatusInternalServerError)
 	}))
 	defer srv.Close()
-	ag := New(llm.New(srv.URL, "k"), "m", 100, "sys")
+	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
 	if _, err := ag.Turn(context.Background(), "go", Events{}); err == nil {
 		t.Fatal("expected error")
 	}
@@ -223,11 +336,11 @@ func TestTurnAuthoredMarksMessage(t *testing.T) {
 	srv := textServer(t, func(n int, req llm.Request) string { return "done" })
 	defer srv.Close()
 
-	ag := New(llm.New(srv.URL, "k"), "m", 100, "sys")
+	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
 	if _, err := ag.TurnAuthored(context.Background(), "i typed this", Events{}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := ag.Turn(context.Background(), "injected by whip", Events{}); err != nil {
+	if _, err := ag.Turn(context.Background(), "injected by ghg", Events{}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -239,7 +352,7 @@ func TestTurnAuthoredMarksMessage(t *testing.T) {
 		switch m.Content {
 		case "i typed this":
 			typed = m.Authored
-		case "injected by whip":
+		case "injected by ghg":
 			injected = m.Authored
 		}
 	}
@@ -262,7 +375,7 @@ func TestUsageAccumulates(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	ag := New(llm.New(srv.URL, "k"), "m", 100, "sys")
+	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
 	var fired int
 	for i := 0; i < 3; i++ {
 		if _, err := ag.Turn(context.Background(), "go", Events{
@@ -290,7 +403,7 @@ func TestUsageAccumulates(t *testing.T) {
 func TestUsageMissingLeavesTotalsAlone(t *testing.T) {
 	srv := textServer(t, func(n int, req llm.Request) string { return "done" })
 	defer srv.Close()
-	ag := New(llm.New(srv.URL, "k"), "m", 100, "sys")
+	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
 	if _, err := ag.Turn(context.Background(), "go", Events{}); err != nil {
 		t.Fatal(err)
 	}
@@ -312,7 +425,7 @@ func TestSteerContinuesTurn(t *testing.T) {
 	})
 	defer srv.Close()
 
-	ag := New(llm.New(srv.URL, "k"), "m", 100, "sys")
+	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
 	ag.Steer("also do this") // queued before the first response completes
 	var steered []string
 	final, err := ag.Turn(context.Background(), "go", Events{
@@ -332,7 +445,7 @@ func TestSteerContinuesTurn(t *testing.T) {
 func TestNoSteerEndsTurn(t *testing.T) {
 	srv := textServer(t, func(n int, req llm.Request) string { return "done" })
 	defer srv.Close()
-	ag := New(llm.New(srv.URL, "k"), "m", 100, "sys")
+	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
 	final, err := ag.Turn(context.Background(), "go", Events{})
 	if err != nil || final != "done" {
 		t.Fatalf("%q %v", final, err)
@@ -370,7 +483,7 @@ func TestTaskToolSpawnsSubagent(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	ag := New(llm.New(srv.URL, "k"), "m", 100, "sys")
+	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
 	final, err := ag.Turn(context.Background(), "go", Events{})
 	if err != nil || final != "done" {
 		t.Fatalf("%q %v", final, err)
@@ -380,8 +493,51 @@ func TestTaskToolSpawnsSubagent(t *testing.T) {
 	}
 }
 
+func TestTaskUsesTinyRoleFactoryForForegroundAndBackground(t *testing.T) {
+	for _, background := range []bool{false, true} {
+		t.Run(map[bool]string{false: "foreground", true: "background"}[background], func(t *testing.T) {
+			parent := New(&fakeBackend{}, "acting-api", 100, "sys")
+			childBackend := &fakeBackend{}
+			var gotRole, gotPrompt string
+			parent.SubagentFactory = func(_ context.Context, role, prompt string) (*Agent, error) {
+				gotRole, gotPrompt = role, prompt
+				return New(childBackend, "tiny-api", 50, "child"), nil
+			}
+
+			if background {
+				task := parent.StartBackground(context.Background(), "probe", "check it")
+				select {
+				case <-task.Done:
+				case <-time.After(2 * time.Second):
+					t.Fatal("background task did not settle")
+				}
+				if got := task.Report; got != "reply" {
+					t.Fatalf("background report = %q", got)
+				}
+			} else {
+				out, err := taskTool(parent).Run(context.Background(), json.RawMessage(`{"prompt":"check it"}`))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if out != "reply" {
+					t.Fatalf("foreground report = %q", out)
+				}
+			}
+			if gotRole != "tiny" {
+				t.Fatalf("factory role = %q, want tiny", gotRole)
+			}
+			if !strings.Contains(gotPrompt, "Current working directory:") {
+				t.Fatalf("factory prompt was not the subagent prompt: %q", gotPrompt)
+			}
+			if len(childBackend.streamRequests) != 1 || childBackend.streamRequests[0].Model != "tiny-api" {
+				t.Fatalf("child requests = %+v", childBackend.streamRequests)
+			}
+		})
+	}
+}
+
 func TestTaskToolBadArgs(t *testing.T) {
-	ag := New(llm.New("http://unused", "k"), "m", 100, "sys")
+	ag := New(testBackend("http://unused", "k"), "m", 100, "sys")
 	out := tools.Execute(context.Background(), ag.Tools, "task", json.RawMessage(`{bad`))
 	if !strings.HasPrefix(out, "Error") {
 		t.Fatalf("expected error, got %q", out)
@@ -400,7 +556,10 @@ func compactionServer(t *testing.T) (*httptest.Server, *int) {
 		case 1:
 			http.Error(w, `{"error":{"code":"context_length_exceeded"}}`, http.StatusBadRequest)
 		case 2:
-			var req llm.Request
+			var req struct {
+				Stream   bool          `json:"stream"`
+				Messages []llm.Message `json:"messages"`
+			}
 			json.NewDecoder(r.Body).Decode(&req)
 			if req.Stream {
 				t.Errorf("summary call should not stream")
@@ -419,7 +578,7 @@ func TestTurnAutoCompactsOnContextLimit(t *testing.T) {
 	srv, pcall := compactionServer(t)
 	defer srv.Close()
 
-	ag := New(llm.New(srv.URL, "k"), "m", 100, "sys")
+	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
 	// build a history that's compactable: system + enough turns
 	for i := 0; i < 8; i++ {
 		ag.Messages = append(ag.Messages,
@@ -458,7 +617,10 @@ func TestCompactDoesNotLoopOnRepeatedContextLimit(t *testing.T) {
 		// one summary call succeeds (to exercise the compaction path), then
 		// every stream fails with context_length_exceeded
 		if r.URL.Path == "/chat/completions" {
-			var req llm.Request
+			var req struct {
+				Stream   bool          `json:"stream"`
+				Messages []llm.Message `json:"messages"`
+			}
 			json.NewDecoder(r.Body).Decode(&req)
 			if !req.Stream { // the summary call
 				w.Write([]byte(`{"choices":[{"message":{"content":"sim"}}]}`))
@@ -469,7 +631,7 @@ func TestCompactDoesNotLoopOnRepeatedContextLimit(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	ag := New(llm.New(srv.URL, "k"), "m", 100, "sys")
+	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
 	for i := 0; i < 8; i++ {
 		ag.Messages = append(ag.Messages,
 			llm.Message{Role: "user", Content: fmt.Sprintf("q%d", i)},
@@ -505,11 +667,30 @@ func TestEstimateTokens(t *testing.T) {
 	}
 }
 
+func TestContextTokensUsesLatestReportedRequest(t *testing.T) {
+	ag := New(testBackend("http://unused", "k"), "m", 100, "sys")
+	if got := ag.ContextTokens(); got != 0 {
+		t.Fatalf("before a response: got %d, want 0", got)
+	}
+
+	ag.Messages = append(ag.Messages,
+		llm.Message{Role: "assistant", Content: "first", Usage: &llm.Usage{PromptTokens: 100, CompletionTokens: 20}},
+		llm.Message{Role: "user", Content: "next"},
+		llm.Message{Role: "assistant", Content: "latest", Usage: &llm.Usage{PromptTokens: 300, CompletionTokens: 40}},
+	)
+	if got, want := ag.ContextTokens(), 340; got != want {
+		t.Fatalf("latest context tokens = %d, want %d", got, want)
+	}
+}
+
 func TestProactiveCompactAtFiftyPercent(t *testing.T) {
 	// the first stream request should already carry the compacted history —
 	// no context_length_exceeded round-trip needed
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var req llm.Request
+		var req struct {
+			Stream   bool          `json:"stream"`
+			Messages []llm.Message `json:"messages"`
+		}
 		json.NewDecoder(r.Body).Decode(&req)
 		if !req.Stream {
 			w.Write([]byte(`{"choices":[{"message":{"content":"summary of prior work"}}]}`))
@@ -526,12 +707,15 @@ func TestProactiveCompactAtFiftyPercent(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	ag := New(llm.New(srv.URL, "k"), "m", 100, "sys")
-	ag.ContextLimit = 1000 // default 50% = 500 estimated tokens
-	// 8 user messages × 120 chars ≈ 272 estimated tokens: under the threshold
+	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
+	ag.ContextLimit = 1000 // default 50% = 500 reported context tokens
 	for i := 0; i < 8; i++ {
 		ag.Messages = append(ag.Messages, llm.Message{Role: "user", Content: strings.Repeat("x", 120)})
 	}
+	ag.Messages = append(ag.Messages, llm.Message{
+		Role: "assistant", Content: "previous response",
+		Usage: &llm.Usage{PromptTokens: 400, CompletionTokens: 150},
+	})
 	var compacted bool
 	final, err := ag.Turn(context.Background(), strings.Repeat("z", 900), Events{
 		OnCompact: func(took, kept int) { compacted = true },
@@ -551,28 +735,36 @@ func TestCompactThresholdExplicitOverride(t *testing.T) {
 	srv := textServer(t, func(n int, req llm.Request) string { return "done" })
 	defer srv.Close()
 
-	// ~74% of the limit: over the 50% default, under an explicit 80% — no
-	// compaction, and the estimate stays deterministic
-	ag := New(llm.New(srv.URL, "m"), "m", 100, "sys")
+	// 55% of the limit: over the 50% default, under an explicit 80% — no
+	// compaction for the explicit override.
+	ag := New(testBackend(srv.URL, "m"), "m", 100, "sys")
 	ag.ContextLimit = 1000
 	ag.CompactThreshold = 0.8
 	for i := 0; i < 8; i++ {
 		ag.Messages = append(ag.Messages, llm.Message{Role: "user", Content: strings.Repeat("x", 360)})
 	}
+	ag.Messages = append(ag.Messages, llm.Message{
+		Role: "assistant", Content: "previous response",
+		Usage: &llm.Usage{PromptTokens: 400, CompletionTokens: 150},
+	})
 	if _, err := ag.Turn(context.Background(), "hi", Events{}); err != nil {
 		t.Fatal(err)
 	}
-	if len(ag.Messages) != 11 { // system + 8 seeded + user + assistant: untouched
+	if len(ag.Messages) != 12 { // system + 8 users + reported assistant + user + assistant
 		t.Fatalf("history should not compact below the explicit threshold, got %d msgs", len(ag.Messages))
 	}
 
 	// CompactThreshold wins over the default: same history at the default 50%
 	// would have compacted
-	ag2 := New(llm.New(srv.URL, "m"), "m", 100, "sys")
+	ag2 := New(testBackend(srv.URL, "m"), "m", 100, "sys")
 	ag2.ContextLimit = 1000
 	for i := 0; i < 8; i++ {
 		ag2.Messages = append(ag2.Messages, llm.Message{Role: "user", Content: strings.Repeat("x", 360)})
 	}
+	ag2.Messages = append(ag2.Messages, llm.Message{
+		Role: "assistant", Content: "previous response",
+		Usage: &llm.Usage{PromptTokens: 400, CompletionTokens: 150},
+	})
 	if err := ag2.maybeCompact(context.Background(), Events{}); err == nil {
 		t.Fatal("the same history should compact at the default 50% threshold")
 	}
@@ -583,14 +775,14 @@ func TestNoProactiveCompactBelowThresholdOrWithoutLimit(t *testing.T) {
 	defer srv.Close()
 
 	// below threshold: estimate well under 50% of the limit
-	ag := New(llm.New(srv.URL, "k"), "m", 100, "sys")
+	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
 	ag.ContextLimit = 100000
 	if _, err := ag.Turn(context.Background(), "hi", Events{}); err != nil {
 		t.Fatal(err)
 	}
 
 	// no advertised limit: proactive compaction disabled regardless of size
-	ag2 := New(llm.New(srv.URL, "k"), "m", 100, "sys")
+	ag2 := New(testBackend(srv.URL, "k"), "m", 100, "sys")
 	ag2.Messages = append(ag2.Messages, llm.Message{Role: "user", Content: strings.Repeat("x", 4000)})
 	if _, err := ag2.Turn(context.Background(), "hi", Events{}); err != nil {
 		t.Fatal(err)
@@ -614,8 +806,8 @@ func TestCompactUsesCompactModel(t *testing.T) {
 	}))
 	defer sum.Close()
 
-	ag := New(llm.New(main.URL, "k"), "conversation-model", 100, "sys")
-	ag.CompactClient = llm.New(sum.URL, "k")
+	ag := New(testBackend(main.URL, "k"), "conversation-model", 100, "sys")
+	ag.CompactBackend = testBackend(sum.URL, "k")
 	ag.CompactModel = "summary-model"
 	for i := 0; i < 8; i++ {
 		ag.Messages = append(ag.Messages,
@@ -632,7 +824,7 @@ func TestCompactUsesCompactModel(t *testing.T) {
 }
 
 func TestCompactTooLittleHistory(t *testing.T) {
-	ag := New(llm.New("http://unused", "k"), "m", 100, "sys")
+	ag := New(testBackend("http://unused", "k"), "m", 100, "sys")
 	ag.Messages = append(ag.Messages, llm.Message{Role: "user", Content: "hi"})
 	if _, _, err := ag.compact(context.Background()); err == nil {
 		t.Fatal("expected error compacting a tiny history")
@@ -646,7 +838,7 @@ func TestCompactKeepsToolCallPair(t *testing.T) {
 		w.Write([]byte(`{"choices":[{"message":{"content":"sim"}}]}`))
 	}))
 	defer srv.Close()
-	ag := New(llm.New(srv.URL, "k"), "m", 100, "sys")
+	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
 	// system, user, asst(with tool call "t1"), tool("t1" result), user, asst, user
 	for i := 0; i < 4; i++ {
 		ag.Messages = append(ag.Messages, llm.Message{Role: "user", Content: fmt.Sprintf("u%d", i)})
@@ -687,12 +879,68 @@ func TestCompactKeepsToolCallPair(t *testing.T) {
 	}
 }
 
+func TestCompactShrinksOversizedRecentToolResultAndKeepsArtifactRef(t *testing.T) {
+	ref := artifact.Ref{
+		ID: "sha256:" + strings.Repeat("a", 64), Hash: strings.Repeat("a", 64),
+		OriginalBytes: 20000, StoredBytes: 20000, Complete: true,
+	}
+	content := strings.Repeat("x", 20000) + tools.ArtifactReference(ref)
+	call := llm.ToolCall{ID: "call-1", Type: "function", Function: struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	}{Name: "read", Arguments: `{}`}}
+	msgs := []llm.Message{
+		{Role: "system", Content: "sys"},
+		{Role: "user", Content: "old"},
+		{Role: "assistant", Content: "old answer"},
+		{Role: "user", Content: "recent"},
+		{Role: "assistant", ToolCalls: []llm.ToolCall{call}},
+		{Role: "tool", Content: content, ToolCallID: "call-1", Name: "read", Artifact: &ref},
+	}
+
+	start, tail := compactTail(msgs, 128)
+	if start != 4 || len(tail) != 2 {
+		t.Fatalf("tail = start %d, %d messages; want call/result pair", start, len(tail))
+	}
+	if len(tail[1].Content) >= len(content) {
+		t.Fatal("oversized recent tool result was not shrunk")
+	}
+	if !strings.Contains(tail[1].Content, "preview shrunk during compaction") ||
+		!strings.Contains(tail[1].Content, ref.ID) {
+		t.Fatalf("shrunk result lost its recovery metadata: %q", tail[1].Content)
+	}
+	if len(tail[0].ToolCalls) != 1 || tail[0].ToolCalls[0].ID != tail[1].ToolCallID {
+		t.Fatalf("shrunk tail orphaned tool result: %+v", tail)
+	}
+}
+
+func TestArtifactManifestIncludesOnlyCitedAndRecentRefs(t *testing.T) {
+	cited := artifact.Ref{ID: "sha256:" + strings.Repeat("b", 64), Hash: strings.Repeat("b", 64), OriginalBytes: 20, StoredBytes: 10, Complete: false}
+	omitted := artifact.Ref{ID: "sha256:" + strings.Repeat("c", 64), Hash: strings.Repeat("c", 64), OriginalBytes: 30, StoredBytes: 15, Complete: false}
+	recent := artifact.Ref{ID: "sha256:" + strings.Repeat("d", 64), Hash: strings.Repeat("d", 64), OriginalBytes: 40, StoredBytes: 40, Complete: true}
+	all := []llm.Message{
+		{Role: "tool", Artifact: &cited},
+		{Role: "tool", Artifact: &omitted},
+	}
+	tail := []llm.Message{{Role: "tool", Artifact: &recent}}
+	manifest := buildArtifactManifest("prior work used "+cited.ID, tail, all)
+	if !strings.Contains(manifest, cited.ID) || !strings.Contains(manifest, recent.ID) {
+		t.Fatalf("manifest missing cited/recent refs: %s", manifest)
+	}
+	if strings.Contains(manifest, omitted.ID) {
+		t.Fatalf("manifest included uncited old ref: %s", manifest)
+	}
+	if !strings.Contains(manifest, "head/tail retained; middle omitted") {
+		t.Fatalf("manifest omitted retention state: %s", manifest)
+	}
+}
+
 func TestManualCompactFiresEvent(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`{"choices":[{"message":{"content":"sim"}}]}`))
 	}))
 	defer srv.Close()
-	ag := New(llm.New(srv.URL, "k"), "m", 100, "sys")
+	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
 	for i := 0; i < 8; i++ {
 		ag.Messages = append(ag.Messages,
 			llm.Message{Role: "user", Content: fmt.Sprintf("q%d", i)},

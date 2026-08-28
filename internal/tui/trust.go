@@ -6,11 +6,11 @@ import (
 	"os"
 	"strings"
 
-	"github.com/context-labs/whip/internal/config"
+	"github.com/sacca97/ghg/internal/config"
 )
 
 // checkTrust gates startup on the folder-trust dialog. If the cwd is already
-// trusted (~/.whip/trusted.json), it returns immediately. Otherwise it asks
+// trusted (~/.ghg/trusted.json), it returns immediately. Otherwise it asks
 // on the terminal (plain stdin/stdout — this runs before the TUI starts):
 // Enter or "y" records the path; anything else declines. When stdin isn't
 // a terminal (piped run, tests), we can't ask — decline safely.
@@ -25,12 +25,12 @@ func checkTrust() (bool, error) {
 	st, err := os.Stdin.Stat()
 	if err != nil || st.Mode()&os.ModeCharDevice == 0 {
 		// no terminal to ask on: don't read untrusted files silently
-		return false, fmt.Errorf("folder %s is not trusted (run interactively once to trust it, or add it to ~/.whip/trusted.json)", wd)
+		return false, fmt.Errorf("folder %s is not trusted (run interactively once to trust it, or add it to ~/.ghg/trusted.json)", wd)
 	}
 	fmt.Fprintf(os.Stderr, "\nDo you trust the files in this folder?\n%s\n\n", wd)
-	fmt.Fprintln(os.Stderr, "whip may read files in this folder. Reading untrusted files may lead whip to behave in unexpected ways.")
+	fmt.Fprintln(os.Stderr, "ghg may read files in this folder. Reading untrusted files may lead ghg to behave in unexpected ways.")
 	fmt.Fprintln(os.Stderr, "")
-	fmt.Fprintln(os.Stderr, "With your permission whip may execute files in this folder. Executing untrusted code is unsafe.")
+	fmt.Fprintln(os.Stderr, "With your permission ghg may execute files in this folder. Executing untrusted code is unsafe.")
 	fmt.Fprintln(os.Stderr, "")
 	fmt.Fprint(os.Stderr, "Proceed? [Y/n] ")
 	r := bufio.NewReader(os.Stdin)
