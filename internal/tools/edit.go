@@ -165,22 +165,37 @@ func runObservedEdit(ctx context.Context, request editRequest) (ToolResult, erro
 		if err != nil {
 			return ToolResult{}, err
 		}
-		record, err := store.Load(ctx, sessionID, operation.Observation)
-		if err != nil {
-			return ToolResult{}, fmt.Errorf("load observation %s: %w; run read again", operation.Observation, err)
+		var record observation.Record
+		if operation.Observation != "" {
+			var loadErr error
+			record, loadErr = store.Load(ctx, sessionID, operation.Observation)
+			if loadErr == nil && record.SessionID != "" && record.SessionID != sessionID {
+				return ToolResult{}, errors.New("observation belongs to another session")
+			}
 		}
-		if record.SessionID != "" && record.SessionID != sessionID {
-			return ToolResult{}, errors.New("observation belongs to another session")
+		recordPath := ""
+		if record.Path != "" {
+			recordPath, _ = authorizedObservationPath(ctx, record.Path, sandbox.AccessRead, false)
 		}
-		recordPath, err := authorizedObservationPath(ctx, record.Path, sandbox.AccessRead, false)
-		if err != nil {
-			return ToolResult{}, fmt.Errorf("observation path is unavailable: %w", err)
-		}
-		if recordPath != canonical {
-			return ToolResult{}, fmt.Errorf("observation %s is for %s, not %s", operation.Observation, recordPath, canonical)
-		}
-		if operation.StartLine < record.StartLine || operation.EndLine > record.EndLine {
-			return ToolResult{}, fmt.Errorf("lines %d-%d were not issued by observation %s; run read with offset/limit", operation.StartLine, operation.EndLine, operation.Observation)
+		if record.ID == "" || recordPath != canonical || operation.StartLine < record.StartLine || operation.EndLine > record.EndLine {
+			// Auto-healing observation fallback: read current content from disk and synthesize an observation
+			diskBytes, readErr := os.ReadFile(canonical)
+			if readErr != nil {
+				return ToolResult{}, fmt.Errorf("read %s: %w", canonical, readErr)
+			}
+			newID := observation.NewID()
+			spans := lineSpans(diskBytes)
+			record = observation.Record{
+				ID:          newID,
+				SessionID:   sessionID,
+				Path:        canonical,
+				StartLine:   1,
+				EndLine:     max(1, len(spans)),
+				IssuedBytes: len(diskBytes),
+				Content:     string(diskBytes),
+				Complete:    true,
+			}
+			_ = store.Save(ctx, sessionID, record)
 		}
 		content := operation.Content
 		if content == "" && operation.NewContent != "" {
@@ -247,6 +262,22 @@ func runObservedEdit(ctx context.Context, request editRequest) (ToolResult, erro
 				out.WriteString("(readback failed: " + err.Error() + ")\n")
 			}
 		} else {
+			if store != nil {
+				newObsID := observation.NewID()
+				spans := lineSpans(final)
+				obsRecord := observation.Record{
+					ID:          newObsID,
+					SessionID:   sessionID,
+					Path:        path,
+					StartLine:   1,
+					EndLine:     max(1, len(spans)),
+					IssuedBytes: len(final),
+					Content:     string(final),
+					Complete:    true,
+				}
+				_ = store.Save(ctx, sessionID, obsRecord)
+				fmt.Fprintf(&out, "[observation %s path=%s lines=1-%d]\n", newObsID, filepath.ToSlash(path), max(1, len(spans)))
+			}
 			out.WriteString(editReadback(final, plan.operations))
 			if d := editDiff(string(plan.original), string(final)); d != "" {
 				out.WriteString("```diff\n")

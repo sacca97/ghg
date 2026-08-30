@@ -7,7 +7,7 @@ Go GHG Go
 </pre>
 </div>
 
-An LLM tool-use loop (bash / read / write / edit / task), an interactive
+An LLM tool-use loop (bash / read / write / edit / grep / glob / find_files / lsp / task), an interactive
 bubbletea session, and provider-routable models. One binary, no runtime,
 config you can read.
 
@@ -59,8 +59,10 @@ install script above.
 ## First things to try
 
 ```
-/context-doctor     audit what a fresh session injects, in tokens
+/plan <text>        propose a read-only plan before execution (/execute to run)
 /goal <text>        work until a structured goal update completes it
+/detach             detach the TUI while background streams and tasks keep running
+/context-doctor     audit what a fresh session injects, in tokens
 /model              pick a model — type to filter (new) entries come from the
                     provider catalog, no config needed
 ```
@@ -83,3 +85,12 @@ Highlights:
 - [docs/features.md](docs/features.md) — full feature map, linked to code
   and tests
 - [docs/roadmap.md](docs/roadmap.md) — shipped vs. next, sources cited
+
+## Upstream
+
+This repository is a hard fork of [context-labs/whip](https://github.com/context-labs/whip).
+
+- Base commit: `5b8b9d8297184cf69ca34ccd62a4be91457a8bbc`
+- Fork module: `github.com/sacca97/ghg`
+- Fork binary: `ghg`
+- Fork date: 2026-08-26

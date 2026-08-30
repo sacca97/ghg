@@ -215,7 +215,7 @@ func TestObservedEditRejectsOverlappingRangesWithoutWriting(t *testing.T) {
 func TestByteLimitedReadAuthorizesReturnedWholeLines(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "large.go")
-	content := strings.Repeat(strings.Repeat("x", 500)+"\n", 100)
+	content := strings.Repeat(strings.Repeat("x", 500)+"\n", 200)
 	if err := os.WriteFile(path, []byte(content), 0o640); err != nil {
 		t.Fatal(err)
 	}

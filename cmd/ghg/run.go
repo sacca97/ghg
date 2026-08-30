@@ -403,27 +403,16 @@ func runCLI(args []string) error {
 		return fmt.Errorf("bind session tool state: %w", err)
 	}
 	if store != nil && sessionID != "" {
-		var pendingRaw []llm.Message
 		ev.OnCompactionReady = func(raw []llm.Message, summary string, cutoff int) error {
-			pendingRaw = raw
 			if len(raw) > saved {
 				if err := store.Save(sessionID, saved, raw, modelName, provName); err != nil {
 					return err
 				}
 			}
-			rawCutoff := cutoff
-			if events := store.Compactions(sessionID); len(events) > 0 {
-				firstRaw := 1
-				for firstRaw < len(pendingRaw) && pendingRaw[firstRaw].Role == "system" {
-					firstRaw++
-				}
-				rawCutoff = events[len(events)-1].Cutoff + cutoff - firstRaw
-			}
-			return store.RecordCompaction(sessionID, rawCutoff, summary)
+			return store.RecordCompaction(sessionID, store.RawCutoff(sessionID, cutoff, raw), summary)
 		}
 		ev.OnCompacted = func(_ string, _ int) {
 			saved = len(ag.MessagesSnapshot())
-			pendingRaw = nil
 		}
 	}
 	if *resumeFlag != "" {

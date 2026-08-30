@@ -315,20 +315,43 @@ func (a *Agent) Usage() llm.Usage {
 }
 
 // ContextTokens returns the token size reported for the latest successful
-// conversation request. PromptTokens already includes any provider-reported
-// prompt-cache input, so the context size is simply prompt plus completion.
-// It is zero before a successful assistant response is recorded.
+// conversation request, or estimates current active tokens across all messages
+// if no provider usage has been reported yet (e.g. turn 1 or unmetered streams).
 func (a *Agent) ContextTokens() int {
+	a.msgsMu.Lock()
+	defer a.msgsMu.Unlock()
+	hasAssistant := false
+	for i := len(a.Messages) - 1; i >= 0; i-- {
+		msg := a.Messages[i]
+		if msg.Role == "assistant" {
+			hasAssistant = true
+			if msg.Usage != nil && (msg.Usage.PromptTokens > 0 || msg.Usage.CompletionTokens > 0) {
+				return max(msg.Usage.PromptTokens+msg.Usage.CompletionTokens, 0)
+			}
+		}
+	}
+	if hasAssistant {
+		return EstimateTokens(a.Messages)
+	}
+	return 0
+}
+
+// ActiveTokens returns the projected active token pressure of the conversation:
+// the latest provider-reported base count plus estimated tokens of any
+// messages/tool results appended since that report (or the full estimate if
+// no report exists).
+func (a *Agent) ActiveTokens() int {
 	a.msgsMu.Lock()
 	defer a.msgsMu.Unlock()
 	for i := len(a.Messages) - 1; i >= 0; i-- {
 		msg := a.Messages[i]
-		if msg.Role != "assistant" || msg.Usage == nil {
-			continue
+		if msg.Role == "assistant" && msg.Usage != nil && (msg.Usage.PromptTokens > 0 || msg.Usage.CompletionTokens > 0) {
+			base := max(msg.Usage.PromptTokens+msg.Usage.CompletionTokens, 0)
+			unreported := EstimateTokens(a.Messages[i+1:])
+			return base + unreported
 		}
-		return max(msg.Usage.PromptTokens+msg.Usage.CompletionTokens, 0)
 	}
-	return 0
+	return EstimateTokens(a.Messages)
 }
 
 func New(backend llm.Backend, model string, maxTokens int, systemPrompt string) *Agent {
@@ -865,16 +888,10 @@ func (a *Agent) turn(ctx context.Context, input string, parts []llm.ContentPart,
 		msg.SentAt = &now
 	}
 	a.msgsMu.Lock()
-	if len(a.Messages) > 0 && a.Messages[len(a.Messages)-1].Role == "user" && len(parts) == 0 && len(a.Messages[len(a.Messages)-1].Parts) == 0 {
-		// Previous turn was interrupted before an assistant message was recorded.
-		// Coalesce consecutive user submissions so the model sees the full prompt.
+	if len(a.Messages) > 0 && a.Messages[len(a.Messages)-1].Role == "user" && len(parts) == 0 && (strings.TrimSpace(input) == "continue" || strings.TrimSpace(input) == "Continue") {
+		// User is explicitly asking to continue the prior unanswered prompt.
 		prev := a.Messages[len(a.Messages)-1]
-		if strings.TrimSpace(input) == "continue" || strings.TrimSpace(input) == "Continue" {
-			// User is asking to continue the prior unanswered prompt.
-			msg.Content = prev.Content
-		} else {
-			msg.Content = prev.Content + "\n\n" + input
-		}
+		msg.Content = prev.Content
 		a.Messages[len(a.Messages)-1] = msg
 	} else {
 		a.Messages = append(a.Messages, msg)
@@ -1226,7 +1243,7 @@ func (a *Agent) threshold() float64 {
 // no-ops when the provider didn't advertise a limit (ContextLimit == 0) — the
 // reactive context-limit retry in Turn still covers that case.
 func (a *Agent) maybeCompact(ctx context.Context, ev Events) error {
-	if !a.Checkpointing || a.ContextLimit == 0 || a.ContextTokens() < int(a.threshold()*float64(a.ContextLimit)) {
+	if !a.Checkpointing || a.ContextLimit == 0 || a.ActiveTokens() < int(a.threshold()*float64(a.ContextLimit)) {
 		return nil
 	}
 	took := len(a.Messages)

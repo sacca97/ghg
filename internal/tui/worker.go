@@ -34,98 +34,21 @@ const (
 	workerApprovalEnv = "GHG_WORKER_APPROVAL"
 )
 
-type workerInput struct {
-	Input        string            `json:"input"`
-	Authored     bool              `json:"authored"`
-	Parts        []llm.ContentPart `json:"parts,omitempty"`
-	Goal         *goal.Record      `json:"goal,omitempty"`
-	SystemPrompt string            `json:"system_prompt,omitempty"`
-	At           int               `json:"at"`
-	Snap         string            `json:"snap,omitempty"`
-}
-
-type workerTurnResult struct {
-	Final    string        `json:"final,omitempty"`
-	Error    string        `json:"error,omitempty"`
-	Usage    llm.Usage     `json:"usage"`
-	At       int           `json:"at"`
-	Snap     string        `json:"snap,omitempty"`
-	Messages []llm.Message `json:"messages,omitempty"`
-}
-
-type workerCompactResult struct {
-	Error    string        `json:"error,omitempty"`
-	Usage    llm.Usage     `json:"usage"`
-	Messages []llm.Message `json:"messages,omitempty"`
-}
-
-type workerTaskState struct {
-	ID          string    `json:"id"`
-	Description string    `json:"description"`
-	Prompt      string    `json:"prompt,omitempty"`
-	Status      string    `json:"status"`
-	Report      string    `json:"report,omitempty"`
-	StartedAt   time.Time `json:"started_at"`
-	EndedAt     time.Time `json:"ended_at,omitempty"`
-}
-
-type workerSnapshot struct {
-	SessionID     string            `json:"session_id"`
-	State         workerwire.State  `json:"state"`
-	Detached      bool              `json:"detached"`
-	Model         string            `json:"model"`
-	ModelName     string            `json:"model_name"`
-	Provider      string            `json:"provider"`
-	Role          string            `json:"role,omitempty"`
-	Protocol      string            `json:"protocol,omitempty"`
-	Effort        string            `json:"effort,omitempty"`
-	ContextLimit  int               `json:"context_limit,omitempty"`
-	ContextTokens int               `json:"context_tokens"`
-	Usage         llm.Usage         `json:"usage"`
-	Messages      []llm.Message     `json:"messages,omitempty"`
-	Tasks         []workerTaskState `json:"tasks,omitempty"`
-	Pending       *workerApproval   `json:"pending_approval,omitempty"`
-	ActiveTool    string            `json:"active_tool,omitempty"`
-	LiveText      string            `json:"live_text,omitempty"`
-	LiveThink     string            `json:"live_think,omitempty"`
-	LiveTool      string            `json:"live_tool_output,omitempty"`
-}
-
-type workerApproval struct {
-	ID      string `json:"id"`
-	Tool    string `json:"tool"`
-	Command string `json:"command"`
-	Rule    string `json:"rule"`
-}
-
-type workerApprovalAnswer struct {
-	ID       string `json:"id"`
-	Decision string `json:"decision"`
-	Redirect string `json:"redirect,omitempty"`
-}
-
-type workerConfigureRequest struct {
-	Model        string `json:"model,omitempty"`
-	ModelName    string `json:"model_name,omitempty"`
-	Provider     string `json:"provider,omitempty"`
-	Role         string `json:"role,omitempty"`
-	Protocol     string `json:"protocol,omitempty"`
-	Effort       string `json:"effort,omitempty"`
-	UpdateEffort bool   `json:"update_effort,omitempty"`
-}
-
-type workerPlanRequest struct {
-	Goal string `json:"goal"`
-}
-
-type workerPlanResult struct {
-	Plan  agent.Plan `json:"plan"`
-	Error string     `json:"error,omitempty"`
-}
-
-type workerPermissionRequest struct {
-	Approval workerApproval `json:"approval"`
-}
+// Wire payload shapes live in internal/worker (workerwire); these aliases
+// keep the historical local names readable.
+type (
+	workerInput             = workerwire.Input
+	workerTurnResult        = workerwire.TurnResult
+	workerCompactResult     = workerwire.CompactResult
+	workerTaskState         = workerwire.TaskState
+	workerApproval          = workerwire.Approval
+	workerApprovalAnswer    = workerwire.ApprovalAnswer
+	workerConfigureRequest  = workerwire.ConfigureRequest
+	workerPlanRequest       = workerwire.PlanRequest
+	workerPlanResult        = workerwire.PlanResult
+	workerSnapshot          = workerwire.Snapshot
+	workerPermissionRequest = workerwire.PermissionRequest
+)
 
 type workerEvent struct {
 	Kind string          `json:"kind"`
@@ -147,6 +70,21 @@ func (m *model) startWorkerProcess(cautious bool) error {
 	if err != nil {
 		return err
 	}
+	// A detached worker already owns this session (resume after /detach, or
+	// --resume while one still runs). Attach to it instead of launching a
+	// competitor: the launch would fail its lifetime lock, the monitor would
+	// see the failed process and close the valid client, and the live worker
+	// would read that as an unacknowledged disconnect and cancel its work.
+	if runtimeFile.Live() {
+		client, cerr := m.connectWorker(runtimeFile)
+		if cerr != nil {
+			return cerr
+		}
+		m.workerRuntime = runtimeFile
+		m.workerClient = client
+		m.pumpWorker(client)
+		return nil
+	}
 	if err := runtimeFile.WritePrompt(m.sysPrompt); err != nil {
 		return err
 	}
@@ -154,12 +92,14 @@ func (m *model) startWorkerProcess(cautious bool) error {
 		"GHG_INTERNAL_WORKER": "1",
 		workerSessionEnv:      m.sessionID,
 		workerBaseEnv:         dir,
-		workerCWDEnv:          mustWorkingDirectory(),
-		workerModelEnv:        m.modelName,
-		workerProviderEnv:     m.provName,
-		workerRoleEnv:         m.agent.Role,
-		workerEffortEnv:       m.agent.Effort,
-		workerCautiousEnv:     strconv.FormatBool(cautious),
+		// Captured at launch, which now happens lazily on the first
+		// worker-backed turn — after any /cd the user made.
+		workerCWDEnv:      mustWorkingDirectory(),
+		workerModelEnv:    m.modelName,
+		workerProviderEnv: m.provName,
+		workerRoleEnv:     m.agent.Role,
+		workerEffortEnv:   m.agent.Effort,
+		workerCautiousEnv: strconv.FormatBool(cautious),
 	}
 	if m.cfg != nil && m.cfg.Execution != nil {
 		workerEnv[workerSandboxEnv] = m.cfg.Execution.Sandbox
@@ -171,20 +111,12 @@ func (m *model) startWorkerProcess(cautious bool) error {
 		_ = runtimeFile.RemovePrompt()
 		return err
 	}
-	var client *workerwire.Client
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		client, err = workerwire.Dial(context.Background(), runtimeFile, m.workerLastSeq)
-		if err == nil {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	if client == nil {
+	client, err := m.connectWorker(runtimeFile)
+	if err != nil {
 		_ = proc.Stop()
 		waitProcess(proc, time.Second)
 		_ = runtimeFile.RemovePrompt()
-		return fmt.Errorf("connect worker: %w", err)
+		return err
 	}
 	m.workerProcess = proc
 	m.workerRuntime = runtimeFile
@@ -192,6 +124,23 @@ func (m *model) startWorkerProcess(cautious bool) error {
 	m.pumpWorker(client)
 	m.monitorWorker(proc, runtimeFile)
 	return nil
+}
+
+// connectWorker dials the session socket until the worker serves it (bounded
+// by 5s — enough for a fresh process to reach Serve, short enough that a dead
+// endpoint fails fast).
+func (m *model) connectWorker(runtimeFile workerwire.Runtime) (*workerwire.Client, error) {
+	var client *workerwire.Client
+	var err error
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		client, err = workerwire.Dial(context.Background(), runtimeFile, m.workerLastSeq)
+		if err == nil {
+			return client, nil
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	return nil, err
 }
 
 func (m *model) attachWorkerProcess(sessionID string) error {
@@ -206,16 +155,8 @@ func (m *model) attachWorkerProcess(sessionID string) error {
 	if err != nil {
 		return err
 	}
-	var client *workerwire.Client
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		client, err = workerwire.Dial(context.Background(), runtimeFile, m.workerLastSeq)
-		if err == nil {
-			break
-		}
-		time.Sleep(20 * time.Millisecond)
-	}
-	if client == nil {
+	client, err := m.connectWorker(runtimeFile)
+	if err != nil {
 		return fmt.Errorf("attach worker: %w", err)
 	}
 	m.workerClient = client
@@ -449,6 +390,11 @@ func (m *model) applyWorkerSnapshot(snapshot workerSnapshot) {
 		m.agent.Effort = snapshot.Effort
 		if len(snapshot.Messages) > 0 {
 			m.agent.Messages = append([]llm.Message(nil), snapshot.Messages...)
+			// The snapshot is authoritative: re-render from it so a turn that
+			// finished between the initial DB load and this attach still shows
+			// its completed blocks (and stale tool rows do not linger).
+			m.rebuildTranscript()
+			m.saved = len(m.agent.Messages)
 		}
 	}
 	m.workerState = snapshot.State
@@ -466,6 +412,23 @@ func (m *model) applyWorkerSnapshot(snapshot workerSnapshot) {
 		}
 		if snapshot.LiveThink != "" {
 			m.curThink = snapshot.LiveThink
+		}
+		// Attaching mid-tool-call: restore the running row the protocol
+		// preserves, then feed the bounded live output into it.
+		if snapshot.ActiveTool != "" {
+			id := "attach-active"
+			row := toolStyle.Render("⚒ "+toolVerb(snapshot.ActiveTool)+" ") + dimStyle.Render("(resumed mid-call)")
+			m.blocks = append(m.blocks, block{kind: blockToolRun, text: row, toolID: id, toolRunning: true})
+			if snapshot.LiveTool != "" {
+				for i := len(m.blocks) - 1; i >= 0; i-- {
+					b := &m.blocks[i]
+					if b.kind == blockToolRun && b.toolRunning && b.toolID == id {
+						b.toolOutput = snapshot.LiveTool
+						b.stale = true
+						break
+					}
+				}
+			}
 		}
 		m.refreshVP()
 	}

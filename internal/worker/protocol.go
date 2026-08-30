@@ -37,9 +37,16 @@ const (
 	CommandConfigure = "configure"
 	CommandCompact   = "compact"
 	CommandPlan      = "plan"
-	CommandRetry     = "retry"
 	CommandStop      = "stop"
 	CommandPing      = "ping"
+	// CommandChdir retargets the worker process at the TUI's new working
+	// directory: the worker owns the tools and sandbox, so a TUI-side chdir
+	// alone would leave it reading and editing the original workspace.
+	CommandChdir = "chdir"
+	// CommandAppend appends a local user-role context message to the
+	// worker-owned conversation (or steers the running turn) — the `!` shell
+	// escape output has to reach the model that actually answers next.
+	CommandAppend = "append"
 )
 
 var (
@@ -236,7 +243,7 @@ func knownCommand(name string) bool {
 	switch name {
 	case CommandDetach, CommandCancel, CommandInput, CommandApprove,
 		CommandConfigure, CommandCompact, CommandPlan,
-		CommandRetry, CommandStop, CommandPing:
+		CommandStop, CommandPing, CommandChdir, CommandAppend:
 		return true
 	default:
 		return false

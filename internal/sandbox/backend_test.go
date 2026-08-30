@@ -45,6 +45,12 @@ func TestSeatbeltProfileIsDenyByDefaultAndHonorsNetworkAndProtectedRoots(t *test
 	if !strings.Contains(profile, "(allow file-write* (literal \"/dev/null\"))") {
 		t.Fatal("profile omitted /dev/null file-write* allow")
 	}
+	if !strings.Contains(profile, "(allow file-write* (literal \"/dev/ptmx\"))") {
+		t.Fatal("profile omitted /dev/ptmx file-write* allow")
+	}
+	if !strings.Contains(profile, "(allow network* (local unix-socket))") {
+		t.Fatal("profile omitted unix-socket allow")
+	}
 
 	granted, err := policy.GrantProtected([]string{gitRoot})
 	if err != nil {

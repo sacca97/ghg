@@ -26,6 +26,7 @@ import (
 
 	"github.com/sacca97/ghg/internal/tools"
 	"github.com/sacca97/ghg/internal/tools/bashrun"
+	workerwire "github.com/sacca97/ghg/internal/worker"
 )
 
 // shellDoneMsg reports a finished `!` command: the transcript block and the
@@ -101,6 +102,15 @@ func (m *model) applyShellDone(msg shellDoneMsg) {
 	}
 
 	content := "$ " + msg.cmd + "\n" + msg.out
+	if m.workerClient != nil {
+		// The worker owns the durable conversation; the shadow agent's copy
+		// stays render-only. The worker decides Steer-vs-append by its own
+		// busy state, which is what actually gates the next request.
+		if err := m.workerClient.Send(workerwire.CommandAppend, workerRequestID("append"), workerwire.AppendRequest{Content: content}); err != nil {
+			m.append(errStyle.Render("shell output not shared with the model: " + err.Error()))
+		}
+		return
+	}
 	if m.busy {
 		// mid-turn: the turn goroutine owns Messages; steer injects the output
 		// at the next loop boundary, where OnSteer echoes it to the transcript.
@@ -135,4 +145,11 @@ func (m *model) cdCommand(arg string) {
 		return
 	}
 	m.append(dimStyle.Render("→ " + cwd()))
+	// The worker owns the tools and sandbox; a TUI-side chdir alone leaves it
+	// reading and editing the original workspace under the original policy.
+	if m.workerClient != nil {
+		if err := m.workerClient.Send(workerwire.CommandChdir, workerRequestID("chdir"), cwd()); err != nil {
+			m.append(errStyle.Render("/cd: worker: " + err.Error()))
+		}
+	}
 }

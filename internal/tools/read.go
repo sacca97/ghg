@@ -14,9 +14,9 @@ import (
 )
 
 const (
-	defaultReadLines   = 200
+	defaultReadLines   = 500
 	maxReadLines       = 1000
-	maxReadBytes       = 32 << 10
+	maxReadBytes       = 64 << 10
 	maxReadLineBytes   = 1 << 20
 	maxObservationPath = 4 << 10
 	readHeaderBudget   = 128

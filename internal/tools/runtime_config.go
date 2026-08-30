@@ -168,7 +168,14 @@ func NewConfiguredRuntime(workspace string, cfg *config.ExecutionConfig, headles
 			cacheRoots = appendUniquePath(cacheRoots, canonical)
 		}
 	}
-	configuredTemp = append(configuredTemp, tempRoot)
+	for _, sysTemp := range []string{"/tmp", "/var/tmp"} {
+		if canonical, err := sandbox.CanonicalPath(sysTemp, false); err == nil && canonical != "" {
+			if privateCanonical == "" || !cacheRootsOverlap(canonical, privateCanonical) {
+				configuredTemp = appendUniquePath(configuredTemp, canonical)
+			}
+		}
+	}
+	configuredTemp = appendUniquePath(configuredTemp, tempRoot)
 
 	for key, value := range envOverrides {
 		if canonical, ok := canonicalCachePaths[filepath.Clean(value)]; ok {

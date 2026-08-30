@@ -97,14 +97,7 @@ func workerAttachCLI(args []string) error {
 }
 
 func workerRuntimeLive(runtimeFile workerwire.Runtime) bool {
-	lock, err := runtimeFile.Acquire()
-	if errors.Is(err, workerwire.ErrAlreadyRunning) {
-		return true
-	}
-	if err == nil {
-		_ = lock.Close()
-	}
-	return false
+	return runtimeFile.Live()
 }
 
 func workerStopCLI(args []string) error {

@@ -98,7 +98,7 @@ func seatbeltProfile(p *Policy) string {
 	for _, root := range writeRoots {
 		seatbeltRule(&b, "allow", "file-write*", root)
 	}
-	for _, dev := range []string{"/dev/null", "/dev/zero", "/dev/dtracehelper", "/dev/tty"} {
+	for _, dev := range []string{"/dev/null", "/dev/zero", "/dev/dtracehelper", "/dev/tty", "/dev/ptmx", "/dev/stdin", "/dev/stdout", "/dev/stderr"} {
 		seatbeltLiteralRule(&b, "allow", "file-write*", dev)
 	}
 	// An allow above may include repository metadata because the workspace is
@@ -117,6 +117,9 @@ func seatbeltProfile(p *Policy) string {
 	}
 	if p.NetworkAllowed() {
 		b.WriteString("(allow network*)\n")
+	} else {
+		b.WriteString("(allow network* (local unix-socket))\n")
+		b.WriteString("(allow network* (remote unix-socket))\n")
 	}
 	return b.String()
 }

@@ -173,9 +173,12 @@ unavailable fallback leaves compaction on the conversation's own model.
 
 Token bookkeeping: `llm.Usage` (prompt/completion/cached) is read off the
 terminal stream chunk (`stream_options: include_usage`) and folded into session
-totals via `AddUsage`. The bottom status box shows the latest successful
-assistant request's prompt plus completion tokens; it starts at zero. Compaction
-and subagent calls count toward the cumulative session totals too.
+totals via `AddUsage`. `ContextTokens()` falls back to `EstimateTokens` when unmetered
+or before the first provider response, so the status bar is never stuck at zero.
+`ActiveTokens()` combines base token count with in-flight message/tool estimations,
+triggering `maybeCompact()` proactively before dispatching bloated requests. If a stream
+exceeds context limits mid-generation, an overflow watchdog aborts the stream, compacts,
+and transparently retries the turn.
 
 Commands: `/compact` (compact now), `/compact <model> [provider]` (pick the
 summarizer), `/compact off` (restore the configured `tiny` role, or the legacy
@@ -184,14 +187,18 @@ built-in default). The settings's
 "default (…)" row that restores the default; "Compaction level" steps the
 threshold ←/→.
 
-Tests: `agent_test.go` — `TestTurnAutoCompactsOnContextLimit`,
-`TestCompactDoesNotLoopOnRepeatedContextLimit`, `TestCompactKeepsToolCallPair`,
-`TestProactiveCompactAtFiftyPercent`, `TestCompactThresholdExplicitOverride`,
-`TestUsageAccumulates`; `compact_cmd_test.go` —
-`TestCompactModelEmptyResolvesDefault`, `TestCompactModelDefaultFallsBack`,
-`TestCompactThresholdFor`, `TestSetCompactPct`; `palette_test.go` —
-`TestPaletteCompactPanelAppliesInPlace`,
-`TestPaletteCompactPanelDefaultRowRestores`, `TestPaletteCompactionLevelSteps`.
+### Session-scoped history search and recall
+
+`internal/agent/history.go`, `internal/session/history.go` — historical conversation
+evidence is stored in an append-only rebuildable SQLite FTS5 index. Compaction prunes the
+active context window, but all previous turns remain queryable:
+
+- `history_search` — searches prior user, assistant, and tool messages using full-text
+  search, with optional role/epoch filters and opaque stable cursor pagination.
+- `history_read` — retrieves exact, bounded ranges of raw historical messages formatted as
+  plain untrusted evidence. Historical messages are never re-injected as live protocol messages.
+
+Tests: `internal/agent/history_test.go` and `internal/session/history_test.go`.
 
 ### Recoverable tool-result artifacts
 
@@ -269,6 +276,21 @@ persistence: `session.TestTaskRoundTrip`, `TestRestoreTaskSettledAndVisible`,
 `TestTaskDoneWaitsForSettlementCallbacks`;
 dock click hit-testing: `TestDockClickOpensClickedRow`,
 `TestDockClickIgnoredWhilePaletteOpen`.
+
+### Detachable live sessions (supervisor / worker)
+
+`internal/worker/`, `cmd/ghg/worker_process.go` — interactive sessions run inside a
+dedicated local worker process communicating over a per-session Unix domain socket
+(`~/.ghg/run/<session-id>/worker.sock`) with an exclusive OS lifetime lock.
+
+- `/detach` — gracefully disconnects the TUI interface after an atomic request/acknowledgment
+  handshake. The worker process continues executing active model streams, tools, and background subagents.
+- `ghg ps` — lists all active and idle detached sessions with uptime, model, and status.
+- `ghg attach <id>` — reconnects to a running or idle detached session, reconstructing the full
+  transcript snapshot, live output rings, active roles, and any pending permission approvals.
+- `ghg stop <id>` — requests graceful cancellation and shutdown of a detached session.
+
+Tests: `internal/worker/server_test.go` and `internal/worker/state_test.go`.
 
 ## Models & providers
 

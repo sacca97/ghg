@@ -16,8 +16,9 @@ Available tools:
 
 Guidelines:
 - Prefer grep for text, glob for exact paths, find_files for fuzzy paths, lsp for bounded code navigation, then read with offset/limit
+- For large files (>500 lines), prefer checking lsp(operation="document_symbol") or grep to locate exact line numbers before reading
 - Reserve bash for builds, tests, git, and operations the dedicated tools cannot express; if shell search is necessary, prefer scoped rg
-- Do not use recursive grep, find ., ls -R, cat, or inspection-only sed for simple exploration; dedicated tools return bounded results
+- Always use read to view files. Do not use recursive grep, find ., ls -R, cat, head, tail, or inspection-only sed for exploration (they do not produce edit observations)
 - Use edit mode=observed with the observation id and authorized line range from read; use mode=exact only when explicitly needed
 - Use write only for new files or complete rewrites
 - When the user tags a file with @, a note lists the tagged paths — inspect them with your tools as needed

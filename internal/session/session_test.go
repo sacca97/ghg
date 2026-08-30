@@ -502,3 +502,76 @@ func TestCompactionEvent(t *testing.T) {
 		t.Fatalf("after deleting the event, raw history should load: %+v", got)
 	}
 }
+
+// The agent reports its compaction cutoff in compacted-view coordinates; the
+// store records raw-log coordinates. After an earlier compaction the view no
+// longer lines up with the raw log, so a second compaction must translate —
+// otherwise the recorded cutoff resurrects already-folded messages.
+func TestRawCutoffTranslatesThroughPriorCompaction(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "s.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	id, _ := st.Create("/tmp", "m", "p")
+	// No prior compaction: the cutoff is already raw.
+	if got := st.RawCutoff(id, 4, nil); got != 4 {
+		t.Fatalf("pass-through cutoff: %d, want 4", got)
+	}
+
+	raw := []llm.Message{
+		{Role: "system", Content: "sys"},
+		{Role: "user", Content: "q1"},
+		{Role: "assistant", Content: "a1"},
+		{Role: "user", Content: "q2"},
+		{Role: "assistant", Content: "a2"},
+		{Role: "user", Content: "q3"},
+		{Role: "assistant", Content: "a3"},
+		{Role: "user", Content: "q4"},
+		{Role: "assistant", Content: "a4"},
+	}
+	if err := st.Save(id, 0, raw, "m", "p"); err != nil {
+		t.Fatal(err)
+	}
+	// First compaction folds through raw row 4 (keeps a2 q3 a3 q4 a4).
+	if err := st.RecordCompaction(id, 4, "first"); err != nil {
+		t.Fatal(err)
+	}
+	// The agent's view after it: [sys, summary, a2, q3, a3, q4, a4] — the
+	// summary is a derived system row, not a raw row. A second compaction
+	// whose tail starts at view index 5 (q4) must record raw row 7.
+	view := []llm.Message{
+		{Role: "system", Content: "sys"},
+		{Role: "system", Content: "Summary of the conversation so far:\n\nfirst"},
+		{Role: "assistant", Content: "a2"},
+		{Role: "user", Content: "q3"},
+		{Role: "assistant", Content: "a3"},
+		{Role: "user", Content: "q4"},
+		{Role: "assistant", Content: "a4"},
+	}
+	if got := st.RawCutoff(id, 5, view); got != 7 {
+		t.Fatalf("translated cutoff: %d, want 7", got)
+	}
+	if err := st.RecordCompaction(id, st.RawCutoff(id, 5, view), "second"); err != nil {
+		t.Fatal(err)
+	}
+	// The derived view after the second compaction: summary + the kept tail
+	// q4,a4 — a2/q3/a3 are folded into the second summary, not resurrected.
+	_, got, err := st.Load(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"q4", "a4"}
+	if len(got) != len(want)+2 {
+		t.Fatalf("second-fold view: %d messages, want %d: %+v", len(got), len(want)+2, got)
+	}
+	if !strings.Contains(got[1].Content, "second") {
+		t.Fatalf("second summary missing: %q", got[1].Content)
+	}
+	for i, content := range want {
+		if got[i+2].Content != content {
+			t.Fatalf("second-fold view[%d]: %q, want %q", i+2, got[i+2].Content, content)
+		}
+	}
+}

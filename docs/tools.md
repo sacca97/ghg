@@ -15,18 +15,22 @@ flowchart TB
         BASH["bash<br/>shell commands, global lock,<br/>interactive PTY for sudo"]
         READ["read<br/>bounded observed line ranges"]
         WRITE["write<br/>create/overwrite"]
-        EDIT["edit<br/>observed range edits"]
+        EDIT["edit<br/>observed range edits, auto-healing"]
         GREP["grep<br/>grouped regex search"]
         GLOB["glob<br/>exact path search"]
         FIND["find_files<br/>fuzzy path search"]
+        LSP["lsp<br/>definition, references, symbols, hover"]
+        LSPR["lsp_rename<br/>preview and atomic rename"]
         SUGGEST["suggest<br/>file completions"]
     end
 
-    subgraph agents["agents & planning — internal/agent"]
+    subgraph agents["agents & persistence — internal/agent"]
         TASK["task<br/>subagent, background: true<br/>for concurrent work"]
         TODO["todowrite<br/>conversation-scoped plan,<br/>reinjected each round"]
         ALIST["artifact_list<br/>session-scoped metadata"]
         AREAD["artifact_read<br/>bounded id + byte range"]
+        HSEARCH["history_search<br/>FTS5 session search"]
+        HREAD["history_read<br/>bounded raw history recall"]
     end
 
     subgraph ext["external — internal/mcp"]
@@ -73,16 +77,18 @@ snapshots use the normal artifact path.
 
 ## read observations and edit
 
-`read` returns at most 200 complete numbered lines (1,000 maximum) and a
-32 KiB output budget. It includes an opaque observation id and continuation
+`read` returns at most 500 complete numbered lines (1,000 maximum) and a
+64 KiB output budget. It includes an opaque observation id and continuation
 offset, and stores the exact original line bytes in the session registry. A
 primary `edit` uses `mode: "observed"` with one `edits` array; operations are
-`replace`, `delete`, `insert_before`, or `insert_after` and must target an
-issued range from the same session and canonical path. If surrounding lines
+`replace`, `delete`, `insert_before`, or `insert_after` and target an
+issued range from the same session and canonical path.
+
+If an edit is invoked with a missing or expired observation, `edit` automatically
+reads the current file on disk and synthesizes a fresh observation on the fly (saving
+a full round-trip `read` call). Successful edits automatically emit fresh observation IDs
+in the readback header for zero-roundtrip consecutive fixes. If surrounding lines
 shift, only one exact occurrence of the stored bytes may relocate the range.
-Changed, missing, ambiguous, overlapping, or unobserved ranges fail without
-writing. `mode: "exact"` retains the old unique `old_string` shape as an
-explicit compatibility escape hatch.
 
 Multi-file observed edits preflight immutable originals, permissions, and
 intersections, acquire sorted path locks, stage same-directory temporary files,
@@ -155,12 +161,19 @@ MCP server for other harnesses — the interop works both ways.
 Config styles and management: README §MCP,
 [features.md](features.md#mcp).
 
-## LSP diagnostics
+## LSP navigation and diagnostics
 
-After an `edit` or `write`, gopls diagnostics for the touched file are
-attached to the tool result, so the model sees "this edit broke three
-callers" immediately instead of on the next compile. See
-[features.md](features.md#lsp-diagnostics).
+`lsp` provides fast, in-memory language server navigation:
+- `definition` — jump directly to symbol definition across files.
+- `references` — locate all callers/references of a symbol.
+- `document_symbol` — retrieve a high-level symbol outline of large files without reading the full file.
+- `hover` — inspect types, signatures, and documentation comments.
+
+`lsp_rename` performs safe, cross-file symbol renames with a preview step and atomic locked multi-file publication. After any `edit` or `write`, gopls diagnostics for touched files are attached to the tool result.
+
+## History recall (`history_search` and `history_read`)
+
+`history_search` queries the session's rebuildable SQLite FTS5 index over previous assistant, user, and tool messages with stable cursor pagination. `history_read` retrieves bounded raw message sequences as untrusted evidence without polluting or expanding active prompt context.
 
 ## Read next
 

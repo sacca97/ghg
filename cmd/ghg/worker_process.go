@@ -42,98 +42,21 @@ const (
 	workerApprovalEnv = "GHG_WORKER_APPROVAL"
 )
 
-type workerInput struct {
-	Input        string            `json:"input"`
-	Authored     bool              `json:"authored"`
-	Parts        []llm.ContentPart `json:"parts,omitempty"`
-	Goal         *goalstate.Record `json:"goal,omitempty"`
-	SystemPrompt string            `json:"system_prompt,omitempty"`
-	At           int               `json:"at"`
-	Snap         string            `json:"snap,omitempty"`
-}
-
-type workerTurnResult struct {
-	Final    string        `json:"final,omitempty"`
-	Error    string        `json:"error,omitempty"`
-	Usage    llm.Usage     `json:"usage"`
-	At       int           `json:"at"`
-	Snap     string        `json:"snap,omitempty"`
-	Messages []llm.Message `json:"messages,omitempty"`
-}
-
-type workerCompactResult struct {
-	Error    string        `json:"error,omitempty"`
-	Usage    llm.Usage     `json:"usage"`
-	Messages []llm.Message `json:"messages,omitempty"`
-}
-
-type workerTaskState struct {
-	ID          string    `json:"id"`
-	Description string    `json:"description"`
-	Prompt      string    `json:"prompt,omitempty"`
-	Status      string    `json:"status"`
-	Report      string    `json:"report,omitempty"`
-	StartedAt   time.Time `json:"started_at"`
-	EndedAt     time.Time `json:"ended_at,omitempty"`
-}
-
-type workerApproval struct {
-	ID      string `json:"id"`
-	Tool    string `json:"tool"`
-	Command string `json:"command"`
-	Rule    string `json:"rule"`
-}
-
-type workerApprovalAnswer struct {
-	ID       string `json:"id"`
-	Decision string `json:"decision"`
-	Redirect string `json:"redirect,omitempty"`
-}
-
-type workerConfigureRequest struct {
-	Model        string `json:"model,omitempty"`
-	ModelName    string `json:"model_name,omitempty"`
-	Provider     string `json:"provider,omitempty"`
-	Role         string `json:"role,omitempty"`
-	Protocol     string `json:"protocol,omitempty"`
-	Effort       string `json:"effort,omitempty"`
-	UpdateEffort bool   `json:"update_effort,omitempty"`
-}
-
-type workerPlanRequest struct {
-	Goal string `json:"goal"`
-}
-
-type workerPlanResult struct {
-	Plan  agent.Plan `json:"plan"`
-	Error string     `json:"error,omitempty"`
-}
-
-type workerSnapshot struct {
-	SessionID     string            `json:"session_id"`
-	State         workerwire.State  `json:"state"`
-	Detached      bool              `json:"detached"`
-	Model         string            `json:"model"`
-	ModelName     string            `json:"model_name"`
-	Provider      string            `json:"provider"`
-	Role          string            `json:"role,omitempty"`
-	Protocol      string            `json:"protocol,omitempty"`
-	Effort        string            `json:"effort,omitempty"`
-	ContextLimit  int               `json:"context_limit,omitempty"`
-	ContextTokens int               `json:"context_tokens"`
-	Usage         llm.Usage         `json:"usage"`
-	Messages      []llm.Message     `json:"messages,omitempty"`
-	Tasks         []workerTaskState `json:"tasks,omitempty"`
-	Pending       *workerApproval   `json:"pending_approval,omitempty"`
-	ActiveTool    string            `json:"active_tool,omitempty"`
-	LiveText      string            `json:"live_text,omitempty"`
-	LiveThink     string            `json:"live_think,omitempty"`
-	LiveTool      string            `json:"live_tool_output,omitempty"`
-}
-
-type workerPermissionRequest struct {
-	Approval workerApproval `json:"approval"`
-}
+// Wire payload shapes live in internal/worker (workerwire); these aliases
+// keep the historical local names readable.
+type (
+	workerInput             = workerwire.Input
+	workerTurnResult        = workerwire.TurnResult
+	workerCompactResult     = workerwire.CompactResult
+	workerTaskState         = workerwire.TaskState
+	workerApproval          = workerwire.Approval
+	workerApprovalAnswer    = workerwire.ApprovalAnswer
+	workerConfigureRequest  = workerwire.ConfigureRequest
+	workerPlanRequest       = workerwire.PlanRequest
+	workerPlanResult        = workerwire.PlanResult
+	workerSnapshot          = workerwire.Snapshot
+	workerPermissionRequest = workerwire.PermissionRequest
+)
 
 type workerProcessState struct {
 	mu              sync.Mutex
@@ -594,6 +517,22 @@ func (w *workerProcessState) Command(_ context.Context, command workerwire.Comma
 			return workerwire.CommandResult{}, errors.New("worker is busy or stopping")
 		}
 		return workerwire.CommandResult{Payload: json.RawMessage(`{"accepted":true}`)}, nil
+	case workerwire.CommandChdir:
+		var dir string
+		if err := json.Unmarshal(command.Payload, &dir); err != nil || dir == "" {
+			return workerwire.CommandResult{}, errors.New("worker chdir target is invalid")
+		}
+		if err := os.Chdir(dir); err != nil {
+			return workerwire.CommandResult{}, fmt.Errorf("worker chdir: %w", err)
+		}
+		return workerwire.CommandResult{Payload: json.RawMessage(`{"accepted":true}`)}, nil
+	case workerwire.CommandAppend:
+		var request workerwire.AppendRequest
+		if err := json.Unmarshal(command.Payload, &request); err != nil || strings.TrimSpace(request.Content) == "" {
+			return workerwire.CommandResult{}, errors.New("worker append payload is invalid")
+		}
+		w.appendContent(request.Content)
+		return workerwire.CommandResult{Payload: json.RawMessage(`{"accepted":true}`)}, nil
 	case workerwire.CommandDetach:
 		w.mu.Lock()
 		allowed := w.state == workerwire.StateRunning || w.state == workerwire.StateWaitingApproval
@@ -642,18 +581,32 @@ func (w *workerProcessState) startOperation(detail string, run func(context.Cont
 	go func() {
 		defer w.turns.Done()
 		run(ctx)
-		w.mu.Lock()
-		w.activeCancel = nil
-		w.activeTool = ""
-		detached := w.detached
-		stopping := w.stopRequested
-		w.mu.Unlock()
-		if !stopping {
-			w.setState(workerwire.StateIdle, detached, detail+" finished")
-		}
-		w.clearLive()
+		w.finishOperation(detail)
 	}()
 	return true
+}
+
+// finishOperation is the one completion path for turns and auxiliary
+// operations: reset the active bookkeeping, publish idle, and — when the
+// worker is detached by then — arm the idle-exit grace. Detached planning and
+// compaction previously skipped the idle scheduling that turn completion had,
+// leaving a detached worker alive indefinitely.
+func (w *workerProcessState) finishOperation(detail string) {
+	w.mu.Lock()
+	w.activeCancel = nil
+	w.activeTool = ""
+	detached := w.detached
+	if w.stopRequested {
+		w.mu.Unlock()
+		return
+	}
+	w.state = workerwire.StateIdle
+	w.mu.Unlock()
+	w.setState(workerwire.StateIdle, detached, detail+" finished")
+	w.clearLive()
+	if detached && !w.hasLiveWork() {
+		w.scheduleIdleExit()
+	}
 }
 
 func (w *workerProcessState) runPlan(ctx context.Context, goal string) {
@@ -719,7 +672,7 @@ func (w *workerProcessState) runCompact(ctx context.Context) {
 					return err
 				}
 			}
-			return w.store.RecordCompaction(w.sessionID, cutoff, summary)
+			return w.store.RecordCompaction(w.sessionID, w.store.RawCutoff(w.sessionID, cutoff, messages), summary)
 		},
 		OnCompacted: func(value string, at int) { summary, cutoff = value, at },
 		OnUsage:     func(usage llm.Usage) { w.publish("usage", usage, true) },
@@ -916,7 +869,7 @@ func (w *workerProcessState) runTurn(ctx context.Context, input workerInput) {
 					return err
 				}
 			}
-			return w.store.RecordCompaction(w.sessionID, cutoff, summary)
+			return w.store.RecordCompaction(w.sessionID, w.store.RawCutoff(w.sessionID, cutoff, messages), summary)
 		},
 		OnCompacted: func(summary string, cutoff int) {
 			w.mu.Lock()
@@ -941,17 +894,7 @@ func (w *workerProcessState) runTurn(ctx context.Context, input workerInput) {
 	}
 	w.persist()
 	w.persistGoalTurn(input.Goal, turnUsage, err)
-	w.mu.Lock()
-	w.activeCancel = nil
-	w.activeTool = ""
-	detached := w.detached
-	if w.stopRequested {
-		w.mu.Unlock()
-	} else {
-		w.state = workerwire.StateIdle
-		w.mu.Unlock()
-		w.setState(workerwire.StateIdle, detached, "turn finished")
-	}
+	w.finishOperation("turn")
 	result := workerTurnResult{
 		Final: final, Usage: turnUsage, At: input.At, Snap: input.Snap,
 		Messages: boundedWorkerMessages(w.ag.MessagesSnapshot()),
@@ -960,10 +903,6 @@ func (w *workerProcessState) runTurn(ctx context.Context, input workerInput) {
 		result.Error = err.Error()
 	}
 	w.publish("turn_done", result, true)
-	w.clearLive()
-	if detached && !w.hasLiveWork() {
-		w.scheduleIdleExit()
-	}
 }
 
 func (w *workerProcessState) persist() {
@@ -1049,6 +988,22 @@ func (w *workerProcessState) goalMaxRounds() int {
 		return w.cfg.GoalMaxRounds
 	}
 	return config.DefaultGoalMaxRounds
+}
+
+// appendContent lands local context (a `!` shell escape's output) on the
+// worker-owned conversation: mid-turn it steers so the turn goroutine keeps
+// ownership of Messages; idle it appends directly and persists, because
+// nothing drains a queued steer until the next turn starts.
+func (w *workerProcessState) appendContent(content string) {
+	w.mu.Lock()
+	busy := w.activeCancel != nil
+	w.mu.Unlock()
+	if busy {
+		w.ag.Steer(content)
+		return
+	}
+	w.ag.AppendUser(content)
+	w.persist()
 }
 
 func truncateWorkerGoalNote(value string) string {

@@ -1070,6 +1070,25 @@ func (s *Store) Compactions(id string) []Compaction {
 	return out
 }
 
+// RawCutoff maps an agent-reported compaction cutoff (an index into its
+// current, possibly already-compacted Messages view) to raw-log coordinates so
+// RecordCompaction always names the raw row the kept tail begins at — a second
+// compaction after an earlier one must not resurrect or fold the wrong
+// history. before is the pre-compaction message view; the leading system
+// messages (summary + optional artifact manifest) are derived rows, not raw
+// log rows, so they are skipped when measuring the offset.
+func (s *Store) RawCutoff(id string, cutoff int, before []llm.Message) int {
+	events := s.Compactions(id)
+	if len(events) == 0 {
+		return cutoff
+	}
+	firstRaw := 1
+	for firstRaw < len(before) && before[firstRaw].Role == "system" {
+		firstRaw++
+	}
+	return events[len(events)-1].Cutoff + cutoff - firstRaw
+}
+
 // DeleteCompaction removes one compaction event by generation (retry drops
 // the bad event before re-compacting from the raw log).
 func (s *Store) DeleteCompaction(id string, seq int) error {

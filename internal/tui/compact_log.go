@@ -3,30 +3,11 @@ package tui
 import (
 	"strconv"
 	"strings"
-
-	"github.com/sacca97/ghg/internal/llm"
 )
 
-// Compaction events are recorded in raw-log coordinates so Load never
-// double-folds a summary. The agent reports its cutoff in compacted
-// coordinates (indices into its current Messages); rawCutoff maps that to the
-// raw row the kept tail begins at. The supplied pre-compaction view lets this
-// account for the prior summary and optional artifact manifest without
-// confusing derived system messages with raw rows.
-func (m *model) rawCutoff(cutoff int, before []llm.Message) int {
-	if m.store == nil || m.sessionID == "" {
-		return cutoff
-	}
-	events := m.store.Compactions(m.sessionID)
-	if len(events) == 0 {
-		return cutoff
-	}
-	firstRaw := 1
-	for firstRaw < len(before) && before[firstRaw].Role == "system" {
-		firstRaw++
-	}
-	return events[len(events)-1].Cutoff + cutoff - firstRaw
-}
+// Compaction events are recorded in raw-log coordinates (session.Store.RawCutoff
+// does the translation) so Load never double-folds a summary. The inspection
+// surface below is what makes a bad summary erasable.
 
 // /compact retry — drop the latest compaction event and re-compact from the
 // raw log. This is the whole point of recording compactions as events: a bad

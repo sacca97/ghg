@@ -536,9 +536,12 @@ func runTUI(cfg *config.Config, modelName, provName, sysPrompt, resumeID string,
 	}
 	p := tea.NewProgram(m, opts...)
 	m.prog = p
-	if launchWorker && m.agent != nil && m.store != nil {
-		m.ensureWorker()
-	} else if !launchWorker {
+	// The worker launches lazily on the first worker-backed turn: it captures
+	// GHG_WORKER_CWD and the session store state at launch, so starting it
+	// here froze both before any /cd — and created empty sessions when the
+	// user opened and immediately exited the TUI. The attach-only path still
+	// dials at startup: `ghg attach` exists to show the live worker's state.
+	if !launchWorker {
 		if err := m.attachWorkerProcess(resumeID); err != nil {
 			return "", err
 		}
@@ -1664,7 +1667,6 @@ func (m *model) appendAssistantBlock(s string) {
 
 func (m *model) appendRaw(kind blockKind, text string) {
 	m.blocks = append(m.blocks, block{kind: kind, text: text})
-	m.follow = true
 	m.refreshVP()
 }
 
@@ -2168,6 +2170,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 				}
 			}
+			if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft && msg.Y >= m.height-3 {
+				m.follow = true
+				m.vp.GotoBottom()
+				return m, nil
+			}
 			if scrollMouseWheel(&m.vp, msg) {
 				m.follow = m.vp.AtBottom()
 				return m, nil
@@ -2195,11 +2202,6 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.showThinking {
 			m.flushCurrent() // thinking renders above the answer
 			m.curThink += string(msg)
-			if i := strings.LastIndexByte(m.curThink, '\n'); i >= 0 {
-				done := m.curThink[:i]
-				m.curThink = m.curThink[i+1:]
-				m.appendThink(done)
-			}
 		}
 		return m, nil
 
@@ -3706,8 +3708,17 @@ func (m *model) setThinking(on bool) {
 func (m *model) flushThink() {
 	cur := strings.TrimRight(m.curThink, " \n")
 	m.curThink = ""
-	if cur != "" {
-		m.appendThink(cur)
+	if cur != "" && m.showThinking {
+		lines := strings.Split(cur, "\n")
+		first := strings.TrimSpace(lines[0])
+		if len(first) > 80 {
+			first = first[:77] + "…"
+		}
+		if len(lines) > 1 {
+			m.append(thinkingStyle.Render(fmt.Sprintf("◌ %s (+%d lines)", first, len(lines)-1)))
+		} else {
+			m.append(thinkingStyle.Render("◌ " + first))
+		}
 	}
 	m.inThink = false
 }
@@ -3881,7 +3892,7 @@ func (m *model) submitTurn(text string, authored bool) (tea.Model, tea.Cmd) {
 					}
 				}
 				if m.store != nil && m.sessionID != "" {
-					return m.store.RecordCompaction(m.sessionID, m.rawCutoff(cutoff, raw), summary)
+					return m.store.RecordCompaction(m.sessionID, m.store.RawCutoff(m.sessionID, cutoff, raw), summary)
 				}
 				return nil
 			},
@@ -4104,7 +4115,7 @@ func (m *model) command(text string) (tea.Model, tea.Cmd) {
 						}
 					}
 					if m.store != nil && m.sessionID != "" {
-						return m.store.RecordCompaction(m.sessionID, m.rawCutoff(cutoff, messages), summary)
+						return m.store.RecordCompaction(m.sessionID, m.store.RawCutoff(m.sessionID, cutoff, messages), summary)
 					}
 					return nil
 				},

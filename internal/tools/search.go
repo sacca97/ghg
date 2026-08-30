@@ -26,7 +26,7 @@ import (
 )
 
 const (
-	defaultSearchMaxResults = 25
+	defaultSearchMaxResults = 60
 	maxSearchResults        = 10000
 	maxSearchEntries        = 100000
 	maxBinaryProbeBytes     = 8 << 10
