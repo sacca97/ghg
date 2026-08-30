@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/sacca97/ghg/internal/observation"
+	"github.com/sacca97/ghg/internal/sandbox"
 )
 
 const (
@@ -44,7 +45,7 @@ func runObservedRead(ctx context.Context, args struct {
 		limit = maxReadLines
 	}
 
-	canonical, err := canonicalObservationPath(args.Path)
+	canonical, err := authorizedObservationPath(ctx, args.Path, sandbox.AccessRead, false)
 	if err != nil {
 		return ToolResult{}, err
 	}
@@ -140,6 +141,9 @@ func runObservedRead(ctx context.Context, args struct {
 			return ToolResult{}, fmt.Errorf("persist read observation: %w", err)
 		}
 	}
+	if runtime := RuntimeFromContext(ctx); runtime != nil && runtime.LanguageService != nil {
+		runtime.LanguageService.Warm(ctx, canonical)
+	}
 	result := TextResultWithSize(raw, raw, int64(len(raw)), true, 0)
 	result.Metadata = map[string]string{
 		"observation_id":          id,
@@ -160,18 +164,40 @@ func canonicalObservationPath(name string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("resolve %s: %w", name, err)
 	}
-	info, err := os.Stat(abs)
-	if err != nil {
-		return "", err
-	}
-	if !info.Mode().IsRegular() {
-		return "", fmt.Errorf("%s is not a regular file", name)
-	}
 	canonical, err := filepath.EvalSymlinks(abs)
 	if err != nil {
 		return "", fmt.Errorf("resolve %s: %w", name, err)
 	}
-	return filepath.Clean(canonical), nil
+	canonical = filepath.Clean(canonical)
+	if err := requireRegularFile(canonical, name); err != nil {
+		return "", err
+	}
+	return canonical, nil
+}
+
+func authorizedObservationPath(ctx context.Context, name string, access sandbox.Access, allowMissing bool) (string, error) {
+	if runtime := RuntimeFromContext(ctx); runtime != nil && runtime.Policy != nil {
+		canonical, err := runtime.Policy.Authorize(name, access, allowMissing)
+		if err != nil {
+			return "", err
+		}
+		if err := requireRegularFile(canonical, name); err != nil {
+			return "", err
+		}
+		return canonical, nil
+	}
+	return canonicalObservationPath(name)
+}
+
+func requireRegularFile(path, display string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("%s is not a regular file", display)
+	}
+	return nil
 }
 
 func readCompleteLine(reader *bufio.Reader, limit int) ([]byte, bool, error) {

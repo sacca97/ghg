@@ -2,6 +2,7 @@ package lsp
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -16,6 +18,8 @@ import (
 	"time"
 
 	"github.com/sacca97/ghg/internal/config"
+	"github.com/sacca97/ghg/internal/sandbox"
+	"github.com/sacca97/ghg/internal/tools"
 )
 
 // diagWait caps how long a write/edit tool call blocks for diagnostics
@@ -90,27 +94,51 @@ type Status struct {
 //
 // Concurrency (docs/concurrency.md): spawn dedup is a close-to-broadcast
 // channel per server key (spawning); diagnostic waiters are channels closed
-// by the publish handler, keyed by (path, version) — no per-waiter
+// by the publish handler, keyed by path — no per-waiter
 // goroutines. mu guards the maps only and is never held across I/O; the
 // publish handler runs on the client's read goroutine and only takes mu
 // briefly to swap caches/close waiters.
 type Manager struct {
-	mu       sync.Mutex
-	specs    map[string]ServerSpec
-	clients  map[string]*clientState // key: id + "\x00" + root
-	broken   map[string]string       // key -> error message
-	spawning map[string]chan struct{}
-	diags    map[string][]Diagnostic    // abs path -> latest pushed set
-	waiters  map[string][]chan struct{} // abs path -> pending wakes
-	keyer    spawnKeyer                 // nil = findRoot (production)
-	closed   bool
+	mu          sync.Mutex
+	specs       map[string]ServerSpec
+	clients     map[string]*clientState // key: id + "\x00" + root
+	broken      map[string]string       // key -> error message
+	spawning    map[string]chan struct{}
+	diags       map[string][]Diagnostic    // abs path -> latest pushed set
+	diagSeq     map[string]uint64          // abs path -> push sequence
+	waiters     map[string][]chan struct{} // abs path -> pending wakes
+	keyer       spawnKeyer                 // nil = findRoot (production)
+	closed      bool
+	runtime     *tools.ToolRuntime
+	lifeCtx     context.Context
+	cancel      context.CancelFunc
+	docMu       sync.Mutex
+	warming     map[string]struct{}
+	warmWG      sync.WaitGroup
+	workspace   string
+	renamesMu   sync.Mutex
+	renames     map[string]*renameEntry
+	renameOrder map[string][]string
+}
+
+// SetRuntime attaches the shared restricted process boundary. It should be
+// called before the first file touch; lazy-spawned servers retain it.
+func (m *Manager) SetRuntime(runtime *tools.ToolRuntime) {
+	m.mu.Lock()
+	m.runtime = runtime
+	m.mu.Unlock()
+	if runtime != nil {
+		runtime.LanguageService = m
+	}
 }
 
 type clientState struct {
-	cli  *client
-	cmd  *exec.Cmd
-	root string
-	docs map[string]int // abs path -> last sent version
+	cli              *client
+	cmd              *exec.Cmd
+	root             string
+	docs             map[string]int      // abs path -> last sent version
+	hashes           map[string][32]byte // abs path -> last sent bytes
+	positionEncoding string
 }
 
 // spawnKeyer resolves the spawn key (server id + root) for a file; nil =
@@ -119,14 +147,41 @@ type spawnKeyer func(serverID, abs string, markers []string) string
 
 // NewManager builds a manager from merged specs (see FromConfigMap).
 func NewManager(specs map[string]ServerSpec) *Manager {
+	lifeCtx, cancel := context.WithCancel(context.Background())
 	return &Manager{
-		specs:    specs,
-		clients:  map[string]*clientState{},
-		broken:   map[string]string{},
-		spawning: map[string]chan struct{}{},
-		diags:    map[string][]Diagnostic{},
-		waiters:  map[string][]chan struct{}{},
+		specs:       specs,
+		clients:     map[string]*clientState{},
+		broken:      map[string]string{},
+		spawning:    map[string]chan struct{}{},
+		diags:       map[string][]Diagnostic{},
+		diagSeq:     map[string]uint64{},
+		waiters:     map[string][]chan struct{}{},
+		lifeCtx:     lifeCtx,
+		cancel:      cancel,
+		warming:     map[string]struct{}{},
+		renames:     map[string]*renameEntry{},
+		renameOrder: map[string][]string{},
 	}
+}
+
+// SetWorkspace supplies the canonical workspace used for rename containment
+// when a manager is used without a ToolRuntime (primarily focused tests).
+func (m *Manager) SetWorkspace(workspace string) error {
+	canonical, err := canonicalDocumentPath(workspace)
+	if err != nil {
+		return err
+	}
+	info, err := os.Stat(canonical)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return errors.New("LSP workspace is not a directory")
+	}
+	m.mu.Lock()
+	m.workspace = canonical
+	m.mu.Unlock()
+	return nil
 }
 
 // WaitDiagnostics touches path (didOpen/didChange at current disk content),
@@ -143,127 +198,69 @@ func (m *Manager) WaitDiagnostics(ctx context.Context, path string) string {
 	if m == nil {
 		return ""
 	}
-	abs, err := filepath.Abs(path)
+	abs, err := documentPath(path)
 	if err != nil {
 		return ""
 	}
-	cs, err := m.clientFor(ctx, abs)
-	if err != nil || cs == nil {
+	m.mu.Lock()
+	beforeSeq := m.diagSeq[abs]
+	m.mu.Unlock()
+	syncResult, err := m.syncDocument(ctx, abs)
+	if err != nil || syncResult.client == nil {
 		return ""
 	}
-	data, err := os.ReadFile(abs)
-	if err != nil {
-		return ""
+	if !syncResult.changed && beforeSeq != 0 {
+		m.mu.Lock()
+		siblings := siblingErrors(abs, m.diags)
+		edited := append([]Diagnostic(nil), m.diags[abs]...)
+		m.mu.Unlock()
+		return Report(abs, edited, siblings)
 	}
-
-	// Snapshot the edited file's diagnostics up front; the wait below runs
-	// until a push for this file arrives (any push: even an identical
-	// diagnostic list proves the server re-evaluated this content) or the
-	// budget/ctx expires. Related pushes (sibling files) are batched by the
-	// server, so they're in the cache by the time the edited file's push
-	// wakes us.
+	// A sequence counter closes the small race between a synchronous server
+	// push and waiter registration without retaining a second document waiter
+	// protocol. The document mutex only serializes sync state and notifications.
+	wch := make(chan struct{})
 	m.mu.Lock()
 	if m.closed {
 		m.mu.Unlock()
 		return ""
 	}
-	before, hadBefore := m.diags[abs]
-	cs.docs[abs]++
-	version := cs.docs[abs]
-	wch := make(chan struct{})
-	pushed := false
-	m.waiters[abs] = append(m.waiters[abs], wch)
-	m.mu.Unlock()
-	defer func() {
-		m.mu.Lock()
-		delete(m.waiters, abs)
-		m.mu.Unlock()
-	}()
-
-	uri := fileURI(abs)
-	if version == 1 {
-		cs.cli.notify("textDocument/didOpen", map[string]any{
-			"textDocument": map[string]any{
-				// languageId: servers match on extension anyway; gopls only
-				// accepts "go". Trim the dot and go.
-				"uri": uri, "languageId": strings.TrimPrefix(filepath.Ext(abs), "."), "version": version, "text": string(data),
-			},
-		})
+	if m.diagSeq[abs] != beforeSeq {
+		wch = nil
 	} else {
-		cs.cli.notify("textDocument/didChange", map[string]any{
-			"textDocument":   map[string]any{"uri": uri, "version": version},
-			"contentChanges": []map[string]any{{"text": string(data)}},
-		})
+		m.waiters[abs] = append(m.waiters[abs], wch)
 	}
-
+	m.mu.Unlock()
 	deadline := time.Now().Add(diagWait)
-	for {
-		m.mu.Lock()
-		edited, ok := m.diags[abs]
-		m.mu.Unlock()
-		// A push that arrived since snapshot — whether or not the message
-		// list differs (a clean file pushes an identical empty list) — means
-		// the server evaluated this exact content. Related pushes (sibling
-		// files) usually batch, but frames can land a tick apart: give
-		// trailing pushes one more wake or up to 50ms before rendering so
-		// sibling errors make the same tool result.
-		arrived := pushed || ok != hadBefore || !diagsEqual(before, edited)
-		if arrived {
-			// One grace window, then out: the select below consumes a push
-			// that arrives during the window, so no second-arrival loop
-			// iteration is needed (and none happens — the path always breaks).
-			m.mu.Lock()
-			wch = make(chan struct{})
-			m.waiters[abs] = append(m.waiters[abs], wch)
-			m.mu.Unlock()
-			graceFor := min(50*time.Millisecond, time.Until(deadline)) // cap is a cap
-			grace := time.NewTimer(graceFor)
+	if wch != nil {
+		defer m.removeWaiter(abs, wch)
+		remain := time.Until(deadline)
+		if remain > 0 {
+			timer := time.NewTimer(remain)
 			select {
 			case <-wch:
-				grace.Stop()
+				timer.Stop()
 				m.mu.Lock()
 				closing := m.closed
 				m.mu.Unlock()
 				if closing {
 					return ""
 				}
-				// The push that woke the grace window is the one the wait
-				// exists for; the grace path breaks below either way, so no
-				// pushed = true re-marking is needed here.
+			case <-ctx.Done():
+				timer.Stop()
+				return ""
+			case <-timer.C:
+			}
+		}
+		graceFor := min(50*time.Millisecond, max(time.Until(deadline), 0))
+		if graceFor > 0 {
+			grace := time.NewTimer(graceFor)
+			select {
 			case <-ctx.Done():
 				grace.Stop()
 				return ""
 			case <-grace.C:
 			}
-			break
-		}
-		remain := time.Until(deadline)
-		if remain <= 0 {
-			break
-		}
-		timer := time.NewTimer(remain)
-		select {
-		case <-wch:
-			timer.Stop()
-			// Manager.Close also closes waiter channels — that wake is a
-			// shutdown signal, not a push.
-			m.mu.Lock()
-			closing := m.closed
-			m.mu.Unlock()
-			if closing {
-				return ""
-			}
-			pushed = true
-			// publish closed and removed this waiter; register a fresh one
-			// for the next push before re-checking the cache.
-			m.mu.Lock()
-			wch = make(chan struct{})
-			m.waiters[abs] = append(m.waiters[abs], wch)
-			m.mu.Unlock()
-		case <-ctx.Done():
-			timer.Stop()
-			return ""
-		case <-timer.C:
 		}
 	}
 
@@ -274,18 +271,186 @@ func (m *Manager) WaitDiagnostics(ctx context.Context, path string) string {
 	return Report(abs, edited, siblings)
 }
 
+func (m *Manager) removeWaiter(path string, wanted chan struct{}) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	waiters := m.waiters[path]
+	for i, waiter := range waiters {
+		if waiter != wanted {
+			continue
+		}
+		waiters = append(waiters[:i], waiters[i+1:]...)
+		if len(waiters) == 0 {
+			delete(m.waiters, path)
+		} else {
+			m.waiters[path] = waiters
+		}
+		return
+	}
+}
+
+type documentSync struct {
+	client  *client
+	path    string
+	root    string
+	data    []byte
+	version int
+	changed bool
+	key     string
+}
+
+func canonicalDocumentPath(name string) (string, error) {
+	abs, err := filepath.Abs(name)
+	if err != nil {
+		return "", err
+	}
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Clean(resolved), nil
+}
+
+func documentPath(name string) (string, error) {
+	abs, err := filepath.Abs(name)
+	if err != nil {
+		return "", err
+	}
+	return filepath.Clean(abs), nil
+}
+
+// syncDocument reads the exact current bytes and sends didOpen once, then
+// didChange only when their SHA-256 changes. The coarse mutex is intentional:
+// LSP document versions and notifications must stay ordered across concurrent
+// navigation calls, and this avoids a per-document state machine.
+func (m *Manager) syncDocument(ctx context.Context, path string) (documentSync, error) {
+	abs, err := documentPath(path)
+	if err != nil {
+		return documentSync{}, err
+	}
+	data, err := os.ReadFile(abs)
+	if err != nil {
+		return documentSync{}, err
+	}
+	cs, err := m.clientFor(ctx, abs)
+	if err != nil {
+		return documentSync{}, err
+	}
+	if cs == nil {
+		return documentSync{path: abs, data: data}, nil
+	}
+	key := m.clientKey(cs)
+	hash := sha256.Sum256(data)
+	m.docMu.Lock()
+	defer m.docMu.Unlock()
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return documentSync{}, context.Canceled
+	}
+	if cs.docs == nil {
+		cs.docs = make(map[string]int)
+	}
+	if cs.hashes == nil {
+		cs.hashes = make(map[string][32]byte)
+	}
+	version := cs.docs[abs]
+	previous, hadPrevious := cs.hashes[abs]
+	changed := !hadPrevious || previous != hash
+	if changed {
+		version++
+		cs.docs[abs] = version
+		cs.hashes[abs] = hash
+	}
+	m.mu.Unlock()
+	if !changed {
+		return documentSync{client: cs.cli, path: abs, root: cs.root, data: data, version: version, key: key}, nil
+	}
+	uri := fileURI(abs)
+	if version == 1 {
+		cs.cli.notify("textDocument/didOpen", map[string]any{
+			"textDocument": map[string]any{
+				"uri": uri, "languageId": strings.TrimPrefix(filepath.Ext(abs), "."), "version": version, "text": string(data),
+			},
+		})
+	} else {
+		cs.cli.notify("textDocument/didChange", map[string]any{
+			"textDocument":   map[string]any{"uri": uri, "version": version},
+			"contentChanges": []map[string]any{{"text": string(data)}},
+		})
+	}
+	return documentSync{client: cs.cli, path: abs, root: cs.root, data: data, version: version, changed: true, key: key}, nil
+}
+
+func (m *Manager) clientKey(want *clientState) string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for key, cs := range m.clients {
+		if cs == want {
+			return key
+		}
+	}
+	return ""
+}
+
+// Warm starts a covered document sync without delaying a successful read.
+// Warm-ups use the manager lifetime rather than a tool-call context, so a
+// transient read cancellation cannot leak or abandon a language-server child.
+func (m *Manager) Warm(_ context.Context, path string) {
+	if m == nil {
+		return
+	}
+	abs, err := canonicalDocumentPath(path)
+	if err != nil || !m.covered(abs) {
+		return
+	}
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return
+	}
+	if _, ok := m.warming[abs]; ok {
+		m.mu.Unlock()
+		return
+	}
+	m.warming[abs] = struct{}{}
+	lifeCtx := m.lifeCtx
+	m.warmWG.Add(1)
+	m.mu.Unlock()
+	go func() {
+		defer m.warmWG.Done()
+		defer func() {
+			m.mu.Lock()
+			delete(m.warming, abs)
+			m.mu.Unlock()
+		}()
+		ctx, cancel := context.WithTimeout(lifeCtx, 2*time.Second)
+		defer cancel()
+		_, _ = m.syncDocument(ctx, abs)
+	}()
+}
+
+func (m *Manager) covered(path string) bool {
+	ext := filepath.Ext(path)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, spec := range m.specs {
+		if spec.Disabled || len(spec.Command) == 0 {
+			continue
+		}
+		for _, supported := range spec.Extensions {
+			if supported == ext {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // diagsEqual compares two diagnostic sets (order-sensitive: servers push
 // ordered lists).
 func diagsEqual(a, b []Diagnostic) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
+	return slices.Equal(a, b)
 }
 
 // clientFor resolves a client for the file, spawning on demand. Spawn dedup:
@@ -297,7 +462,13 @@ func (m *Manager) clientFor(ctx context.Context, abs string) (*clientState, erro
 	var name string
 	var spec ServerSpec
 	m.mu.Lock()
-	for n, s := range m.specs {
+	names := make([]string, 0, len(m.specs))
+	for n := range m.specs {
+		names = append(names, n)
+	}
+	sort.Strings(names)
+	for _, n := range names {
+		s := m.specs[n]
 		for _, e := range s.Extensions {
 			if e == ext {
 				name, spec = n, s
@@ -318,6 +489,10 @@ func (m *Manager) clientFor(ctx context.Context, abs string) (*clientState, erro
 	}
 
 	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return nil, context.Canceled
+	}
 	key := name + "\x00" + root
 	if cs, ok := m.clients[key]; ok {
 		m.mu.Unlock()
@@ -336,10 +511,16 @@ func (m *Manager) clientFor(ctx context.Context, abs string) (*clientState, erro
 		}
 		m.mu.Lock()
 		defer m.mu.Unlock()
+		if m.closed {
+			return nil, context.Canceled
+		}
 		if cs, ok := m.clients[key]; ok {
 			return cs, nil
 		}
-		return nil, errors.New(m.broken[key])
+		if msg, ok := m.broken[key]; ok {
+			return nil, errors.New(msg)
+		}
+		return nil, errors.New("language server failed to start")
 	}
 	ch := make(chan struct{})
 	m.spawning[key] = ch
@@ -349,6 +530,14 @@ func (m *Manager) clientFor(ctx context.Context, abs string) (*clientState, erro
 
 	m.mu.Lock()
 	delete(m.spawning, key)
+	if m.closed {
+		close(ch) // wake deduped callers before killing the late child
+		m.mu.Unlock()
+		if cs != nil {
+			cs.kill()
+		}
+		return nil, context.Canceled
+	}
 	if err != nil {
 		// A caller-side cancel (ctrl+c mid-spawn) must not poison the server:
 		// the process may be fine. Only genuine spawn/handshake failures are
@@ -369,11 +558,28 @@ func (m *Manager) spawn(ctx context.Context, key, name string, spec ServerSpec, 
 	if _, err := exec.LookPath(spec.Command[0]); err != nil {
 		return nil, fmt.Errorf("%s not on PATH", spec.Command[0])
 	}
-	cmd := exec.Command(spec.Command[0], spec.Command[1:]...)
-	cmd.Dir = root
-	cmd.Env = os.Environ()
-	for k, v := range spec.Env {
-		cmd.Env = append(cmd.Env, k+"="+v)
+	m.mu.Lock()
+	runtime := m.runtime
+	m.mu.Unlock()
+	var cmd *exec.Cmd
+	if runtime != nil && runtime.Policy != nil {
+		wrapped, err := runtime.WrapCommand(sandbox.CommandSpec{
+			Program: spec.Command[0], Args: spec.Command[1:], Dir: root,
+			Env: runtime.ChildEnv(runtime.SafeExplicitEnv(spec.Env)),
+		})
+		if err != nil {
+			return nil, err
+		}
+		cmd = exec.Command(wrapped.Program, wrapped.Args...)
+		cmd.Dir = wrapped.Dir
+		cmd.Env = wrapped.Env
+	} else {
+		cmd = exec.Command(spec.Command[0], spec.Command[1:]...)
+		cmd.Dir = root
+		cmd.Env = os.Environ()
+		for k, v := range spec.Env {
+			cmd.Env = append(cmd.Env, k+"="+v)
+		}
 	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true} // own group: kills take the tree
 	stdin, err := cmd.StdinPipe()
@@ -389,7 +595,7 @@ func (m *Manager) spawn(ctx context.Context, key, name string, spec ServerSpec, 
 		return nil, err
 	}
 
-	cs := &clientState{cmd: cmd, root: root, docs: map[string]int{}}
+	cs := &clientState{cmd: cmd, root: root, docs: map[string]int{}, hashes: map[string][32]byte{}}
 	cs.cli = newClient(stdin, stdout, func(uri string, version int, diags []Diagnostic) {
 		m.publish(key, uri, version, diags)
 	})
@@ -399,6 +605,11 @@ func (m *Manager) spawn(ctx context.Context, key, name string, spec ServerSpec, 
 	// ponytail: didChange always sends full text, which gopls (and every
 	// server worth configuring) accepts; if a stricter server ever rejects
 	// it, parse capabilities.textDocumentSync.change from the result.
+	var initResult struct {
+		Capabilities struct {
+			PositionEncoding string `json:"positionEncoding"`
+		} `json:"capabilities"`
+	}
 	err = cs.cli.request(initCtx, "initialize", map[string]any{
 		"processId": os.Getpid(),
 		"rootUri":   fileURI(root),
@@ -410,12 +621,22 @@ func (m *Manager) spawn(ctx context.Context, key, name string, spec ServerSpec, 
 				"synchronization":    map[string]any{"didOpen": true, "didChange": true},
 				"publishDiagnostics": map[string]any{"versionSupport": true},
 			},
+			"general": map[string]any{"positionEncodings": []string{"utf-16"}},
 		},
-	}, nil)
+	}, &initResult)
 	if err != nil {
 		cs.kill()
 		return nil, fmt.Errorf("initialize: %w", err)
 	}
+	encoding := strings.ToLower(strings.TrimSpace(initResult.Capabilities.PositionEncoding))
+	if encoding == "" {
+		encoding = "utf-16"
+	}
+	if encoding != "utf-16" {
+		cs.kill()
+		return nil, fmt.Errorf("initialize: unsupported LSP position encoding %q (only utf-16 is supported)", encoding)
+	}
+	cs.positionEncoding = encoding
 	cs.cli.notify("initialized", map[string]any{})
 	return cs, nil
 }
@@ -434,6 +655,7 @@ func (m *Manager) publish(key, uri string, version int, diags []Diagnostic) {
 		return
 	}
 	m.diags[path] = diags
+	m.diagSeq[path]++
 	// Wake everyone waiting on this file regardless of push version: a stale
 	// push is harmless (the waiter re-checks the cache and re-registers), a
 	// missed one costs the full timeout. (ponytail: version matching could
@@ -476,12 +698,22 @@ func (m *Manager) Statuses() []Status {
 // Close shuts every server down (shutdown/exit then kill) and wakes all
 // waiters. Called on ghg exit before bashrun.KillAll, mirroring mcpMgr.
 func (m *Manager) Close() {
+	if m == nil {
+		return
+	}
+	if m.cancel != nil {
+		m.cancel()
+	}
 	m.mu.Lock()
 	if m.closed {
 		m.mu.Unlock()
 		return
 	}
 	m.closed = true
+	m.renamesMu.Lock()
+	m.renames = map[string]*renameEntry{}
+	m.renameOrder = map[string][]string{}
+	m.renamesMu.Unlock()
 	clients := make([]*clientState, 0, len(m.clients))
 	for _, cs := range m.clients {
 		clients = append(clients, cs)
@@ -496,6 +728,7 @@ func (m *Manager) Close() {
 	for _, cs := range clients {
 		cs.kill()
 	}
+	m.warmWG.Wait()
 }
 
 // kill tries the polite LSP shutdown then SIGKILLs the process group.
@@ -545,7 +778,7 @@ func fileURI(path string) string {
 // containing a literal % would corrupt or drop).
 func uriPath(uri string) string {
 	u, err := url.Parse(uri)
-	if err != nil || u.Scheme != "file" {
+	if err != nil || u.Scheme != "file" || (u.Host != "" && u.Host != "localhost") {
 		return ""
 	}
 	return u.Path

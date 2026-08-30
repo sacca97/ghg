@@ -88,14 +88,14 @@ Prompt.
 
 func TestSubagentGuidanceMatchesBoundedExplorationTools(t *testing.T) {
 	prompt := subagentPrompt()
-	for _, fragment := range []string{"grep", "glob", "find_files", "bounded read", "observed edit ranges"} {
+	for _, fragment := range []string{"grep", "glob", "find_files", "lsp", "lsp_rename", "bounded read", "observed edit ranges"} {
 		if !strings.Contains(prompt, fragment) {
 			t.Errorf("subagent prompt lacks %q: %s", fragment, prompt)
 		}
 	}
 	parent := New(nil, "model", 100, "system")
 	description := taskTool(parent).Def.Function.Description
-	for _, fragment := range []string{"grep", "glob", "find_files", "observed edit ranges"} {
+	for _, fragment := range []string{"grep", "glob", "find_files", "lsp", "lsp_rename", "observed edit ranges"} {
 		if !strings.Contains(description, fragment) {
 			t.Errorf("task description lacks %q: %s", fragment, description)
 		}
@@ -121,12 +121,12 @@ func TestRunDefinitionStopsAtSubmitPlanAndReportsTelemetry(t *testing.T) {
 	if result.TerminalName != "submit_plan" || string(result.TerminalArgs) != args {
 		t.Fatalf("terminal result = %+v", result)
 	}
-	if len(backend.requests) != 1 || len(backend.requests[0].Tools) != 4 {
+	if len(backend.requests) != 1 || len(backend.requests[0].Tools) != 5 {
 		t.Fatalf("planner request/tools = %d/%d", len(backend.requests), len(backend.requests[0].Tools))
 	}
 	for _, tool := range backend.requests[0].Tools {
 		switch tool.Function.Name {
-		case "read", "grep", "glob", "submit_plan":
+		case "read", "grep", "glob", "lsp", "submit_plan":
 		default:
 			t.Fatalf("unexpected planner tool %q", tool.Function.Name)
 		}

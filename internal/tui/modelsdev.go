@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"slices"
 	"strings"
 
 	"github.com/sacca97/ghg/internal/config"
@@ -125,7 +126,7 @@ func enrichCatalogMetadata(cat config.Catalog, metadata config.ModelsDevCache, p
 			continue
 		}
 		if !cat.Models[i].ReasoningKnown && len(cat.Models[i].ReasoningEfforts) == 0 {
-			cat.Models[i].ReasoningEfforts = append([]string(nil), info.Efforts...)
+			cat.Models[i].ReasoningEfforts = slices.Clone(info.Efforts)
 			cat.Models[i].ReasoningKnown = true
 			changed = true
 		}

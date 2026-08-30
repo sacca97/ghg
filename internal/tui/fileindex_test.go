@@ -18,7 +18,7 @@ func chdir(t *testing.T) string {
 	currentRoot = func() (string, error) { return dir, nil }
 	t.Cleanup(func() { currentRoot = old })
 	fileIndex.Lock()
-	fileIndex.root, fileIndex.files, fileIndex.builtAt = "", nil, time.Time{}
+	fileIndex.root, fileIndex.builtAt = "", time.Time{}
 	fileIndex.Unlock()
 	return dir
 }

@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"slices"
 	"strings"
 
 	"github.com/sacca97/ghg/internal/config"
@@ -52,7 +53,7 @@ func (m *model) effortsFor() []string {
 				if strings.EqualFold(e, "none") || strings.EqualFold(e, "off") || e == "" {
 					continue // "none"/"off" are our off ("")
 				}
-				if !contains(out, e) {
+				if !slices.Contains(out, e) {
 					out = append(out, e)
 				}
 			}
@@ -114,17 +115,8 @@ func (m *model) updateCatalogs(cats map[string]config.Catalog) {
 	if n := m.contextLimitFor(m.provName, m.agent.Model); n != m.agent.ContextLimit {
 		m.agent.ContextLimit = n // /models is the source of truth
 	}
-	if !contains(m.effortsFor(), m.agent.Effort) {
+	if !slices.Contains(m.effortsFor(), m.agent.Effort) {
 		m.resetEffort("")
 		m.append(dimStyle.Render("⚡ effort reset to off: not supported by " + m.agent.Model))
 	}
-}
-
-func contains(xs []string, x string) bool {
-	for _, e := range xs {
-		if e == x {
-			return true
-		}
-	}
-	return false
 }

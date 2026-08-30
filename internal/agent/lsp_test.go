@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -45,10 +46,8 @@ func TestLSPDiagnosticsReachModel(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	tools.LSP = stubWaiter{block: "\n\n<diagnostics file=\"" + target + "\">\nERROR [2:3] undefined: foo\n</diagnostics>"}
-	defer func() { tools.LSP = nil }()
-
 	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
+	ag.Runtime = &tools.ToolRuntime{LanguageService: stubWaiter{block: "\n\n<diagnostics file=\"" + target + "\">\nERROR [2:3] undefined: foo\n</diagnostics>"}}
 	if _, err := ag.Turn(context.Background(), "write the file", Events{}); err != nil {
 		t.Fatal(err)
 	}
@@ -60,6 +59,20 @@ func TestLSPDiagnosticsReachModel(t *testing.T) {
 type stubWaiter struct{ block string }
 
 func (s stubWaiter) WaitDiagnostics(ctx context.Context, path string) string { return s.block }
+func (stubWaiter) Warm(context.Context, string)                              {}
+func (stubWaiter) Navigate(context.Context, tools.NavigationRequest) (tools.NavigationResult, error) {
+	return tools.NavigationResult{}, errors.New("not implemented")
+}
+func (stubWaiter) PreviewRename(context.Context, tools.RenameRequest) (tools.RenamePreview, error) {
+	return tools.RenamePreview{}, errors.New("not implemented")
+}
+func (stubWaiter) LookupRename(context.Context, string, string) (tools.RenamePlan, error) {
+	return tools.RenamePlan{}, errors.New("not implemented")
+}
+func (stubWaiter) ValidateRename(context.Context, tools.RenamePlan) error {
+	return errors.New("not implemented")
+}
+func (stubWaiter) ConsumeRename(context.Context, string, string) error { return nil }
 
 func jsonString(s string) string {
 	b, _ := json.Marshal(s)

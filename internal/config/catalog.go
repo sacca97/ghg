@@ -56,10 +56,8 @@ func (c Catalog) SupportsVision(id string) (vision, found bool) {
 // ContextLength reports the advertised context window for a model id
 // (0 when the catalog has no entry for it — callers must fall back).
 func (c Catalog) ContextLength(id string) int {
-	for _, mi := range c.Models {
-		if mi.ID == id {
-			return mi.ContextLength
-		}
+	if mi := c.Find(id); mi != nil {
+		return mi.ContextLength
 	}
 	return 0
 }
@@ -67,10 +65,8 @@ func (c Catalog) ContextLength(id string) int {
 // MaxCompletionTokens reports the advertised output-token cap for a model id
 // (0 when unknown — callers must fall back to the configured context).
 func (c Catalog) MaxCompletionTokens(id string) int {
-	for _, mi := range c.Models {
-		if mi.ID == id {
-			return mi.MaxCompletionTokens
-		}
+	if mi := c.Find(id); mi != nil {
+		return mi.MaxCompletionTokens
 	}
 	return 0
 }
@@ -79,10 +75,8 @@ func (c Catalog) MaxCompletionTokens(id string) int {
 // false when the catalog has no entry for it or the entry has no prices, in
 // which case callers should hide cost rather than show $0.
 func (c Catalog) Pricing(id string) (in, out, cacheRead float64, ok bool) {
-	for _, mi := range c.Models {
-		if mi.ID == id {
-			return mi.InPrice, mi.OutPrice, mi.CacheReadPrice, mi.InPrice > 0 || mi.OutPrice > 0
-		}
+	if mi := c.Find(id); mi != nil {
+		return mi.InPrice, mi.OutPrice, mi.CacheReadPrice, mi.InPrice > 0 || mi.OutPrice > 0
 	}
 	return 0, 0, 0, false
 }

@@ -3,6 +3,7 @@ package tui
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 )
@@ -31,7 +32,7 @@ func completionTable() []cand {
 // execNow lists commands the menu runs immediately on enter (they act
 // sensibly with no arguments); others insert themselves for arguments.
 var execNow = map[string]bool{
-	"/clear": true, "/compact": true, "/context-doctor": true, "/effort": true, "/goal": true, "/goal-from-context": true, "/help": true,
+	"/clear": true, "/compact": true, "/context-doctor": true, "/detach": true, "/effort": true, "/goal": true, "/goal-from-context": true, "/help": true,
 	"/execute": true, "/mcp": true, "/model": true, "/mouse": true, "/pwd": true, "/quit": true, "/report": true, "/resume": true, "/tasks": true,
 }
 
@@ -104,7 +105,7 @@ func filterPrefix(all []cand, prefix string) []cand {
 // subsequence), best tier first. An empty prefix keeps the original order.
 func filterFuzzy(all []cand, q string) []cand {
 	if q == "" {
-		return append([]cand(nil), all...)
+		return slices.Clone(all)
 	}
 	type hit struct {
 		c    cand

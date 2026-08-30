@@ -18,12 +18,17 @@ type bashRedirect struct {
 
 var simpleSedRange = regexp.MustCompile(`^'?([0-9]+),([0-9]+)p'?$`)
 
-func redirectBashSearch(command string) (bashRedirect, bool) {
+func simpleCommandTokens(command string) ([]string, bool) {
 	if strings.TrimSpace(command) == "" || strings.ContainsAny(command, ";&|<>`$\n\r") {
-		return bashRedirect{}, false
+		return nil, false
 	}
 	tokens := strings.Fields(command)
-	if len(tokens) == 0 {
+	return tokens, len(tokens) > 0
+}
+
+func redirectBashSearch(command string) (bashRedirect, bool) {
+	tokens, ok := simpleCommandTokens(command)
+	if !ok {
 		return bashRedirect{}, false
 	}
 	for _, token := range tokens {
@@ -142,11 +147,8 @@ func bashPreviewLimit(command string) int {
 // expression: commands containing operators keep the ordinary preview cap
 // because they are an explicit escape hatch.
 func isBashExploration(command string) bool {
-	if strings.TrimSpace(command) == "" || strings.ContainsAny(command, ";|&<>`$\n\r") {
-		return false
-	}
-	tokens := strings.Fields(command)
-	if len(tokens) == 0 {
+	tokens, ok := simpleCommandTokens(command)
+	if !ok {
 		return false
 	}
 	switch filepath.Base(tokens[0]) {

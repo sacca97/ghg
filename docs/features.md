@@ -1,7 +1,7 @@
 # Features
 
 ghg is a minimal coding agent: an interactive bubbletea TUI driving an
-LLM tool-use loop (bash / read / write / edit / grep / glob / find_files / task) with provider-routable
+LLM tool-use loop (bash / read / write / edit / grep / glob / find_files / lsp / lsp_rename / task) with provider-routable
 models. This document is the map of what's shipped and where it lives. Each
 section links the behavior to the code and its tests.
 
@@ -23,9 +23,9 @@ to goroutines and collects results on a buffered channel, laid back out in
 **per-canonical-path channel semaphore** (a 1-capacity `chan struct{}` per
 path: send to acquire, receive to release). Multi-file edits acquire all
 canonical paths in sorted order, so overlapping calls cannot deadlock. Edits
-to different files run in parallel; `bash` takes the global write side of a
-read/write lock because its side effects aren't attributable to one path.
-Reads don't lock.
+to different files run in parallel; `bash` and `lsp_rename apply` take the
+global write side of a read/write lock because their side effects cannot be
+attributed to one path before validation. Reads and rename previews don't lock.
 
 This is the Go-native port of pi's `withFileMutationQueue` (per-path promise
 chains in TypeScript). In Go the lock is a buffered channel — no explicit
@@ -96,6 +96,37 @@ all originals and permissions, stage same-directory files, publish atomically,
 preserve modes/line endings, and return a compact diff, readback, and
 diagnostics. `ToolTelemetry` reports preview/retained/original bytes,
 truncation, and Bash exploration redirects to JSON consumers.
+
+### LSP navigation, safe rename, and post-edit hooks
+
+`internal/lsp/manager.go` owns one lazy language-server manager per TUI or
+headless run. The same `tools.ToolRuntime` is inherited by planners and
+delegated agents, so server processes, document versions, sandbox policy, and
+hook configuration are not duplicated. The manager synchronizes exact file
+bytes before each request, advertises UTF-16 only, and warms covered files
+asynchronously after a successful `read`.
+
+The read-only `lsp` tool supports only `definition`, `references`,
+`document_symbol`, and `hover`. Results are canonical, policy-authorized,
+sorted, deduplicated, bounded, and marked untrusted: limits are 20
+definitions, 100 references, 200 flattened symbols, and 8 KiB of hover text.
+The built-in planner can use `lsp`, but not `lsp_rename`.
+
+`lsp_rename preview` validates a complete file-only `WorkspaceEdit`, converts
+UTF-16 ranges at exact rune boundaries, and stores the original/updated bytes
+behind a short `rn_...` id scoped to the current session. `lsp_rename apply`
+uses that exact plan under the global mutation lock, rechecks authorization,
+bytes, versions, and the normal permission gate, then publishes atomically;
+success consumes the id and stale or restarted sessions require a new preview.
+Server-driven `workspace/applyEdit` is rejected explicitly.
+
+Root `postEdit` config entries are trusted argv arrays with optional normalized
+extensions and a 1–60 second timeout. After a successful write, edit, or rename
+publication, matching hooks receive sorted canonical paths directly under the
+shared sandbox/runtime; ghg then rereads final bytes and runs diagnostics.
+Hook failures never roll back the mutation or change its exit status, but
+bounded redacted output is reported. `internal/lsp/navigation_test.go` and
+`internal/tools/hooks_test.go` cover the main and failure paths.
 
 ### Project instructions and streamed tool output
 
@@ -648,6 +679,38 @@ prompts, killed after 15s of no input.
 Tests: `killall_test.go` — `TestKillAllReapsChildren` (kills a live `sleep 60`),
 `TestBackgroundGrandchildDoesNotHang`.
 
+## Execution policy and sandboxing
+
+`internal/tools.ToolRuntime` is the per-agent execution boundary shared by native file/search
+tools, Bash, local MCP stdio servers, LSP, TUI agents, headless runs, and delegated agents.
+Canonical workspace/read/write roots reject symlink and nonexistent-target escapes; `.git`,
+`.ghg`, and configured ghg state remain protected from native writes. Child processes receive
+only a minimal runtime environment, with provider keys and secret-resolver inputs removed from
+Bash/LSP environments.
+
+Restricted subprocesses use macOS `/usr/bin/sandbox-exec` or Linux bubblewrap. Linux starts from
+an empty mount root and trusted bubblewrap discovery rejects user-writable executables. The
+modes are `read-only`, `workspace-write` (default), and explicit `danger-full-access`; network
+is `deny` by default or explicitly `host`. Missing or untrusted backends fail closed and their
+status plus recent denials appear in `/context-doctor`. Local MCP and LSP processes use the same
+boundary, with private temp and canonical build/package caches injected into children.
+
+Exceptional command approvals are separate from containment. Simple commands retain useful
+arity rules, but compound commands are fully classified and stored as exact normalized rules.
+Path-aware destructive removal keeps broad targets hard-denied and gives external roots only to
+the active human-approved call. `ask` uses the human prompt, `never` denies escalation, and opt-in `auto-review` calls the configured `tiny` role
+once with no tools; the reviewer cannot approve broad/destructive, privileged, credential,
+policy, external-root, protected-metadata, global-install, persistent, or opaque shell
+operations. Explicit shell redirections outside configured roots and Git metadata writes use
+an exact, human-only one-shot grant; the grant is applied only to that command.
+Approval requests, reviewer telemetry, and audit history structurally redact secret-bearing
+flags, assignments, headers, URLs, and configured secret-name patterns; opaque shell syntax is
+represented by a fingerprint rather than retained verbatim.
+
+The CLI accepts one-shot `--sandbox`, `--network`, and `--approval` overrides. Headless runs
+fail closed unless `--approval auto-review` (or the equivalent trusted execution config) is
+explicitly selected. See [the Phase 3 implementation plan](../.ai-docs/plans/phase-3-execution-policy/README.md).
+
 ## LSP diagnostics
 
 `internal/lsp/` — a stdlib-only LSP client over stdio (JSON-RPC +
@@ -665,8 +728,7 @@ wakeup (a per-file channel close instead of polling timeouts).
   ported verbatim from opencode's `lsp/diagnostic.ts`): errors+warnings for
   the edited file (max 20), errors-only for up to 5 sibling files in the
   same directory, with a "this edit introduced errors in other files" note.
-  Injection is via the package hook `tools.LSP` (same pattern as
-  `tools.InteractiveBash`); nil hook = unchanged output.
+  Injection is via the per-run `ToolRuntime.LanguageService`; nil service = unchanged output.
 - **Manager** (`manager.go`) — the registry is data: `gopls` built-in (root =
   nearest `go.work`/`go.mod`/`go.sum`, found by walking up from the file);
   the `"lsp"` block in `~/.ghg/config.json` (same shape as the `mcp`
@@ -680,14 +742,16 @@ wakeup (a per-file channel close instead of polling timeouts).
   is never delayed further or failed.
 - **Client** (`client.go`) — one reader goroutine parses frames and routes
   responses by id into cap-1 pending channels; writes funnel through a
-  buffered channel drained by one writer goroutine (no locks). Server→client
-  requests (`window/workDoneProgress/create`, `workspace/configuration`,
-  `client/registerCapability`) get a null-result ack, same as opencode.
-  Shutdown is polite `shutdown`/`exit` then SIGKILL of the process group;
-  `Manager.Close()` runs next to `mcpMgr.Close()` on exit.
+  buffered channel drained by one writer goroutine (no locks). Frames are
+  capped before allocation. Supported server requests receive typed responses:
+  configuration gets `[]`, progress/capability registration gets `null`, and
+  `workspace/applyEdit` is explicitly rejected in favor of `lsp_rename`.
+  Unknown requests receive JSON-RPC method-not-found. Shutdown is polite
+  `shutdown`/`exit` then SIGKILL of the process group; `Manager.Close()` runs
+  next to `mcpMgr.Close()` on exit.
 - **TUI** — `/lsp` prints per-server rows (`● connected (root: …)` /
   `○ not started` / `✗ err`); the manager is built in the same startup block
-  as MCP and installed on `tools.LSP`.
+  as MCP and installed on the shared `ToolRuntime`.
 
 Tests: `internal/lsp/client_test.go` (frame parsing incl. split/garbage,
 request routing, ctx-cancel on unanswered requests, server-request acks),
@@ -703,9 +767,7 @@ block in the tool result on the next call), `internal/tui/lsp_test.go`
 (`/lsp` status view).
 
 Out of scope (breadcrumbs in `.ai-docs/plans/lsp-diagnostics/README.md`):
-@-mention symbol-range expansion (Linear INF-4991), read warm-up
-(opencode forks `touchFile` on read — cut; revisit if first-edit latency
-annoys), pull diagnostics, navigation tools (definition/references/hover),
+@-mention symbol-range expansion (Linear INF-4991), pull diagnostics, and
 auto-installing servers.
 
 ## Skills
@@ -755,8 +817,13 @@ leak, issue URL round-trip, fenced snippet, busy-safe).
 `◌ connecting`). Skipped on resume.
 Tests: `tui/startup_report_test.go` (warnings, MCP glyphs, silence when empty).
 
-Installed: the `golang-*` skill set plus `i-have-adhd` (output-shaping for ADHD
-readers; invoke with `/i-have-adhd`, off with "stop adhd mode").
+The repository ships a small project-focused catalog: Bubble Tea, Go benchmarking,
+CLI, concurrency, context, SQLite, gopls, security, testing, new-feature development,
+and the ponytail minimalism/review workflows. Generic Go references and personal
+output preferences normally belong in `~/.ghg/skills/`; `i-have-adhd` is retained as
+an explicit-only project skill because it is part of this repository's dogfooding set.
+It and `ponytail-review` remain invocable as `$i-have-adhd` and `$ponytail-review`
+without taxing the automatic catalog.
 
 ## Scope note
 

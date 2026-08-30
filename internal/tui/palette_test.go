@@ -417,7 +417,7 @@ func TestPaletteCompactPanelDefaultRowRestores(t *testing.T) {
 // The Compaction level row steps the threshold ±10% in place and shows it.
 func TestPaletteCompactionLevelSteps(t *testing.T) {
 	m := compactCmdModel()
-	m.agent.CompactThreshold = compactThresholdFor(m.cfg) // default 50%
+	m.agent.CompactThreshold = compactThresholdFor(m.cfg) // default 40%
 	m.openPalette()
 	var it *paletteItem
 	for i := range m.settings.items {
@@ -433,15 +433,15 @@ func TestPaletteCompactionLevelSteps(t *testing.T) {
 		t.Fatal("Compaction level should be ←/→ steppable")
 	}
 	it.stepFwd(m)
-	if m.agent.CompactThreshold != 0.6 {
-		t.Fatalf("→ should step to 60%%, got %v", m.agent.CompactThreshold)
+	if m.agent.CompactThreshold != 0.5 {
+		t.Fatalf("→ should step to 50%%, got %v", m.agent.CompactThreshold)
 	}
 	it.stepBack(m)
 	it.stepBack(m)
-	if m.agent.CompactThreshold != 0.4 {
-		t.Fatalf("← ← should step to 40%%, got %v", m.agent.CompactThreshold)
+	if m.agent.CompactThreshold != 0.3 {
+		t.Fatalf("← ← should step to 30%%, got %v", m.agent.CompactThreshold)
 	}
-	if state := paletteState(m, *it); !strings.Contains(state, "40%") {
+	if state := paletteState(m, *it); !strings.Contains(state, "30%") {
 		t.Fatalf("the row badge should show the live level, got %q", state)
 	}
 }

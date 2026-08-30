@@ -22,7 +22,7 @@ func TestCommandRuleArity(t *testing.T) {
 		"rm -rf build":                  "rm",
 		"FOO=bar go test ./...":         "go test",
 		"docker compose up":             "docker compose up",
-		"git checkout main && rm -rf /": "git checkout", // chain stops at the operator
+		"git checkout main && rm -rf /": "git checkout main && rm -rf /", // compound commands use an exact rule
 		"somescript.sh --flag":          "somescript.sh",
 	}
 	for in, want := range cases {

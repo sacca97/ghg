@@ -110,7 +110,7 @@ Two modes, both used heavily in `internal/tui/*_test.go`:
   (`probe.go`, dispatched at `tui.go:1432`.) Always `defer func() { p.Kill(); <-done }()`.
 
 Run `go test -race ./internal/tui` for anything touching a goroutine. Note that
-`TestMain` points `HARNESS_HOME` at a scratch dir and pins the dark theme —
+`TestMain` points `GHG_HOME` at a scratch dir and pins the dark theme —
 tests that persist through `config.Save()` rely on it; do not remove it.
 
 ## Anti-patterns

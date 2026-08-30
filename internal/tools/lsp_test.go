@@ -3,6 +3,7 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -20,17 +21,30 @@ func (s *stubLSP) WaitDiagnostics(ctx context.Context, path string) string {
 	return s.block
 }
 
+func (*stubLSP) Warm(context.Context, string) {}
+func (*stubLSP) Navigate(context.Context, NavigationRequest) (NavigationResult, error) {
+	return NavigationResult{}, errors.New("not implemented")
+}
+func (*stubLSP) PreviewRename(context.Context, RenameRequest) (RenamePreview, error) {
+	return RenamePreview{}, errors.New("not implemented")
+}
+func (*stubLSP) LookupRename(context.Context, string, string) (RenamePlan, error) {
+	return RenamePlan{}, errors.New("not implemented")
+}
+func (*stubLSP) ValidateRename(context.Context, RenamePlan) error {
+	return errors.New("not implemented")
+}
+func (*stubLSP) ConsumeRename(context.Context, string, string) error { return nil }
+
 func TestWriteEditAppendLSPDiagnostics(t *testing.T) {
 	stub := &stubLSP{block: "\n\n<diagnostics file=\"x.go\">\nERROR [1:1] boom\n</diagnostics>"}
-	saved := LSP
-	LSP = stub
-	defer func() { LSP = saved }()
+	ctx := WithRuntime(context.Background(), &ToolRuntime{LanguageService: stub})
 
 	dir := t.TempDir()
 	p := filepath.Join(dir, "x.go")
 
 	args, _ := json.Marshal(map[string]any{"path": p, "content": "package main\n"})
-	out := Execute(context.Background(), All(), "write", args)
+	out := Execute(ctx, All(), "write", args)
 	if !strings.Contains(out, "<diagnostics") || !strings.Contains(out, "ERROR [1:1] boom") {
 		t.Fatalf("write output missing diagnostics: %q", out)
 	}
@@ -39,7 +53,7 @@ func TestWriteEditAppendLSPDiagnostics(t *testing.T) {
 	}
 
 	args, _ = json.Marshal(map[string]any{"mode": "exact", "path": p, "old_string": "main", "new_string": "main2"})
-	out = Execute(context.Background(), All(), "edit", args)
+	out = Execute(ctx, All(), "edit", args)
 	if !strings.Contains(out, "<diagnostics") {
 		t.Fatalf("edit output missing diagnostics: %q", out)
 	}
@@ -49,9 +63,6 @@ func TestWriteEditAppendLSPDiagnostics(t *testing.T) {
 }
 
 func TestLSPNilUnchangedOutput(t *testing.T) {
-	saved := LSP
-	LSP = nil
-	defer func() { LSP = saved }()
 	dir := t.TempDir()
 	p := filepath.Join(dir, "x.go")
 	args, _ := json.Marshal(map[string]any{"path": p, "content": "hi"})
@@ -62,13 +73,11 @@ func TestLSPNilUnchangedOutput(t *testing.T) {
 }
 
 func TestLSPFailureNeverFailsTool(t *testing.T) {
-	saved := LSP
-	LSP = &stubLSP{block: ""} // server slow/absent: empty block
-	defer func() { LSP = saved }()
+	ctx := WithRuntime(context.Background(), &ToolRuntime{LanguageService: &stubLSP{block: ""}}) // server slow/absent: empty block
 	dir := t.TempDir()
 	p := filepath.Join(dir, "x.go")
 	args, _ := json.Marshal(map[string]any{"path": p, "content": "hi"})
-	out := Execute(context.Background(), All(), "write", args)
+	out := Execute(ctx, All(), "write", args)
 	if !strings.HasPrefix(out, "Wrote") {
 		t.Fatalf("tool result should be the success message, got %q", out)
 	}

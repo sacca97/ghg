@@ -1,6 +1,6 @@
 ---
 name: golang-benchmark
-description: "Golang benchmarking, profiling, and performance measurement. Use when writing or comparing Go benchmarks, profiling with pprof, interpreting CPU/memory/trace profiles, benchstat analysis, CI benchmark regression detection, or production performance issues. For optimizations → `golang-performance`."
+description: "Measure ghg performance with Go benchmarks, pprof, execution traces, and benchstat. Use for benchmark design, profile interpretation, regression comparison, or proving a performance optimization; not for speculative tuning without measurements."
 user-invocable: true
 license: MIT
 compatibility: Designed for Claude Code, Codex or similar harness, and for projects using Golang.

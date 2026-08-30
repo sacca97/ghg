@@ -10,6 +10,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -36,6 +37,7 @@ import (
 	"github.com/sacca97/ghg/internal/skills"
 	"github.com/sacca97/ghg/internal/tools"
 	"github.com/sacca97/ghg/internal/tools/bashrun"
+	workerwire "github.com/sacca97/ghg/internal/worker"
 
 	"github.com/charmbracelet/x/ansi"
 	"github.com/muesli/termenv"
@@ -79,7 +81,6 @@ type planProposalMsg struct {
 type compactMsg struct {
 	took, kept int // messages removed / kept after compaction
 	summary    string
-	cutoff     int // index in the pre-compaction history the summary replaces
 	err        error
 }
 type turnDoneMsg struct {
@@ -103,6 +104,17 @@ type imageMsg struct {                     // ctrl+v clipboard image result
 	err  error
 }
 
+type workerFrameMsg struct{ frame workerwire.Frame }
+type workerErrorMsg struct {
+	err     error
+	process *workerwire.Process
+}
+type workerPermissionMsg struct{ approval workerApproval }
+type workerCompactDoneMsg struct {
+	err   error
+	usage llm.Usage
+}
+
 // menu is the open completion dropdown.
 type menu struct {
 	head   string // input before the token being completed
@@ -117,6 +129,7 @@ type menu struct {
 type model struct {
 	cfg       *config.Config
 	agent     *agent.Agent
+	runtime   *tools.ToolRuntime
 	modelName string
 	provName  string
 	sysPrompt string
@@ -219,6 +232,18 @@ type model struct {
 	future []llm.Message // clipped tail kept for forward travel after a rewind
 
 	namePrompt *namePrompt // inline text prompt (fork naming, /rename)
+
+	workerClient      *workerwire.Client
+	workerProcess     *workerwire.Process
+	workerRuntime     workerwire.Runtime
+	workerLastSeq     uint64
+	workerDetached    bool
+	workerState       workerwire.State
+	workerLiveWork    bool
+	workerTasks       map[string]workerTaskState
+	detachRequestID   string
+	workerStartFailed bool
+	cautious          bool
 }
 
 // picker is the /resume session picker. metas is newest-first; the list is
@@ -259,6 +284,17 @@ func newInput() textarea.Model {
 // Run starts the interactive session. It returns the id of the session that
 // was active on exit ("" if nothing was said).
 func Run(cfg *config.Config, modelName, provName, sysPrompt, resumeID string, cautious bool) (string, error) {
+	return runTUI(cfg, modelName, provName, sysPrompt, resumeID, cautious, true)
+}
+
+// RunAttached opens the normal TUI on an already-running session worker. It
+// does not launch a second worker and is intentionally the only caller of the
+// attach-only path.
+func RunAttached(cfg *config.Config, modelName, provName, sysPrompt, sessionID string, cautious bool) (string, error) {
+	return runTUI(cfg, modelName, provName, sysPrompt, sessionID, cautious, false)
+}
+
+func runTUI(cfg *config.Config, modelName, provName, sysPrompt, resumeID string, cautious, launchWorker bool) (string, error) {
 	// Trust gate first: before ghg reads a single file, ask whether this
 	// folder's contents may steer the model. Persisted per absolute path in
 	// ~/.ghg/trusted.json (claude-code's per-project trust dialog).
@@ -303,6 +339,17 @@ func Run(cfg *config.Config, modelName, provName, sysPrompt, resumeID string, ca
 	if err != nil {
 		return "", err
 	}
+	runtime, runtimeCleanup, err := tools.NewConfiguredRuntime(".", cfg.Execution, false, cfg.PostEdit)
+	if err != nil {
+		return "", err
+	}
+	defer runtimeCleanup()
+	if ag != nil {
+		ag.Runtime = runtime
+		if runtime.ApprovalMode == tools.ApprovalAutoReview {
+			runtime.Reviewer = ag.ApproveForMe
+		}
+	}
 
 	ti := newInput()
 
@@ -330,19 +377,47 @@ func Run(cfg *config.Config, modelName, provName, sysPrompt, resumeID string, ca
 		showThinking = *cfg.Thinking
 	}
 	m := &model{
-		cfg: cfg, agent: ag, modelName: mn, provName: pn, sysPrompt: sysPrompt,
+		cfg: cfg, agent: ag, runtime: runtime, modelName: mn, provName: pn, sysPrompt: sysPrompt,
 		input: ti, spin: spinner.New(spinner.WithSpinner(spinner.Dot)), follow: true, saved: 1,
 		catalogs: config.LoadCatalogs(), profiles: profiles, definitions: definitions, mouseOn: mouseOn, now: time.Now, showThinking: showThinking,
 		compactModel: cfg.CompactModel, compactProv: cfg.CompactProvider,
 		mode:      uiModeExecute,
+		cautious:  cautious,
 		skillScan: func() []skills.Skill { return skills.Scan(skills.DefaultDirs()...) },
 	}
+	m.perms = loadPermRules()
+	runtime.HumanGate = m.askPermission
+	runtime.OnAudit = func(audit tools.ExecutionAudit) {
+		message := audit.Disposition + " " + audit.Request.Fingerprint
+		if audit.Error != "" {
+			message += ": " + audit.Error
+		}
+		config.LogEvent("execution.policy", message)
+	}
+	runtime.OnReviewerCall = func(call tools.ReviewerCall) {
+		message := fmt.Sprintf("%s/%s %s %dms", call.Provider, call.Model, call.Purpose, call.LatencyMS)
+		if call.Error != "" {
+			message += ": " + call.Error
+		}
+		config.LogEvent("execution.reviewer", message)
+	}
+	defer func() {
+		// These are process-local compatibility hooks. Runtime consumers use the
+		// per-agent context; clear the globals so a later terminal/session cannot
+		// inherit a closed TUI's callbacks.
+		tools.InteractiveBash = nil
+		tools.Gate = nil
+	}()
 	m.initArtifacts()
 	m.applyCompactModel()
 	if m.agent != nil {
 		m.agent.CompactThreshold = compactThresholdFor(cfg)
 	}
 	m.wireTasks() // redraw the UI when background subagents start/settle
+	// LSP shares the same runtime and manager across the TUI, planners, and
+	// delegated agents. Servers still spawn lazily on covered file access.
+	m.lspMgr = lsp.NewManager(lsp.FromConfigMap(cfg.LSPServers))
+	m.lspMgr.SetRuntime(runtime)
 
 	// MCP: merge ghg's own config with imported claude (.mcp.json) and codex
 	// (~/.codex/config.toml) servers — gated by the mcpImport policy, whose
@@ -355,6 +430,7 @@ func Run(cfg *config.Config, modelName, provName, sysPrompt, resumeID string, ca
 		merged, mcpErrs := disc.Merged, disc.Errs
 		if len(merged) > 0 || len(disc.Blocked) > 0 || len(mcpErrs) > 0 {
 			m.mcpMgr = mcp.NewManager(merged)
+			m.mcpMgr.SetRuntime(runtime)
 			m.mcpMgr.SetBlocked(disc.Blocked)
 			// MCP connects settle in the background; push each new tool set
 			// into the CURRENT agent (mutex-guarded on the agent side) so
@@ -377,14 +453,9 @@ func Run(cfg *config.Config, modelName, provName, sysPrompt, resumeID string, ca
 				m.append(errStyle.Render(fmt.Sprintf("mcp: %s: %s", src, derr)))
 			}
 		}
-		// LSP: build the diagnostics manager (built-ins merged under the
-		// config's "lsp" block) and install it for write/edit tool output.
-		// Servers spawn lazily on first covered file touch; a missing binary
-		// is remembered as broken, so this never blocks startup.
-		m.lspMgr = lsp.NewManager(lsp.FromConfigMap(cfg.LSPServers))
-		tools.LSP = m.lspMgr
 	}
-	// Permission prompts are opt-in (--cautious); without it tools run free.
+	// Permission prompts remain opt-in for routine commands (--cautious), while
+	// the runtime always owns exceptional capability escalation.
 	if cautious {
 		m.installPermGate()
 	}
@@ -465,6 +536,13 @@ func Run(cfg *config.Config, modelName, provName, sysPrompt, resumeID string, ca
 	}
 	p := tea.NewProgram(m, opts...)
 	m.prog = p
+	if launchWorker && m.agent != nil && m.store != nil {
+		m.ensureWorker()
+	} else if !launchWorker {
+		if err := m.attachWorkerProcess(resumeID); err != nil {
+			return "", err
+		}
+	}
 	// Bubble Tea normally restores raw mode on every exit path. Keep a second
 	// snapshot of the caller's tty as a last-resort guard: ghg also manages
 	// mouse escape sequences outside Bubble Tea, and a startup/shutdown error
@@ -491,6 +569,7 @@ func Run(cfg *config.Config, modelName, provName, sysPrompt, resumeID string, ca
 	if restoreTTY != nil {
 		restoreTTY()
 	}
+	m.stopWorker()
 	// Shut MCP servers down first (graceful: stdin close → SIGTERM → SIGKILL)
 	// so a clean stdio server never becomes a KillAll target.
 	if m.mcpMgr != nil {
@@ -499,7 +578,6 @@ func Run(cfg *config.Config, modelName, provName, sysPrompt, resumeID string, ca
 	// LSP servers get the same courtesy (shutdown/exit, then SIGKILL).
 	if m.lspMgr != nil {
 		m.lspMgr.Close()
-		tools.LSP = nil
 	}
 	// Make sure no agent-spawned child process (a server the model started, a
 	// watcher, a daemon) outlives ghg. KillAll SIGKILLs every tracked process
@@ -687,11 +765,6 @@ func applyTmuxMouseFix() {
 		"#{||:#{alternate_on},#{pane_in_mode},#{mouse_all_flag}}", "send-keys -M", "copy-mode -M").Run()
 }
 
-// catalogLites converts llm model records into the catalog-cache shape.
-func catalogLites(infos []llm.ModelInfo) []config.ModelInfoLite {
-	return config.ModelInfoLites(infos)
-}
-
 // fetchCatalogs refreshes each provider's cached model list in the background,
 // enriches missing context and reasoning metadata from models.dev, and sends
 // the merged result to the UI. force bypasses both catalog TTLs (/model refresh)
@@ -759,7 +832,7 @@ func (m *model) fetchCatalogs(force bool) {
 			continue // keep any stale cache
 		}
 		config.LogEvent("catalog.fetch", fmt.Sprintf("%s ok: %d models", name, len(infos)))
-		cats[name] = config.Catalog{FetchedAt: time.Now(), BaseURL: resolved.BaseURL, Models: catalogLites(infos)}
+		cats[name] = config.Catalog{FetchedAt: time.Now(), BaseURL: resolved.BaseURL, Models: config.ModelInfoLites(infos)}
 		dirty = true
 	}
 	metadata := config.LoadModelsDev()
@@ -906,7 +979,7 @@ func (m *model) resume(id string) error {
 		}
 		m.agent.SetUsage(u)
 	}
-	if contains(m.effortsFor(), effort) {
+	if slices.Contains(m.effortsFor(), effort) {
 		m.agent.Effort = effort
 	}
 	m.sessionID = meta.ID
@@ -997,7 +1070,33 @@ func (m *model) seedTranscript(msgs []llm.Message, base int) {
 // persist writes any unsaved messages to the session store and re-stamps the
 // session's bookkeeping (goal, effort) — the effort stamp is what a resume
 // restores, so it runs even when no new messages landed.
+func (m *model) ensureSession() bool {
+	if m.store == nil || m.agent == nil || m.sessionID != "" {
+		return m.sessionID != ""
+	}
+	id, err := m.store.Create(cwd(), m.modelName, m.provName)
+	if err != nil {
+		config.LogEvent("session.save", "create failed: "+err.Error())
+		m.append(errStyle.Render("session save failed: " + err.Error()))
+		return false
+	}
+	m.sessionID = id
+	bashrun.SetMarkers(id, m.agent.Model)
+	m.agent.Tasks().SetSessionID(id) // publish before Save so a settling subagent records
+	m.agent.SetSessionID(id)         // scopes the per-session memory file
+	if err := m.agent.BindState(context.Background()); err != nil {
+		config.LogEvent("session.state", "bind failed: "+err.Error())
+	}
+	return true
+}
+
 func (m *model) persist() {
+	// The worker is the sole owner of session writes once attached. The TUI
+	// keeps a shadow agent for rendering, but saving it here can race the
+	// worker and duplicate rows.
+	if m.workerClient != nil || m.workerProcess != nil {
+		return
+	}
 	if m.store == nil || m.agent == nil {
 		return
 	}
@@ -1006,18 +1105,8 @@ func (m *model) persist() {
 		if len(msgs) <= m.saved {
 			return // nothing new to say; don't create an empty session row
 		}
-		id, err := m.store.Create(cwd(), m.modelName, m.provName)
-		if err != nil {
-			config.LogEvent("session.save", "create failed: "+err.Error())
-			m.append(errStyle.Render("session save failed: " + err.Error()))
+		if !m.ensureSession() {
 			return
-		}
-		m.sessionID = id
-		bashrun.SetMarkers(id, m.agent.Model)
-		m.agent.Tasks().SetSessionID(id) // publish before Save so a settling subagent records
-		m.agent.SetSessionID(id)         // scopes the per-session memory file
-		if err := m.agent.BindState(context.Background()); err != nil {
-			config.LogEvent("session.state", "bind failed: "+err.Error())
 		}
 	}
 	// Bookkeeping re-stamps every persist — even one with no new messages —
@@ -1103,6 +1192,10 @@ func (m *model) setEffort(lv string) {
 	if m.agent == nil {
 		return
 	}
+	if m.workerClient != nil && m.workerLiveWork {
+		m.append(dimStyle.Render("(worker is busy — change reasoning after this work finishes)"))
+		return
+	}
 	m.agent.Effort = lv
 	m.cfg.DefaultEffort = lv
 	if err := m.cfg.Save(); err != nil {
@@ -1111,6 +1204,7 @@ func (m *model) setEffort(lv string) {
 	if m.store != nil && m.sessionID != "" {
 		_ = m.store.SetEffort(m.sessionID, lv) // best-effort; persist() re-stamps
 	}
+	m.syncWorkerConfiguration(true)
 }
 
 // resetEffort applies a level without touching the global default.
@@ -1121,6 +1215,9 @@ func (m *model) resetEffort(lv string) {
 	m.agent.Effort = lv
 	if m.store != nil && m.sessionID != "" {
 		_ = m.store.SetEffort(m.sessionID, lv)
+	}
+	if !m.workerLiveWork {
+		m.syncWorkerConfiguration(true)
 	}
 }
 
@@ -1216,8 +1313,13 @@ func (m *model) configureArtifactAgent(ag *agent.Agent) {
 	if ag == nil {
 		return
 	}
+	ag.Runtime = m.runtime
+	if m.runtime != nil && m.runtime.ApprovalMode == tools.ApprovalAutoReview {
+		m.runtime.Reviewer = ag.ApproveForMe
+	}
 	ag.ArtifactStore = m.artifactStore
 	ag.ArtifactCatalog = m.store
+	ag.HistoryCatalog = m.store
 	if m.store != nil {
 		ag.SetObservationStore(m.store.ObservationRegistryStore())
 		ag.SetSearchStore(m.store.SearchRegistryStore())
@@ -1952,6 +2054,37 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.permDialog = &permDialog{req: msg.req, reply: msg.reply}
 		return m, nil
 
+	case workerFrameMsg:
+		return m.handleWorkerFrame(msg.frame)
+
+	case workerErrorMsg:
+		if msg.process != nil && msg.process == m.workerProcess {
+			if m.workerClient != nil {
+				_ = m.workerClient.Close()
+			}
+			m.workerClient = nil
+			m.workerProcess = nil
+			m.workerRuntime = workerwire.Runtime{}
+			m.workerState = workerwire.StateInterrupted
+			m.workerLiveWork = false
+			m.busy = false
+			m.cancel = nil
+			m.interrupt1 = false
+			m.turnStart = time.Time{}
+			m.workerStartFailed = false
+		}
+		if msg.err != nil && !m.workerDetached {
+			m.append(errStyle.Render("worker: " + msg.err.Error()))
+		}
+		return m, nil
+
+	case workerPermissionMsg:
+		m.permDialog = &permDialog{
+			req:      tools.GateRequest{Tool: msg.approval.Tool, Command: msg.approval.Command, Rule: msg.approval.Rule},
+			workerID: msg.approval.ID,
+		}
+		return m, nil
+
 	case tea.KeyMsg:
 		return m.key(msg)
 
@@ -2220,12 +2353,12 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.finishPlanProposal(msg)
 
 	case compactMsg:
-		// compaction lands between turns: record it as an event and note it
+		// compaction lands between turns after its event is durable; note it
 		// inline. The raw message log stays on disk — Load derives the
 		// compacted view from the event, so a bad summary is inspectable and
 		// retryable (/compact retry). A live turn fires two compactMsgs per
-		// compaction (OnCompact's counts, then OnCompacted's summary+cutoff);
-		// only the one carrying the summary records/notes.
+		// compaction (OnCompact's counts, then OnCompacted's summary); only the
+		// one carrying the summary adds the note.
 		m.flushThink()
 		m.flushCurrent()
 		switch {
@@ -2235,13 +2368,6 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			// counts-only path (no summary means no event was produced);
 			// nothing to record
 		default:
-			if m.store != nil && m.sessionID != "" {
-				// the agent's cutoff is in compacted coordinates; store the raw
-				// seq so Load never double-folds a summary
-				if err := m.store.RecordCompaction(m.sessionID, m.rawCutoff(msg.cutoff), msg.summary); err != nil {
-					config.LogEvent("session.compact", "record failed: "+err.Error())
-				}
-			}
 			m.append(dimStyle.Render(fmt.Sprintf("◎ compacted — summarized %d msgs, %d kept · raw history preserved", msg.took, msg.kept)))
 			m.future = nil   // compaction rewrote history; stale redo entries would resurrect it
 			m.msgBlock = nil // indices no longer match; rebuilt as blocks stream in
@@ -2253,7 +2379,28 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.agent != nil && m.store != nil && m.sessionID != "" {
 				m.saved = len(m.agent.MessagesSnapshot())
 			}
-			m.persist() // append the new (compacted) rows; raw rows stay
+			m.persist() // append the new tail; the raw pre-cutover rows are already saved
+		}
+		return m, nil
+
+	case workerCompactDoneMsg:
+		m.flushThink()
+		m.flushCurrent()
+		m.busy = false
+		m.cancel = nil
+		m.interrupt1 = false
+		m.turnStart = time.Time{}
+		m.future = nil
+		m.msgBlock = nil
+		if m.agent != nil {
+			m.agent.SetUsage(msg.usage)
+		}
+		if msg.err != nil {
+			if errors.Is(msg.err, context.Canceled) {
+				m.append(dimStyle.Render("(compaction interrupted)"))
+			} else {
+				m.append(errStyle.Render("compact failed: " + msg.err.Error()))
+			}
 		}
 		return m, nil
 
@@ -2518,6 +2665,8 @@ func (m *model) key(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.tasksFocus = !m.tasksFocus
 		m.clampTaskSel()
 		return m, nil
+	case tea.KeyCtrlD:
+		return m.command("/detach")
 	case tea.KeyCtrlC:
 		if m.busy && m.cancel != nil {
 			// explicit interruption: first press arms, second cancels
@@ -3004,11 +3153,7 @@ func (m *model) sessionCost() (float64, bool) {
 // agent's threshold fraction. Out-of-range values clamp to [10, 90]; 0 (unset)
 // means the built-in default.
 func compactThresholdFor(cfg *config.Config) float64 {
-	pct := cfg.CompactPct
-	if pct == 0 {
-		pct = config.DefaultCompactPct
-	}
-	return float64(min(max(pct, 10), 90)) / 100
+	return config.CompactThreshold(cfg)
 }
 
 // applyCompactModel points the agent's compaction summary call at the
@@ -3188,6 +3333,10 @@ func (m *model) tasksView() string {
 
 // switchModel rebuilds the agent on a new model/provider, carrying history.
 func (m *model) switchModel(name, prov string) {
+	if m.workerClient != nil && m.workerLiveWork {
+		m.append(dimStyle.Render("(worker is busy — change the model after this work finishes)"))
+		return
+	}
 	previous := m.agent
 	ag, mn, pn, err := buildAgent(m.cfg, name, prov, m.sysPrompt)
 	if err != nil {
@@ -3213,7 +3362,8 @@ func (m *model) switchModel(name, prov string) {
 	m.configureArtifactAgent(m.agent)
 	m.applyCompactModel()
 	m.wireTasks()
-	if !contains(m.effortsFor(), ag.Effort) {
+	m.syncWorkerConfiguration(true)
+	if !slices.Contains(m.effortsFor(), ag.Effort) {
 		m.resetEffort("") // the new model doesn't support the current level
 	}
 	m.cfg.DefaultModel, m.cfg.DefaultProvider = mn, pn // store the switch as the new default
@@ -3465,20 +3615,13 @@ func (m *model) supportsVision() bool {
 	if m.agent != nil {
 		modelID = m.agent.Model
 	}
-	return modelSupportsVision(m.cfg, m.modelName, modelID, m.catalogs, m.provName)
-}
-
-// modelSupportsVision is supportsVision lifted off the TUI model so
-// buildAgent (which runs before the model exists) can gate the screenshot
-// sink the same way.
-func modelSupportsVision(cfg *config.Config, modelName, modelID string, catalogs map[string]config.Catalog, provName string) bool {
-	if cat, ok := catalogs[provName]; ok {
+	if cat, ok := m.catalogs[m.provName]; ok {
 		if vision, found := cat.SupportsVision(modelID); found {
 			return vision
 		}
 	}
-	if cfg != nil {
-		if mc, ok := cfg.Models[modelName]; ok {
+	if m.cfg != nil {
+		if mc, ok := m.cfg.Models[m.modelName]; ok {
 			return mc.Vision
 		}
 	}
@@ -3618,6 +3761,14 @@ func (m *model) submitTurn(text string, authored bool) (tea.Model, tea.Cmd) {
 	if !m.requireAgent() {
 		return m, nil
 	}
+	// Establish the durable boundary before the agent can compact during this
+	// turn, while still leaving truly idle sessions uncreated.
+	if m.store != nil && m.sessionID == "" {
+		m.ensureSession()
+	}
+	if m.workerClient == nil && m.workerProcess == nil && m.prog != nil {
+		m.ensureWorker()
+	}
 	m.busy = true
 	m.turnStart = m.nowFn()
 	prepared, parts := m.prepareTurn(text)
@@ -3646,6 +3797,15 @@ func (m *model) submitTurn(text string, authored bool) (tea.Model, tea.Cmd) {
 	}
 	goalCtx, hasGoal := m.goalRecordForSession()
 	hasGoal = hasGoal && goalCtx.Status == goalstate.StatusActive
+	if m.workerClient != nil {
+		return m.submitWorkerTurn(text, authored, prepared, parts, userMsgIdx, preSnap, func() *goalstate.Record {
+			if !hasGoal {
+				return nil
+			}
+			copy := goalCtx
+			return &copy
+		}())
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	m.cancel = cancel
 	p := m.prog
@@ -3714,7 +3874,20 @@ func (m *model) submitTurn(text string, authored bool) (tea.Model, tea.Cmd) {
 				flush()
 				send(steeredMsg(s))
 			},
-			OnCompacted: func(sum string, cutoff int) { send(compactMsg{summary: sum, cutoff: cutoff}) },
+			OnCompactionReady: func(raw []llm.Message, summary string, cutoff int) error {
+				if m.store != nil && m.sessionID != "" && len(raw) > m.saved {
+					if err := m.store.Save(m.sessionID, m.saved, raw, m.modelName, m.provName); err != nil {
+						return err
+					}
+				}
+				if m.store != nil && m.sessionID != "" {
+					return m.store.RecordCompaction(m.sessionID, m.rawCutoff(cutoff, raw), summary)
+				}
+				return nil
+			},
+			OnCompacted: func(sum string, _ int) {
+				send(compactMsg{summary: sum})
+			},
 			OnUsage: func(u llm.Usage) {
 				mu.Lock()
 				goalUsage.PromptTokens += u.PromptTokens
@@ -3735,10 +3908,7 @@ func (m *model) submitTurn(text string, authored bool) (tea.Model, tea.Cmd) {
 				mu.Lock()
 				goalUpdates = append(goalUpdates, update)
 				mu.Unlock()
-				if p != nil {
-					send(goalUpdateMsg{update: update})
-					return
-				}
+				send(goalUpdateMsg{update: update})
 			},
 			OnRetry: func(ev llm.RetryEvent) {
 				flush()
@@ -3770,7 +3940,7 @@ func (m *model) submitTurn(text string, authored bool) (tea.Model, tea.Cmd) {
 		}
 		flush()
 		mu.Lock()
-		updates := append([]agent.GoalUpdate(nil), goalUpdates...)
+		updates := slices.Clone(goalUpdates)
 		usage := goalUsage
 		mu.Unlock()
 		// stamp rewind provenance on the submitted message (appended by turn)
@@ -3800,7 +3970,7 @@ func busyCmd(text string) bool {
 		return false
 	}
 	switch fields[0] {
-	case "/help", "/theme", "/mouse", "/effort", "/tasks", "/cd", "/pwd", "/report":
+	case "/help", "/theme", "/mouse", "/effort", "/tasks", "/cd", "/pwd", "/report", "/detach":
 		return true
 	case "/plan", "/execute": // handled immediately so a slash command is not sent as chat text
 		return true
@@ -3820,6 +3990,22 @@ func (m *model) command(text string) (tea.Model, tea.Cmd) {
 	switch fields[0] {
 	case "/quit", "/exit", "/q":
 		return m, tea.Quit
+	case "/detach":
+		live := m.busy || m.workerState == workerwire.StateRunning || m.workerState == workerwire.StateWaitingApproval || m.workerLiveWork
+		if m.workerClient == nil || !live {
+			m.append(dimStyle.Render("(nothing running to detach)"))
+			return m, nil
+		}
+		if m.detachRequestID != "" {
+			return m, nil
+		}
+		requestID := workerRequestID("detach")
+		if err := m.workerClient.Send(workerwire.CommandDetach, requestID, nil); err != nil {
+			m.append(errStyle.Render("detach failed: " + err.Error()))
+			return m, nil
+		}
+		m.detachRequestID = requestID
+		return m, nil
 	case "/clear":
 		if m.busy {
 			m.append(dimStyle.Render("(busy — /clear after this turn)"))
@@ -3827,6 +4013,12 @@ func (m *model) command(text string) (tea.Model, tea.Cmd) {
 		}
 		if !m.requireAgent() {
 			return m, nil
+		}
+		// A worker owns the durable session. Stop it before creating the fresh
+		// session boundary below; the next submitted turn starts a new worker.
+		if m.workerClient != nil || m.workerProcess != nil {
+			m.stopWorker()
+			m.workerStartFailed = false
 		}
 		m.agent.Messages = m.agent.Messages[:1] // keep system prompt
 		m.agent.ResetUsage()                    // zero the status line's spend counters
@@ -3849,6 +4041,30 @@ func (m *model) command(text string) (tea.Model, tea.Cmd) {
 	case "/me":
 		return m, m.openMe()
 	case "/compact":
+		if len(fields) == 1 && m.workerClient != nil {
+			if m.busy {
+				m.append(dimStyle.Render("(busy — /compact after this turn)"))
+				return m, nil
+			}
+			if !m.requireAgent() {
+				return m, nil
+			}
+			requestID := workerRequestID("compact")
+			m.busy = true
+			m.turnStart = m.nowFn()
+			m.append(dimStyle.Render("◎ compacting…"))
+			m.cancel = func() {
+				if m.workerClient != nil {
+					_ = m.workerClient.Send(workerwire.CommandCancel, requestID+"-cancel", nil)
+				}
+			}
+			if err := m.workerClient.Send(workerwire.CommandCompact, requestID, nil); err != nil {
+				m.busy = false
+				m.cancel = nil
+				m.append(errStyle.Render("compact failed: " + err.Error()))
+			}
+			return m, m.spin.Tick
+		}
 		if len(fields) > 1 {
 			switch fields[1] {
 			case "retry":
@@ -3868,6 +4084,9 @@ func (m *model) command(text string) (tea.Model, tea.Cmd) {
 		if !m.requireAgent() {
 			return m, nil
 		}
+		if m.store != nil && m.sessionID == "" {
+			m.ensureSession()
+		}
 		m.busy = true
 		m.append(dimStyle.Render("◎ compacting…"))
 		p := m.prog
@@ -3877,12 +4096,22 @@ func (m *model) command(text string) (tea.Model, tea.Cmd) {
 		go func() {
 			took := len(ag.Messages)
 			var summary string
-			var cutoff int
 			err := ag.ManualCompact(ctx, agent.Events{
-				OnCompacted: func(s string, c int) { summary, cutoff = s, c },
+				OnCompactionReady: func(messages []llm.Message, summary string, cutoff int) error {
+					if m.store != nil && m.sessionID != "" && len(messages) > m.saved {
+						if err := m.store.Save(m.sessionID, m.saved, messages, m.modelName, m.provName); err != nil {
+							return err
+						}
+					}
+					if m.store != nil && m.sessionID != "" {
+						return m.store.RecordCompaction(m.sessionID, m.rawCutoff(cutoff, messages), summary)
+					}
+					return nil
+				},
+				OnCompacted: func(s string, _ int) { summary = s },
 			})
 			if p != nil { // nil in headless tests; compaction still ran
-				p.Send(compactMsg{took: took - len(ag.Messages), kept: len(ag.Messages), summary: summary, cutoff: cutoff, err: err})
+				p.Send(compactMsg{took: took - len(ag.Messages), kept: len(ag.Messages), summary: summary, err: err})
 				p.Send(turnDoneMsg{}) // clear busy state
 			}
 		}()

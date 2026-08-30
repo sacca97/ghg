@@ -65,6 +65,23 @@ func FanIn(evs ...Events) Events {
 				}
 			}
 		},
+		OnCompacted: func(summary string, cutoff int) {
+			for _, e := range evs {
+				if e.OnCompacted != nil {
+					e.OnCompacted(summary, cutoff)
+				}
+			}
+		},
+		OnCompactionReady: func(messages []llm.Message, summary string, cutoff int) error {
+			for _, e := range evs {
+				if e.OnCompactionReady != nil {
+					if err := e.OnCompactionReady(messages, summary, cutoff); err != nil {
+						return err
+					}
+				}
+			}
+			return nil
+		},
 		OnUsage: func(u llm.Usage) {
 			for _, e := range evs {
 				if e.OnUsage != nil {
@@ -83,6 +100,13 @@ func FanIn(evs ...Events) Events {
 			for _, e := range evs {
 				if e.OnModelCallStart != nil {
 					e.OnModelCallStart(call)
+				}
+			}
+		},
+		OnPromptView: func(view PromptView) {
+			for _, e := range evs {
+				if e.OnPromptView != nil {
+					e.OnPromptView(view)
 				}
 			}
 		},

@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"slices"
 
 	"github.com/sacca97/ghg/internal/observation"
 	"github.com/sacca97/ghg/internal/search"
@@ -17,6 +18,16 @@ type searchHintsKey struct{}
 type SearchHints struct {
 	Touched  []string
 	Modified []string
+}
+
+type observationStore interface {
+	Save(context.Context, string, observation.Record) error
+	Load(context.Context, string, string) (observation.Record, error)
+}
+
+type searchStore interface {
+	Save(context.Context, string, search.Snapshot) error
+	Load(context.Context, string, string) (search.Snapshot, error)
 }
 
 // WithOnUpdate attaches a per-tool-call callback for accumulated output
@@ -37,10 +48,7 @@ func onUpdate(ctx context.Context) func(snapshot string) {
 // WithObservationStore supplies the session-scoped observation registry used
 // by read and stateful edit. sessionID is part of the context value so an
 // edit cannot accidentally authorize bytes from another session.
-func WithObservationStore(ctx context.Context, sessionID string, store interface {
-	Save(context.Context, string, observation.Record) error
-	Load(context.Context, string, string) (observation.Record, error)
-}) context.Context {
+func WithObservationStore(ctx context.Context, sessionID string, store observationStore) context.Context {
 	if store == nil {
 		return ctx
 	}
@@ -49,26 +57,17 @@ func WithObservationStore(ctx context.Context, sessionID string, store interface
 
 type observationContext struct {
 	sessionID string
-	store     interface {
-		Save(context.Context, string, observation.Record) error
-		Load(context.Context, string, string) (observation.Record, error)
-	}
+	store     observationStore
 }
 
-func observationContextFor(ctx context.Context) (string, interface {
-	Save(context.Context, string, observation.Record) error
-	Load(context.Context, string, string) (observation.Record, error)
-}) {
+func observationContextFor(ctx context.Context) (string, observationStore) {
 	value, _ := ctx.Value(observationStoreKey{}).(observationContext)
 	return value.sessionID, value.store
 }
 
 // WithSearchStore supplies the stable snapshot registry used by grep/glob
 // pagination. The registry can mirror snapshots into the session database.
-func WithSearchStore(ctx context.Context, sessionID string, store interface {
-	Save(context.Context, string, search.Snapshot) error
-	Load(context.Context, string, string) (search.Snapshot, error)
-}) context.Context {
+func WithSearchStore(ctx context.Context, sessionID string, store searchStore) context.Context {
 	if store == nil {
 		return ctx
 	}
@@ -77,24 +76,18 @@ func WithSearchStore(ctx context.Context, sessionID string, store interface {
 
 type searchContext struct {
 	sessionID string
-	store     interface {
-		Save(context.Context, string, search.Snapshot) error
-		Load(context.Context, string, string) (search.Snapshot, error)
-	}
+	store     searchStore
 }
 
-func searchContextFor(ctx context.Context) (string, interface {
-	Save(context.Context, string, search.Snapshot) error
-	Load(context.Context, string, string) (search.Snapshot, error)
-}) {
+func searchContextFor(ctx context.Context) (string, searchStore) {
 	value, _ := ctx.Value(searchStoreKey{}).(searchContext)
 	return value.sessionID, value.store
 }
 
 // WithSearchHints attaches non-authoritative ranking hints for one search.
 func WithSearchHints(ctx context.Context, hints SearchHints) context.Context {
-	hints.Touched = append([]string(nil), hints.Touched...)
-	hints.Modified = append([]string(nil), hints.Modified...)
+	hints.Touched = slices.Clone(hints.Touched)
+	hints.Modified = slices.Clone(hints.Modified)
 	return context.WithValue(ctx, searchHintsKey{}, hints)
 }
 

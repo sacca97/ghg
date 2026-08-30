@@ -9,11 +9,13 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"maps"
 	"net"
 	"net/url"
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"unicode"
@@ -712,7 +714,7 @@ func cloneProfile(profile Profile) Profile {
 		profile.Routes = make([]Route, len(profile.Routes))
 		for i, route := range routes {
 			profile.Routes[i] = route
-			profile.Routes[i].Models = append([]string(nil), route.Models...)
+			profile.Routes[i].Models = slices.Clone(route.Models)
 			profile.Routes[i].DefaultHeaders = cloneHeaders(route.DefaultHeaders)
 		}
 	}
@@ -774,14 +776,7 @@ func legacyOpenCodeAnthropicProfile(name string, in Instance) Profile {
 }
 
 func cloneHeaders(headers map[string]string) map[string]string {
-	if headers == nil {
-		return nil
-	}
-	copyHeaders := make(map[string]string, len(headers))
-	for name, value := range headers {
-		copyHeaders[name] = value
-	}
-	return copyHeaders
+	return maps.Clone(headers)
 }
 
 func located(source string, err error) error {

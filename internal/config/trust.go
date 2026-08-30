@@ -55,16 +55,7 @@ func Trust(dir string) error {
 		t.Paths = map[string]bool{}
 	}
 	t.Paths[dir] = true
-	data, err := json.MarshalIndent(t, "", "  ")
-	if err != nil {
-		return err
-	}
-	tmp := p + ".tmp"
-	if err := os.WriteFile(tmp, append(data, '\n'), 0o600); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, p); err != nil {
-		_ = os.Remove(tmp)
+	if err := WriteJSON("trusted.json", t); err != nil {
 		return err
 	}
 	LogEvent("trust.grant", dir)

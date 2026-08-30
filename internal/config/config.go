@@ -4,9 +4,14 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
+	pathpkg "path"
 	"path/filepath"
+	"slices"
 	"strings"
+
+	"github.com/sacca97/ghg/internal/sandbox"
 )
 
 // Provider is an API endpoint that can serve models.
@@ -119,8 +124,18 @@ const DefaultCompactModel = "deepseek-v4-flash-0731"
 
 // DefaultCompactPct is the built-in compaction threshold: compact once the
 // estimated context use crosses this percent of the model's context window.
-// 50% keeps compaction deterministic instead of letting the context bloat.
-const DefaultCompactPct = 50
+// 40% keeps compaction deterministic instead of letting the context bloat (see Uber guidelines of compacting at ~400K, we use mostly 1M).
+const DefaultCompactPct = 40
+
+// CompactThreshold returns the configured compaction fraction, clamped to the
+// supported 10–90% range. Zero selects DefaultCompactPct.
+func CompactThreshold(c *Config) float64 {
+	pct := DefaultCompactPct
+	if c != nil && c.CompactPct != 0 {
+		pct = c.CompactPct
+	}
+	return float64(min(max(pct, 10), 90)) / 100
+}
 
 // Config is the root of ~/.ghg/config.json (JSONC: comments allowed).
 type Config struct {
@@ -137,6 +152,7 @@ type Config struct {
 	GoalMaxRounds   int                   `json:"goalMaxRounds,omitempty"`   // global goal-loop round cap; 0 = DefaultGoalMaxRounds; projects.json may override per folder
 	MaxRetries      int                   `json:"maxRetries,omitempty"`      // attempts per provider request on transient failures (429/5xx/network); 0 = llm.DefaultMaxAttempts, 1 = no retries
 	Artifacts       *ArtifactConfig       `json:"artifacts,omitempty"`       // bounded tool-result persistence; nil/enabled nil uses defaults
+	Execution       *ExecutionConfig      `json:"execution,omitempty"`       // filesystem/network/approval policy for tool subprocesses
 	Providers       map[string]Provider   `json:"providers"`
 	Models          map[string]Model      `json:"models"`
 	Roles           map[string]RoleConfig `json:"roles,omitempty"`
@@ -152,6 +168,82 @@ type Config struct {
 	// internal/lsp.FromConfigMap for the merge semantics). Entries extend or
 	// disable the built-in registry (gopls).
 	LSPServers map[string]LSPServer `json:"lsp,omitempty"`
+	// PostEdit contains trusted argv-style commands run after successful
+	// mutations and before their final readback.
+	PostEdit []PostEditConfig `json:"postEdit,omitempty"`
+}
+
+// ExecutionConfig controls the shared Phase 3 execution boundary. Empty
+// fields select the safe defaults: workspace-write, network deny, and an
+// interactive human approval layer for exceptional capabilities.
+type ExecutionConfig struct {
+	Sandbox        string   `json:"sandbox,omitempty"`        // read-only, workspace-write, danger-full-access
+	Network        string   `json:"network,omitempty"`        // deny or host
+	Approval       string   `json:"approval,omitempty"`       // ask, auto-review, never
+	BubblewrapPath string   `json:"bubblewrapPath,omitempty"` // trusted absolute bwrap path on Linux
+	SecretNames    []string `json:"secretNames,omitempty"`    // additional secret-name glob patterns
+	ReadRoots      []string `json:"readRoots,omitempty"`      // explicit additional read roots
+	WriteRoots     []string `json:"writeRoots,omitempty"`     // explicit additional write roots
+	CacheRoots     []string `json:"cacheRoots,omitempty"`     // trusted canonical cache roots
+	TempRoots      []string `json:"tempRoots,omitempty"`      // private temporary roots
+	ProtectedRoots []string `json:"protectedRoots,omitempty"` // additional read-only metadata/state roots
+}
+
+// ApplyExecutionOverrides applies one-shot CLI/session overrides without
+// persisting them. Empty arguments leave the loaded configuration unchanged.
+func (c *Config) ApplyExecutionOverrides(mode, network, approval string) error {
+	if c == nil || (mode == "" && network == "" && approval == "") {
+		return nil
+	}
+	settings := ExecutionConfig{}
+	if c.Execution != nil {
+		settings = *c.Execution
+		settings.SecretNames = append([]string(nil), c.Execution.SecretNames...)
+		settings.ReadRoots = append([]string(nil), c.Execution.ReadRoots...)
+		settings.WriteRoots = append([]string(nil), c.Execution.WriteRoots...)
+		settings.CacheRoots = append([]string(nil), c.Execution.CacheRoots...)
+		settings.TempRoots = append([]string(nil), c.Execution.TempRoots...)
+		settings.ProtectedRoots = append([]string(nil), c.Execution.ProtectedRoots...)
+	}
+	if mode != "" {
+		settings.Sandbox = mode
+	}
+	if network != "" {
+		settings.Network = network
+	}
+	if approval != "" {
+		settings.Approval = approval
+	}
+	c.Execution = &settings
+	return c.ValidateExecution()
+}
+
+// ValidateExecution rejects unknown policy values before a run can start with
+// a silently different trust boundary.
+func (c *Config) ValidateExecution() error {
+	if c == nil || c.Execution == nil {
+		return nil
+	}
+	if _, err := sandbox.ParseMode(c.Execution.Sandbox); err != nil {
+		return err
+	}
+	if _, err := sandbox.ParseNetworkMode(c.Execution.Network); err != nil {
+		return err
+	}
+	switch strings.TrimSpace(strings.ToLower(c.Execution.Approval)) {
+	case "", "ask", "auto-review", "never":
+	default:
+		return fmt.Errorf("unknown approval mode %q (want ask, auto-review, or never)", c.Execution.Approval)
+	}
+	if pathValue := strings.TrimSpace(c.Execution.BubblewrapPath); pathValue != "" && !filepath.IsAbs(pathValue) {
+		return fmt.Errorf("bubblewrapPath must be absolute: %q", c.Execution.BubblewrapPath)
+	}
+	for _, pattern := range c.Execution.SecretNames {
+		if _, err := pathpkg.Match(pattern, "SECRET"); err != nil {
+			return fmt.Errorf("invalid secretNames pattern %q: %w", pattern, err)
+		}
+	}
+	return nil
 }
 
 // ArtifactConfig controls durable tool-result evidence. Persistence is on by
@@ -171,6 +263,69 @@ type LSPServer struct {
 	RootMarkers []string          `json:"rootMarkers,omitempty"`
 	Env         map[string]string `json:"env,omitempty"`
 	Enabled     *bool             `json:"enabled,omitempty"`
+}
+
+// PostEditConfig describes one trusted post-publication hook. Commands are
+// argv arrays rather than shell strings; an extension without a leading dot
+// is normalized during validation.
+type PostEditConfig struct {
+	Command        []string `json:"command"`
+	Extensions     []string `json:"extensions,omitempty"`
+	TimeoutSeconds int      `json:"timeoutSeconds,omitempty"`
+}
+
+// ValidatePostEdit normalizes and validates the trusted hook configuration.
+func (c *Config) ValidatePostEdit() error {
+	if c == nil {
+		return nil
+	}
+	for i := range c.PostEdit {
+		hook := &c.PostEdit[i]
+		if len(hook.Command) == 0 {
+			return fmt.Errorf("postEdit[%d].command must not be empty", i)
+		}
+		for j, arg := range hook.Command {
+			if arg == "" {
+				return fmt.Errorf("postEdit[%d].command[%d] must not be empty", i, j)
+			}
+			if strings.IndexByte(arg, 0) >= 0 {
+				return fmt.Errorf("postEdit[%d].command[%d] contains NUL", i, j)
+			}
+		}
+		if hook.TimeoutSeconds == 0 {
+			hook.TimeoutSeconds = 10
+		}
+		if hook.TimeoutSeconds < 1 || hook.TimeoutSeconds > 60 {
+			return fmt.Errorf("postEdit[%d].timeoutSeconds must be between 1 and 60", i)
+		}
+		for j, extension := range hook.Extensions {
+			normalized, err := normalizePostEditExtension(extension)
+			if err != nil {
+				return fmt.Errorf("postEdit[%d].extensions[%d]: %w", i, j, err)
+			}
+			hook.Extensions[j] = normalized
+		}
+	}
+	return nil
+}
+
+func normalizePostEditExtension(extension string) (string, error) {
+	extension = strings.TrimSpace(strings.ToLower(extension))
+	if extension == "" {
+		return "", fmt.Errorf("extension must not be empty")
+	}
+	if !strings.HasPrefix(extension, ".") {
+		extension = "." + extension
+	}
+	if len(extension) < 2 || strings.ContainsAny(extension, `/\\`) || strings.IndexByte(extension, 0) >= 0 {
+		return "", fmt.Errorf("invalid extension %q", extension)
+	}
+	for _, r := range extension[1:] {
+		if r == ' ' || r == '\t' || r == '\n' || r == '\r' {
+			return "", fmt.Errorf("invalid extension %q", extension)
+		}
+	}
+	return extension, nil
 }
 
 // MCPImport selects which claude/codex MCP server definitions ghg imports.
@@ -263,6 +418,14 @@ func Load() (*Config, error) {
 		logf("config.load", "ROLE VALIDATION FAILURE %s: %v", p, err)
 		return nil, fmt.Errorf("validate %s: %w", p, err)
 	}
+	if err := cfg.ValidateExecution(); err != nil {
+		logf("config.load", "EXECUTION VALIDATION FAILURE %s: %v", p, err)
+		return nil, fmt.Errorf("validate %s: %w", p, err)
+	}
+	if err := cfg.ValidatePostEdit(); err != nil {
+		logf("config.load", "POST-EDIT VALIDATION FAILURE %s: %v", p, err)
+		return nil, fmt.Errorf("validate %s: %w", p, err)
+	}
 	// Recover from a clobbered/empty config: no providers and no models is
 	// never a usable state, so prefer the backup, else regenerate defaults —
 	// BUT preserve any MCP server/import entries: an mcp-only config is valid
@@ -280,12 +443,16 @@ func Load() (*Config, error) {
 				if restored.MCPImport == nil {
 					restored.MCPImport = cfg.MCPImport // keep import gating too
 				}
+				if len(restored.PostEdit) == 0 && len(cfg.PostEdit) > 0 {
+					restored.PostEdit = cfg.PostEdit // keep trusted hooks too
+				}
 				return &restored, restored.Save()
 			}
 		}
 		def := Default()
 		def.MCPServers = cfg.MCPServers // mcp-only configs are valid; keep them
 		def.MCPImport = cfg.MCPImport
+		def.PostEdit = cfg.PostEdit
 		logf("config.load", "no usable .bak; regenerated defaults (%s), keeping %d mcp entries", def.fingerprint(), len(cfg.MCPServers))
 		return def, def.Save()
 	}
@@ -300,6 +467,12 @@ func Load() (*Config, error) {
 // ever been reached by a bug, never intentionally.
 func (c *Config) Save() error {
 	if err := c.ValidateRoles(); err != nil {
+		return err
+	}
+	if err := c.ValidateExecution(); err != nil {
+		return err
+	}
+	if err := c.ValidatePostEdit(); err != nil {
 		return err
 	}
 	p, err := path()
@@ -445,14 +618,8 @@ func (c *Config) resolveFromCatalog(model, provider string) (Model, string, erro
 }
 
 func keys[V any](m map[string]V) string {
-	s := ""
-	for k := range m {
-		if s != "" {
-			s += ", "
-		}
-		s += k
-	}
-	return s
+	keys := slices.Sorted(maps.Keys(m))
+	return strings.Join(keys, ", ")
 }
 
 // Default returns the first-run config, wired for the built-in default service.

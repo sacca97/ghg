@@ -18,6 +18,7 @@ import (
 
 	"github.com/sacca97/ghg/internal/config"
 	"github.com/sacca97/ghg/internal/llm"
+	"github.com/sacca97/ghg/internal/sandbox"
 	"github.com/sacca97/ghg/internal/tools"
 )
 
@@ -155,6 +156,15 @@ type Manager struct {
 
 	onChangeMu sync.Mutex // guards onChange, blocked, and closed (writes may race connect goroutines)
 	closed     bool       // set by Close; connect() won't store new sessions after it
+	runtime    *tools.ToolRuntime
+}
+
+// SetRuntime installs the shared execution boundary for local MCP stdio
+// servers. Call it before Start; reconnects retain the same inherited policy.
+func (m *Manager) SetRuntime(runtime *tools.ToolRuntime) {
+	m.onChangeMu.Lock()
+	m.runtime = runtime
+	m.onChangeMu.Unlock()
 }
 
 // NewManager builds a manager from merged server configs. Config errors
@@ -259,7 +269,12 @@ func (s *server) connect(ctx context.Context, m *Manager) {
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	transport, err := m.connectTransport(s.cfg, s.stderr)
+	m.onChangeMu.Lock()
+	runtime := m.runtime
+	m.onChangeMu.Unlock()
+	cfg := s.cfg
+	cfg.runtime = runtime
+	transport, err := m.connectTransport(cfg, s.stderr)
 	if err == nil {
 		client := sdkmcp.NewClient(&sdkmcp.Implementation{Name: "ghg", Title: "ghg"}, nil)
 		var sess *sdkmcp.ClientSession
@@ -525,10 +540,6 @@ func flattenResult(res *sdkmcp.CallToolResult) string {
 	return mcpToolResult(res).Preview
 }
 
-func flattenResultRaw(res *sdkmcp.CallToolResult) string {
-	return mcpToolResult(res).Retained
-}
-
 // normalizeSchema passes the server's input schema through as a JSON string,
 // coercing it into the object shape providers require (opencode forces
 // type:object + properties:{} + additionalProperties:false).
@@ -762,10 +773,28 @@ func defaultTransport(cfg ServerConfig, stderr *ringBuffer) (sdkmcp.Transport, e
 			DisableStandaloneSSE: true,
 		}, nil
 	}
+	env := append(os.Environ(), envPairs(cfg.Env)...)
+	if cfg.runtime != nil {
+		env = cfg.runtime.ChildEnv(cfg.Env)
+		wrapped, err := cfg.runtime.WrapCommand(sandbox.CommandSpec{
+			Program: cfg.Command[0], Args: cfg.Command[1:], Dir: cfg.Cwd, Env: env,
+		})
+		if err != nil {
+			return nil, err
+		}
+		cmd := exec.Command(wrapped.Program, wrapped.Args...)
+		cmd.Dir = wrapped.Dir
+		cmd.Env = wrapped.Env
+		if stderr != nil {
+			cmd.Stderr = stderr
+		}
+		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+		return &sdkmcp.CommandTransport{Command: cmd, TerminateDuration: 3 * time.Second}, nil
+	}
 	cmd := exec.Command(cfg.Command[0], cfg.Command[1:]...)
-	// Inherit ghg's environment and layer the server's vars on top (opencode
-	// does the same — users expect $PATH etc. to work).
-	cmd.Env = append(os.Environ(), envPairs(cfg.Env)...)
+	// Legacy/direct transport callers inherit ghg's environment and layer the
+	// server's vars on top (opencode does the same — users expect $PATH etc.).
+	cmd.Env = env
 	if cfg.Cwd != "" {
 		cmd.Dir = cfg.Cwd
 	}

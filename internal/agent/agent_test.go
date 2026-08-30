@@ -3,10 +3,12 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -220,7 +222,7 @@ func TestToolOutputCarriesCallID(t *testing.T) {
 	ag := New(testBackend("http://unused", "k"), "m", 100, "sys")
 	var ids []string
 	var snapshots []string
-	results := ag.runTools(context.Background(), []llm.ToolCall{{
+	results := ag.runToolResultsWithTools(context.Background(), []llm.ToolCall{{
 		ID: "bash-1",
 		Function: struct {
 			Name      string `json:"name"`
@@ -231,8 +233,8 @@ func TestToolOutputCarriesCallID(t *testing.T) {
 			ids = append(ids, id)
 			snapshots = append(snapshots, output)
 		},
-	})
-	if len(results) != 1 || !strings.Contains(results[0], "second") {
+	}, ag.AllTools())
+	if len(results) != 1 || !strings.Contains(results[0].Preview, "second") {
 		t.Fatalf("tool result: %v", results)
 	}
 	if len(snapshots) == 0 {
@@ -261,13 +263,13 @@ func TestParallelToolOutputStaysWithCall(t *testing.T) {
 	}
 	var mu sync.Mutex
 	seen := map[string][]string{}
-	ag.runTools(context.Background(), []llm.ToolCall{call("a"), call("b")}, Events{
+	ag.runToolResultsWithTools(context.Background(), []llm.ToolCall{call("a"), call("b")}, Events{
 		OnToolOutput: func(id, output string) {
 			mu.Lock()
 			seen[id] = append(seen[id], output)
 			mu.Unlock()
 		},
-	})
+	}, ag.AllTools())
 	for _, id := range []string{"a", "b"} {
 		mu.Lock()
 		outputs := append([]string(nil), seen[id]...)
@@ -969,7 +971,7 @@ func (b *routeBackend) Complete(context.Context, llm.Request) (llm.Message, llm.
 func TestCompactTooLittleHistory(t *testing.T) {
 	ag := New(testBackend("http://unused", "k"), "m", 100, "sys")
 	ag.Messages = append(ag.Messages, llm.Message{Role: "user", Content: "hi"})
-	if _, _, err := ag.compact(context.Background()); err == nil {
+	if _, _, err := ag.compactWithEvents(context.Background(), Events{}); err == nil {
 		t.Fatal("expected error compacting a tiny history")
 	}
 }
@@ -995,7 +997,7 @@ func TestCompactKeepsToolCallPair(t *testing.T) {
 		}
 	}
 	before := len(ag.Messages)
-	if _, _, err := ag.compact(context.Background()); err != nil {
+	if _, _, err := ag.compactWithEvents(context.Background(), Events{}); err != nil {
 		t.Fatalf("compact: %v", err)
 	}
 	if len(ag.Messages) >= before {
@@ -1096,5 +1098,22 @@ func TestManualCompactFiresEvent(t *testing.T) {
 	}
 	if !fired {
 		t.Fatal("OnCompact should fire for ManualCompact")
+	}
+}
+
+func TestCompactionPersistenceFailureKeepsRawMessages(t *testing.T) {
+	ag := New(&routeBackend{}, "m", 100, "sys")
+	for i := 0; i < 8; i++ {
+		ag.Messages = append(ag.Messages,
+			llm.Message{Role: "user", Content: fmt.Sprintf("q%d", i)},
+			llm.Message{Role: "assistant", Content: fmt.Sprintf("a%d", i)},
+		)
+	}
+	before := ag.MessagesSnapshot()
+	err := ag.ManualCompact(context.Background(), Events{OnCompactionReady: func([]llm.Message, string, int) error {
+		return errors.New("disk full")
+	}})
+	if err == nil || !reflect.DeepEqual(ag.MessagesSnapshot(), before) {
+		t.Fatalf("failed persistence changed raw messages: err=%v", err)
 	}
 }

@@ -3,7 +3,7 @@ package agent
 import "testing"
 
 func TestParsePlanAndSeedTodos(t *testing.T) {
-	p, err := ParsePlan("```json\n{\"goal\":\"ship it\",\"steps\":[\"write code\",\"run tests\"],\"acceptance_checks\":[\"tests pass\"]}\n```")
+	p, err := ParsePlan(`{"goal":"ship it","steps":["write code","run tests"],"acceptance_checks":["tests pass"]}`)
 	if err != nil {
 		t.Fatal(err)
 	}

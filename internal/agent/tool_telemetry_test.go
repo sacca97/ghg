@@ -21,10 +21,10 @@ func TestToolTelemetryReportsPreviewRetentionAndRedirect(t *testing.T) {
 		},
 	}
 	var got ToolTelemetry
-	a.runToolResults(context.Background(), []llm.ToolCall{{ID: "call-1", Function: struct {
+	a.runToolResultsWithTools(context.Background(), []llm.ToolCall{{ID: "call-1", Function: struct {
 		Name      string `json:"name"`
 		Arguments string `json:"arguments"`
-	}{Name: "probe", Arguments: `{}`}}}, Events{OnToolTelemetry: func(value ToolTelemetry) { got = value }})
+	}{Name: "probe", Arguments: `{}`}}}, Events{OnToolTelemetry: func(value ToolTelemetry) { got = value }}, a.AllTools())
 	if got.Name != "probe" || got.ID != "call-1" || got.PreviewBytes != len("preview") || got.RetainedBytes != 100 || got.OriginalBytes != 100 || !got.Truncated {
 		t.Fatalf("telemetry = %+v", got)
 	}

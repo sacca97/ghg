@@ -3,6 +3,8 @@ package agent
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,6 +20,7 @@ import (
 	"github.com/sacca97/ghg/internal/llm"
 	"github.com/sacca97/ghg/internal/observation"
 	"github.com/sacca97/ghg/internal/search"
+	"github.com/sacca97/ghg/internal/session"
 	"github.com/sacca97/ghg/internal/tools"
 )
 
@@ -30,13 +33,18 @@ type Events struct {
 	OnToolEnd        func(id, name, result string)    // a tool call finished
 	OnSteer          func(text string)                // a steered message was injected
 	OnCompact        func(took, kept int)             // context was auto-compacted (messages removed/kept)
-	OnCompacted      func(summary string, cutoff int) // a compaction ran; record it (raw log survives)
+	OnCompacted      func(summary string, cutoff int) // a durable compaction completed
 	OnUsage          func(u llm.Usage)                // a request reported its token usage
 	OnRetry          func(ev llm.RetryEvent)          // a transient request failure is being retried
 	OnGoalUpdate     func(GoalUpdate)                 // structured active-goal checkpoint
 	OnToolTelemetry  func(ToolTelemetry)              // bounded-output accounting for one tool call
 	OnModelCallStart func(ModelCallStart)
+	OnPromptView     func(PromptView)
 	OnModelCallEnd   func(ModelCallEnd)
+	// OnCompactionReady receives the exact pre-cutover view after checkpoint
+	// generation succeeds, but before Agent.Messages is replaced. Persistence
+	// adapters must save the raw messages and compaction event or return an error.
+	OnCompactionReady func(messages []llm.Message, summary string, cutoff int) error
 }
 
 // ToolTelemetry records the distinction between what a tool produced, what
@@ -51,6 +59,8 @@ type ToolTelemetry struct {
 	OriginalBytes int64             `json:"original_bytes"`
 	Truncated     bool              `json:"truncated"`
 	BashRedirect  bool              `json:"bash_redirect"`
+	Fingerprint   string            `json:"fingerprint,omitempty"`
+	Duplicate     bool              `json:"duplicate,omitempty"`
 	Metadata      map[string]string `json:"metadata,omitempty"`
 }
 
@@ -62,6 +72,7 @@ type ModelCallStart struct {
 	Provider string `json:"provider,omitempty"`
 	Model    string `json:"model"`
 	Protocol string `json:"protocol,omitempty"`
+	Purpose  string `json:"purpose,omitempty"`
 }
 
 // ModelCallEnd completes a ModelCallStart with request timing and provider
@@ -74,6 +85,17 @@ type ModelCallEnd struct {
 	FinishReason string    `json:"finish_reason,omitempty"`
 	Usage        llm.Usage `json:"usage"`
 	Error        string    `json:"error,omitempty"`
+}
+
+// PromptView records bounded request-shape telemetry without retaining the
+// prompt itself. It lets paired evaluations compare derived views while the
+// raw session remains outside the event payload.
+type PromptView struct {
+	ModelCallStart
+	MessageCount    int `json:"message_count"`
+	EstimatedTokens int `json:"estimated_tokens"`
+	SerializedBytes int `json:"serialized_bytes"`
+	ContextLimit    int `json:"context_limit"`
 }
 
 // ArtifactCatalog is the session-scoped metadata index used by the
@@ -108,8 +130,11 @@ type Agent struct {
 	// background tasks use it to build their role-specific agent; nil preserves
 	// the legacy behavior of cloning the parent backend.
 	SubagentFactory SubagentFactory
-	Tools           []tools.Tool
-	Messages        []llm.Message
+	// Runtime is the shared execution policy for native and subprocess tools.
+	// Delegated agents inherit a child view in newSubagent.
+	Runtime  *tools.ToolRuntime
+	Tools    []tools.Tool
+	Messages []llm.Message
 	// ArtifactWriter receives retained tool output before the model-facing
 	// preview is shortened. Nil means no artifact persistence is configured.
 	ArtifactWriter artifact.Writer
@@ -118,6 +143,9 @@ type Agent struct {
 	// remains an explicit boundary.
 	ArtifactCatalog ArtifactCatalog
 	ArtifactStore   *artifact.Store
+	// HistoryCatalog is the durable session boundary for bounded history
+	// recall. It is optional so no-session runs never advertise recall tools.
+	HistoryCatalog session.HistoryStore
 	// ArtifactsDisabled distinguishes an intentional config opt-out from a
 	// session store that is simply unavailable.
 	ArtifactsDisabled bool
@@ -126,6 +154,13 @@ type Agent struct {
 	// the provider's GET /models (0 when unadvertised — proactive compaction
 	// is then disabled and only the reactive context-limit retry applies).
 	ContextLimit int
+	// ResultAging enables the deterministic derived prompt view for older tool
+	// results. It never rewrites Agent.Messages or the durable raw log.
+	ResultAging bool
+	// Checkpointing and HistoryRecall are independent switches. New agents
+	// enable both; callers can disable either without changing the other.
+	Checkpointing bool
+	HistoryRecall bool
 	// CompactBackend and CompactModel run the compaction summary; nil/"" uses
 	// the conversation's own backend and model. The provider/protocol fields
 	// keep route telemetry correct when the summary uses the tiny role.
@@ -168,6 +203,9 @@ type Agent struct {
 
 	touchedMu sync.Mutex
 	touched   map[string]struct{}
+
+	operationMu   sync.Mutex
+	seenOperation map[string]int
 
 	// Todos is the todowrite plan, rewritten in full by the model and
 	// injected per round. Like Messages, it is only mutated by the turn
@@ -295,10 +333,12 @@ func (a *Agent) ContextTokens() int {
 
 func New(backend llm.Backend, model string, maxTokens int, systemPrompt string) *Agent {
 	a := &Agent{
-		Backend:   backend,
-		Model:     model,
-		MaxTokens: maxTokens,
-		Messages:  []llm.Message{{Role: "system", Content: systemPrompt}},
+		Backend:       backend,
+		Model:         model,
+		MaxTokens:     maxTokens,
+		Messages:      []llm.Message{{Role: "system", Content: systemPrompt}},
+		Checkpointing: true,
+		HistoryRecall: true,
 	}
 	if p, ok := backend.(llm.ProtocolBackend); ok {
 		a.Protocol = string(p.AdapterProtocol())
@@ -313,6 +353,7 @@ func New(backend llm.Backend, model string, maxTokens int, systemPrompt string) 
 	a.observations = observation.NewRegistry()
 	a.searchState = search.NewRegistry()
 	a.touched = make(map[string]struct{})
+	a.seenOperation = make(map[string]int)
 	return a
 }
 
@@ -341,6 +382,9 @@ func (a *Agent) newSubagent(ctx context.Context, role string) (*Agent, error) {
 	sub.observationStore = observationStore
 	sub.searchStore = searchStore
 	sub.stateMu.Unlock()
+	sub.Checkpointing = a.Checkpointing
+	sub.HistoryRecall = a.HistoryRecall
+	sub.ResultAging = a.ResultAging
 	sub.Effort = a.Effort
 	if a.SubagentFactory == nil {
 		sub.ReasoningToggle = a.ReasoningToggle
@@ -355,9 +399,12 @@ func (a *Agent) newSubagent(ctx context.Context, role string) (*Agent, error) {
 	// The task tool is deliberately non-recursive: replace any factory-built
 	// default tool set with the ordinary built-ins, then restore artifact tools.
 	sub.Tools = tools.All()
+	sub.Runtime = a.Runtime.Child()
+	sub.files = a.files
 	sub.ArtifactWriter = a.ArtifactWriter
 	sub.ArtifactCatalog = a.ArtifactCatalog
 	sub.ArtifactStore = a.ArtifactStore
+	sub.HistoryCatalog = a.HistoryCatalog
 	sub.ArtifactsDisabled = a.ArtifactsDisabled
 	sub.SetSessionID(a.currentSessionID())
 	sub.Tools = append(sub.Tools, artifactTools(sub)...)
@@ -501,6 +548,69 @@ func (a *Agent) recordTouched(toolName, args string) {
 	}
 }
 
+// operationFingerprint is observation-only telemetry. It hashes canonical,
+// redacted tool arguments so duplicate measurements never carry a secret or
+// raw argument payload into an event stream.
+func (a *Agent) operationFingerprint(name, args string) string {
+	canonical := strings.TrimSpace(args)
+	var value any
+	if json.Unmarshal([]byte(canonical), &value) == nil {
+		value = redactOperationValue(value, a.Runtime)
+		if data, err := json.Marshal(value); err == nil {
+			canonical = string(data)
+		}
+	} else if a.Runtime != nil {
+		canonical = a.Runtime.RedactText(canonical)
+	}
+	h := sha256.New()
+	h.Write([]byte(name))
+	h.Write([]byte{0})
+	h.Write([]byte(canonical))
+	return "sha256:" + hex.EncodeToString(h.Sum(nil))[:24]
+}
+
+func redactOperationValue(value any, runtime *tools.ToolRuntime) any {
+	switch value := value.(type) {
+	case map[string]any:
+		for key, item := range value {
+			if sensitiveOperationKey(key) {
+				value[key] = "<redacted>"
+				continue
+			}
+			value[key] = redactOperationValue(item, runtime)
+		}
+	case []any:
+		for i, item := range value {
+			value[i] = redactOperationValue(item, runtime)
+		}
+	case string:
+		if runtime != nil {
+			return runtime.RedactText(value)
+		}
+	}
+	return value
+}
+
+func sensitiveOperationKey(key string) bool {
+	key = strings.ToLower(strings.TrimSpace(key))
+	for _, marker := range []string{"key", "token", "auth", "password", "secret", "credential", "cookie", "private"} {
+		if strings.Contains(key, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *Agent) seenOperationCount(fingerprint string) int {
+	a.operationMu.Lock()
+	defer a.operationMu.Unlock()
+	if a.seenOperation == nil {
+		a.seenOperation = make(map[string]int)
+	}
+	a.seenOperation[fingerprint]++
+	return a.seenOperation[fingerprint]
+}
+
 func (a *Agent) searchHints() tools.SearchHints {
 	a.touchedMu.Lock()
 	paths := make([]string, 0, len(a.touched))
@@ -535,6 +645,23 @@ func (a *Agent) MessagesSnapshot() []llm.Message {
 	return append([]llm.Message(nil), a.Messages...)
 }
 
+// SetSystemPrompt replaces the session's system prompt between turns. The
+// worker attach path refreshes it with the current skills and project
+// instructions without exposing the message slice to another goroutine.
+func (a *Agent) SetSystemPrompt(prompt string) {
+	if a == nil {
+		return
+	}
+	a.msgsMu.Lock()
+	if len(a.Messages) == 0 {
+		a.Messages = []llm.Message{{Role: "system", Content: prompt}}
+	} else {
+		a.Messages[0].Role = "system"
+		a.Messages[0].Content = prompt
+	}
+	a.msgsMu.Unlock()
+}
+
 // SetMCPTools swaps in the current MCP tool set (called by the MCP manager's
 // OnChange whenever a server settles). MCP tools live separately from
 // a.Tools so a settle mid-turn never mutates the slice a Turn is reading.
@@ -566,7 +693,11 @@ func (a *Agent) suggest(name string) []string {
 func (a *Agent) AllTools() []tools.Tool {
 	a.toolsMu.Lock()
 	defer a.toolsMu.Unlock()
-	return append(append([]tools.Tool(nil), a.Tools...), a.mcpTools...)
+	all := append(append([]tools.Tool(nil), a.Tools...), a.mcpTools...)
+	if a.HistoryRecall && a.HistoryCatalog != nil && a.currentSessionID() != "" {
+		all = append(all, historyTools(a)...)
+	}
+	return all
 }
 
 // Stream performs one streaming model call and emits the start/end telemetry
@@ -588,7 +719,14 @@ func (a *Agent) Complete(ctx context.Context, req llm.Request, ev Events) (llm.M
 // one-shot callers such as title generation and goal formulation, which do
 // not run through Turn but must still report their provider and adapter.
 func (a *Agent) CompleteWithRoute(ctx context.Context, backend llm.Backend, role, provider, protocol string, req llm.Request, ev Events) (llm.Message, llm.Usage, error) {
-	return a.callComplete(ctx, backend, role, provider, protocol, req, ev)
+	return a.callCompletePurpose(ctx, backend, role, provider, protocol, "", req, ev)
+}
+
+// CompleteWithRoutePurpose is the telemetry-aware variant used by bounded
+// internal model calls such as the optional approval reviewer. Purpose keeps
+// that spend distinguishable from an ordinary tiny subagent turn.
+func (a *Agent) CompleteWithRoutePurpose(ctx context.Context, backend llm.Backend, role, provider, protocol, purpose string, req llm.Request, ev Events) (llm.Message, llm.Usage, error) {
+	return a.callCompletePurpose(ctx, backend, role, provider, protocol, purpose, req, ev)
 }
 
 func (a *Agent) callInfo(backend llm.Backend, role, provider, protocol, model string) ModelCallStart {
@@ -604,6 +742,7 @@ func (a *Agent) callInfo(backend llm.Backend, role, provider, protocol, model st
 func (a *Agent) callStream(ctx context.Context, backend llm.Backend, role, provider, protocol string, req llm.Request, sink llm.EventSink, ev Events) (llm.Message, llm.Usage, error) {
 	start := time.Now()
 	call := a.callInfo(backend, role, provider, protocol, req.Model)
+	a.emitPromptView(ev, call, req)
 	if ev.OnModelCallStart != nil {
 		ev.OnModelCallStart(call)
 	}
@@ -617,9 +756,11 @@ func (a *Agent) callStream(ctx context.Context, backend llm.Backend, role, provi
 	return msg, usage, err
 }
 
-func (a *Agent) callComplete(ctx context.Context, backend llm.Backend, role, provider, protocol string, req llm.Request, ev Events) (llm.Message, llm.Usage, error) {
+func (a *Agent) callCompletePurpose(ctx context.Context, backend llm.Backend, role, provider, protocol, purpose string, req llm.Request, ev Events) (llm.Message, llm.Usage, error) {
 	start := time.Now()
 	call := a.callInfo(backend, role, provider, protocol, req.Model)
+	call.Purpose = purpose
+	a.emitPromptView(ev, call, req)
 	if ev.OnModelCallStart != nil {
 		ev.OnModelCallStart(call)
 	}
@@ -631,6 +772,20 @@ func (a *Agent) callComplete(ctx context.Context, backend llm.Backend, role, pro
 	msg, usage, err := backend.Complete(ctx, req)
 	a.emitCallEnd(ev, call, start, msg, usage, err)
 	return msg, usage, err
+}
+
+func (a *Agent) emitPromptView(ev Events, call ModelCallStart, req llm.Request) {
+	if ev.OnPromptView == nil {
+		return
+	}
+	data, _ := json.Marshal(req)
+	ev.OnPromptView(PromptView{
+		ModelCallStart:  call,
+		MessageCount:    len(req.Messages),
+		EstimatedTokens: EstimateTokens(req.Messages),
+		SerializedBytes: len(data),
+		ContextLimit:    a.ContextLimit,
+	})
 }
 
 func (a *Agent) emitCallEnd(ev Events, call ModelCallStart, start time.Time, msg llm.Message, usage llm.Usage, err error) {
@@ -710,7 +865,20 @@ func (a *Agent) turn(ctx context.Context, input string, parts []llm.ContentPart,
 		msg.SentAt = &now
 	}
 	a.msgsMu.Lock()
-	a.Messages = append(a.Messages, msg)
+	if len(a.Messages) > 0 && a.Messages[len(a.Messages)-1].Role == "user" && len(parts) == 0 && len(a.Messages[len(a.Messages)-1].Parts) == 0 {
+		// Previous turn was interrupted before an assistant message was recorded.
+		// Coalesce consecutive user submissions so the model sees the full prompt.
+		prev := a.Messages[len(a.Messages)-1]
+		if strings.TrimSpace(input) == "continue" || strings.TrimSpace(input) == "Continue" {
+			// User is asking to continue the prior unanswered prompt.
+			msg.Content = prev.Content
+		} else {
+			msg.Content = prev.Content + "\n\n" + input
+		}
+		a.Messages[len(a.Messages)-1] = msg
+	} else {
+		a.Messages = append(a.Messages, msg)
+	}
 	a.msgsMu.Unlock()
 	rounds := 0
 	for {
@@ -722,11 +890,14 @@ func (a *Agent) turn(ctx context.Context, input string, parts []llm.ContentPart,
 			return "", err
 		}
 		msgs := a.Messages
+		if a.ResultAging {
+			msgs = ageResultMessages(msgs, a.ContextLimit)
+		}
 		if block := a.todoBlock(); block != "" {
 			// Open plan items ride along as an ephemeral system message each
 			// round: a.Messages stays clean, and the plan survives long tool
 			// loops and compaction because it is re-derived, not stored.
-			msgs = append(append([]llm.Message(nil), a.Messages...),
+			msgs = append(append([]llm.Message(nil), msgs...),
 				llm.Message{Role: "system", Content: block})
 		}
 		available := a.AllTools()
@@ -757,15 +928,42 @@ func (a *Agent) turn(ctx context.Context, input string, parts []llm.ContentPart,
 			ev.OnUsage(usage)
 		}
 		if err != nil {
-			if !a.compacted && llm.IsContextLimit(err) && ctx.Err() == nil {
+			if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+				if msg.Content != "" || len(msg.ToolCalls) > 0 {
+					msg.Usage = &usage
+					msg.Model = a.Model + " @ " + a.Provider
+					msg.StopReason = "interrupted"
+					a.msgsMu.Lock()
+					a.Messages = append(a.Messages, msg)
+					for _, tc := range msg.ToolCalls {
+						a.Messages = append(a.Messages, llm.Message{
+							Role:       "tool",
+							Content:    "Error: tool call interrupted — the turn was canceled by user before execution completed",
+							ToolCallID: tc.ID,
+							Name:       tc.Function.Name,
+						})
+					}
+					a.msgsMu.Unlock()
+				}
+			}
+			if a.Checkpointing && !a.compacted && llm.IsContextLimit(err) && ctx.Err() == nil {
 				a.compacted = true
 				took := len(a.Messages)
 				sum, cutoff, cerr := a.compactWithEvents(ctx, ev)
 				if cerr != nil {
+					if emergency, emergencyCutoff, emergencyErr := a.emergencyCutover(ctx, ev); emergencyErr == nil {
+						if ev.OnCompact != nil {
+							ev.OnCompact(took-len(a.Messages), len(a.Messages))
+						}
+						if ev.OnCompacted != nil {
+							ev.OnCompacted(emergency, emergencyCutoff)
+						}
+						continue
+					}
 					// restore the guard on hard errors so a manual /compact
 					// can still attempt a compaction for the next turn
 					a.compacted = false
-					return "", cerr
+					return "", fmt.Errorf("context limit exceeded and continuation checkpoint failed: %w", cerr)
 				}
 				if ev.OnCompact != nil {
 					ev.OnCompact(took-len(a.Messages), len(a.Messages))
@@ -868,35 +1066,8 @@ func (a *Agent) ReasoningRequest() (string, *bool) {
 	return effort, &enabled
 }
 
-// runTools executes a batch of tool calls concurrently, returning one result
-// per call in the original order (the API matches tool results to call IDs, so
-// order must be preserved even though execution is parallel). This is the
-// channel-native version of pi's executeToolCallsParallel + withFileMutationQueue:
-//
-//   - Each call runs in its own goroutine; a buffered results channel collects
-//     (index, output) pairs, and a final pass lays them back out in order.
-//   - Mutations to the same file serialize through a per-path channel
-//     semaphore (fileLocks), so two edits to foo.go can't interleave; edits to
-//     different files run truly in parallel.
-//   - bash takes a global lock: its side effects aren't attributable to a path.
-//   - OnToolStart/OnToolEnd fire per call so the UI shows each tool as it
-//     begins and lands, not in a burst at the end.
-func (a *Agent) runTools(ctx context.Context, calls []llm.ToolCall, ev Events) []string {
-	detailed := a.runToolResults(ctx, calls, ev)
-	results := make([]string, len(detailed))
-	for i := range detailed {
-		results[i] = detailed[i].Preview
-	}
-	return results
-}
-
-// runToolResults is the structured implementation behind runTools. The
-// compatibility wrapper keeps tests and integrations that only need strings
-// unchanged while the agent turn retains artifact references and execution
-// metadata on the persisted tool message.
-func (a *Agent) runToolResults(ctx context.Context, calls []llm.ToolCall, ev Events) []tools.ToolResult {
-	return a.runToolResultsWithTools(ctx, calls, ev, a.AllTools())
-}
+// runToolResultsWithTools executes a batch of tool calls concurrently, returning
+// one structured result per call in the original order.
 
 func (a *Agent) runToolResultsWithTools(ctx context.Context, calls []llm.ToolCall, ev Events, available []tools.Tool) []tools.ToolResult {
 	results := make([]tools.ToolResult, len(calls))
@@ -914,6 +1085,8 @@ func (a *Agent) runToolResultsWithTools(ctx context.Context, calls []llm.ToolCal
 			defer wg.Done()
 			name, args := tc.Function.Name, tc.Function.Arguments
 			a.recordTouched(name, args)
+			fingerprint := a.operationFingerprint(name, args)
+			duplicate := a.seenOperationCount(fingerprint) > 1
 
 			// Serialize against other mutations before starting. Acquiring here
 			// (before OnToolStart) keeps "running" rows honest: a tool only
@@ -922,7 +1095,7 @@ func (a *Agent) runToolResultsWithTools(ctx context.Context, calls []llm.ToolCal
 			if a.files != nil {
 				if paths := toolMutationPaths(name, args); len(paths) > 0 {
 					release = a.files.acquirePaths(paths)
-				} else if name == "bash" {
+				} else if toolRequiresGlobalMutation(name, args) {
 					release = a.files.acquireGlobal()
 				}
 			}
@@ -944,6 +1117,8 @@ func (a *Agent) runToolResultsWithTools(ctx context.Context, calls []llm.ToolCal
 			toolCtx = tools.WithObservationStore(toolCtx, a.currentSessionID(), observations)
 			toolCtx = tools.WithSearchStore(toolCtx, a.currentSessionID(), searchState)
 			toolCtx = tools.WithSearchHints(toolCtx, a.searchHints())
+			toolCtx = tools.WithSessionID(toolCtx, a.currentSessionID())
+			toolCtx = tools.WithRuntime(toolCtx, a.Runtime)
 			result := tools.ExecuteResult(toolCtx, available, name, json.RawMessage(args))
 			result = a.attachArtifact(ctx, result)
 			ms := time.Since(start).Milliseconds()
@@ -960,6 +1135,8 @@ func (a *Agent) runToolResultsWithTools(ctx context.Context, calls []llm.ToolCal
 					OriginalBytes: result.OriginalBytes,
 					Truncated:     !result.Complete || result.OriginalBytes > int64(len(result.Preview)),
 					BashRedirect:  result.Metadata["bash_redirect"] == "true",
+					Fingerprint:   fingerprint,
+					Duplicate:     duplicate,
 					Metadata:      metadata,
 				})
 			}
@@ -987,8 +1164,9 @@ func (a *Agent) runToolResultsWithTools(ctx context.Context, calls []llm.ToolCal
 // delivered. Artifact failures never fail a tool call: the bounded preview is
 // still useful and remains the model-facing result.
 func (a *Agent) attachArtifact(ctx context.Context, result tools.ToolResult) tools.ToolResult {
+	agingCandidate := a.ResultAging && result.Complete && len(result.Preview) > agedPreviewBytes
 	if result.Artifact != nil || result.Retained == "" ||
-		(result.Complete && result.OriginalBytes <= int64(len(result.Preview))) {
+		(result.Complete && result.OriginalBytes <= int64(len(result.Preview)) && !agingCandidate) {
 		return result
 	}
 	if a.ArtifactWriter == nil {
@@ -1048,7 +1226,7 @@ func (a *Agent) threshold() float64 {
 // no-ops when the provider didn't advertise a limit (ContextLimit == 0) — the
 // reactive context-limit retry in Turn still covers that case.
 func (a *Agent) maybeCompact(ctx context.Context, ev Events) error {
-	if a.ContextLimit == 0 || a.ContextTokens() < int(a.threshold()*float64(a.ContextLimit)) {
+	if !a.Checkpointing || a.ContextLimit == 0 || a.ContextTokens() < int(a.threshold()*float64(a.ContextLimit)) {
 		return nil
 	}
 	took := len(a.Messages)
@@ -1092,14 +1270,6 @@ func EstimateTokens(msgs []llm.Message) int {
 // on the conversation's own backend and model — and stores the summary as a
 // system-role message (it must carry no tool_call IDs that the kept tail
 // would orphan).
-//
-// It returns the summary text and the cutoff (the index in the pre-compaction
-// Messages the summary replaces, i.e. where the kept tail began). The caller
-// records those as a compaction event so the raw log survives on disk.
-func (a *Agent) compact(ctx context.Context) (summary string, cutoff int, err error) {
-	return a.compactWithEvents(ctx, Events{})
-}
-
 func (a *Agent) compactWithEvents(ctx context.Context, ev Events) (summary string, cutoff int, err error) {
 	if len(a.Messages) < 3 { // system + ≥1 user + one later message
 		return "", 0, errors.New("not enough history to compact")
@@ -1141,6 +1311,14 @@ func (a *Agent) compactWithEvents(ctx context.Context, ev Events) (summary strin
 		return "", 0, fmt.Errorf("compaction summary failed: %w", cerr)
 	}
 	summary = strings.TrimSpace(sum.TextContent())
+	if summary == "" {
+		return "", 0, errors.New("continuation checkpoint was empty")
+	}
+	if ev.OnCompactionReady != nil {
+		if err := ev.OnCompactionReady(append([]llm.Message(nil), a.Messages...), summary, tailStart); err != nil {
+			return "", 0, fmt.Errorf("persist raw history before compaction: %w", err)
+		}
+	}
 	kept := append([]llm.Message(nil), tail...)
 	manifest := buildArtifactManifest(summary, kept, a.Messages)
 	view := []llm.Message{sysPrompt,
@@ -1154,6 +1332,58 @@ func (a *Agent) compactWithEvents(ctx context.Context, ev Events) (summary strin
 	a.Messages = view
 	a.msgsMu.Unlock()
 	return summary, tailStart, nil
+}
+
+// emergencyCutover is the deterministic last resort after a real context
+// rejection and a failed semantic checkpoint. It is available only when the
+// raw history has a durable session boundary, so the omitted range remains
+// recoverable through history tools.
+func (a *Agent) emergencyCutover(ctx context.Context, ev Events) (string, int, error) {
+	if a == nil || a.HistoryCatalog == nil || a.currentSessionID() == "" {
+		return "", 0, errors.New("emergency cutover requires a durable session")
+	}
+	if err := ctx.Err(); err != nil {
+		return "", 0, err
+	}
+	tailStart, tail := compactTail(a.Messages, a.ContextLimit)
+	if tailStart <= 1 || len(tail) == 0 {
+		return "", 0, errors.New("no complete history tail fits an emergency cutover")
+	}
+	checkpoint := latestCheckpoint(a.Messages)
+	marker := fmt.Sprintf("Emergency context cutover: raw messages before sequence %d were omitted without semantic summarization; continuation state may be incomplete. Use history_search/history_read to recover the omitted session history.", tailStart)
+	summary := marker
+	if checkpoint != nil {
+		checkpointText := strings.TrimPrefix(checkpoint.Content, "Summary of the conversation so far:\n\n")
+		if checkpointText != "" {
+			summary += "\n\nLatest successful continuation checkpoint:\n" + checkpointText
+		}
+	}
+	if ev.OnCompactionReady != nil {
+		if err := ev.OnCompactionReady(append([]llm.Message(nil), a.Messages...), summary, tailStart); err != nil {
+			return "", 0, fmt.Errorf("persist raw history before emergency cutover: %w", err)
+		}
+	}
+	manifest := buildArtifactManifest("", tail, a.Messages)
+	view := []llm.Message{a.Messages[0], {Role: "system", Content: "Summary of the conversation so far:\n\n" + summary}}
+	if manifest != "" {
+		view = append(view, llm.Message{Role: "system", Content: manifest})
+	}
+	view = append(view, tail...)
+	a.msgsMu.Lock()
+	a.Messages = view
+	a.msgsMu.Unlock()
+	return summary, tailStart, nil
+}
+
+func latestCheckpoint(msgs []llm.Message) *llm.Message {
+	for i := len(msgs) - 1; i > 0; i-- {
+		if msgs[i].Role != "system" || !strings.HasPrefix(msgs[i].Content, "Summary of the conversation so far:\n\n") {
+			continue
+		}
+		copy := msgs[i]
+		return &copy
+	}
+	return nil
 }
 
 const defaultCompactTailTokens = 32
@@ -1295,20 +1525,25 @@ func buildArtifactManifest(summary string, tail, all []llm.Message) string {
 }
 
 // buildSummaryPrompt renders the unsummarized turns as a transcript the model
-// folds into a concise digest. Tool results are truncated so a giant file
-// read doesn't push the summary request over the window we just overflowed.
+// folds into an actionable continuation checkpoint. Tool results are
+// truncated so a giant file read doesn't push the summary request over the
+// window we just overflowed.
 func buildSummaryPrompt(msgs []llm.Message) string {
 	var b strings.Builder
-	b.WriteString("Summarize the following conversation between the user and the assistant. ")
-	b.WriteString("Capture the user's intent, decisions made, work completed, files touched, ")
-	b.WriteString("and any open task the assistant is mid-way through. ")
-	b.WriteString("Be concise (a few short paragraphs at most); use bullet points for code/files. ")
-	b.WriteString("Preserve artifact ids, hashes, sizes, and incomplete-retention warnings from the tool ledger. Never imply that omitted middle bytes were inspected. ")
-	b.WriteString("Do not include verbatim tool output. End with a single line: ")
-	b.WriteString("\"Open task: <what the assistant was doing last, or none>\".\n\n")
+	b.WriteString("Create a continuation checkpoint for an agent that will continue this exact task.\n")
+	b.WriteString("Preserve:\n")
+	b.WriteString("- current objective and explicit user constraints\n")
+	b.WriteString("- established facts and important discoveries\n")
+	b.WriteString("- decisions and their rationale\n")
+	b.WriteString("- files modified and relevant symbols or locations\n")
+	b.WriteString("- failed approaches and why they failed\n")
+	b.WriteString("- verification performed and its result\n")
+	b.WriteString("- unresolved problems and blockers\n")
+	b.WriteString("- immediate next actions\n\n")
+	b.WriteString("Exclude routine exploration unless it established a material fact. Preserve artifact IDs and incomplete-retention warnings. Never imply omitted artifact bytes were read.\n\n")
 	b.WriteString("---\n\n")
 	writeTranscript(&b, msgs)
-	b.WriteString("\n---\n\nWrite the summary now.")
+	b.WriteString("\n---\n\nWrite the continuation checkpoint now.")
 	return b.String()
 }
 
@@ -1402,6 +1637,9 @@ func truncateField(s string, n int) string {
 // OnCompact and reports whether compaction ran (false when there's too
 // little history). It is safe to call while a turn is not in flight.
 func (a *Agent) ManualCompact(ctx context.Context, ev Events) error {
+	if !a.Checkpointing {
+		return errors.New("continuation checkpoints are disabled")
+	}
 	sum, cutoff, err := a.compactWithEvents(ctx, ev)
 	if err != nil {
 		return err

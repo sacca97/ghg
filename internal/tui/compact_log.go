@@ -3,15 +3,17 @@ package tui
 import (
 	"strconv"
 	"strings"
+
+	"github.com/sacca97/ghg/internal/llm"
 )
 
 // Compaction events are recorded in raw-log coordinates so Load never
 // double-folds a summary. The agent reports its cutoff in compacted
 // coordinates (indices into its current Messages); rawCutoff maps that to the
-// raw row the kept tail begins at. When the compacted history carries a prior
-// summary at index 1, it stands in for everything before the previous event's
-// cutoff, so the raw boundary shifts by one.
-func (m *model) rawCutoff(cutoff int) int {
+// raw row the kept tail begins at. The supplied pre-compaction view lets this
+// account for the prior summary and optional artifact manifest without
+// confusing derived system messages with raw rows.
+func (m *model) rawCutoff(cutoff int, before []llm.Message) int {
 	if m.store == nil || m.sessionID == "" {
 		return cutoff
 	}
@@ -19,9 +21,11 @@ func (m *model) rawCutoff(cutoff int) int {
 	if len(events) == 0 {
 		return cutoff
 	}
-	// the prior event's summary sat at index 1 of the just-compacted history,
-	// so compacted index c corresponds to raw seq (prev.cutoff + c - 1)
-	return events[len(events)-1].Cutoff + cutoff - 1
+	firstRaw := 1
+	for firstRaw < len(before) && before[firstRaw].Role == "system" {
+		firstRaw++
+	}
+	return events[len(events)-1].Cutoff + cutoff - firstRaw
 }
 
 // /compact retry — drop the latest compaction event and re-compact from the

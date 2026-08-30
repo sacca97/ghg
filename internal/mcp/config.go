@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/sacca97/ghg/internal/config"
+	"github.com/sacca97/ghg/internal/tools"
 )
 
 // ServerConfig is ghg's normalized MCP server definition. Claude-style
@@ -44,6 +45,11 @@ type ServerConfig struct {
 	// display (a failed server should point at the file to fix); never
 	// persisted.
 	Source string `json:"-"`
+
+	// runtime is attached by Manager for local stdio servers. It is not part
+	// of discovery/config serialization and keeps legacy transport tests
+	// independent from the execution boundary.
+	runtime *tools.ToolRuntime
 }
 
 // Remote reports whether the server connects over HTTP rather than stdio.

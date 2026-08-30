@@ -2,7 +2,6 @@ package session
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -83,9 +82,6 @@ func (s *Store) LoadSearchSnapshot(ctx context.Context, sessionID, id string) (s
 	var data string
 	err := s.db.QueryRowContext(ctx, `SELECT snapshot FROM search_snapshots WHERE session_id=? AND snapshot_id=?`, sessionID, id).Scan(&data)
 	if err != nil {
-		if err == sql.ErrNoRows {
-			return search.Snapshot{}, err
-		}
 		return search.Snapshot{}, err
 	}
 	var snapshot search.Snapshot
@@ -95,50 +91,14 @@ func (s *Store) LoadSearchSnapshot(ctx context.Context, sessionID, id string) (s
 	return snapshot, nil
 }
 
-type observationRegistryStore struct{ store *Store }
-
-func (s observationRegistryStore) Save(ctx context.Context, sessionID string, record observation.Record) error {
-	return s.store.SaveObservation(ctx, sessionID, record)
-}
-
-func (s observationRegistryStore) SaveObservation(ctx context.Context, sessionID string, record observation.Record) error {
-	return s.store.SaveObservation(ctx, sessionID, record)
-}
-
-func (s observationRegistryStore) Load(ctx context.Context, sessionID, id string) (observation.Record, error) {
-	return s.store.LoadObservation(ctx, sessionID, id)
-}
-
-func (s observationRegistryStore) LoadObservation(ctx context.Context, sessionID, id string) (observation.Record, error) {
-	return s.store.LoadObservation(ctx, sessionID, id)
-}
-
 // ObservationRegistryStore adapts the durable session store to the live
 // registry used by tools without making the observation package depend on SQL.
 func (s *Store) ObservationRegistryStore() observation.Store {
-	return observationRegistryStore{store: s}
-}
-
-type searchRegistryStore struct{ store *Store }
-
-func (s searchRegistryStore) Save(ctx context.Context, sessionID string, snapshot search.Snapshot) error {
-	return s.store.SaveSearchSnapshot(ctx, sessionID, snapshot)
-}
-
-func (s searchRegistryStore) SaveSearchSnapshot(ctx context.Context, sessionID string, snapshot search.Snapshot) error {
-	return s.store.SaveSearchSnapshot(ctx, sessionID, snapshot)
-}
-
-func (s searchRegistryStore) Load(ctx context.Context, sessionID, id string) (search.Snapshot, error) {
-	return s.store.LoadSearchSnapshot(ctx, sessionID, id)
-}
-
-func (s searchRegistryStore) LoadSearchSnapshot(ctx context.Context, sessionID, id string) (search.Snapshot, error) {
-	return s.store.LoadSearchSnapshot(ctx, sessionID, id)
+	return s
 }
 
 // SearchRegistryStore adapts the durable session store to the live search
 // registry used by tools without coupling that package to database/sql.
 func (s *Store) SearchRegistryStore() search.Store {
-	return searchRegistryStore{store: s}
+	return s
 }

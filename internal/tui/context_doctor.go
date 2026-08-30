@@ -160,6 +160,24 @@ func (m *model) doctorReport() string {
 		b.WriteString(line + "\n")
 	}
 	fmt.Fprintf(&b, "  %-*s %7s\n", w, "TOTAL injected before you type", "~"+tok(total))
+	if m.runtime != nil && m.runtime.Policy != nil {
+		status := m.runtime.Policy.Status()
+		fmt.Fprintf(&b, "\nExecution policy: %s · backend: %s · network: %s\n", status.Mode, status.Backend, status.Network)
+		fmt.Fprintf(&b, "  workspace: %s\n", status.Workspace)
+		fmt.Fprintf(&b, "  read roots: %s\n", strings.Join(status.ReadRoots, ", "))
+		fmt.Fprintf(&b, "  write roots: %s\n", strings.Join(status.WriteRoots, ", "))
+		fmt.Fprintf(&b, "  immutable roots: %s\n", strings.Join(status.ImmutableRoots, ", "))
+		fmt.Fprintf(&b, "  protected roots: %s\n", strings.Join(status.ProtectedRoots, ", "))
+		if status.Degraded {
+			fmt.Fprintf(&b, "  degraded: %s\n", status.Reason)
+		}
+		for _, audit := range m.runtime.Audits() {
+			if audit.Error == "" {
+				continue
+			}
+			fmt.Fprintf(&b, "  recent denial: %s (%s)\n", audit.Error, audit.Request.Fingerprint)
+		}
+	}
 	b.WriteString("\nTrim: /mcp <name> disable · remove a skill from .agents/skills · /context-doctor again")
 	return b.String()
 }

@@ -11,6 +11,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -83,7 +84,6 @@ func (r *Registry) BindSession(ctx context.Context, sessionID string) error {
 	for key, snapshot := range r.snapshots {
 		if strings.HasPrefix(key, "\x00") {
 			copySnapshot := cloneSnapshot(snapshot)
-			copySnapshot.ID = snapshot.ID
 			r.snapshots[sessionKey(sessionID, snapshot.ID)] = copySnapshot
 			delete(r.snapshots, key)
 			pending = append(pending, copySnapshot)
@@ -151,7 +151,7 @@ func (r *Registry) Load(ctx context.Context, sessionID, id string) (Snapshot, er
 func sessionKey(sessionID, id string) string { return sessionID + "\x00" + id }
 
 func cloneSnapshot(in Snapshot) Snapshot {
-	in.Items = append([]Item(nil), in.Items...)
+	in.Items = slices.Clone(in.Items)
 	return in
 }
 
@@ -290,7 +290,7 @@ func indexedFiles(root string) []string {
 		fileIndexes.entries = make(map[string]fileIndexEntry)
 	}
 	if entry, ok := fileIndexes.entries[root]; ok && time.Since(entry.builtAt) < fileIndexTTL {
-		files := append([]string(nil), entry.files...)
+		files := slices.Clone(entry.files)
 		fileIndexes.Unlock()
 		return files
 	}
@@ -323,7 +323,7 @@ func indexedFiles(root string) []string {
 	sort.Strings(files)
 
 	fileIndexes.Lock()
-	fileIndexes.entries[root] = fileIndexEntry{builtAt: time.Now(), files: append([]string(nil), files...)}
+	fileIndexes.entries[root] = fileIndexEntry{builtAt: time.Now(), files: slices.Clone(files)}
 	fileIndexes.Unlock()
 	return files
 }

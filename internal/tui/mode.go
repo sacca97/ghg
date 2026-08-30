@@ -1,10 +1,11 @@
 package tui
 
 import (
+	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
-	"github.com/sacca97/ghg/internal/agent"
 	"github.com/sacca97/ghg/internal/config"
 )
 
@@ -45,7 +46,7 @@ func roleLabel(name string) string {
 
 func (m *model) activeRoleLabel() string {
 	if m.agent != nil {
-		if label := roleLabel(m.agent.Role); contains(modelRoleLabels, label) {
+		if label := roleLabel(m.agent.Role); slices.Contains(modelRoleLabels, label) {
 			return label
 		}
 	}
@@ -90,6 +91,9 @@ func (m *model) activateRoute(modelName, providerName, role string) error {
 		m.agent.Role = role
 		return nil
 	}
+	if m.workerClient != nil && m.workerLiveWork {
+		return errors.New("worker is busy; change the model after this work finishes")
+	}
 	ag, mn, pn, err := buildAgentWithProfiles(m.cfg, modelName, providerName, m.sysPrompt, m.profiles)
 	if err != nil {
 		return err
@@ -105,7 +109,7 @@ func (m *model) activateRoute(modelName, providerName, role string) error {
 			ag.Messages = append(ag.Messages, msgs[1:]...)
 		}
 		ag.SetUsage(old.Usage())
-		ag.Todos = append([]agent.Todo(nil), old.Todos...)
+		ag.Todos = slices.Clone(old.Todos)
 		ag.CompactBackend = old.CompactBackend
 		ag.CompactModel = old.CompactModel
 		ag.CompactProvider = old.CompactProvider
@@ -122,7 +126,8 @@ func (m *model) activateRoute(modelName, providerName, role string) error {
 	m.configureArtifactAgent(m.agent)
 	m.applyCompactModel()
 	m.wireTasks()
-	if !contains(m.effortsFor(), ag.Effort) {
+	m.syncWorkerConfiguration(true)
+	if !slices.Contains(m.effortsFor(), ag.Effort) {
 		m.resetEffort("")
 	}
 	return nil
@@ -171,7 +176,7 @@ func (m *model) modelRolePanel(direct bool) *ppanel {
 	return &ppanel{
 		kind:   panelRole,
 		title:  "Model role",
-		list:   append([]string(nil), modelRoleLabels...),
+		list:   slices.Clone(modelRoleLabels),
 		midx:   idx,
 		direct: direct,
 	}

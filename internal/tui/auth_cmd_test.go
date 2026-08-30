@@ -462,10 +462,10 @@ func TestAuthMaskedRender(t *testing.T) {
 	}
 }
 
-// catalogLites carries context/output caps, reasoning efforts, vision
+// ModelInfoLites carries context/output caps, reasoning efforts, vision
 // modalities, and pricing from the provider's /models into the cache shape.
 func TestCatalogLites(t *testing.T) {
-	lites := catalogLites([]llm.ModelInfo{
+	lites := config.ModelInfoLites([]llm.ModelInfo{
 		{ID: "gpt-test", ContextLength: 400000, MaxCompletionTokens: 128000,
 			ReasoningEfforts: []string{"low", "high"}, InputModalities: []string{"text", "image"},
 			Pricing: &llm.Pricing{Prompt: "0.00000125", Completion: "0.00001", InputCacheRead: "0.000000125"}},

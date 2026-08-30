@@ -57,15 +57,12 @@ func (c *Config) UpsertProviderKey(name string, resolved provider.Resolved, key 
 		c.Providers = map[string]Provider{}
 	}
 	c.Providers[name] = p
-	logf("config.provider", "upserted provider %q profile=%q auth=%s", name, p.Profile, authStorageMode(envMode))
-	return nil
-}
-
-func authStorageMode(envMode bool) string {
+	authMode := "literal"
 	if envMode {
-		return "environment"
+		authMode = "environment"
 	}
-	return "literal"
+	logf("config.provider", "upserted provider %q profile=%q auth=%s", name, p.Profile, authMode)
+	return nil
 }
 
 // AnyProviderConfigured reports whether any configured provider currently has

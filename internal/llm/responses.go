@@ -1,7 +1,6 @@
 package llm
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -31,10 +30,6 @@ type OpenAIResponsesClient struct {
 	OnRetry    func(RetryEvent)
 }
 
-// ResponsesClient is kept as a short alias for callers that do not need to
-// spell out the OpenAI API family.
-type ResponsesClient = OpenAIResponsesClient
-
 // NewOpenAIResponses creates an OpenAI Responses client.
 func NewOpenAIResponses(baseURL, apiKey string) *OpenAIResponsesClient {
 	return &OpenAIResponsesClient{
@@ -42,11 +37,6 @@ func NewOpenAIResponses(baseURL, apiKey string) *OpenAIResponsesClient {
 		APIKey:  apiKey,
 		HTTP:    &http.Client{Timeout: 10 * time.Minute},
 	}
-}
-
-// NewResponses is the concise constructor equivalent of NewOpenAIResponses.
-func NewResponses(baseURL, apiKey string) *OpenAIResponsesClient {
-	return NewOpenAIResponses(baseURL, apiKey)
 }
 
 func (c *OpenAIResponsesClient) attempts() int {
@@ -859,7 +849,9 @@ func consumeOpenAIResponsesSSE(r io.Reader, onText, onThink func(string)) (Messa
 					return err
 				}
 				final = &response
-				usage = openAIResponsesUsageOrZero(response.Usage)
+				if response.Usage != nil {
+					usage = *response.Usage
+				}
 			}
 			sawTerminal = true
 		case "response.failed", "response.error", "error":
@@ -881,7 +873,9 @@ func consumeOpenAIResponsesSSE(r io.Reader, onText, onThink func(string)) (Messa
 		return nil
 	}
 
-	if err := scanOpenAIResponsesSSE(r, handle); err != nil {
+	if err := scanSSE(r, maxOpenAIResponsesSSELine, handle, func(line string) error {
+		return nonRetryable{fmt.Errorf("malformed openai responses SSE line %q", line)}
+	}); err != nil {
 		return Message{}, openAIResponsesUsageValue(&usage), err
 	}
 	if !sawTerminal {
@@ -891,9 +885,9 @@ func consumeOpenAIResponsesSSE(r io.Reader, onText, onThink func(string)) (Messa
 	if final != nil && len(final.Output) > 0 {
 		msg, err := messageFromOpenAIResponses(*final)
 		if err != nil {
-			return Message{}, usageToResponseUsage(final.Usage), err
+			return Message{}, openAIResponsesUsageValue(final.Usage), err
 		}
-		return msg, usageToResponseUsage(final.Usage), nil
+		return msg, openAIResponsesUsageValue(final.Usage), nil
 	}
 	for _, call := range calls {
 		if call.Index < 0 {
@@ -935,17 +929,6 @@ func consumeOpenAIResponsesSSE(r io.Reader, onText, onThink func(string)) (Messa
 	return msg, openAIResponsesUsageValue(&usage), nil
 }
 
-func openAIResponsesUsageOrZero(raw *openAIResponsesUsage) openAIResponsesUsage {
-	if raw == nil {
-		return openAIResponsesUsage{}
-	}
-	return *raw
-}
-
-func usageToResponseUsage(raw *openAIResponsesUsage) Usage {
-	return openAIResponsesUsageValue(raw)
-}
-
 func firstNonEmpty(values ...string) string {
 	for _, value := range values {
 		if strings.TrimSpace(value) != "" {
@@ -958,49 +941,4 @@ func firstNonEmpty(values ...string) string {
 func openAIResponsesHTTPError(resp *http.Response) error {
 	body, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	return &HTTPError{Status: resp.Status, Body: strings.TrimSpace(string(body))}
-}
-
-func scanOpenAIResponsesSSE(r io.Reader, handle func(string, []byte) error) error {
-	sc := bufio.NewScanner(r)
-	sc.Buffer(make([]byte, 64*1024), maxOpenAIResponsesSSELine)
-	var data []string
-	eventName := ""
-	dispatch := func() error {
-		if len(data) == 0 {
-			eventName = ""
-			return nil
-		}
-		payload := strings.Join(data, "\n")
-		name := eventName
-		data = nil
-		eventName = ""
-		return handle(name, []byte(payload))
-	}
-	for sc.Scan() {
-		line := strings.TrimSuffix(sc.Text(), "\r")
-		if line == "" {
-			if err := dispatch(); err != nil {
-				return err
-			}
-			continue
-		}
-		if strings.HasPrefix(line, ":") {
-			continue
-		}
-		field, value, ok := strings.Cut(line, ":")
-		if !ok {
-			return nonRetryable{fmt.Errorf("malformed openai responses SSE line %q", line)}
-		}
-		value = strings.TrimPrefix(value, " ")
-		switch field {
-		case "event":
-			eventName = value
-		case "data":
-			data = append(data, value)
-		}
-	}
-	if err := sc.Err(); err != nil {
-		return err
-	}
-	return dispatch()
 }

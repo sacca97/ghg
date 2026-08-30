@@ -21,15 +21,14 @@ func TestRepoSkillsSpecClean(t *testing.T) {
 }
 
 // The block total should stay sane: it lands in EVERY session's system
-// prompt, so growth here is a per-turn tax. Pruning the golang-* skills for
-// libraries this module doesn't import took it from 24,673 chars across 49
-// skills to ~14.5k across 33; the budget was tightened to match so the next
-// batch of additions has to argue for itself rather than coasting on old
-// headroom. Raising it is a deliberate decision, not a fix for a red test.
+// prompt, so growth here is a per-turn tax. The repo catalog contains only
+// guidance that encodes ghg-specific risks or workflows; generic Go references
+// belong in user-installed skills. The budget is a ratchet, so a new project
+// skill has to justify its permanent prompt cost.
 func TestSkillBlockBudget(t *testing.T) {
 	sk := Scan("../../.agents/skills")
 	block := PromptBlock(sk)
-	const budget = 20_000 // ≈5k tokens
+	const budget = 8_000 // ≈2k tokens
 	if len(block) > budget {
 		t.Errorf("skills block = %d chars (budget %d)", len(block), budget)
 	}

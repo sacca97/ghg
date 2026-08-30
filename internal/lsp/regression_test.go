@@ -23,15 +23,23 @@ func TestWedgedServerTeardown(t *testing.T) {
 	outR, outW := io.Pipe() // stdout never written: readLoop blocks harmlessly
 	defer outW.Close()
 	c := newClient(inW, outR, nil)
+	dead := func() bool {
+		select {
+		case <-c.dead:
+			return true
+		default:
+			return false
+		}
+	}
 
 	start := time.Now()
 	for i := 0; i < 200; i++ {
 		c.notify("test/flood", map[string]any{"i": i})
-		if c.isDead() {
+		if dead() {
 			break
 		}
 	}
-	if !c.isDead() {
+	if !dead() {
 		t.Fatal("wedged server should have torn the client down")
 	}
 	if took := time.Since(start); took > writeTimeout+2*time.Second {

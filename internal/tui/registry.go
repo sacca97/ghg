@@ -28,6 +28,7 @@ var registry = []registryEntry{
 	{Name: "/clear", Hint: "— reset conversation", Category: "Session"},
 	{Name: "/compact", Hint: "[model] [provider]|off — compact now, or pick the compaction model (off restores the default); retry undoes the last compaction, log lists them; compaction level: ctrl+p › Compaction level", Category: "Session"},
 	{Name: "/context-doctor", Hint: "— audit what a fresh session injects (skills, MCP, tool schemas) and its token cost", Category: "Session"},
+	{Name: "/detach", Hint: "— leave a running worker in the background (ctrl+d)", Keybind: "ctrl+d", Category: "Session"},
 	{Name: "/effort", Hint: "[level] — reasoning effort: off·low·medium·high (bare opens selector)", Category: "Agent"},
 	{Name: "/fork", Hint: "[name] — copy the conversation into a new session (pick a point in the rewind picker with f)", Category: "Session"},
 	{Name: "/goal", Hint: "<text> — keep working until the goal is met (resume | clear | rounds <n>|default [--global])", Category: "Session"},
@@ -51,10 +52,6 @@ var registry = []registryEntry{
 	{Name: "!cmd", Hint: "— run a shell command locally; output lands in the transcript and the conversation", Category: "App"},
 }
 
-func sortEntries(es []registryEntry) {
-	sort.Slice(es, func(i, j int) bool { return es[i].Name < es[j].Name })
-}
-
 // slashRegistry returns the registry entries that name a slash command,
 // sorted by name (the canonical order for help and completion).
 func slashRegistry() []registryEntry {
@@ -64,7 +61,7 @@ func slashRegistry() []registryEntry {
 			out = append(out, e)
 		}
 	}
-	sortEntries(out)
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
 }
 
@@ -77,21 +74,6 @@ func registryFind(name string) *registryEntry {
 		}
 	}
 	return nil
-}
-
-// dispatches reports whether the command switch routes name to a real
-// handler rather than the unknown-command error. It is a probe — meant for
-// tests — that runs the bare command on a scratch model and checks the
-// transcript.
-func (m *model) dispatches(name string) bool {
-	before := len(m.blocks)
-	m.command(name)
-	for _, b := range m.blocks[before:] {
-		if strings.Contains(b.text, "unknown command") {
-			return false
-		}
-	}
-	return true
 }
 
 // helpText renders /help from the registry plus the settings's keybind hints:
@@ -108,6 +90,7 @@ func helpText() string {
 	for _, hint := range []string{
 		"ctrl+k — clear the conversation",
 		"ctrl+t — focus the subagents dock (↑/↓ select, enter opens, esc backs out)",
+		"ctrl+d — detach a running turn",
 		palHintThinking + " — toggle thinking tokens",
 		"ctrl+e — expand the last tool result",
 		"ctrl+j / shift+enter — newline",

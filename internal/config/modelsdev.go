@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"time"
 )
@@ -162,15 +163,7 @@ func cloneModelsDevReasoning(info ModelsDevReasoning) ModelsDevReasoning {
 }
 
 func sameModelsDevReasoning(a, b ModelsDevReasoning) bool {
-	if a.Toggle != b.Toggle || len(a.Efforts) != len(b.Efforts) {
-		return false
-	}
-	for i := range a.Efforts {
-		if a.Efforts[i] != b.Efforts[i] {
-			return false
-		}
-	}
-	return true
+	return a.Toggle == b.Toggle && slices.Equal(a.Efforts, b.Efforts)
 }
 
 func modelsDevPath() (string, error) {
@@ -333,22 +326,13 @@ func normalizeModelsDevReasoning(options []modelsDevReasoningOption) ModelsDevRe
 						effort = "none"
 					}
 				}
-				if !containsString(out.Efforts, effort) {
+				if !slices.Contains(out.Efforts, effort) {
 					out.Efforts = append(out.Efforts, effort)
 				}
 			}
 		}
 	}
 	return out
-}
-
-func containsString(values []string, want string) bool {
-	for _, value := range values {
-		if value == want {
-			return true
-		}
-	}
-	return false
 }
 
 // FetchModelsDev retrieves and normalizes the wanted models from the public

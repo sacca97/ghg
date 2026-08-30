@@ -1,6 +1,6 @@
 ---
 name: golang-gopls
-description: "Golang semantic code intelligence via `gopls` — go-to-definition, references, call hierarchy, symbols, diagnostics, rename, refactors. Use when navigating or refactoring Go code. Not for published ecosystem → `golang-pkg-go-dev`; vuln audits → `golang-security`."
+description: "Use gopls for semantic navigation and refactoring in ghg: definitions, references, call hierarchy, symbols, diagnostics, rename, and code actions. Use when text search cannot safely answer a resolved-build question; not for external package research."
 user-invocable: true
 license: MIT
 compatibility: Designed for Claude Code, Codex or similar harness. Requires the gopls binary (go install golang.org/x/tools/gopls@latest) v0.20+ on PATH.

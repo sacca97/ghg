@@ -151,9 +151,11 @@ Improvement plan with per-item checkboxes: [`.ai-docs/plans/mcp-polish/`](../.ai
 ## Safety & permissions
 
 - [x] Permission prompt: Allow once / Allow always / Reject, where "always" previews the exact rule it installs and "reject" takes a free-text redirect message back to the model (opencode `routes/session/permission.tsx`)
-- [x] Command-prefix arity for useful "allow always" rules: `git checkout branch` → rule for `git checkout`, not the whole string (opencode `permission/arity.ts`)
+- [x] Command-prefix arity for simple "allow always" rules: `git checkout branch` → rule for `git checkout`; compound commands use exact normalized rules and cannot reuse a first-command approval (opencode `permission/arity.ts`)
 - [x] Project trust prompt on first run in a directory (pi: `trust.json`, `defaultProjectTrust: "ask"`) — `internal/tui/trust.go` + `~/.ghg/trusted.json`, plain-terminal prompt before the TUI starts, piped stdin declines safely
 - [x] Secrets as references, never values: `"$VAR"`/`"!cmd"` (or `${ENV_VAR}`-style) indirection in config and MCP/tool init, resolved host-side at point of use so raw keys never enter the event log or model context (exo `crates/exoharness/src/secrets.rs` — AES-GCM at rest with keychain/file master key is the full version; the indirection alone is most of the safety)
+- [x] Initial shared execution policy and OS sandbox substrate: canonical native roots, protected metadata, minimal child environments, fail-closed macOS Seatbelt/Linux bubblewrap wrappers, explicit sandbox/network modes, local MCP/LSP process wiring, and headless/TUI runtime inheritance — plan.md Phase 3; backend-denial retry remains open
+- [x] Optional `auto-review`/`approve-for-me`: one tool-less bounded `tiny` decision for the deterministic ambiguous middle, strict structured output, human fallback in interactive mode, fail-closed headless behavior, one-shot network grants plus human-only external-root/protected grants, in-flight deduplication, and separate reviewer audit telemetry — plan.md Phase 3
 
 ## Theming & config
 

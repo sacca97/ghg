@@ -22,7 +22,10 @@ import (
 	"github.com/sacca97/ghg/internal/agent"
 	"github.com/sacca97/ghg/internal/artifact"
 	"github.com/sacca97/ghg/internal/config"
+	"github.com/sacca97/ghg/internal/llm"
+	"github.com/sacca97/ghg/internal/lsp"
 	"github.com/sacca97/ghg/internal/session"
+	"github.com/sacca97/ghg/internal/tools"
 )
 
 func runCLI(args []string) error {
@@ -38,10 +41,13 @@ func runCLI(args []string) error {
 	systemFileFlag := fs.String("system-file", "", "read the system prompt from this file (wins over -system)")
 	maxTurnsFlag := fs.Int("max-turns", 0, "cap the tool-call loop at N rounds (0 = uncapped); a capped run exits non-zero")
 	timeoutFlag := fs.Duration("timeout", 0, "wall-clock cap on the whole run (e.g. 30s, 5m); 0 = no timeout")
+	sandboxFlag := fs.String("sandbox", "", "execution sandbox: read-only, workspace-write, or danger-full-access")
+	networkFlag := fs.String("network", "", "execution network: deny or host")
+	approvalFlag := fs.String("approval", "", "exceptional capability approval: ask, auto-review, or never")
 	quietFlag := fs.Bool("quiet", false, "suppress the stderr tool/session notes (clean stdout for -format json piping)")
 	noSessionFlag := fs.Bool("no-session", false, "run without persisting a session (one-off jobs don't clutter ghg sessions)")
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "usage: ghg run [--plan | --plan-only] [--format text|json] [--role role] [-m model] [-p provider] [-resume id] [-system text | -system-file path] [-max-turns N] [-timeout dur] [-quiet] [-no-session] \"prompt\"")
+		fmt.Fprintln(os.Stderr, "usage: ghg run [--plan | --plan-only] [--format text|json] [--role role] [-m model] [-p provider] [-resume id] [-system text | -system-file path] [-max-turns N] [-timeout dur] [--sandbox mode] [--network mode] [--approval mode] [-quiet] [-no-session] \"prompt\"")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
@@ -74,6 +80,9 @@ func runCLI(args []string) error {
 
 	cfg, err := config.Load()
 	if err != nil {
+		return err
+	}
+	if err := cfg.ApplyExecutionOverrides(*sandboxFlag, *networkFlag, *approvalFlag); err != nil {
 		return err
 	}
 	profiles, err := loadProviderProfiles()
@@ -155,25 +164,68 @@ func runCLI(args []string) error {
 				"type": "tool_telemetry", "id": telemetry.ID, "name": telemetry.Name,
 				"preview_bytes": telemetry.PreviewBytes, "retained_bytes": telemetry.RetainedBytes,
 				"original_bytes": telemetry.OriginalBytes, "truncated": telemetry.Truncated,
-				"bash_redirect": telemetry.BashRedirect, "metadata": telemetry.Metadata,
+				"bash_redirect": telemetry.BashRedirect, "fingerprint": telemetry.Fingerprint,
+				"duplicate": telemetry.Duplicate, "metadata": telemetry.Metadata,
 			})
 		}
 		ev.OnModelCallStart = func(call agent.ModelCallStart) {
 			emit(map[string]any{
 				"type": "model_call_start", "role": call.Role, "provider": call.Provider,
-				"model": call.Model, "protocol": call.Protocol,
+				"model": call.Model, "protocol": call.Protocol, "purpose": call.Purpose,
 			})
 		}
 		ev.OnModelCallEnd = func(call agent.ModelCallEnd) {
 			emit(map[string]any{
 				"type": "model_call_end", "role": call.Role, "provider": call.Provider,
 				"model": call.Model, "protocol": call.Protocol, "latency_ms": call.LatencyMS,
-				"finish_reason": call.FinishReason, "usage": call.Usage, "error": call.Error,
+				"purpose": call.Purpose, "finish_reason": call.FinishReason, "usage": call.Usage, "error": call.Error,
+			})
+		}
+		ev.OnPromptView = func(view agent.PromptView) {
+			emit(map[string]any{
+				"type": "prompt_view", "role": view.Role, "provider": view.Provider,
+				"model": view.Model, "protocol": view.Protocol, "purpose": view.Purpose,
+				"message_count": view.MessageCount, "estimated_tokens": view.EstimatedTokens,
+				"serialized_bytes": view.SerializedBytes, "context_limit": view.ContextLimit,
 			})
 		}
 	} else {
 		ev.OnText = func(d string) { fmt.Fprint(os.Stdout, d) }
 		ev.OnToolStart = func(_, name, args string) { note("⚒ %s", name) }
+	}
+	runtime, runtimeCleanup, err := tools.NewConfiguredRuntime(".", cfg.Execution, true, cfg.PostEdit)
+	if err != nil {
+		return err
+	}
+	defer runtimeCleanup()
+	lspMgr := lsp.NewManager(lsp.FromConfigMap(cfg.LSPServers))
+	lspMgr.SetRuntime(runtime)
+	defer lspMgr.Close()
+	if emit != nil {
+		status := runtime.Policy.Status()
+		emit(map[string]any{
+			"type": "execution_policy", "mode": status.Mode, "backend": status.Backend,
+			"network": status.Network, "workspace": status.Workspace,
+			"read_roots": status.ReadRoots, "write_roots": status.WriteRoots,
+			"cache_roots": status.CacheRoots, "immutable_roots": status.ImmutableRoots,
+			"temp_roots":      status.TempRoots,
+			"protected_roots": status.ProtectedRoots, "degraded": status.Degraded,
+			"reason": status.Reason,
+		})
+		runtime.OnAudit = func(audit tools.ExecutionAudit) {
+			emit(map[string]any{
+				"type": "execution_audit", "disposition": audit.Disposition,
+				"fingerprint": audit.Request.Fingerprint, "granted": audit.Granted,
+				"error": audit.Error,
+			})
+		}
+		runtime.OnReviewerCall = func(call tools.ReviewerCall) {
+			emit(map[string]any{
+				"type": "model_call_end", "role": call.Role, "provider": call.Provider,
+				"model": call.Model, "protocol": call.Protocol, "purpose": call.Purpose,
+				"latency_ms": call.LatencyMS, "usage": call.Usage, "error": call.Error,
+			})
+		}
 	}
 
 	var ag *agent.Agent
@@ -189,6 +241,7 @@ func runCLI(args []string) error {
 			}
 			return planErr
 		}
+		planner.Runtime = runtime
 		planner.Effort = cfg.DefaultEffort
 		if planner.Effort == "" {
 			planner.Effort = "medium"
@@ -257,10 +310,15 @@ func runCLI(args []string) error {
 		ag = agent.New(backend, apiID, mdl.MaxTokens, sys)
 		ag.ModelName, ag.Provider, ag.Role = modelName, provName, config.RoleDefault
 		ag.ContextLimit = mdl.ContextWindow()
+		ag.CompactThreshold = config.CompactThreshold(cfg)
 		configureSubagentFactory(ag, cfg, profiles)
 	}
 	if err != nil {
 		return err
+	}
+	ag.Runtime = runtime
+	if runtime.ApprovalMode == tools.ApprovalAutoReview {
+		runtime.Reviewer = ag.ApproveForMe
 	}
 	ag.Effort = cfg.DefaultEffort
 	if ag.Effort == "" {
@@ -306,6 +364,7 @@ func runCLI(args []string) error {
 	// -no-session (a one-off cron job shouldn't clutter ghg sessions).
 	var store *session.Store
 	var sessionID string
+	saved := 0 // headless sessions persist the system message at sequence zero
 	if !*noSessionFlag {
 		if dir, derr := config.Dir(); derr == nil {
 			if st, serr := session.Open(dir + "/sessions.db"); serr == nil {
@@ -321,7 +380,12 @@ func runCLI(args []string) error {
 				return fmt.Errorf("-resume: %w", lerr)
 			}
 			sessionID = meta.ID
-			ag.Messages = append(ag.Messages[:1], msgs[1:]...) // keep our system prompt, replay the rest
+			loaded := msgs
+			if len(loaded) > 0 && loaded[0].Role == "system" {
+				loaded = loaded[1:]
+			}
+			ag.Messages = append(ag.Messages[:1], loaded...) // keep our system prompt, replay the rest
+			saved = len(ag.Messages)
 		} else if cwd, cerr := os.Getwd(); cerr == nil {
 			if id, ierr := store.Create(cwd, modelName, provName); ierr == nil {
 				sessionID = id
@@ -330,12 +394,37 @@ func runCLI(args []string) error {
 	}
 	if store != nil {
 		ag.ArtifactCatalog = store
+		ag.HistoryCatalog = store
 		ag.SetObservationStore(store.ObservationRegistryStore())
 		ag.SetSearchStore(store.SearchRegistryStore())
 	}
 	ag.SetSessionID(sessionID)
 	if err := ag.BindState(ctx); err != nil {
 		return fmt.Errorf("bind session tool state: %w", err)
+	}
+	if store != nil && sessionID != "" {
+		var pendingRaw []llm.Message
+		ev.OnCompactionReady = func(raw []llm.Message, summary string, cutoff int) error {
+			pendingRaw = raw
+			if len(raw) > saved {
+				if err := store.Save(sessionID, saved, raw, modelName, provName); err != nil {
+					return err
+				}
+			}
+			rawCutoff := cutoff
+			if events := store.Compactions(sessionID); len(events) > 0 {
+				firstRaw := 1
+				for firstRaw < len(pendingRaw) && pendingRaw[firstRaw].Role == "system" {
+					firstRaw++
+				}
+				rawCutoff = events[len(events)-1].Cutoff + cutoff - firstRaw
+			}
+			return store.RecordCompaction(sessionID, rawCutoff, summary)
+		}
+		ev.OnCompacted = func(_ string, _ int) {
+			saved = len(ag.MessagesSnapshot())
+			pendingRaw = nil
+		}
 	}
 	if *resumeFlag != "" {
 		ag.RebuildTouched(ag.MessagesSnapshot())
@@ -356,10 +445,11 @@ func runCLI(args []string) error {
 	}
 
 	// Best-effort persistence (the TUI's persist does the same each turn).
-	// Save from index 0: Load re-derives the system-prompt slot, so a resumed
-	// conversation must not skip it (saving from 1 shifts everything off).
+	// Before the first compaction, saved is zero so the headless session keeps
+	// its system prompt at sequence zero. After a cutover it tracks the derived
+	// view and Save appends only the new raw tail.
 	if store != nil && sessionID != "" {
-		if serr := store.Save(sessionID, 0, ag.MessagesSnapshot(), modelName, provName); serr != nil {
+		if serr := store.Save(sessionID, saved, ag.MessagesSnapshot(), modelName, provName); serr != nil {
 			config.LogEvent("session.save", "run FAILED id="+sessionID+": "+serr.Error())
 		}
 		note("session %s — resume with: ghg run -resume %s \"…\" · or interactively: ghg --resume %s", sessionID, sessionID, sessionID)
@@ -370,26 +460,24 @@ func runCLI(args []string) error {
 func executionPrompt(p agent.Plan) string {
 	var b strings.Builder
 	b.WriteString("Execute this validated plan now. Use the available tools to make the changes and verify the acceptance checks; do not merely describe what should be done. Keep the todowrite checklist updated.\n\n")
-	b.WriteString("Goal: " + p.Goal + "\n\nOrdered steps:\n")
-	for i, step := range p.Steps {
-		fmt.Fprintf(&b, "%d. %s\n", i+1, step)
-	}
-	b.WriteString("\nAcceptance checks:\n")
-	for _, check := range p.AcceptanceChecks {
-		b.WriteString("- " + check + "\n")
-	}
+	writePlanBody(&b, p, "Ordered steps")
 	return b.String()
 }
 
 func headlessPlanText(p agent.Plan) string {
 	var b strings.Builder
-	b.WriteString("Plan\nGoal: " + p.Goal + "\n\nSteps:\n")
+	b.WriteString("Plan\n")
+	writePlanBody(&b, p, "Steps")
+	return strings.TrimRight(b.String(), "\n")
+}
+
+func writePlanBody(b *strings.Builder, p agent.Plan, stepsLabel string) {
+	b.WriteString("Goal: " + p.Goal + "\n\n" + stepsLabel + ":\n")
 	for i, step := range p.Steps {
-		fmt.Fprintf(&b, "%d. %s\n", i+1, step)
+		fmt.Fprintf(b, "%d. %s\n", i+1, step)
 	}
 	b.WriteString("\nAcceptance checks:\n")
 	for _, check := range p.AcceptanceChecks {
 		b.WriteString("- " + check + "\n")
 	}
-	return strings.TrimRight(b.String(), "\n")
 }

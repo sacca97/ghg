@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 )
 
@@ -13,8 +14,9 @@ import (
 // per path is the idiomatic Go form of pi's per-path promise-chain queue — no
 // explicit unlock bookkeeping.
 //
-// Only write/edit take a per-path lock; reads don't. Bash takes the global
-// lock because a command can touch anything.
+// Only write/edit take a per-path lock; reads don't. Bash and lsp_rename apply
+// take the global lock because their side effects cannot be attributed to one
+// path before the tool validates the complete request.
 type fileLocks struct {
 	mu     sync.Mutex
 	locks  map[string]chan struct{}
@@ -27,13 +29,6 @@ func newFileLocks() *fileLocks {
 		locks:  map[string]chan struct{}{},
 		global: make(chan struct{}, 1),
 	}
-}
-
-// acquirePath blocks until the lock for path is held, returning a release func.
-// The 1-capacity channel means the first acquirer succeeds immediately and
-// later acquirers block on send until the holder receives.
-func (f *fileLocks) acquirePath(path string) func() {
-	return f.acquirePaths([]string{path})
 }
 
 // acquirePaths takes every path lock in canonical lexical order. The sorted
@@ -98,17 +93,6 @@ func canonicalPathKey(path string) string {
 	return filepath.Clean(path)
 }
 
-// toolMutationPath extracts the path a write/edit tool call will mutate. The
-// second return is false for tools whose side effects aren't path-scoped
-// (bash), which must take the global lock.
-func toolMutationPath(toolName, args string) (string, bool) {
-	paths := toolMutationPaths(toolName, args)
-	if len(paths) > 0 {
-		return paths[0], true
-	}
-	return "", false
-}
-
 // toolMutationPaths extracts every file an explicit mutation can replace.
 // Bash remains global because its side effects are intentionally opaque.
 func toolMutationPaths(toolName, args string) []string {
@@ -134,4 +118,20 @@ func toolMutationPaths(toolName, args string) []string {
 		}
 	}
 	return paths
+}
+
+func toolRequiresGlobalMutation(toolName, args string) bool {
+	if toolName == "bash" {
+		return true
+	}
+	if toolName != "lsp_rename" {
+		return false
+	}
+	var request struct {
+		Operation string `json:"operation"`
+	}
+	if err := json.Unmarshal([]byte(args), &request); err != nil {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(request.Operation), "apply")
 }

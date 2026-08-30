@@ -86,7 +86,7 @@ func TestLargeToolResultGetsAnArtifactReference(t *testing.T) {
 		Name      string `json:"name"`
 		Arguments string `json:"arguments"`
 	}{Name: "large", Arguments: `{}`}}}
-	results := ag.runToolResults(context.Background(), calls, Events{})
+	results := ag.runToolResultsWithTools(context.Background(), calls, Events{}, ag.AllTools())
 	if len(results) != 1 || results[0].Artifact == nil {
 		t.Fatalf("result did not get an artifact: %+v", results)
 	}
@@ -99,6 +99,21 @@ func TestLargeToolResultGetsAnArtifactReference(t *testing.T) {
 	got, err := store.Read(context.Background(), *results[0].Artifact, 0, 100)
 	if err != nil || string(got) != strings.Repeat("x", 100) {
 		t.Fatalf("stored result = %q, %v", got, err)
+	}
+}
+
+func TestAgingPromotesCompleteToolResult(t *testing.T) {
+	store, err := artifact.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ag := New(nil, "m", 100, "sys")
+	ag.ResultAging = true
+	ag.ArtifactWriter = store
+	raw := strings.Repeat("x", 2_000)
+	result := ag.attachArtifact(context.Background(), tools.TextResult(raw, raw))
+	if result.Artifact == nil {
+		t.Fatal("aging-eligible complete result was not promoted")
 	}
 }
 
@@ -116,7 +131,7 @@ func TestDisabledArtifactsExplainUnrecoverableOutput(t *testing.T) {
 		Name      string `json:"name"`
 		Arguments string `json:"arguments"`
 	}{Name: "large", Arguments: `{}`}}}
-	results := ag.runToolResults(context.Background(), calls, Events{})
+	results := ag.runToolResultsWithTools(context.Background(), calls, Events{}, ag.AllTools())
 	if len(results) != 1 || results[0].Artifact != nil {
 		t.Fatalf("disabled result should not have an artifact: %+v", results)
 	}

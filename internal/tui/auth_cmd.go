@@ -267,6 +267,10 @@ func (m *model) applyAuthResult(res authResultMsg) {
 			m.wireTasks()
 		}
 	}
+	if m.agent != nil && m.prog != nil && m.workerClient == nil {
+		m.workerStartFailed = false
+		m.ensureWorker()
+	}
 	if res.catalogErr != nil {
 		m.append(dimStyle.Render("(catalog prefetch failed; /model refresh will retry)"))
 	}

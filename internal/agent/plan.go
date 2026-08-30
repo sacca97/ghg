@@ -46,48 +46,12 @@ func (p Plan) Validate() error {
 	return nil
 }
 
-// ParsePlan accepts the JSON object returned by the planner, including a
-// fenced JSON block or a response with a small amount of surrounding prose.
-// The planner caller still treats a validation error as a failed proposal.
+// ParsePlan accepts the JSON object returned by the planner.
 func ParsePlan(response string) (Plan, error) {
 	response = strings.TrimSpace(response)
-	if strings.HasPrefix(response, "```") {
-		if nl := strings.IndexByte(response, '\n'); nl >= 0 {
-			response = strings.TrimSpace(response[nl+1:])
-		}
-		response = strings.TrimSpace(strings.TrimSuffix(response, "```"))
-	}
-	start := strings.IndexByte(response, '{')
-	end := strings.LastIndexByte(response, '}')
-	if start < 0 || end < start {
-		return Plan{}, fmt.Errorf("planner returned non-JSON output")
-	}
-	response = response[start : end+1]
-
-	var wire struct {
-		Goal             string   `json:"goal"`
-		Steps            []string `json:"steps"`
-		AcceptanceChecks []string `json:"acceptance_checks"`
-		Checks           []string `json:"checks"`
-		Plan             *struct {
-			Goal             string   `json:"goal"`
-			Steps            []string `json:"steps"`
-			AcceptanceChecks []string `json:"acceptance_checks"`
-			Checks           []string `json:"checks"`
-		} `json:"plan"`
-	}
-	if err := json.Unmarshal([]byte(response), &wire); err != nil {
+	var p Plan
+	if err := json.Unmarshal([]byte(response), &p); err != nil {
 		return Plan{}, fmt.Errorf("planner returned invalid JSON: %w", err)
-	}
-	p := Plan{Goal: wire.Goal, Steps: wire.Steps, AcceptanceChecks: wire.AcceptanceChecks}
-	if len(p.AcceptanceChecks) == 0 {
-		p.AcceptanceChecks = wire.Checks
-	}
-	if wire.Plan != nil {
-		p = Plan{Goal: wire.Plan.Goal, Steps: wire.Plan.Steps, AcceptanceChecks: wire.Plan.AcceptanceChecks}
-		if len(p.AcceptanceChecks) == 0 {
-			p.AcceptanceChecks = wire.Plan.Checks
-		}
 	}
 	if err := p.Validate(); err != nil {
 		return Plan{}, err

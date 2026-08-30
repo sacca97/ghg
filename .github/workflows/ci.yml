@@ -54,3 +54,53 @@ jobs:
             GOOS=${target%/*} GOARCH=${target#*/} CGO_ENABLED=0 \
               go build -trimpath -o /dev/null ./cmd/ghg || exit 1
           done
+
+  native-sandbox:
+    name: native sandbox (${{ matrix.backend }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            backend: seatbelt
+          - os: ubuntu-latest
+            backend: bubblewrap
+    env:
+      GHG_REQUIRE_SANDBOX_BACKEND: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: install bubblewrap
+        if: matrix.backend == 'bubblewrap'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes bubblewrap
+
+      - name: enable unprivileged user namespaces
+        if: matrix.backend == 'bubblewrap'
+        run: |
+          if [ -e /proc/sys/kernel/unprivileged_userns_clone ]; then
+            echo 1 | sudo tee /proc/sys/kernel/unprivileged_userns_clone >/dev/null
+          fi
+          if [ -e /proc/sys/user/max_user_namespaces ]; then
+            echo 28633 | sudo tee /proc/sys/user/max_user_namespaces >/dev/null
+          fi
+
+      - name: verify bubblewrap trust
+        if: matrix.backend == 'bubblewrap'
+        run: |
+          bwrap=$(command -v bwrap)
+          test -x "$bwrap"
+          test "$(stat -c '%u' "$bwrap")" = 0
+          for path in "$bwrap" "$(dirname "$bwrap")" /usr; do
+            test "$(stat -c '%u' "$path")" = 0
+            test -z "$(find "$path" -maxdepth 0 -perm /022 -print)"
+          done
+
+      - name: native sandbox contracts
+        run: go test -count=1 ./internal/sandbox ./internal/tools

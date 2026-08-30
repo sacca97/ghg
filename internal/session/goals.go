@@ -166,8 +166,7 @@ func (s *Store) ClearGoal(sessionID string) error {
 	if err := s.CheckpointGoal(sessionID, record); err != nil {
 		return err
 	}
-	_, err = s.db.Exec(`UPDATE sessions SET goal='' WHERE id=?`, sessionID)
-	return err
+	return nil
 }
 
 // GoalCheckpoints returns the durable lifecycle history oldest first.

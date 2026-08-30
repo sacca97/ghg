@@ -78,7 +78,7 @@ func TestToolCallsRunInParallel(t *testing.T) {
 // Two edits to the SAME path must serialize (per-path lock), even though
 // unrelated calls run in parallel.
 func TestSamePathEditsSerialize(t *testing.T) {
-	// craft an agent whose runTools we drive directly
+	// craft an agent whose tool runner we drive directly
 	ag := New(testBackend("http://unused", "k"), "m", 100, "sys")
 
 	var conc, maxConc atomic.Int32
@@ -109,7 +109,7 @@ func TestSamePathEditsSerialize(t *testing.T) {
 			Arguments string `json:"arguments"`
 		}{Name: "write", Arguments: `{"path":"/tmp/same.go"}`}},
 	}
-	ag.runTools(context.Background(), calls, Events{})
+	ag.runToolResultsWithTools(context.Background(), calls, Events{}, ag.AllTools())
 	if maxConc.Load() != 1 {
 		t.Fatalf("same-path writes must serialize (max concurrency 1), got %d", maxConc.Load())
 	}
@@ -148,7 +148,7 @@ func TestMultiFileMutationsWithReversePathOrderDoNotDeadlock(t *testing.T) {
 
 	done := make(chan struct{})
 	go func() {
-		ag.runTools(context.Background(), []llm.ToolCall{first, second}, Events{})
+		ag.runToolResultsWithTools(context.Background(), []llm.ToolCall{first, second}, Events{}, ag.AllTools())
 		close(done)
 	}()
 	select {
@@ -382,23 +382,23 @@ func TestCanonicalPathKey(t *testing.T) {
 	}
 }
 
-// toolMutationPath pulls the path out of write/edit args and reports
+// toolMutationPaths pulls paths out of write/edit args and reports
 // non-path-scoped for everything else.
-func TestToolMutationPath(t *testing.T) {
-	if p, ok := toolMutationPath("write", `{"path":"/a/b.go"}`); !ok || p != "/a/b.go" {
-		t.Fatalf("write: %q %v", p, ok)
+func TestToolMutationPaths(t *testing.T) {
+	if paths := toolMutationPaths("write", `{"path":"/a/b.go"}`); len(paths) != 1 || paths[0] != "/a/b.go" {
+		t.Fatalf("write: %v", paths)
 	}
-	if p, ok := toolMutationPath("edit", `{"path":"rel.go"}`); !ok || p != "rel.go" {
-		t.Fatalf("edit: %q %v", p, ok)
+	if paths := toolMutationPaths("edit", `{"path":"rel.go"}`); len(paths) != 1 || paths[0] != "rel.go" {
+		t.Fatalf("edit: %v", paths)
 	}
-	if _, ok := toolMutationPath("bash", `{"command":"ls"}`); ok {
-		t.Fatal("bash must be global (not path-scoped)")
+	if paths := toolMutationPaths("bash", `{"command":"ls"}`); len(paths) != 0 {
+		t.Fatalf("bash must be global (not path-scoped): %v", paths)
 	}
-	if _, ok := toolMutationPath("read", `{"path":"/a"}`); ok {
-		t.Fatal("read is not a mutation")
+	if paths := toolMutationPaths("read", `{"path":"/a"}`); len(paths) != 0 {
+		t.Fatalf("read is not a mutation: %v", paths)
 	}
-	if _, ok := toolMutationPath("write", `{bad`); ok {
-		t.Fatal("malformed write args fall back to global")
+	if paths := toolMutationPaths("write", `{bad`); len(paths) != 0 {
+		t.Fatalf("malformed write args fall back to global: %v", paths)
 	}
 }
 

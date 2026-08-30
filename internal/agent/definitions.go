@@ -51,7 +51,7 @@ const (
 var definitionNameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
 
 var knownDefinitionTools = map[string]struct{}{
-	"bash": {}, "read": {}, "write": {}, "edit": {}, "grep": {}, "glob": {}, "find_files": {},
+	"bash": {}, "read": {}, "write": {}, "edit": {}, "grep": {}, "glob": {}, "find_files": {}, "lsp": {}, "lsp_rename": {},
 	"task": {}, "todowrite": {}, "remember": {}, "forget": {},
 	"artifact_list": {}, "artifact_read": {}, "submit_plan": {},
 }
@@ -65,11 +65,11 @@ func BuiltInPlannerDefinition() Definition {
 		Name:        builtInPlannerName,
 		Description: "Read-only implementation planner",
 		Role:        "smart",
-		Tools:       []string{"read", "grep", "glob", "submit_plan"},
+		Tools:       []string{"read", "grep", "glob", "lsp", "submit_plan"},
 		MaxRounds:   4,
 		Prompt: `You are ghg's planning agent. Produce an implementation plan for the user's goal.
 
-Inspect the repository when useful with read, grep, and glob. These tools are read-only. Do not use bash, write, edit, task, MCP, or any other tool. When you have enough information, call submit_plan exactly once with a concrete goal, ordered imperative steps, and independently verifiable acceptance checks. Do not finish with a prose plan: submit_plan is the terminal result.`,
+Inspect the repository when useful with read, grep, glob, and bounded lsp navigation. These tools are read-only. Do not use bash, write, edit, lsp_rename, task, MCP, or any other tool. When you have enough information, call submit_plan exactly once with a concrete goal, ordered imperative steps, and independently verifiable acceptance checks. Do not finish with a prose plan: submit_plan is the terminal result.`,
 	}
 }
 

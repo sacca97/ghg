@@ -1,7 +1,6 @@
 package llm
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/base64"
@@ -884,41 +883,11 @@ func consumeAnthropicSSE(r io.Reader, onText, onThink func(string)) (Message, Us
 }
 
 func scanAnthropicSSE(r io.Reader, handle func([]byte) error) error {
-	sc := bufio.NewScanner(r)
-	sc.Buffer(make([]byte, 64*1024), maxAnthropicSSELine)
-	var data []string
-	dispatch := func() error {
-		if len(data) == 0 {
-			return nil
-		}
-		payload := strings.Join(data, "\n")
-		data = nil
-		return handle([]byte(payload))
-	}
-	for sc.Scan() {
-		line := strings.TrimSuffix(sc.Text(), "\r")
-		if line == "" {
-			if err := dispatch(); err != nil {
-				return err
-			}
-			continue
-		}
-		if strings.HasPrefix(line, ":") {
-			continue
-		}
-		field, value, ok := strings.Cut(line, ":")
-		if !ok {
-			return nonRetryable{fmt.Errorf("malformed anthropic SSE line %q", line)}
-		}
-		value = strings.TrimPrefix(value, " ")
-		if field == "data" {
-			data = append(data, value)
-		}
-	}
-	if err := sc.Err(); err != nil {
-		return err
-	}
-	return dispatch()
+	return scanSSE(r, maxAnthropicSSELine, func(_ string, data []byte) error {
+		return handle(data)
+	}, func(line string) error {
+		return nonRetryable{fmt.Errorf("malformed anthropic SSE line %q", line)}
+	})
 }
 
 func rawString(raw json.RawMessage) string {

@@ -21,7 +21,6 @@ var fileIndex struct {
 	sync.Mutex
 	builtAt time.Time
 	root    string
-	files   []string // slash-separated, relative to root
 }
 
 // currentRoot reports the directory fuzzy @mentions search. The TUI runs from
@@ -44,9 +43,7 @@ func refreshFileIndex() {
 	fileIndex.root, fileIndex.builtAt = wd, time.Now()
 	fileIndex.Unlock()
 	search.InvalidateFileIndex(wd)
-	fileIndex.Lock()
-	fileIndex.files = search.FuzzyFiles(wd, "", 0)
-	fileIndex.Unlock()
+	_ = search.FuzzyFiles(wd, "", 0) // warm the shared index
 }
 
 // fuzzyFiles returns up to limit files from the index matching query, best

@@ -1,6 +1,7 @@
 package tools
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"strconv"
@@ -81,7 +82,7 @@ func retainText(s string) (string, bool) {
 
 func retainBytes(data []byte, limit int64) []byte {
 	if limit <= 0 || int64(len(data)) <= limit {
-		return append([]byte(nil), data...)
+		return bytes.Clone(data)
 	}
 	head := int(limit / 2)
 	tail := int(limit) - head

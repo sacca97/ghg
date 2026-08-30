@@ -41,23 +41,7 @@ func loadProjects() projectsFile {
 }
 
 func (f projectsFile) save() error {
-	p, err := projectsPath()
-	if err != nil {
-		return err
-	}
-	data, err := json.MarshalIndent(f, "", "  ")
-	if err != nil {
-		return err
-	}
-	tmp := p + ".tmp"
-	if err := os.WriteFile(tmp, append(data, '\n'), 0o600); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, p); err != nil {
-		_ = os.Remove(tmp)
-		return err
-	}
-	return nil
+	return WriteJSON("projects.json", f)
 }
 
 // ProjectGoalMaxRounds returns the goal-round cap overridden for dir

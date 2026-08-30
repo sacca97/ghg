@@ -95,7 +95,7 @@ func TestPlanRetriesInvalidProposalOnce(t *testing.T) {
 		`{"goal":"ship it","steps":["write code"],"acceptance_checks":["tests pass"]}`,
 	}}
 	planner := agent.New(b, "smart-model", 100, "sys")
-	if _, err := requestPlan(context.Background(), planner, nil, "ship it"); err != nil {
+	if _, err := requestPlanWithDefinition(context.Background(), planner, nil, "ship it", agent.BuiltInPlannerDefinition()); err != nil {
 		t.Fatal(err)
 	}
 	b.mu.Lock()

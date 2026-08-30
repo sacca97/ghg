@@ -1,6 +1,6 @@
 # Phase 2.5 search and observed edits
 
-Status: implementation complete; Phase 3 checkpoint commit pending (2026-08-28)
+Status: implementation complete; Phase 3 checkpoint commit `8597a4d` recorded (2026-08-28)
 
 This slice replaces unbounded exploration and fragile edit strings with:
 
@@ -29,7 +29,7 @@ Stabilization gate implementation:
 Verification:
 
 - `go test ./... -count=1`, `go test -race ./... -count=1`, `go vet ./...`,
-  changed-file `gopls check`, and `CGO_ENABLED=0 go build` pass; the checkpoint
-  commit remains pending.
+  changed-file `gopls check`, and `CGO_ENABLED=0 go build` pass; checkpoint
+  `8597a4d` keeps this verified slice separate from Phase 3 work.
 
 The parent plan remains authoritative; this checkpoint records the completed slice.

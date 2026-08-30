@@ -121,7 +121,7 @@ func readIgnoreFile(fsys fs.FS, dir string) ([]ignoreRule, error) {
 	}
 	f, err := fsys.Open(name)
 	if err != nil {
-		if fsysErrNotExist(err) {
+		if errors.Is(err, fs.ErrNotExist) {
 			return nil, nil
 		}
 		return nil, fmt.Errorf("read %s: %w", name, err)
@@ -208,10 +208,6 @@ func trimIgnoreWhitespace(line string) string {
 		line = line[:len(line)-1]
 	}
 	return line
-}
-
-func fsysErrNotExist(err error) bool {
-	return errors.Is(err, fs.ErrNotExist)
 }
 
 func cleanFSPath(name string) string {

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"strings"
 )
@@ -382,12 +383,5 @@ var _ Backend = (*AnthropicBackend)(nil)
 var _ CatalogBackend = (*AnthropicBackend)(nil)
 
 func cloneHeaders(headers map[string]string) map[string]string {
-	if headers == nil {
-		return nil
-	}
-	copyHeaders := make(map[string]string, len(headers))
-	for name, value := range headers {
-		copyHeaders[name] = value
-	}
-	return copyHeaders
+	return maps.Clone(headers)
 }

@@ -205,7 +205,7 @@ func TestCompactThresholdFor(t *testing.T) {
 		pct  int
 		want float64
 	}{
-		{0, 0.5},   // unset → built-in default
+		{0, 0.4},   // unset → built-in default
 		{70, 0.7},  // user preference
 		{5, 0.1},   // clamped to the floor
 		{99, 0.9},  // clamped to the ceiling

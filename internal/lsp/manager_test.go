@@ -27,9 +27,10 @@ type fakeServer struct {
 	clientToServer io.WriteCloser // manager writes here
 	serverToClient io.ReadCloser  // manager reads here
 
-	mu       sync.Mutex
-	opened   map[string]int // uri -> latest version
-	onChange chan string    // receives each touched uri
+	mu        sync.Mutex
+	opened    map[string]int // uri -> latest version
+	onChange  chan string    // receives each touched uri
+	onRequest func(method string, params json.RawMessage) json.RawMessage
 }
 
 // push describes one scripted publishDiagnostics. Version semantics mirror
@@ -45,11 +46,16 @@ type push struct {
 // is called on every didOpen/didChange with the touched uri and version, and
 // returns pushes to emit.
 func startFakeServer(t *testing.T, script func(uri string, version int) []push) *fakeServer {
+	return startFakeServerWithRequest(t, script, nil)
+}
+
+func startFakeServerWithRequest(t *testing.T, script func(uri string, version int) []push, onRequest func(method string, params json.RawMessage) json.RawMessage) *fakeServer {
 	t.Helper()
 	f := &fakeServer{
-		t:        t,
-		opened:   map[string]int{},
-		onChange: make(chan string, 64),
+		t:         t,
+		opened:    map[string]int{},
+		onChange:  make(chan string, 64),
+		onRequest: onRequest,
 	}
 	// Client stdin <- server reads; client stdout -> server writes.
 	cStdinR, cStdinW := io.Pipe()
@@ -119,7 +125,13 @@ func (f *fakeServer) serve(r io.Reader, w io.Writer, script func(string, int) []
 			}
 		default:
 			if len(msg.ID) > 0 {
-				c.send(rpcMessage{ID: msg.ID, Result: json.RawMessage("null")})
+				result := json.RawMessage("null")
+				if f.onRequest != nil {
+					if scripted := f.onRequest(msg.Method, msg.Params); scripted != nil {
+						result = scripted
+					}
+				}
+				c.send(rpcMessage{ID: msg.ID, Result: result})
 			}
 		}
 	}

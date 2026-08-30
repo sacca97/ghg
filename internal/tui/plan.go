@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -11,6 +12,7 @@ import (
 
 	"github.com/sacca97/ghg/internal/agent"
 	"github.com/sacca97/ghg/internal/config"
+	workerwire "github.com/sacca97/ghg/internal/worker"
 )
 
 // planCommand proposes a structured plan with the smart role. The planner
@@ -29,6 +31,23 @@ func (m *model) planCommand(text string) (tea.Model, tea.Cmd) {
 	if !m.requireAgent() {
 		return m, nil
 	}
+	if m.workerClient != nil {
+		m.busy = true
+		m.turnStart = m.nowFn()
+		m.append(dimStyle.Render("◎ planning with smart…"))
+		requestID := workerRequestID("plan")
+		m.cancel = func() {
+			if m.workerClient != nil {
+				_ = m.workerClient.Send(workerwire.CommandCancel, requestID+"-cancel", nil)
+			}
+		}
+		if err := m.workerClient.Send(workerwire.CommandPlan, requestID, workerPlanRequest{Goal: goal}); err != nil {
+			m.busy = false
+			m.cancel = nil
+			m.append(errStyle.Render("planning failed: " + err.Error()))
+		}
+		return m, m.spin.Tick
+	}
 
 	planner := m.agent
 	if m.cfg != nil {
@@ -43,6 +62,7 @@ func (m *model) planCommand(text string) (tea.Model, tea.Cmd) {
 		m.append(errStyle.Render("planning failed: no smart model is configured"))
 		return m, nil
 	}
+	planner.Runtime = m.runtime
 	planner.Role = config.RoleSmart
 	if effort := m.currentEffort(); effort != "" {
 		planner.Effort = effort
@@ -71,14 +91,6 @@ func (m *model) planCommand(text string) (tea.Model, tea.Cmd) {
 		go p.Send(planProposalMsg{plan: plan, err: err})
 	}()
 	return m, m.spin.Tick
-}
-
-func requestPlan(ctx context.Context, planner, usageAgent *agent.Agent, goal string) (agent.Plan, error) {
-	events := agent.Events{}
-	if usageAgent != nil && usageAgent != planner {
-		events.OnUsage = usageAgent.AddUsage
-	}
-	return agent.ProposePlan(ctx, planner, goal, events)
 }
 
 func requestPlanWithDefinition(ctx context.Context, planner, usageAgent *agent.Agent, goal string, definition agent.Definition) (agent.Plan, error) {
@@ -196,8 +208,8 @@ func (m *model) executeCommand(text string) (tea.Model, tea.Cmd) {
 }
 
 func clonePlan(p agent.Plan) agent.Plan {
-	p.Steps = append([]string(nil), p.Steps...)
-	p.AcceptanceChecks = append([]string(nil), p.AcceptanceChecks...)
+	p.Steps = slices.Clone(p.Steps)
+	p.AcceptanceChecks = slices.Clone(p.AcceptanceChecks)
 	return p
 }
 

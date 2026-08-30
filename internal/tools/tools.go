@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/sacca97/ghg/internal/llm"
+	"github.com/sacca97/ghg/internal/sandbox"
 	"github.com/sacca97/ghg/internal/tools/bashrun"
 )
 
@@ -20,6 +21,17 @@ type Tool struct {
 	Def       llm.Tool
 	Run       func(ctx context.Context, args json.RawMessage) (string, error)
 	RunResult func(ctx context.Context, args json.RawMessage) (ToolResult, error)
+}
+
+func resultTool(def llm.Tool, run func(context.Context, json.RawMessage) (ToolResult, error)) Tool {
+	return Tool{
+		Def: def,
+		Run: func(ctx context.Context, args json.RawMessage) (string, error) {
+			result, err := run(ctx, args)
+			return result.Preview, err
+		},
+		RunResult: run,
+	}
 }
 
 // InteractiveRunner runs an interactive bash command with PTY-backed live I/O.
@@ -37,18 +49,9 @@ type InteractiveRunner interface {
 // (which fast-fails sudo-style prompts instead of hanging).
 var InteractiveBash InteractiveRunner
 
-// LSP, when non-nil, feeds language-server diagnostics back to the model by
-// appending a <diagnostics> block to write/edit tool output (see
-// internal/lsp). Installed by the TUI at startup; nil in tests and headless
-// runs. Implementations must be safe for concurrent use (parallel tool
-// calls) and must honor ctx (ctrl+c cancels the wait).
-var LSP interface {
-	WaitDiagnostics(ctx context.Context, path string) string
-}
-
 // All returns the built-in tool set.
 func All() []Tool {
-	return []Tool{bashTool(), readTool(), writeTool(), editTool(), grepTool(), globTool(), findFilesTool()}
+	return []Tool{bashTool(), readTool(), writeTool(), editTool(), grepTool(), globTool(), findFilesTool(), lspTool(), lspRenameTool()}
 }
 
 // Defs returns the llm.Tool definitions for a tool set.
@@ -140,10 +143,11 @@ func truncate(s string) string {
 // Never fails the tool: a nil hook, an uncovered file, or a slow server all
 // yield "" (the wait is capped inside internal/lsp).
 func lspDiagnostics(ctx context.Context, path string) string {
-	if LSP == nil {
+	runtime := RuntimeFromContext(ctx)
+	if runtime == nil || runtime.LanguageService == nil {
 		return ""
 	}
-	return LSP.WaitDiagnostics(ctx, path)
+	return runtime.LanguageService.WaitDiagnostics(ctx, path)
 }
 
 // TruncateTail caps tool output at maxOutput bytes, keeping the tail (the end
@@ -157,16 +161,10 @@ func TruncateTail(s string) string {
 }
 
 func bashTool() Tool {
-	return Tool{
-		Def: llm.NewTool("bash",
-			"Execute a bash command in the current working directory and return its combined stdout/stderr. Use for builds, tests, git, and operations the dedicated read/search/edit tools cannot express. Prefer grep, glob, find_files, and bounded read for exploration; simple recursive inspection commands may be redirected.",
-			`{"type":"object","properties":{"command":{"type":"string","description":"The bash command to execute"},"timeout":{"type":"number","description":"Timeout in seconds (default 120)"},"interactive":{"type":"boolean","description":"Run in a PTY so sudo/ssh-style password prompts work. ghg stays in control of the terminal and forwards your keystrokes; the command is killed after 15s of no input. Use only for commands that genuinely need a password."}},"required":["command"]}`),
-		Run: func(ctx context.Context, args json.RawMessage) (string, error) {
-			result, err := runBashResult(ctx, args)
-			return result.Preview, err
-		},
-		RunResult: runBashResult,
-	}
+	return resultTool(llm.NewTool("bash",
+		"Execute a bash command in the current working directory and return its combined stdout/stderr. Use for builds, tests, git, and operations the dedicated read/search/edit tools cannot express. Prefer grep, glob, find_files, and bounded read for exploration; simple recursive inspection commands may be redirected.",
+		`{"type":"object","properties":{"command":{"type":"string","description":"The bash command to execute"},"timeout":{"type":"number","description":"Timeout in seconds (default 120)"},"interactive":{"type":"boolean","description":"Run in a PTY so sudo/ssh-style password prompts work. ghg stays in control of the terminal and forwards your keystrokes; the command is killed after 15s of no input. Use only for commands that genuinely need a password."}},"required":["command"]}`),
+		runBashResult)
 }
 
 func runBashResult(ctx context.Context, args json.RawMessage) (ToolResult, error) {
@@ -192,29 +190,46 @@ func runBashResult(ctx context.Context, args json.RawMessage) (ToolResult, error
 		}
 		return result, nil
 	}
-	if deny := checkGate("bash", a.Command); deny != "" {
-		return ToolResult{}, errors.New(deny)
+	runtime := RuntimeFromContext(ctx)
+	var executionPolicy *sandbox.Policy
+	approvalCovered := false
+	if runtime != nil {
+		var err error
+		executionPolicy, approvalCovered, err = runtime.authorizeCommand(ctx, "bash", a.Command, ".")
+		if err != nil {
+			return ToolResult{}, err
+		}
+	}
+	if !approvalCovered {
+		if deny := checkGate("bash", a.Command); deny != "" {
+			return ToolResult{}, errors.New(deny)
+		}
 	}
 	dur := time.Duration(a.Timeout * float64(time.Second))
+	commandCtx := ctx
+	if runtime != nil && executionPolicy != nil {
+		commandCtx = WithRuntime(ctx, runtime.WithPolicy(executionPolicy))
+	}
 
 	// Interactive mode hands the live terminal to the user only when the
 	// TUI has wired a runner. Without it we run non-interactively, which
 	// fails sudo-style prompts fast instead of hanging on ghg's tty.
 	if a.Interactive && InteractiveBash != nil {
 		keys := make(chan []byte, 16)
-		out := InteractiveBash.Run(ctx, a.Command, dur, keys)
+		out := InteractiveBash.Run(commandCtx, a.Command, dur, keys)
 		return MarkUntrusted(TextResultWithSize(out, boundedTailPreview(out, bashPreviewLimit(a.Command)), int64(len(out)), true, 0), "bash"), nil
 	}
 
 	var update func(string)
-	if fn := onUpdate(ctx); fn != nil {
+	if fn := onUpdate(commandCtx); fn != nil {
 		update = func(snapshot string) { fn(boundedTailPreview(snapshot, bashPreviewLimit(a.Command))) }
 	}
-	res := bashrun.Run(ctx, bashrun.Options{
-		Command:  a.Command,
-		Timeout:  dur,
-		OnUpdate: update,
-	})
+	opts := bashrun.Options{Command: a.Command, Timeout: dur, OnUpdate: update}
+	if runtime != nil && executionPolicy != nil {
+		opts.Env = runtime.ChildEnv(nil)
+		opts.Sandbox = executionPolicy
+	}
+	res := bashrun.Run(commandCtx, opts)
 
 	full := res.Output
 	originalBytes := res.OriginalBytes
@@ -244,16 +259,10 @@ func boolToExitCode(success bool) int {
 }
 
 func readTool() Tool {
-	return Tool{
-		Def: llm.NewTool("read",
-			"Read a bounded range of complete lines and issue an observation id for later range-authorized edits. Use offset/limit to continue.",
-			`{"type":"object","properties":{"path":{"type":"string","description":"Path to the file"},"offset":{"type":"number","description":"1-based line to start from (default 1)"},"limit":{"type":"number","description":"Max complete lines to return (default 200, maximum 1000)"}},"required":["path"]}`),
-		Run: func(ctx context.Context, args json.RawMessage) (string, error) {
-			result, err := runReadResult(ctx, args)
-			return result.Preview, err
-		},
-		RunResult: runReadResult,
-	}
+	return resultTool(llm.NewTool("read",
+		"Read a bounded range of complete lines and issue an observation id for later range-authorized edits. Use offset/limit to continue.",
+		`{"type":"object","properties":{"path":{"type":"string","description":"Path to the file"},"offset":{"type":"number","description":"1-based line to start from (default 1)"},"limit":{"type":"number","description":"Max complete lines to return (default 200, maximum 1000)"}},"required":["path"]}`),
+		runReadResult)
 }
 
 func runReadResult(ctx context.Context, args json.RawMessage) (ToolResult, error) {
@@ -269,16 +278,10 @@ func runReadResult(ctx context.Context, args json.RawMessage) (ToolResult, error
 }
 
 func writeTool() Tool {
-	return Tool{
-		Def: llm.NewTool("write",
-			"Write content to a file, creating it (and parent directories) or overwriting it.",
-			`{"type":"object","properties":{"path":{"type":"string","description":"Path to the file"},"content":{"type":"string","description":"Full file content"}},"required":["path","content"]}`),
-		Run: func(ctx context.Context, args json.RawMessage) (string, error) {
-			result, err := runWriteResult(ctx, args)
-			return result.Preview, err
-		},
-		RunResult: runWriteResult,
-	}
+	return resultTool(llm.NewTool("write",
+		"Write content to a file, creating it (and parent directories) or overwriting it.",
+		`{"type":"object","properties":{"path":{"type":"string","description":"Path to the file"},"content":{"type":"string","description":"Full file content"}},"required":["path","content"]}`),
+		runWriteResult)
 }
 
 func runWriteResult(ctx context.Context, args json.RawMessage) (ToolResult, error) {
@@ -289,34 +292,40 @@ func runWriteResult(ctx context.Context, args json.RawMessage) (ToolResult, erro
 	if err := json.Unmarshal(args, &a); err != nil {
 		return ToolResult{}, err
 	}
-	if deny := checkGate("write", a.Path); deny != "" {
+	path, err := AuthorizePath(ctx, a.Path, sandbox.AccessWrite, true)
+	if err != nil {
+		return ToolResult{}, err
+	}
+	if deny := checkGate("write", path); deny != "" {
 		return ToolResult{}, errors.New(deny)
 	}
-	if err := os.MkdirAll(filepath.Dir(a.Path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return ToolResult{}, err
 	}
-	if err := os.WriteFile(a.Path, []byte(a.Content), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte(a.Content), 0o644); err != nil {
 		return ToolResult{}, err
 	}
-	raw := fmt.Sprintf("Wrote %d bytes to %s", len(a.Content), a.Path) + lspDiagnostics(ctx, a.Path)
+	hookReports := runtimePostEditReports(ctx, []string{path})
+	raw := fmt.Sprintf("Wrote %d bytes to %s", len(a.Content), path)
+	if final, readErr := os.ReadFile(path); readErr == nil {
+		if string(final) != a.Content {
+			raw += fmt.Sprintf("\npostEdit final bytes: %d", len(final))
+		}
+		raw += lspDiagnostics(ctx, path)
+	} else if os.IsNotExist(readErr) {
+		raw += "\npostEdit removed the file"
+	}
+	for _, report := range hookReports {
+		raw += "\n\n" + report.note(RuntimeFromContext(ctx))
+	}
 	return textResult(raw, raw, 0), nil
 }
 
 func editTool() Tool {
-	return Tool{
-		Def: llm.NewTool("edit",
-			"Apply one or more observed line-range edits atomically. Each primary edit references a read observation; use mode=exact only for temporary unique old_string compatibility.",
-			`{"type":"object","properties":{"mode":{"type":"string","enum":["observed","exact"],"description":"observed is the primary range-authorized mode; exact is compatibility mode"},"edits":{"type":"array","description":"Observed operations to apply atomically across one or more files","items":{"type":"object","properties":{"observation":{"type":"string"},"path":{"type":"string"},"start_line":{"type":"integer"},"end_line":{"type":"integer"},"operation":{"type":"string","enum":["replace","delete","insert_before","insert_after"]},"content":{"type":"string"}},"required":["observation","path","start_line","end_line","operation","content"]}},"path":{"type":"string","description":"Compatibility-mode file path"},"old_string":{"type":"string","description":"Compatibility-mode exact text"},"new_string":{"type":"string","description":"Compatibility-mode replacement"},"replace_all":{"type":"boolean","description":"Compatibility-mode replace every occurrence"}},"required":["mode"]}`),
-		Run: func(ctx context.Context, args json.RawMessage) (string, error) {
-			result, err := runEditResult(ctx, args)
-			return result.Preview, err
-		},
-		RunResult: runEditResult,
-	}
-}
-
-func runEditResult(ctx context.Context, args json.RawMessage) (ToolResult, error) {
-	return runEdit(ctx, args)
+	return resultTool(llm.NewTool("edit",
+		"Apply one or more observed line-range edits atomically. Each primary edit references a read observation; use mode=exact only for temporary unique old_string compatibility.",
+		`{"type":"object","properties":{"mode":{"type":"string","enum":["observed","exact"],"description":"observed is the primary range-authorized mode; exact is compatibility mode"},"edits":{"type":"array","description":"Observed operations to apply atomically across one or more files","items":{"type":"object","properties":{"observation":{"type":"string"},"path":{"type":"string"},"start_line":{"type":"integer"},"end_line":{"type":"integer"},"operation":{"type":"string","enum":["replace","delete","insert_before","insert_after"]},"content":{"type":"string"}},"required":["observation","path","start_line","end_line","operation","content"]}},"path":{"type":"string","description":"Compatibility-mode file path"},"old_string":{"type":"string","description":"Compatibility-mode exact text"},"new_string":{"type":"string","description":"Compatibility-mode replacement"},"replace_all":{"type":"boolean","description":"Compatibility-mode replace every occurrence"}},"required":["mode"]}`),
+		runEdit)
 }
 
 // editDiff renders the changed region of an edit as a compact unified-ish
@@ -353,6 +362,10 @@ func editDiff(oldS, newS string) string {
 	}
 	return strings.TrimSuffix(b.String(), "\n")
 }
+
+// EditDiff exposes the existing compact diff formatter to the LSP adapter;
+// both ordinary edits and rename previews therefore use the same output cap.
+func EditDiff(oldS, newS string) string { return editDiff(oldS, newS) }
 
 const maxEditDiffLines = 40
 

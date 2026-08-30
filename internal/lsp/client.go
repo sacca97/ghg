@@ -34,6 +34,8 @@ type rpcError struct {
 	Message string `json:"message"`
 }
 
+const maxLSPFrameBytes = 16 << 20
+
 func (e *rpcError) Error() string { return fmt.Sprintf("rpc error %d: %s", e.Code, e.Message) }
 
 // diagHandler receives publishDiagnostics pushes (uri, doc version, decoded
@@ -48,12 +50,13 @@ type diagHandler func(uri string, version int, diags []Diagnostic)
 // write locks. Shutdown is a close-to-broadcast on `dead`, which resolves
 // every pending request with an error.
 type client struct {
-	stdin  io.Writer
-	out    chan []byte // frames to write; pump owns stdin
-	pend   sync.Map    // id (string form) -> chan rpcResponse, capacity 1
-	nextID atomic.Int64
-	dead   chan struct{} // closed once when the connection dies/closes
-	onDiag diagHandler
+	stdin    io.Writer
+	out      chan []byte // frames to write; pump owns stdin
+	pend     sync.Map    // id (string form) -> chan rpcResponse, capacity 1
+	nextID   atomic.Int64
+	dead     chan struct{} // closed once when the connection dies/closes
+	deadOnce sync.Once
+	onDiag   diagHandler
 }
 
 type rpcResponse struct {
@@ -76,21 +79,7 @@ func newClient(stdin io.Writer, stdout io.Reader, onDiag diagHandler) *client {
 // shutdown stops the write pump. The read loop exits on stdout EOF (process
 // death); both broadcast on `dead`.
 func (c *client) shutdown() {
-	select {
-	case <-c.dead:
-	default:
-		close(c.dead)
-	}
-}
-
-// isDead reports whether the connection has been torn down.
-func (c *client) isDead() bool {
-	select {
-	case <-c.dead:
-		return true
-	default:
-		return false
-	}
+	c.deadOnce.Do(func() { close(c.dead) })
 }
 
 func (c *client) writeLoop() {
@@ -107,10 +96,9 @@ func (c *client) writeLoop() {
 	}
 }
 
-// readLoop parses Content-Length frames and dispatches: responses by id,
-// publishDiagnostics to the handler, server→client requests answered with a
-// minimal null result (opencode does the same for workDoneProgress/create,
-// workspace/configuration, client/registerCapability — client.ts:173-208).
+// readLoop parses Content-Length frames and dispatches responses by id,
+// publishDiagnostics notifications to the handler, and the small typed set of
+// server→client requests supported by respondToServerRequest.
 func (c *client) readLoop(r io.Reader) {
 	defer c.shutdown()
 	br := bufio.NewReader(r)
@@ -152,8 +140,7 @@ func (c *client) readLoop(r io.Reader) {
 				c.onDiag(p.URI, p.Version, diags)
 			}
 		case len(msg.ID) > 0 && msg.Method != "":
-			// Server→client request: ack with null so the server isn't blocked.
-			c.send(rpcMessage{JSONRPC: "2.0", ID: msg.ID, Result: json.RawMessage("null")})
+			c.respondToServerRequest(msg)
 		case len(msg.ID) > 0:
 			key := string(msg.ID)
 			if ch, ok := c.pend.LoadAndDelete(key); ok {
@@ -165,6 +152,21 @@ func (c *client) readLoop(r io.Reader) {
 			}
 		}
 	}
+}
+
+func (c *client) respondToServerRequest(msg rpcMessage) {
+	response := rpcMessage{JSONRPC: "2.0", ID: msg.ID}
+	switch msg.Method {
+	case "workspace/applyEdit":
+		response.Result = json.RawMessage(`{"applied":false,"failureReason":"use lsp_rename preview/apply"}`)
+	case "workspace/configuration":
+		response.Result = json.RawMessage(`[]`)
+	case "window/workDoneProgress/create", "client/registerCapability":
+		response.Result = json.RawMessage(`null`)
+	default:
+		response.Error = &rpcError{Code: -32601, Message: "method not found"}
+	}
+	c.send(response)
 }
 
 // readFrame reads one Content-Length framed message body.
@@ -179,9 +181,13 @@ func readFrame(br *bufio.Reader) ([]byte, error) {
 		if line == "" {
 			break // end of headers
 		}
-		if v, ok := strings.CutPrefix(line, "Content-Length: "); ok {
+		if key, value, ok := strings.Cut(line, ":"); ok && strings.EqualFold(strings.TrimSpace(key), "Content-Length") {
+			v := value
 			n, err := strconv.Atoi(strings.TrimSpace(v))
-			if err != nil || n < 0 {
+			if err != nil || n < 0 || n > maxLSPFrameBytes {
+				if n > maxLSPFrameBytes {
+					return nil, fmt.Errorf("Content-Length %d exceeds %d-byte limit", n, maxLSPFrameBytes)
+				}
 				return nil, fmt.Errorf("bad Content-Length %q", v)
 			}
 			length = n

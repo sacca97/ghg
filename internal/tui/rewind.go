@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -179,9 +180,9 @@ func (m *model) applyRewind(cut int) string {
 	switch {
 	case cut > base: // forward: pull clipped messages back in
 		m.agent.Messages = append(m.agent.Messages, m.future[:cut-base]...)
-		m.future = append([]llm.Message(nil), m.future[cut-base:]...)
+		m.future = slices.Clone(m.future[cut-base:])
 	case cut < base: // back: clip the tail into the redo stack (oldest first)
-		clipped := append([]llm.Message(nil), m.agent.Messages[cut:]...)
+		clipped := slices.Clone(m.agent.Messages[cut:])
 		m.future = append(clipped, m.future...)
 		m.agent.Messages = m.agent.Messages[:cut]
 		m.saved = min(m.saved, cut)

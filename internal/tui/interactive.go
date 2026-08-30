@@ -69,7 +69,7 @@ func (r *interactiveRunner) Run(ctx context.Context, command string, timeout tim
 	r.mu.Unlock()
 	r.prog.Send(interactiveStartMsg{keys: keys})
 
-	res := bashrun.Run(ctx, bashrun.Options{
+	opts := bashrun.Options{
 		Command:           command,
 		Timeout:           timeout,
 		Interactive:       true,
@@ -77,7 +77,12 @@ func (r *interactiveRunner) Run(ctx context.Context, command string, timeout tim
 		OnOutput:          func(chunk string) { r.prog.Send(interactiveOutMsg{chunk}) },
 		OnAwaitInput:      func(s int) { r.prog.Send(interactiveAwaitMsg{secsLeft: s}) },
 		Keys:              keys,
-	})
+	}
+	if runtime := tools.RuntimeFromContext(ctx); runtime != nil && runtime.Policy != nil {
+		opts.Env = runtime.ChildEnv(nil)
+		opts.Sandbox = runtime.Policy
+	}
+	res := bashrun.Run(ctx, opts)
 
 	r.mu.Lock()
 	r.keys = nil

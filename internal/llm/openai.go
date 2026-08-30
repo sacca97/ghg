@@ -13,6 +13,7 @@ import (
 	"io"
 	"math/rand/v2"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -710,12 +711,7 @@ type ModelInfo struct {
 
 // SupportsVision reports whether the model advertises image input.
 func (mi ModelInfo) SupportsVision() bool {
-	for _, m := range mi.InputModalities {
-		if m == "image" {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(mi.InputModalities, "image")
 }
 
 // Pricing is the provider's per-token USD rates as decimal strings

@@ -143,7 +143,7 @@ func ReadJSON(name string, v any) error {
 	return json.Unmarshal(data, v)
 }
 
-// WriteJSON writes v as JSON to a small file in the loopy dir.
+// WriteJSON writes v as JSON to a small file in the loopy dir atomically.
 func WriteJSON(name string, v any) error {
 	dir, err := Dir()
 	if err != nil {
@@ -153,5 +153,18 @@ func WriteJSON(name string, v any) error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(dir, name), data, 0o600)
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(name)+".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer func() { _ = os.Remove(tmpName) }()
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, filepath.Join(dir, name))
 }

@@ -71,8 +71,8 @@ func TestReadConsumesAndBoundsAnOversizedSingleLine(t *testing.T) {
 }
 
 func TestHelpersAndEdgeCases(t *testing.T) {
-	if len(Defs(All())) != 7 {
-		t.Fatal("expected 7 tool defs")
+	if len(Defs(All())) != 9 {
+		t.Fatal("expected 9 tool defs")
 	}
 	long := strings.Repeat("x", maxOutput+10)
 	if out := truncate(long); !strings.Contains(out, "truncated 10 bytes") {

@@ -188,7 +188,7 @@ func TestRunPlanOnlyUsesReadOnlyPlannerAndExits(t *testing.T) {
 	for _, tool := range reqs[0].Tools {
 		names = append(names, tool.Function.Name)
 	}
-	if got := strings.Join(names, ","); got != "read,grep,glob,submit_plan" {
+	if got := strings.Join(names, ","); got != "read,grep,glob,lsp,submit_plan" {
 		t.Fatalf("planner tools = %q", got)
 	}
 	for _, forbidden := range []string{"bash", "write", "edit", "task"} {

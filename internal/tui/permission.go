@@ -1,13 +1,14 @@
 package tui
 
 import (
-	"fmt"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/sacca97/ghg/internal/config"
 	"github.com/sacca97/ghg/internal/tools"
+	workerwire "github.com/sacca97/ghg/internal/worker"
 )
 
 // Permission prompts: when the agent is about to run a gated tool (bash,
@@ -34,13 +35,14 @@ type permAnswer struct {
 type permDialog struct {
 	req       tools.GateRequest
 	reply     chan permAnswer
+	workerID  string
 	sel       int  // 0=allow once, 1=allow always, 2=reject
 	rejecting bool // typing the redirect message
 	rejectIn  string
 }
 
 // permRules is the saved "allow always" set, persisted to
-// ~/.loopy/permissions.json as a flat list of "tool:rule" strings.
+// ~/.ghg/permissions.json as a flat list of "tool:rule" strings.
 type permRules map[string]bool
 
 func loadPermRules() permRules {
@@ -76,21 +78,25 @@ func (r permRules) coveredBy(req tools.GateRequest) bool {
 	return r[ruleKey(req.Tool, rule)]
 }
 
+// askPermission is the human decision layer used both by the legacy cautious
+// gate and by execution-policy capability escalation. A missing UI fails
+// closed; headless runs use ToolRuntime's never/auto-review modes instead.
+func (m *model) askPermission(req tools.GateRequest) (tools.GateDecision, string) {
+	if m.perms.coveredBy(req) {
+		return tools.GateAllowOnce, ""
+	}
+	if m.prog == nil {
+		return tools.GateReject, "no interactive reviewer is available"
+	}
+	reply := make(chan permAnswer, 1)
+	m.prog.Send(permRequest{req: req, reply: reply})
+	ans := <-reply // block the tool goroutine until the user answers
+	return ans.decision, ans.redirect
+}
+
 // installPermGate wires tools.Gate to the modal. Called once at startup.
 func (m *model) installPermGate() {
-	m.perms = loadPermRules()
-	tools.Gate = func(req tools.GateRequest) (tools.GateDecision, string) {
-		if m.perms.coveredBy(req) {
-			return tools.GateAllowOnce, ""
-		}
-		if m.prog == nil {
-			return tools.GateAllowOnce, "" // headless: no one to ask
-		}
-		reply := make(chan permAnswer, 1)
-		m.prog.Send(permRequest{req: req, reply: reply})
-		ans := <-reply // block the tool goroutine until the user answers
-		return ans.decision, ans.redirect
-	}
+	tools.Gate = m.askPermission
 }
 
 // permKey handles keys while the dialog is open. Returns (handled).
@@ -100,7 +106,24 @@ func (m *model) permKey(msg tea.KeyMsg) bool {
 		return false
 	}
 	answer := func(a permAnswer) {
-		d.reply <- a
+		if d.workerID != "" {
+			decision := "reject"
+			switch a.decision {
+			case tools.GateAllowOnce:
+				decision = "allow_once"
+			case tools.GateAllowAlways:
+				decision = "allow_always"
+			}
+			if m.workerClient != nil {
+				if err := m.workerClient.Send(workerwire.CommandApprove, workerRequestID("approve"), workerApprovalAnswer{
+					ID: d.workerID, Decision: decision, Redirect: a.redirect,
+				}); err != nil {
+					m.append(errStyle.Render("approval failed: " + err.Error()))
+				}
+			}
+		} else if d.reply != nil {
+			d.reply <- a
+		}
 		m.permDialog = nil
 	}
 	if d.rejecting {
@@ -175,7 +198,7 @@ func (m *model) permView() string {
 		title = "Run this command?"
 	}
 	b.WriteString(youStyle.Render("⚠ " + title))
-	b.WriteString("\n  " + ansi_Truncate(d.req.Command, m.width-4))
+	b.WriteString("\n  " + ansi.Truncate(d.req.Command, m.width-4, "…"))
 	rule := d.req.Rule
 	if d.req.Tool != "bash" {
 		rule = d.req.Command
@@ -197,16 +220,3 @@ func (m *model) permView() string {
 	}
 	return b.String()
 }
-
-// small local helper so this file doesn't import ansi for one call
-func ansi_Truncate(s string, width int) string {
-	if width <= 0 {
-		width = 80
-	}
-	if len(s) <= width {
-		return s
-	}
-	return s[:width-1] + "…"
-}
-
-var _ = fmt.Sprint

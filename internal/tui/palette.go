@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 
@@ -907,7 +908,7 @@ func (m *model) previewModel(it modelItem) {
 	m.configureArtifactAgent(m.agent)
 	m.applyCompactModel()
 	m.wireTasks()
-	if !contains(m.effortsFor(), ag.Effort) {
+	if !slices.Contains(m.effortsFor(), ag.Effort) {
 		m.setEffort("") // the previewed model doesn't support the current level
 	}
 }
@@ -1316,7 +1317,7 @@ func (m *model) panelView(pp *ppanel) string {
 	cap := m.panelListCapacity(len(footer))
 	start := min(max(pp.offset, 0), len(rows))
 	end := min(start+cap, len(rows))
-	visible := append([]string(nil), rows[start:end]...)
+	visible := slices.Clone(rows[start:end])
 	more := ""
 	if start > 0 {
 		more += " ↑ more"

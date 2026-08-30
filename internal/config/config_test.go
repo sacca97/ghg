@@ -27,6 +27,28 @@ func TestLoadSaveDefaults(t *testing.T) {
 	}
 }
 
+func TestExecutionOverridesValidateWithoutPersisting(t *testing.T) {
+	cfg := &Config{}
+	if err := cfg.ApplyExecutionOverrides("workspace-write", "deny", "auto-review"); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Execution == nil || cfg.Execution.Approval != "auto-review" {
+		t.Fatalf("execution overrides = %+v", cfg.Execution)
+	}
+	if err := cfg.ApplyExecutionOverrides("unsafe", "", ""); err == nil {
+		t.Fatal("invalid sandbox override should fail")
+	}
+	cfg.Execution.BubblewrapPath = "bwrap"
+	if err := cfg.ValidateExecution(); err == nil {
+		t.Fatal("relative bubblewrap path should fail")
+	}
+	cfg.Execution.BubblewrapPath = "/usr/bin/bwrap"
+	cfg.Execution.SecretNames = []string{"["}
+	if err := cfg.ValidateExecution(); err == nil {
+		t.Fatal("invalid secret name pattern should fail")
+	}
+}
+
 func TestLoadRejectsBadJSON(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -138,6 +160,7 @@ func TestLoadJSONCCommentsAndTrailingCommas(t *testing.T) {
     "m1": { "providers": ["a",], "api": "anthropic-messages", "maxTokens": 1024, },
   },
 }
+
 `
 	os.WriteFile(filepath.Join(home, ".ghg", "config.json"), []byte(src), 0o600)
 	cfg, err := Load()
@@ -149,6 +172,33 @@ func TestLoadJSONCCommentsAndTrailingCommas(t *testing.T) {
 	}
 	if cfg.Models["m1"].Providers[0] != "a" || cfg.Models["m1"].API != "anthropic-messages" || cfg.Models["m1"].MaxTokens != 1024 {
 		t.Fatalf("model: %+v", cfg.Models["m1"])
+	}
+}
+
+func TestPostEditConfigValidation(t *testing.T) {
+	cfg := &Config{PostEdit: []PostEditConfig{{
+		Command:    []string{"gofmt", "-w"},
+		Extensions: []string{" GO ", ".Go"},
+	}}}
+	if err := cfg.ValidatePostEdit(); err != nil {
+		t.Fatal(err)
+	}
+	hook := cfg.PostEdit[0]
+	if hook.TimeoutSeconds != 10 || hook.Extensions[0] != ".go" || hook.Extensions[1] != ".go" {
+		t.Fatalf("normalized hook = %+v", hook)
+	}
+
+	invalid := []PostEditConfig{
+		{Command: nil},
+		{Command: []string{""}},
+		{Command: []string{"echo\x00bad"}},
+		{Command: []string{"echo"}, Extensions: []string{"dir/go"}},
+		{Command: []string{"echo"}, TimeoutSeconds: 61},
+	}
+	for i, hook := range invalid {
+		if err := (&Config{PostEdit: []PostEditConfig{hook}}).ValidatePostEdit(); err == nil {
+			t.Fatalf("invalid hook %d was accepted", i)
+		}
 	}
 }
 

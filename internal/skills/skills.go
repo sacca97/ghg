@@ -4,6 +4,7 @@ package skills
 import (
 	"bufio"
 	"fmt"
+	"html"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -182,24 +183,19 @@ func PromptBlock(sk []Skill) string {
 		return ""
 	}
 	var b strings.Builder
+	escape := func(value string) string {
+		value = html.EscapeString(value)
+		value = strings.ReplaceAll(value, "&#34;", "&quot;")
+		return strings.ReplaceAll(value, "&#39;", "&apos;")
+	}
 	b.WriteString("\n\n<available_skills>\nThese skills hold task-specific instructions. When one is relevant, read its SKILL.md with the read tool and follow it. Relative paths in a skill resolve against the skill's directory (the parent of its SKILL.md).\n")
 	for _, s := range visible {
 		b.WriteString("  <skill>\n")
-		fmt.Fprintf(&b, "    <name>%s</name>\n", xmlEscape(s.Name))
-		fmt.Fprintf(&b, "    <description>%s</description>\n", xmlEscape(s.Description))
-		fmt.Fprintf(&b, "    <location>%s</location>\n", xmlEscape(s.Path))
+		fmt.Fprintf(&b, "    <name>%s</name>\n", escape(s.Name))
+		fmt.Fprintf(&b, "    <description>%s</description>\n", escape(s.Description))
+		fmt.Fprintf(&b, "    <location>%s</location>\n", escape(s.Path))
 		b.WriteString("  </skill>\n")
 	}
 	b.WriteString("</available_skills>")
 	return b.String()
-}
-
-func xmlEscape(s string) string {
-	return strings.NewReplacer(
-		"&", "&amp;",
-		"<", "&lt;",
-		">", "&gt;",
-		`"`, "&quot;",
-		"'", "&apos;",
-	).Replace(s)
 }

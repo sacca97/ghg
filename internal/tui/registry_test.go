@@ -5,6 +5,17 @@ import (
 	"testing"
 )
 
+func (m *model) dispatches(name string) bool {
+	before := len(m.blocks)
+	m.command(name)
+	for _, b := range m.blocks[before:] {
+		if strings.Contains(b.text, "unknown command") {
+			return false
+		}
+	}
+	return true
+}
+
 // Every slash command in the registry must route through the dispatch switch
 // to a real handler — the "registry says it exists but the switch 404s" drift
 // class. The probe runs the bare command on a scratch model and fails if the

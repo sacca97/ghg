@@ -13,6 +13,7 @@ package tui
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -82,9 +83,7 @@ func (m *model) dockTasks() []agent.BackgroundTask {
 			out = append(out, t)
 		}
 	}
-	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
-		out[i], out[j] = out[j], out[i]
-	}
+	slices.Reverse(out)
 	return out
 }
 

@@ -14,12 +14,14 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/sacca97/ghg/internal/llm"
+	"github.com/sacca97/ghg/internal/sandbox"
 	"github.com/sacca97/ghg/internal/search"
 )
 
@@ -63,42 +65,24 @@ type findFilesArgs struct {
 }
 
 func grepTool() Tool {
-	return Tool{
-		Def: llm.NewTool("grep",
-			"Search text files for a regular expression. Prefer this for text; use patterns for one OR search. Results respect nested .gitignore files, skip binaries and symlinks, are grouped by file, and paginate with cursor.",
-			`{"type":"object","properties":{"pattern":{"type":"string","description":"Regular expression to search for; use patterns for multiple alternatives"},"patterns":{"type":"array","items":{"type":"string"},"description":"Regular expressions ORed together and searched in one traversal"},"path":{"type":"string","description":"File or directory to search (default: current working directory)"},"include":{"type":"string","description":"Optional glob filter such as *.go"},"max_results":{"type":"integer","description":"Matches per page (default 25, maximum 10000)"},"cursor":{"type":"string","description":"Cursor returned by an earlier page; reuse it with max_results to continue"},"case_sensitive":{"type":"boolean","description":"Whether the expression is case-sensitive (default true)"},"literal":{"type":"boolean","description":"Treat patterns as literal text instead of regular expressions"}},"required":[]}`),
-		Run: func(ctx context.Context, args json.RawMessage) (string, error) {
-			result, err := runGrepResult(ctx, args)
-			return result.Preview, err
-		},
-		RunResult: runGrepResult,
-	}
+	return resultTool(llm.NewTool("grep",
+		"Search text files for a regular expression. Prefer this for text; use patterns for one OR search. Results respect nested .gitignore files, skip binaries and symlinks, are grouped by file, and paginate with cursor.",
+		`{"type":"object","properties":{"pattern":{"type":"string","description":"Regular expression to search for; use patterns for multiple alternatives"},"patterns":{"type":"array","items":{"type":"string"},"description":"Regular expressions ORed together and searched in one traversal"},"path":{"type":"string","description":"File or directory to search (default: current working directory)"},"include":{"type":"string","description":"Optional glob filter such as *.go"},"max_results":{"type":"integer","description":"Matches per page (default 25, maximum 10000)"},"cursor":{"type":"string","description":"Cursor returned by an earlier page; reuse it with max_results to continue"},"case_sensitive":{"type":"boolean","description":"Whether the expression is case-sensitive (default true)"},"literal":{"type":"boolean","description":"Treat patterns as literal text instead of regular expressions"}},"required":[]}`),
+		runGrepResult)
 }
 
 func globTool() Tool {
-	return Tool{
-		Def: llm.NewTool("glob",
-			"Find regular files by deterministic slash-aware glob. Use ** for recursive paths. It respects nested .gitignore files, never follows symlinks, and paginates with cursor.",
-			`{"type":"object","properties":{"pattern":{"type":"string","description":"Glob pattern relative to path, for example **/*.go"},"path":{"type":"string","description":"Directory or file to search (default: current working directory)"},"max_results":{"type":"integer","description":"Paths per page (default 25, maximum 10000)"},"cursor":{"type":"string","description":"Cursor returned by an earlier page"}},"required":["pattern"]}`),
-		Run: func(ctx context.Context, args json.RawMessage) (string, error) {
-			result, err := runGlobResult(ctx, args)
-			return result.Preview, err
-		},
-		RunResult: runGlobResult,
-	}
+	return resultTool(llm.NewTool("glob",
+		"Find regular files by deterministic slash-aware glob. Use ** for recursive paths. It respects nested .gitignore files, never follows symlinks, and paginates with cursor.",
+		`{"type":"object","properties":{"pattern":{"type":"string","description":"Glob pattern relative to path, for example **/*.go"},"path":{"type":"string","description":"Directory or file to search (default: current working directory)"},"max_results":{"type":"integer","description":"Paths per page (default 25, maximum 10000)"},"cursor":{"type":"string","description":"Cursor returned by an earlier page"}},"required":["pattern"]}`),
+		runGlobResult)
 }
 
 func findFilesTool() Tool {
-	return Tool{
-		Def: llm.NewTool("find_files",
-			"Find files by fuzzy path or filename match. Every candidate is scored before the best results are selected; use glob for exact patterns.",
-			`{"type":"object","properties":{"query":{"type":"string","description":"Filename or path text to match fuzzily"},"path":{"type":"string","description":"Directory to search (default: current working directory)"},"max_results":{"type":"integer","description":"Paths per page (default 25, maximum 10000)"},"cursor":{"type":"string","description":"Cursor returned by an earlier page"}},"required":["query"]}`),
-		Run: func(ctx context.Context, args json.RawMessage) (string, error) {
-			result, err := runFindFilesResult(ctx, args)
-			return result.Preview, err
-		},
-		RunResult: runFindFilesResult,
-	}
+	return resultTool(llm.NewTool("find_files",
+		"Find files by fuzzy path or filename match. Every candidate is scored before the best results are selected; use glob for exact patterns.",
+		`{"type":"object","properties":{"query":{"type":"string","description":"Filename or path text to match fuzzily"},"path":{"type":"string","description":"Directory to search (default: current working directory)"},"max_results":{"type":"integer","description":"Paths per page (default 25, maximum 10000)"},"cursor":{"type":"string","description":"Cursor returned by an earlier page"}},"required":["query"]}`),
+		runFindFilesResult)
 }
 
 func runGrepResult(ctx context.Context, args json.RawMessage) (ToolResult, error) {
@@ -164,6 +148,12 @@ func runFindFilesResult(ctx context.Context, args json.RawMessage) (ToolResult, 
 	abs, err := filepath.Abs(root)
 	if err != nil {
 		return ToolResult{}, fmt.Errorf("resolve find_files path: %w", err)
+	}
+	if runtime := RuntimeFromContext(ctx); runtime != nil && runtime.Policy != nil {
+		abs, err = runtime.Policy.Authorize(root, sandbox.AccessRead, false)
+		if err != nil {
+			return ToolResult{}, err
+		}
 	}
 	info, err := os.Lstat(abs)
 	if err != nil {
@@ -247,7 +237,7 @@ func collectGrepSnapshot(ctx context.Context, args grepArgs) (search.Snapshot, e
 	if err != nil {
 		return search.Snapshot{}, err
 	}
-	scope, err := openSearchScope(args.Path)
+	scope, err := openSearchScope(ctx, args.Path)
 	if err != nil {
 		return search.Snapshot{}, err
 	}
@@ -331,7 +321,7 @@ func compileGlobSnapshot(ctx context.Context, args globArgs) (search.Snapshot, e
 	if err != nil {
 		return search.Snapshot{}, err
 	}
-	scope, err := openSearchScope(args.Path)
+	scope, err := openSearchScope(ctx, args.Path)
 	if err != nil {
 		return search.Snapshot{}, err
 	}
@@ -377,16 +367,11 @@ func compileGlobSnapshot(ctx context.Context, args globArgs) (search.Snapshot, e
 }
 
 func saveSearchSnapshot(ctx context.Context, snapshot search.Snapshot) error {
-	_, store := searchContextFor(ctx)
+	sessionID, store := searchContextFor(ctx)
 	if store == nil {
 		return nil
 	}
-	return store.Save(ctx, searchSessionID(ctx), snapshot)
-}
-
-func searchSessionID(ctx context.Context) string {
-	id, _ := searchContextFor(ctx)
-	return id
+	return store.Save(ctx, sessionID, snapshot)
 }
 
 type searchCursor struct {
@@ -423,7 +408,8 @@ func loadSearchPage(ctx context.Context, kind, raw string) (search.Snapshot, sea
 	if store == nil {
 		return search.Snapshot{}, searchCursor{}, errors.New("search cursor requires an active agent session; run the search again")
 	}
-	snapshot, err := store.Load(ctx, searchSessionID(ctx), cursor.ID)
+	sessionID, _ := searchContextFor(ctx)
+	snapshot, err := store.Load(ctx, sessionID, cursor.ID)
 	if err != nil {
 		return search.Snapshot{}, searchCursor{}, fmt.Errorf("load search cursor: %w", err)
 	}
@@ -529,7 +515,7 @@ func selectSearchPage(snapshot search.Snapshot, chunks [][]search.Item, offset, 
 		if len(page) > 0 && len(page)+len(chunk) > size {
 			break
 		}
-		candidate := append(append([]search.Item(nil), page...), chunk...)
+		candidate := append(slices.Clone(page), chunk...)
 		candidateOffset := i + 1
 		candidateHasMore := cursorAvailable && candidateOffset < len(chunks)
 		candidateRemaining := len(snapshot.Items) - searchPageItemsBefore(chunks, candidateOffset)
@@ -556,7 +542,7 @@ func searchPageItemsBefore(chunks [][]search.Item, end int) int {
 
 func groupedSearchChunks(items []search.Item, capPerFile int) [][]search.Item {
 	if capPerFile <= 0 {
-		return [][]search.Item{append([]search.Item(nil), items...)}
+		return [][]search.Item{slices.Clone(items)}
 	}
 	chunks := make([][]search.Item, 0)
 	for i := 0; i < len(items); {
@@ -566,7 +552,7 @@ func groupedSearchChunks(items []search.Item, capPerFile int) [][]search.Item {
 		}
 		for start := i; start < end; start += capPerFile {
 			chunkEnd := min(start+capPerFile, end)
-			chunks = append(chunks, append([]search.Item(nil), items[start:chunkEnd]...))
+			chunks = append(chunks, slices.Clone(items[start:chunkEnd]))
 		}
 		i = end
 	}
@@ -694,10 +680,9 @@ func grepSnapshotFile(ctx context.Context, fsys fs.FS, name, display string, mat
 
 func rankSearchItems(items []search.Item, scope *searchScope, requested string, hints SearchHints, modified map[string]struct{}) {
 	touched := canonicalPathSet(hints.Touched)
-	modifiedSet := modified
 	sort.SliceStable(items, func(i, j int) bool {
 		a, b := items[i], items[j]
-		ra, rb := searchItemRank(a.Path, scope, requested, touched, modifiedSet), searchItemRank(b.Path, scope, requested, touched, modifiedSet)
+		ra, rb := searchItemRank(a.Path, scope, requested, touched, modified), searchItemRank(b.Path, scope, requested, touched, modified)
 		if ra.priority != rb.priority {
 			return ra.priority < rb.priority
 		}
@@ -779,6 +764,20 @@ func gitModifiedPaths(ctx context.Context, root string) map[string]struct{} {
 	gitCtx, cancel := context.WithTimeout(ctx, 250*time.Millisecond)
 	defer cancel()
 	cmd := exec.CommandContext(gitCtx, "git", "-C", root, "status", "--porcelain=v1", "-z", "--untracked-files=all")
+	if runtime := RuntimeFromContext(ctx); runtime != nil && runtime.Policy != nil {
+		wrapped, err := runtime.WrapCommand(sandbox.CommandSpec{
+			Program: "git",
+			Args:    []string{"-C", root, "status", "--porcelain=v1", "-z", "--untracked-files=all"},
+			Dir:     root,
+			Env:     runtime.ChildEnv(nil),
+		})
+		if err != nil {
+			return set
+		}
+		cmd = exec.CommandContext(gitCtx, wrapped.Program, wrapped.Args...)
+		cmd.Dir = wrapped.Dir
+		cmd.Env = wrapped.Env
+	}
 	out, err := cmd.Output()
 	if err != nil {
 		return set
@@ -879,7 +878,7 @@ func (s *searchScope) matchPath(name string) string {
 	return name
 }
 
-func openSearchScope(requested string) (*searchScope, error) {
+func openSearchScope(ctx context.Context, requested string) (*searchScope, error) {
 	if strings.TrimSpace(requested) == "" {
 		requested = "."
 	}
@@ -893,6 +892,12 @@ func openSearchScope(requested string) (*searchScope, error) {
 	}
 	if info.Mode()&os.ModeSymlink != 0 {
 		return nil, fmt.Errorf("search path %q is a symlink; symlinks are not followed", requested)
+	}
+	if runtime := RuntimeFromContext(ctx); runtime != nil && runtime.Policy != nil {
+		abs, err = runtime.Policy.Authorize(abs, sandbox.AccessRead, false)
+		if err != nil {
+			return nil, err
+		}
 	}
 	resolved, err := filepath.EvalSymlinks(abs)
 	if err != nil {

@@ -163,6 +163,14 @@ CREATE TABLE IF NOT EXISTS search_snapshots (
 	PRIMARY KEY (session_id, snapshot_id)
 );
 CREATE INDEX IF NOT EXISTS search_snapshots_session_created ON search_snapshots(session_id, created_at);
+-- Derived, rebuildable full-text index for bounded session history recall.
+-- Raw messages remain authoritative; this table stores only extracted text.
+CREATE VIRTUAL TABLE IF NOT EXISTS history_fts USING fts5(
+	session_id UNINDEXED,
+	seq        UNINDEXED,
+	role       UNINDEXED,
+	content
+);
 `
 
 // extraColumns are added idempotently after the base schema: SQLite's
@@ -200,14 +208,21 @@ type Meta struct {
 	UpdatedAt   time.Time
 }
 
+const sessionMetaColumns = `id, title, model, provider, cwd, goal, forked_from, fork_seq, tags, pinned, effort, usage_in, usage_cached, usage_out, updated_at`
+
 type Store struct{ db *sql.DB }
 
 // Open opens (creating if needed) the sessions database at path.
 func Open(path string) (*Store, error) {
-	db, err := sql.Open("sqlite", path)
+	dsn := path
+	if !strings.Contains(dsn, "?") {
+		dsn += "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=temp_store(MEMORY)"
+	}
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
 	}
+	db.SetMaxOpenConns(1)
 	for _, pragma := range []string{
 		"PRAGMA busy_timeout=5000",
 		"PRAGMA journal_mode=WAL",   // faster commits, no read/write blocking
@@ -234,6 +249,10 @@ func Open(path string) (*Store, error) {
 	if err := migrateLegacyGoals(db); err != nil {
 		_ = db.Close()
 		return nil, err
+	}
+	if err := backfillHistoryFTS(db); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("backfill history index: %w", err)
 	}
 	return &Store{db: db}, nil
 }
@@ -290,6 +309,13 @@ func (s *Store) SetEffort(id, effort string) error {
 // stamped with real totals on the next save.
 func (s *Store) SetUsage(id string, in, cached, out int) error {
 	_, err := s.db.Exec(`UPDATE sessions SET usage_in=?, usage_cached=?, usage_out=? WHERE id=?`, in, cached, out, id)
+	return err
+}
+
+// SetRoute records the model/provider selected for an existing session even
+// when no new message has been saved yet.
+func (s *Store) SetRoute(id, model, provider string) error {
+	_, err := s.db.Exec(`UPDATE sessions SET model=?, provider=?, updated_at=? WHERE id=?`, model, provider, now(), id)
 	return err
 }
 
@@ -406,6 +432,9 @@ func (s *Store) Save(id string, from int, msgs []llm.Message, model, provider st
 		}
 		if _, err := tx.Exec(`INSERT OR REPLACE INTO messages (session_id, seq, role, content) VALUES (?,?,?,?)`,
 			id, seq, msgs[i].Role, string(data)); err != nil {
+			return err
+		}
+		if err := replaceHistoryFTS(tx, id, seq, msgs[i]); err != nil {
 			return err
 		}
 		if msgs[i].Artifact != nil {
@@ -607,7 +636,7 @@ func (s *Store) DeleteSession(id string) error {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	for _, table := range []string{"artifacts", "messages", "tasks", "snapshots", "schedules", "compactions", "goal_checkpoints", "goals", "observations", "search_snapshots"} {
+	for _, table := range []string{"artifacts", "messages", "history_fts", "tasks", "snapshots", "schedules", "compactions", "goal_checkpoints", "goals", "observations", "search_snapshots"} {
 		if _, err := tx.Exec(`DELETE FROM `+table+` WHERE session_id=?`, id); err != nil {
 			return err
 		}
@@ -620,7 +649,7 @@ func (s *Store) DeleteSession(id string) error {
 
 // Load resolves idOrPrefix to a session and returns its metadata and messages.
 func (s *Store) Load(idOrPrefix string) (Meta, []llm.Message, error) {
-	rows, err := s.db.Query(`SELECT id, title, model, provider, cwd, goal, forked_from, fork_seq, tags, pinned, effort, usage_in, usage_cached, usage_out, updated_at FROM sessions WHERE id LIKE ?||'%' LIMIT 3`, idOrPrefix)
+	rows, err := s.db.Query(`SELECT `+sessionMetaColumns+` FROM sessions WHERE id LIKE ?||'%' LIMIT 3`, idOrPrefix)
 	if err != nil {
 		return Meta{}, nil, err
 	}
@@ -694,7 +723,10 @@ func applyCompactionRows(db *sql.DB, sessionID string, rows []storedMessage) []l
 			break
 		}
 	}
-	if fold == len(rows) && (len(rows) == 0 || rows[len(rows)-1].seq < cutoff) {
+	// A cutover at the next raw sequence is valid even when the just-submitted
+	// tail has not been persisted yet (for example, an interrupted TUI turn).
+	// Only ignore an event that skips beyond a genuinely missing raw range.
+	if fold == len(rows) && (len(rows) == 0 || rows[len(rows)-1].seq+1 < cutoff) {
 		return storedMessages(rows) // the event post-dates the raw log
 	}
 	out := make([]llm.Message, 0, len(rows)+1)
@@ -775,7 +807,7 @@ func answerDanglingToolCalls(msgs []llm.Message) []llm.Message {
 
 // Recent returns up to n sessions, newest first.
 func (s *Store) Recent(n int) ([]Meta, error) {
-	rows, err := s.db.Query(`SELECT id, title, model, provider, cwd, goal, forked_from, fork_seq, tags, pinned, effort, usage_in, usage_cached, usage_out, updated_at FROM sessions
+	rows, err := s.db.Query(`SELECT `+sessionMetaColumns+` FROM sessions
 		WHERE EXISTS (SELECT 1 FROM messages WHERE session_id = sessions.id)
 		ORDER BY updated_at DESC LIMIT ?`, n)
 	if err != nil {
@@ -788,7 +820,7 @@ func (s *Store) Recent(n int) ([]Meta, error) {
 // Empty sessions are deliberately excluded, matching Recent and the resume
 // picker: --continue should return something the user can actually resume.
 func (s *Store) MostRecentForCWD(cwd string) (Meta, error) {
-	rows, err := s.db.Query(`SELECT id, title, model, provider, cwd, goal, forked_from, fork_seq, tags, pinned, effort, usage_in, usage_cached, usage_out, updated_at FROM sessions
+	rows, err := s.db.Query(`SELECT `+sessionMetaColumns+` FROM sessions
 		WHERE cwd=? AND EXISTS (SELECT 1 FROM messages WHERE session_id = sessions.id)
 		ORDER BY updated_at DESC, rowid DESC LIMIT 1`, cwd)
 	if err != nil {
@@ -879,6 +911,9 @@ func (s *Store) ClearMessages(id string) error {
 	if _, err := tx.Exec(`DELETE FROM messages WHERE session_id=?`, id); err != nil {
 		return err
 	}
+	if _, err := tx.Exec(`DELETE FROM history_fts WHERE session_id=?`, id); err != nil {
+		return err
+	}
 	if _, err := tx.Exec(`DELETE FROM artifacts WHERE session_id=?`, id); err != nil {
 		return err
 	}
@@ -898,6 +933,9 @@ func (s *Store) DeleteFrom(id string, from int) error {
 	}
 	defer func() { _ = tx.Rollback() }()
 	if _, err := tx.Exec(`DELETE FROM messages WHERE session_id=? AND seq>=?`, id, from); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM history_fts WHERE session_id=? AND seq>=?`, id, from); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(`DELETE FROM snapshots WHERE session_id=? AND seq>=?`, id, from); err != nil {
@@ -1109,6 +1147,11 @@ func (s *Store) Fork(srcID string, uptoSeq int, title string) (string, error) {
 			newID, srcID, uptoSeq); err != nil {
 			return "", err
 		}
+		if _, err := tx.Exec(`INSERT INTO history_fts (session_id, seq, role, content)
+			SELECT ?, seq, role, content FROM history_fts WHERE session_id=? AND seq <= ?`,
+			newID, srcID, uptoSeq); err != nil {
+			return "", err
+		}
 		artifactIDs, err := artifactIDsInMessages(tx, srcID, uptoSeq)
 		if err != nil {
 			return "", err
@@ -1189,7 +1232,7 @@ func (s *Store) SetPinned(id string, pinned bool) error {
 // ForksOf lists sessions forked from id, newest first — the session tree's
 // children of one node.
 func (s *Store) ForksOf(id string) ([]Meta, error) {
-	rows, err := s.db.Query(`SELECT id, title, model, provider, cwd, goal, forked_from, fork_seq, tags, pinned, effort, usage_in, usage_cached, usage_out, updated_at
+	rows, err := s.db.Query(`SELECT `+sessionMetaColumns+`
 		FROM sessions WHERE forked_from=? ORDER BY updated_at DESC`, id)
 	if err != nil {
 		return nil, err

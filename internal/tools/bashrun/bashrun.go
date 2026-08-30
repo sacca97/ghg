@@ -16,6 +16,7 @@
 package bashrun
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -31,6 +32,7 @@ import (
 	"github.com/creack/pty"
 
 	"github.com/sacca97/ghg/internal/artifact"
+	"github.com/sacca97/ghg/internal/sandbox"
 )
 
 // userShell resolves the user's login shell: $SHELL first, then the passwd
@@ -122,8 +124,8 @@ func (c *boundedCapture) Write(p []byte) (int, error) {
 	if headLen > len(c.data) {
 		headLen = len(c.data)
 	}
-	c.head = append([]byte(nil), c.data[:headLen]...)
-	c.tail = append([]byte(nil), c.data[len(c.data)-(c.limit-headLen):]...)
+	c.head = bytes.Clone(c.data[:headLen])
+	c.tail = bytes.Clone(c.data[len(c.data)-(c.limit-headLen):])
 	c.data = nil
 	return len(p), nil
 }
@@ -177,6 +179,13 @@ type Options struct {
 	// the PTY. The runner drains it until the command ends, then closes it.
 	// Interactive only; may be nil for a fire-and-forget interactive run.
 	Keys <-chan []byte
+	// Env is the complete child environment. Nil retains the legacy process
+	// environment for direct package callers; ToolRuntime always supplies a
+	// minimal environment.
+	Env []string
+	// Sandbox applies an OS policy to the shell process. A non-nil policy is
+	// fail-closed when its backend is unavailable.
+	Sandbox *sandbox.Policy
 }
 
 // Run executes the command and returns its result.
@@ -195,8 +204,29 @@ func Run(ctx context.Context, opts Options) Result {
 	ctx, cancel := context.WithTimeout(ctx, opts.Timeout)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, userShell(), "-c", opts.Command)
-	cmd.Env = append(os.Environ(), ChildMarkers...)
+	program := userShell()
+	args := []string{"-c", opts.Command}
+	var dir string
+	if opts.Sandbox != nil {
+		wrapped, err := opts.Sandbox.WrapCommand(sandbox.CommandSpec{
+			Program: program,
+			Args:    args,
+			Env:     opts.Env,
+		})
+		if err != nil {
+			return Result{Exit: "sandbox: " + err.Error()}
+		}
+		program, args, dir = wrapped.Program, wrapped.Args, wrapped.Dir
+	}
+	cmd := exec.CommandContext(ctx, program, args...)
+	if dir != "" {
+		cmd.Dir = dir
+	}
+	if opts.Env != nil {
+		cmd.Env = append(append([]string(nil), opts.Env...), ChildMarkers...)
+	} else {
+		cmd.Env = append(os.Environ(), ChildMarkers...)
+	}
 
 	if opts.Interactive {
 		return runInteractive(ctx, cmd, opts)
@@ -226,7 +256,8 @@ func runPiped(ctx context.Context, cmd *exec.Cmd, opts Options) Result {
 	if err != nil {
 		return Result{Exit: "pipe: " + err.Error()}
 	}
-	if devNull := openDevNull(); devNull != nil {
+	devNull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
+	if err == nil {
 		cmd.Stdin = devNull
 		defer devNull.Close()
 	}
@@ -326,23 +357,7 @@ func runPiped(ctx context.Context, cmd *exec.Cmd, opts Options) Result {
 	mu.Lock()
 	output := out.String()
 	mu.Unlock()
-	res := Result{Output: output, OriginalBytes: out.total, Complete: !out.truncated}
-	if ctx.Err() == context.DeadlineExceeded {
-		res.TimedOut = true
-		res.Killed = true
-		res.Exit = "timed out"
-		return res
-	}
-	if isCancelled(ctx, waitErr) {
-		res.Killed = true
-		res.Exit = "cancelled"
-		return res
-	}
-	res.Exit = exitString(waitErr)
-	if waitErr != nil {
-		res.Killed = isKilledBySignal(waitErr)
-	}
-	return res
+	return finalizeResult(ctx, Result{Output: output, OriginalBytes: out.total, Complete: !out.truncated}, waitErr)
 }
 
 // runInteractive runs the command in a PTY. sudo, ssh, gpg and friends detect a
@@ -450,20 +465,7 @@ func runInteractive(ctx context.Context, cmd *exec.Cmd, opts Options) Result {
 			// command exited). Wait for the child and return.
 			if !ok || chunk == nil {
 				waitErr := cmd.Wait()
-				res := Result{Output: buf.String(), Interactive: true, OriginalBytes: buf.total, Complete: !buf.truncated}
-				if ctx.Err() == context.DeadlineExceeded {
-					res.TimedOut = true
-					res.Killed = true
-					res.Exit = "timed out"
-					return res
-				}
-				if isCancelled(ctx, waitErr) {
-					res.Killed = true
-					res.Exit = "cancelled"
-					return res
-				}
-				res.Exit = exitString(waitErr)
-				return res
+				return finalizeResult(ctx, Result{Output: buf.String(), Interactive: true, OriginalBytes: buf.total, Complete: !buf.truncated}, waitErr)
 			}
 			buf.Write(chunk)
 			if opts.OnOutput != nil {
@@ -515,6 +517,27 @@ func exitString(err error) string {
 	return fmt.Sprintf("(exit: %v)", err)
 }
 
+// finalizeResult maps the command wait result and run context to the public
+// command result shared by piped and PTY runs.
+func finalizeResult(ctx context.Context, res Result, waitErr error) Result {
+	if ctx.Err() == context.DeadlineExceeded {
+		res.TimedOut = true
+		res.Killed = true
+		res.Exit = "timed out"
+		return res
+	}
+	if ctx.Err() == context.Canceled {
+		res.Killed = true
+		res.Exit = "cancelled"
+		return res
+	}
+	res.Exit = exitString(waitErr)
+	if waitErr != nil {
+		res.Killed = isKilledBySignal(waitErr)
+	}
+	return res
+}
+
 // isKilledBySignal reports whether the error was a kill-by-signal.
 func isKilledBySignal(err error) bool {
 	var exitErr *exec.ExitError
@@ -525,21 +548,6 @@ func isKilledBySignal(err error) bool {
 		return ws.Signaled()
 	}
 	return false
-}
-
-// isCancelled reports whether the context was cancelled (user interrupt) and
-// the error reflects that.
-func isCancelled(ctx context.Context, _ error) bool {
-	return errors.Is(ctx.Err(), context.Canceled)
-}
-
-// openDevNull returns /dev/null for a child's stdin, or nil on failure.
-func openDevNull() *os.File {
-	f, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
-	if err != nil {
-		return nil
-	}
-	return f
 }
 
 // Registry of in-flight child processes so KillAll can guarantee none outlive
