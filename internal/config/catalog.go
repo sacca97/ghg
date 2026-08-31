@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"time"
 
 	"github.com/sacca97/ghg/internal/llm"
@@ -37,20 +38,11 @@ type ModelInfoLite struct {
 // id. The bool is tri-state: found==false means the catalog has no entry or the
 // entry doesn't advertise modalities, so the caller falls back to config.
 func (c Catalog) SupportsVision(id string) (vision, found bool) {
-	for _, mi := range c.Models {
-		if mi.ID == id {
-			if len(mi.InputModalities) == 0 {
-				return false, false
-			}
-			for _, m := range mi.InputModalities {
-				if m == "image" {
-					return true, true
-				}
-			}
-			return false, true
-		}
+	mi := c.Find(id)
+	if mi == nil || len(mi.InputModalities) == 0 {
+		return false, false
 	}
-	return false, false
+	return slices.Contains(mi.InputModalities, "image"), true
 }
 
 // ContextLength reports the advertised context window for a model id

@@ -158,6 +158,74 @@ func TestProposePlanRetriesWhenPlannerDoesNotSubmit(t *testing.T) {
 	}
 }
 
+func TestRunDefinitionReservesFinalRoundForTerminalSubmission(t *testing.T) {
+	tmp := t.TempDir()
+	readPath := filepath.Join(tmp, "main.go")
+	_ = os.WriteFile(readPath, []byte("package main\n"), 0o600)
+
+	def := Definition{
+		Name:        "short-planner",
+		Description: "Short planner",
+		Role:        "smart",
+		Tools:       []string{"read", "submit_plan"},
+		MaxRounds:   3,
+		Prompt:      "Prompt",
+	}
+
+	readCall := llm.ToolCall{
+		ID:   "call-1",
+		Type: "function",
+		Function: struct {
+			Name      string `json:"name"`
+			Arguments string `json:"arguments"`
+		}{
+			Name:      "read",
+			Arguments: `{"path":"` + readPath + `"}`,
+		},
+	}
+	submitArgs := `{"goal":"complete work","steps":["step 1"],"acceptance_checks":["pass"]}`
+	submitCall := llm.ToolCall{
+		ID:   "call-2",
+		Type: "function",
+		Function: struct {
+			Name      string `json:"name"`
+			Arguments string `json:"arguments"`
+		}{
+			Name:      "submit_plan",
+			Arguments: submitArgs,
+		},
+	}
+
+	backend := &definitionBackend{messages: []llm.Message{
+		{Role: "assistant", StopReason: "tool_use", ToolCalls: []llm.ToolCall{readCall}},
+		{Role: "assistant", StopReason: "tool_use", ToolCalls: []llm.ToolCall{readCall}},
+		{Role: "assistant", StopReason: "tool_use", ToolCalls: []llm.ToolCall{submitCall}},
+	}}
+
+	a := New(backend, "smart-model", 100, "system")
+	res, err := a.RunDefinition(context.Background(), "do it", def, Events{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.TerminalName != "submit_plan" || string(res.TerminalArgs) != submitArgs {
+		t.Fatalf("unexpected terminal result: %+v", res)
+	}
+	if len(backend.requests) != 3 {
+		t.Fatalf("expected 3 requests, got %d", len(backend.requests))
+	}
+	if len(backend.requests[0].Tools) != 2 || len(backend.requests[1].Tools) != 2 {
+		t.Fatalf("initial rounds tools count = %d, %d; want 2", len(backend.requests[0].Tools), len(backend.requests[1].Tools))
+	}
+	if len(backend.requests[2].Tools) != 1 || backend.requests[2].Tools[0].Function.Name != "submit_plan" {
+		t.Fatalf("final round tools = %+v, want only submit_plan", backend.requests[2].Tools)
+	}
+	finalReq := backend.requests[2]
+	lastMsg := finalReq.Messages[len(finalReq.Messages)-1]
+	if lastMsg.Role != "user" || !strings.Contains(lastMsg.Content, "submit_plan") {
+		t.Fatalf("expected submission prompt in final request, got: %+v", lastMsg)
+	}
+}
+
 func definitionToolCall(args string) llm.ToolCall {
 	var call llm.ToolCall
 	call.ID = "plan-1"

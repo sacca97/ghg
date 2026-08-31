@@ -13,7 +13,7 @@ func TestLoadEmbeddedProfiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, id := range []string{"anthropic", "generic-openai", "inference", "openrouter", "opencode"} {
+	for _, id := range []string{"anthropic", "commandcode", "generic-openai", "inference", "openrouter", "opencode"} {
 		if _, ok := profiles.Lookup(id); !ok {
 			t.Fatalf("embedded profile %q missing; ids=%v", id, profiles.IDs())
 		}
@@ -40,6 +40,32 @@ func TestLoadEmbeddedProfiles(t *testing.T) {
 	}
 	if opencode.Routes[1].Protocol != ProtocolOpenAIResponses {
 		t.Fatalf("opencode responses route: %+v", opencode.Routes[1])
+	}
+	commandcode, ok := profiles.Lookup("commandcode")
+	if !ok {
+		t.Fatal("commandcode profile missing")
+	}
+	if commandcode.BaseURL != "https://api.commandcode.ai/provider/v1" || commandcode.Auth.Kind != AuthBearer || commandcode.Auth.Header != "Authorization" || commandcode.Auth.EnvVar != "CMD_API_KEY" {
+		t.Fatalf("commandcode profile/auth: %+v", commandcode)
+	}
+	if commandcode.Docs.KeysURL != "https://commandcode.ai/settings/keys" || commandcode.Catalog.Kind != CatalogOpenAIModels || commandcode.Catalog.Public {
+		t.Fatalf("commandcode docs/catalog: %+v", commandcode)
+	}
+
+	resolved, err := profiles.ResolveModel(Instance{Name: "commandcode", Profile: "commandcode"}, "claude-sonnet-4-6")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved.Protocol != ProtocolAnthropicMessages || resolved.Auth.Kind != AuthBearer || resolved.Auth.Header != "Authorization" || resolved.Auth.EnvVar != "CMD_API_KEY" || resolved.DefaultHeaders["anthropic-version"] != "2023-06-01" {
+		t.Fatalf("commandcode Claude route: %+v", resolved)
+	}
+
+	resolved, err = profiles.ResolveModel(Instance{Name: "commandcode", Profile: "commandcode"}, "deepseek/deepseek-v4-flash")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resolved.Protocol != ProtocolOpenAIChatCompletions {
+		t.Fatalf("commandcode non-Claude route: %+v", resolved)
 	}
 }
 

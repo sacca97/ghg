@@ -189,7 +189,8 @@ func TestObservedEditRejectsOverlappingRangesWithoutWriting(t *testing.T) {
 	if err := os.WriteFile(path, []byte(original), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	ctx := WithObservationStore(context.Background(), "session-1", observation.NewRegistry())
+	registry := observation.NewRegistry()
+	ctx := WithObservationStore(context.Background(), "session-1", registry)
 	read := ExecuteResult(ctx, All(), "read", json.RawMessage(fmt.Sprintf(`{"path":%q}`, path)))
 	args := map[string]any{
 		"mode": "observed",
@@ -219,12 +220,23 @@ func TestByteLimitedReadAuthorizesReturnedWholeLines(t *testing.T) {
 	if err := os.WriteFile(path, []byte(content), 0o640); err != nil {
 		t.Fatal(err)
 	}
-	ctx := WithObservationStore(context.Background(), "session-1", observation.NewRegistry())
+	registry := observation.NewRegistry()
+	ctx := WithObservationStore(context.Background(), "session-1", registry)
 	read := ExecuteResult(ctx, All(), "read", json.RawMessage(fmt.Sprintf(`{"path":%q,"limit":1000}`, path)))
 	if read.ExitCode != 0 || read.Metadata["observation_complete"] != "false" {
 		t.Fatalf("read should stop at the byte ceiling: %+v", read)
 	}
+	if len(read.Preview) > maxOutput || read.Retained == "" || len(read.Retained) != len(read.Preview) {
+		t.Fatalf("read preview/retention bounds: preview=%d retained=%d", len(read.Preview), len(read.Retained))
+	}
 	id := read.Metadata["observation_id"]
+	record, err := registry.Load(context.Background(), "session-1", id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.IssuedBytes != len(read.Preview) {
+		t.Fatalf("observation issued %d bytes but preview shows %d; authorization exceeds visible content", record.IssuedBytes, len(read.Preview))
+	}
 	result := ExecuteResult(ctx, All(), "edit", observedReplaceArgs(id, path, 1, 1, "changed"))
 	if result.ExitCode != 0 {
 		t.Fatalf("returned whole line should authorize edit: %+v", result)
@@ -528,4 +540,114 @@ func (s foreignObservationStore) Save(context.Context, string, observation.Recor
 
 func (s foreignObservationStore) Load(context.Context, string, string) (observation.Record, error) {
 	return s.record, nil
+}
+
+func TestFabricatedObservationRejectedWithoutModifyingFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "auth.txt")
+	initial := "original line 1\noriginal line 2\noriginal line 3\n"
+	if err := os.WriteFile(path, []byte(initial), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ctx := WithObservationStore(context.Background(), "session-1", observation.NewRegistry())
+	args := map[string]any{
+		"mode": "observed",
+		"edits": []any{map[string]any{
+			"observation": "obs-fabricated-9999",
+			"path":        path,
+			"start_line":  2,
+			"end_line":    2,
+			"operation":   "replace",
+			"content":     "malicious overwrite",
+		}},
+	}
+	data, _ := json.Marshal(args)
+	result := ExecuteResult(ctx, All(), "edit", data)
+	if result.ExitCode == 0 && !strings.Contains(result.Preview, "not found") {
+		t.Fatalf("fabricated observation should fail: %+v", result)
+	}
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != initial {
+		t.Fatalf("fabricated observation modified file: %q, want %q", got, initial)
+	}
+}
+
+func TestPostEditObservationChainingAuthorizesConsecutiveEdits(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "chain.txt")
+	initial := "line 1\nline 2\nline 3\nline 4\nline 5\n"
+	if err := os.WriteFile(path, []byte(initial), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	registry := observation.NewRegistry()
+	ctx := WithObservationStore(context.Background(), "session-chain", registry)
+
+	// Initial explicit read
+	read := ExecuteResult(ctx, All(), "read", json.RawMessage(fmt.Sprintf(`{"path":%q,"offset":1,"limit":5}`, path)))
+	if read.ExitCode != 0 || read.Metadata["observation_id"] == "" {
+		t.Fatalf("initial read failed: %+v", read)
+	}
+	firstObsID := read.Metadata["observation_id"]
+
+	// First observed edit
+	edit1Args := map[string]any{
+		"mode": "observed",
+		"edits": []any{map[string]any{
+			"observation": firstObsID,
+			"path":        path,
+			"start_line":  2,
+			"end_line":    2,
+			"operation":   "replace",
+			"content":     "line two modified",
+		}},
+	}
+	data1, _ := json.Marshal(edit1Args)
+	res1 := ExecuteResult(ctx, All(), "edit", data1)
+	if res1.ExitCode != 0 {
+		t.Fatalf("first edit failed: %+v", res1)
+	}
+
+	// Extract chained observation ID from the edit result text
+	// Format is [observation <id> path=... lines=...]
+	preview := res1.Preview
+	obsIdx := strings.Index(preview, "[observation ")
+	if obsIdx < 0 {
+		t.Fatalf("edit result lacks chained observation header: %q", preview)
+	}
+	rest := preview[obsIdx+len("[observation "):]
+	spaceIdx := strings.IndexByte(rest, ' ')
+	if spaceIdx < 0 {
+		t.Fatalf("malformed observation header: %q", preview)
+	}
+	chainedObsID := rest[:spaceIdx]
+
+	// Second observed edit without an intermediate explicit read call
+	edit2Args := map[string]any{
+		"mode": "observed",
+		"edits": []any{map[string]any{
+			"observation": chainedObsID,
+			"path":        path,
+			"start_line":  3,
+			"end_line":    3,
+			"operation":   "replace",
+			"content":     "line three modified",
+		}},
+	}
+	data2, _ := json.Marshal(edit2Args)
+	res2 := ExecuteResult(ctx, All(), "edit", data2)
+	if res2.ExitCode != 0 {
+		t.Fatalf("chained second edit failed: %+v", res2)
+	}
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "line 1\nline two modified\nline three modified\nline 4\nline 5\n"
+	if string(got) != want {
+		t.Fatalf("consecutive edit result = %q, want %q", got, want)
+	}
 }

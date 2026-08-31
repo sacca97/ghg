@@ -39,6 +39,7 @@ const (
 	CommandPlan      = "plan"
 	CommandStop      = "stop"
 	CommandPing      = "ping"
+	CommandLSPStatus = "lsp_status"
 	// CommandChdir retargets the worker process at the TUI's new working
 	// directory: the worker owns the tools and sandbox, so a TUI-side chdir
 	// alone would leave it reading and editing the original workspace.
@@ -243,7 +244,7 @@ func knownCommand(name string) bool {
 	switch name {
 	case CommandDetach, CommandCancel, CommandInput, CommandApprove,
 		CommandConfigure, CommandCompact, CommandPlan,
-		CommandStop, CommandPing, CommandChdir, CommandAppend:
+		CommandStop, CommandPing, CommandLSPStatus, CommandChdir, CommandAppend:
 		return true
 	default:
 		return false

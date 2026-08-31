@@ -280,32 +280,40 @@ func TestGrepPageDoesNotOverflowOnWholeFileGroups(t *testing.T) {
 
 func TestSearchPreviewPaginationDoesNotSkipLongResults(t *testing.T) {
 	dir := t.TempDir()
-	first := writeSearchFile(t, dir, "a.txt", "FIRST "+strings.Repeat("x", maxMatchLineBytes)+"\n")
-	second := writeSearchFile(t, dir, "b.txt", "SECOND "+strings.Repeat("y", maxMatchLineBytes)+"\n")
+	files := make([]string, 5)
+	for i := range files {
+		files[i] = writeSearchFile(t, dir, fmt.Sprintf("%c.txt", 'a'+i), fmt.Sprintf("MATCH %d ", i)+strings.Repeat("x", maxMatchLineBytes)+"\n")
+	}
 	ctx := WithSearchStore(context.Background(), "session-1", search.NewRegistry())
-	args := fmt.Sprintf(`{"pattern":"FIRST|SECOND","path":%q,"max_results":2}`, dir)
+	args := fmt.Sprintf(`{"pattern":"MATCH","path":%q,"max_results":5}`, dir)
 	page := ExecuteResult(ctx, All(), "grep", json.RawMessage(args))
 	if len(page.Preview) > searchPreviewBytes {
 		t.Fatalf("first search preview exceeded byte ceiling: %d", len(page.Preview))
 	}
-	if page.Metadata["search_displayed"] != "1" || page.Metadata["search_remaining"] != "1" {
+	var displayed, remaining int
+	fmt.Sscan(page.Metadata["search_displayed"], &displayed)
+	fmt.Sscan(page.Metadata["search_remaining"], &remaining)
+	if displayed <= 0 || displayed+remaining != 5 || remaining == 0 {
 		t.Fatalf("first page accounting = %+v", page.Metadata)
 	}
-	if !strings.Contains(page.Preview, first) || strings.Contains(page.Preview, second) {
+	if !strings.Contains(page.Preview, files[0]) {
 		t.Fatalf("first page rendered the wrong results: %q", page.Preview)
 	}
 	cursor := page.Metadata["search_cursor"]
 	if cursor == "" {
 		t.Fatal("first page should retain the unseen long result behind a cursor")
 	}
-	page2 := ExecuteResult(ctx, All(), "grep", json.RawMessage(fmt.Sprintf(`{"cursor":%q,"max_results":2}`, cursor)))
+	page2 := ExecuteResult(ctx, All(), "grep", json.RawMessage(fmt.Sprintf(`{"cursor":%q,"max_results":5}`, cursor)))
 	if len(page2.Preview) > searchPreviewBytes {
 		t.Fatalf("second search preview exceeded byte ceiling: %d", len(page2.Preview))
 	}
-	if page2.Metadata["search_displayed"] != "1" || page2.Metadata["search_remaining"] != "0" || page2.Metadata["search_cursor"] != "" {
-		t.Fatalf("second page accounting = %+v", page2.Metadata)
+	var displayed2, remaining2 int
+	fmt.Sscan(page2.Metadata["search_displayed"], &displayed2)
+	fmt.Sscan(page2.Metadata["search_remaining"], &remaining2)
+	if displayed+displayed2 != 5 || remaining2 != 0 {
+		t.Fatalf("second page accounting = %+v, displayed1=%d", page2.Metadata, displayed)
 	}
-	if !strings.Contains(page2.Preview, second) || strings.Contains(page2.Preview, first) {
+	if !strings.Contains(page2.Preview, files[displayed]) {
 		t.Fatalf("second page skipped or repeated a result: %q", page2.Preview)
 	}
 }

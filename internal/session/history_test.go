@@ -143,4 +143,3 @@ func TestHistorySearchConcurrentWithSaveDoesNotLockDatabase(t *testing.T) {
 	}
 	<-done
 }
-

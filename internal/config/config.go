@@ -534,9 +534,18 @@ func marshalConfig(c *Config) ([]byte, error) {
 	return append(out, '\n'), nil
 }
 
+// ResolvedRoute contains the canonical provider and model resolution result.
+type ResolvedRoute struct {
+	Provider     Provider
+	Model        Model
+	ProviderName string
+	ModelName    string
+	APIID        string
+}
+
 // Resolve picks the provider and API model id for a model name.
 // provider may be "" to use the config default routing.
-func (c *Config) Resolve(model, provider string) (Provider, Model, string, error) {
+func (c *Config) Resolve(model, provider string) (ResolvedRoute, error) {
 	if model == "" {
 		model = c.DefaultModel
 	}
@@ -547,7 +556,7 @@ func (c *Config) Resolve(model, provider string) (Provider, Model, string, error
 		var err error
 		m, provider, err = c.resolveFromCatalog(model, provider)
 		if err != nil {
-			return Provider{}, Model{}, "", err
+			return ResolvedRoute{}, err
 		}
 	}
 	if provider == "" {
@@ -558,13 +567,19 @@ func (c *Config) Resolve(model, provider string) (Provider, Model, string, error
 	}
 	p, ok := c.Providers[provider]
 	if !ok {
-		return Provider{}, Model{}, "", fmt.Errorf("unknown provider %q (providers: %s)", provider, keys(c.Providers))
+		return ResolvedRoute{}, fmt.Errorf("unknown provider %q (providers: %s)", provider, keys(c.Providers))
 	}
 	id := m.ID
 	if id == "" {
 		id = model
 	}
-	return p, m, id, nil
+	return ResolvedRoute{
+		Provider:     p,
+		Model:        m,
+		ProviderName: provider,
+		ModelName:    model,
+		APIID:        id,
+	}, nil
 }
 
 // resolveFromCatalog synthesizes a Model for an id advertised in a provider's
@@ -607,12 +622,7 @@ func (c *Config) resolveFromCatalog(model, provider string) (Model, string, erro
 		ID:        model,
 		Context:   h.mi.ContextLength,
 		MaxOut:    h.mi.MaxCompletionTokens,
-	}
-	for _, mod := range h.mi.InputModalities {
-		if mod == "image" {
-			m.Vision = true
-			break
-		}
+		Vision:    slices.Contains(h.mi.InputModalities, "image"),
 	}
 	return m, h.prov, nil
 }

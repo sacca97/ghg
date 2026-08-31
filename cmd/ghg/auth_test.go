@@ -132,12 +132,12 @@ func TestAuthCLICustomProfileValidatesUpsertsAndSeedsCatalog(t *testing.T) {
 	if cat.ContextLength("gpt-go") != 400000 {
 		t.Errorf("catalog capabilities were not carried: %+v", cat.Models)
 	}
-	_, model, _, err := cfg.Resolve("claude-go", "")
+	route, err := cfg.Resolve("claude-go", "")
 	if err != nil {
 		t.Fatalf("catalog model should resolve: %v", err)
 	}
-	if len(model.Providers) != 1 || model.Providers[0] != "opencode" {
-		t.Errorf("catalog model route: %+v", model)
+	if len(route.Model.Providers) != 1 || route.Model.Providers[0] != "opencode" {
+		t.Errorf("catalog model route: %+v", route.Model)
 	}
 }
 

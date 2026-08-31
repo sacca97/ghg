@@ -119,6 +119,21 @@ func (r Runtime) RemovePrompt() error {
 	return err
 }
 
+// Live reports whether a worker currently owns this runtime's lifetime lock.
+// The lock, not a leftover socket or state file, is the ownership signal: a
+// crashed worker leaves both behind. Callers use it to attach to a live
+// worker instead of launching a competing one.
+func (r Runtime) Live() bool {
+	lock, err := r.Acquire()
+	if errors.Is(err, ErrAlreadyRunning) {
+		return true
+	}
+	if err == nil {
+		_ = lock.Close()
+	}
+	return false
+}
+
 type Lock struct {
 	file *os.File
 }

@@ -1,0 +1,23 @@
+schema: 1
+id: commandcode
+display_name: CommandCode
+protocol: openai-chat-completions
+base_url: https://api.commandcode.ai/provider/v1
+
+auth:
+  kind: bearer
+  header: Authorization
+  env_var: CMD_API_KEY
+
+docs:
+  keys_url: https://commandcode.ai/settings/keys
+
+routes:
+  - models: ["claude-*"]
+    protocol: anthropic-messages
+    default_headers:
+      anthropic-version: "2023-06-01"
+
+catalog:
+  kind: openai-models
+  public: false

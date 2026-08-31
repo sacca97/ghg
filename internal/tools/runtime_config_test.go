@@ -82,6 +82,56 @@ func TestNewConfiguredRuntimeProvidesPrivateTempAndDefaultCaches(t *testing.T) {
 	}
 }
 
+func TestNewConfiguredRuntimeRedirectsRelativeScratchPathsAndCleans(t *testing.T) {
+	home := t.TempDir()
+	workspace := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("GHG_HOME", filepath.Join(home, ".ghg"))
+	t.Setenv("TMPDIR", ".")
+	t.Setenv("TMP", ".")
+	t.Setenv("TEMP", ".")
+	t.Setenv("GOPATH", ".gopath-one"+string(os.PathListSeparator)+".gopath-two")
+	t.Setenv("GOCACHE", ".gocache")
+	t.Setenv("GOMODCACHE", ".gomodcache")
+	t.Setenv("CARGO_HOME", ".cargo")
+	t.Setenv("RUSTUP_HOME", ".rustup")
+	t.Setenv("BUN_INSTALL", ".bun")
+	t.Setenv("NPM_CONFIG_CACHE", ".npm")
+	t.Setenv("XDG_CACHE_HOME", ".xdg-cache")
+
+	rt, cleanup, err := NewConfiguredRuntime(workspace, nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !filepath.IsAbs(rt.TempDir) || pathEqualOrWithin(filepath.Clean(rt.TempDir), filepath.Clean(wd)) {
+		t.Fatalf("runtime temp directory=%q must be outside the working directory", rt.TempDir)
+	}
+	env := make(map[string]string)
+	for _, pair := range rt.ChildEnv(nil) {
+		key, value, ok := strings.Cut(pair, "=")
+		if ok {
+			env[key] = value
+		}
+	}
+	for _, key := range []string{"GOPATH", "GOCACHE", "GOMODCACHE", "CARGO_HOME", "RUSTUP_HOME", "BUN_INSTALL", "NPM_CONFIG_CACHE", "XDG_CACHE_HOME"} {
+		for _, value := range splitPathList(env[key]) {
+			if !pathEqualOrWithin(filepath.Clean(value), filepath.Clean(rt.TempDir)) {
+				t.Fatalf("child %s=%q escaped runtime temp %q", key, value, rt.TempDir)
+			}
+		}
+	}
+	cleanup()
+	cleanup()
+	if _, err := os.Stat(rt.TempDir); !os.IsNotExist(err) {
+		t.Fatalf("runtime temp directory=%q still exists after cleanup: %v", rt.TempDir, err)
+	}
+}
+
 func TestCacheRootsAreNarrowAndSiblingStateIsProtected(t *testing.T) {
 	home := t.TempDir()
 	workspace := t.TempDir()

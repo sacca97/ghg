@@ -95,3 +95,36 @@ func TestWheelScrollKeepsPromptAndStatusFixed(t *testing.T) {
 		}
 	}
 }
+
+func TestScrolledUpViewportDoesNotSnapToBottomOnAssistantOutput(t *testing.T) {
+	m := compactCmdModel()
+	m.Update(mkWinSize(80, 20))
+	for i := 0; i < 40; i++ {
+		m.appendAssistant(fmt.Sprintf("line %d of initial transcript content", i))
+	}
+	m.vp.GotoBottom()
+	start := m.vp.YOffset
+
+	// Scroll up 5 lines
+	for i := 0; i < 5; i++ {
+		um, _ := m.Update(tea.MouseMsg(tea.MouseEvent{Action: tea.MouseActionPress, Button: tea.MouseButtonWheelUp, X: 40, Y: 10}))
+		m = um.(*model)
+	}
+	if m.follow {
+		t.Fatal("expected follow == false after scrolling up")
+	}
+	scrolledOffset := m.vp.YOffset
+	if scrolledOffset >= start {
+		t.Fatalf("expected viewport to have scrolled up from %d, got %d", start, scrolledOffset)
+	}
+
+	// Incoming assistant text arrives
+	m.appendAssistant("new assistant message arriving while scrolled up")
+
+	if m.follow {
+		t.Fatal("appendAssistant should not reset follow to true when user is scrolled up")
+	}
+	if m.vp.YOffset != scrolledOffset {
+		t.Fatalf("viewport moved from %d to %d on assistant text while follow was false", scrolledOffset, m.vp.YOffset)
+	}
+}

@@ -6,12 +6,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"slices"
-	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -462,20 +462,10 @@ func (m *Manager) clientFor(ctx context.Context, abs string) (*clientState, erro
 	var name string
 	var spec ServerSpec
 	m.mu.Lock()
-	names := make([]string, 0, len(m.specs))
-	for n := range m.specs {
-		names = append(names, n)
-	}
-	sort.Strings(names)
-	for _, n := range names {
+	for _, n := range slices.Sorted(maps.Keys(m.specs)) {
 		s := m.specs[n]
-		for _, e := range s.Extensions {
-			if e == ext {
-				name, spec = n, s
-				break
-			}
-		}
-		if name != "" {
+		if slices.Contains(s.Extensions, ext) {
+			name, spec = n, s
 			break
 		}
 	}
@@ -671,12 +661,7 @@ func (m *Manager) Statuses() []Status {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	var out []Status
-	names := make([]string, 0, len(m.specs))
-	for n := range m.specs {
-		names = append(names, n)
-	}
-	sort.Strings(names)
-	for _, n := range names {
+	for _, n := range slices.Sorted(maps.Keys(m.specs)) {
 		st := Status{Name: n, State: "not started"}
 		for key, cs := range m.clients {
 			if strings.HasPrefix(key, n+"\x00") {

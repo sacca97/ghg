@@ -17,7 +17,7 @@ package lsp
 import (
 	"fmt"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 )
 
@@ -121,7 +121,7 @@ func Report(edited string, editedDiags []Diagnostic, siblings map[string][]Diagn
 	if len(names) == 0 {
 		return out
 	}
-	sort.Strings(names)
+	slices.Sort(names)
 	shown := min(len(names), maxSiblingFiles)
 	for _, p := range names[:shown] {
 		out += block(p, siblings[p])
@@ -151,8 +151,7 @@ func siblingErrors(edited string, all map[string][]Diagnostic) map[string][]Diag
 		if p == edited || filepath.Dir(p) != dir {
 			continue
 		}
-		kept := make([]Diagnostic, len(ds))
-		copy(kept, ds)
+		kept := slices.Clone(ds)
 		for _, d := range ds {
 			if d.Severity == SeverityError {
 				out[p] = kept

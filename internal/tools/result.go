@@ -263,6 +263,7 @@ func normalizeResult(result ToolResult) ToolResult {
 	if result.Preview == "" {
 		result.Preview = "(no output)"
 	}
+	result.Preview = truncate(result.Preview)
 	return result
 }
 

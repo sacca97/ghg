@@ -1,11 +1,5 @@
 package config
 
-import (
-	"encoding/json"
-	"os"
-	"path/filepath"
-)
-
 // projects.json holds per-project overrides keyed by absolute folder path —
 // settings that should apply only when working in a given repo, on top of the
 // global defaults in config.json.
@@ -18,25 +12,9 @@ type projectsFile struct {
 	GoalMaxRounds map[string]int `json:"goalMaxRounds,omitempty"`
 }
 
-func projectsPath() (string, error) {
-	dir, err := Dir()
-	if err != nil {
-		return "", err
-	}
-	return filepath.Join(dir, "projects.json"), nil
-}
-
 func loadProjects() projectsFile {
 	var f projectsFile
-	p, err := projectsPath()
-	if err != nil {
-		return f
-	}
-	data, err := os.ReadFile(p)
-	if err != nil {
-		return f
-	}
-	_ = json.Unmarshal(data, &f)
+	_ = ReadJSON("projects.json", &f)
 	return f
 }
 

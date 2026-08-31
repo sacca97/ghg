@@ -575,3 +575,39 @@ func TestRawCutoffTranslatesThroughPriorCompaction(t *testing.T) {
 		}
 	}
 }
+
+func TestPersistCompactionSavesUnsavedAndRecordsEvent(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "s.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	id, err := st.Create("/work", "m", "p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	msgs := []llm.Message{
+		{Role: "system", Content: "sys"},
+		{Role: "user", Content: "q1"},
+		{Role: "assistant", Content: "a1"},
+		{Role: "user", Content: "q2"},
+		{Role: "assistant", Content: "a2"},
+	}
+	if err := st.Save(id, 0, msgs[:3], "m", "p"); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := st.PersistCompaction(id, 3, msgs, "m", "p", "summarized turns", 3); err != nil {
+		t.Fatal(err)
+	}
+
+	raw := st.RawMessages(id)
+	if len(raw) != 5 {
+		t.Fatalf("expected 5 raw messages, got %d", len(raw))
+	}
+
+	compactions := st.Compactions(id)
+	if len(compactions) != 1 || compactions[0].Summary != "summarized turns" || compactions[0].Cutoff != 3 {
+		t.Fatalf("unexpected compaction record: %+v", compactions)
+	}
+}

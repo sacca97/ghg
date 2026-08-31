@@ -56,7 +56,10 @@ func (a *Agent) ApproveForMe(ctx context.Context, request tools.ApprovalRequest)
 		},
 		MaxTokens: 256,
 	}, Events{})
-	reviewerError := errorString(err)
+	var reviewerError string
+	if err != nil {
+		reviewerError = err.Error()
+	}
 	if a.Runtime != nil {
 		reviewerError = a.Runtime.RedactText(reviewerError)
 	}
@@ -112,11 +115,4 @@ func parseApprovalResult(text string) (tools.ApprovalResult, error) {
 		return tools.ApprovalResult{}, errors.New("decision reason must be short and non-empty")
 	}
 	return result, nil
-}
-
-func errorString(err error) string {
-	if err == nil {
-		return ""
-	}
-	return err.Error()
 }

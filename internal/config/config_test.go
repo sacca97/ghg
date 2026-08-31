@@ -103,18 +103,18 @@ func TestResolveRouting(t *testing.T) {
 			"m1": {Providers: []string{"a", "b"}, ID: "vendor/m1"},
 		},
 	}
-	p, _, id, err := cfg.Resolve("", "")
-	if err != nil || p.BaseURL != "https://a" || id != "vendor/m1" {
-		t.Fatalf("default routing: %v %v %v", p.BaseURL, id, err)
+	route, err := cfg.Resolve("", "")
+	if err != nil || route.Provider.BaseURL != "https://a" || route.APIID != "vendor/m1" || route.ProviderName != "a" || route.ModelName != "m1" {
+		t.Fatalf("default routing: %+v %v", route, err)
 	}
-	p, _, _, err = cfg.Resolve("m1", "b")
-	if err != nil || p.BaseURL != "https://b" {
-		t.Fatalf("provider override: %v %v", p.BaseURL, err)
+	route, err = cfg.Resolve("m1", "b")
+	if err != nil || route.Provider.BaseURL != "https://b" || route.ProviderName != "b" {
+		t.Fatalf("provider override: %+v %v", route, err)
 	}
-	if _, _, _, err = cfg.Resolve("nope", ""); err == nil {
+	if _, err = cfg.Resolve("nope", ""); err == nil {
 		t.Fatal("expected unknown model error")
 	}
-	if _, _, _, err = cfg.Resolve("m1", "nope"); err == nil {
+	if _, err = cfg.Resolve("m1", "nope"); err == nil {
 		t.Fatal("expected unknown provider error")
 	}
 }

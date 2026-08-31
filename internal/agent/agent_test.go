@@ -765,8 +765,8 @@ func TestEstimateTokens(t *testing.T) {
 
 func TestContextTokensUsesLatestReportedRequest(t *testing.T) {
 	ag := New(testBackend("http://unused", "k"), "m", 100, "sys")
-	if got := ag.ContextTokens(); got != 0 {
-		t.Fatalf("before a response: got %d, want 0", got)
+	if got, want := ag.ContextTokens(), EstimateTokens(ag.Messages); got != want {
+		t.Fatalf("before a response: got %d, want %d", got, want)
 	}
 
 	ag.Messages = append(ag.Messages,
@@ -776,6 +776,11 @@ func TestContextTokensUsesLatestReportedRequest(t *testing.T) {
 	)
 	if got, want := ag.ContextTokens(), 340; got != want {
 		t.Fatalf("latest context tokens = %d, want %d", got, want)
+	}
+
+	ag.Messages = append(ag.Messages, llm.Message{Role: "user", Content: strings.Repeat("x", 400)})
+	if got, want := ag.ContextTokens(), 340+104; got != want {
+		t.Fatalf("context tokens with unreported message = %d, want %d", got, want)
 	}
 }
 
@@ -810,7 +815,11 @@ func TestProactiveCompactAtFiftyPercent(t *testing.T) {
 	}
 	ag.Messages = append(ag.Messages, llm.Message{
 		Role: "assistant", Content: "previous response",
-		Usage: &llm.Usage{PromptTokens: 400, CompletionTokens: 150},
+		Usage: &llm.Usage{PromptTokens: 250, CompletionTokens: 100},
+	})
+	// Unreported pressure from a large tool result after the last usage-bearing assistant message
+	ag.Messages = append(ag.Messages, llm.Message{
+		Role: "tool", Content: strings.Repeat("a", 1000),
 	})
 	var compacted bool
 	final, err := ag.Turn(context.Background(), strings.Repeat("z", 900), Events{
@@ -1115,5 +1124,57 @@ func TestCompactionPersistenceFailureKeepsRawMessages(t *testing.T) {
 	}})
 	if err == nil || !reflect.DeepEqual(ag.MessagesSnapshot(), before) {
 		t.Fatalf("failed persistence changed raw messages: err=%v", err)
+	}
+}
+
+func TestPreflightCompactionTriggersOnAbsoluteReserve(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"choices":[{"message":{"content":"summary of previous turns"}}]}`))
+	}))
+	defer srv.Close()
+
+	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
+	ag.ContextLimit = 1000
+	ag.CompactThreshold = 0.9 // high percent threshold (900 tokens)
+	ag.OutputReserve = 600    // absolute reserve forces budget down to 1000-600 = 400 tokens
+
+	for i := 0; i < 8; i++ {
+		ag.Messages = append(ag.Messages,
+			llm.Message{Role: "user", Content: strings.Repeat("hello world ", 10)},
+			llm.Message{Role: "assistant", Content: strings.Repeat("answer here ", 10)},
+		)
+	}
+
+	tokens := ag.ActiveTokens()
+	if tokens < 400 || tokens >= 900 {
+		t.Fatalf("expected active tokens between 400 and 900, got %d", tokens)
+	}
+
+	before := len(ag.Messages)
+	if err := ag.maybeCompact(context.Background(), Events{}); err != nil {
+		t.Fatalf("maybeCompact failed: %v", err)
+	}
+	if len(ag.Messages) >= before {
+		t.Fatalf("messages should have compacted due to output reserve budget: before=%d, after=%d", before, len(ag.Messages))
+	}
+}
+
+func TestOneShotOverflowFailsTerminalOnSecondError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(`{"error":{"message":"maximum context length exceeded","type":"invalid_request_error"}}`))
+	}))
+	defer srv.Close()
+
+	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
+	for i := 0; i < 8; i++ {
+		ag.Messages = append(ag.Messages,
+			llm.Message{Role: "user", Content: fmt.Sprintf("q%d", i)},
+			llm.Message{Role: "assistant", Content: fmt.Sprintf("a%d", i)},
+		)
+	}
+	_, err := ag.Turn(context.Background(), "hello", Events{})
+	if err == nil || !llm.IsContextLimit(err) {
+		t.Fatalf("expected context limit exceeded terminal error, got %v", err)
 	}
 }

@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -35,7 +36,7 @@ func TestStatusLineAlwaysShown(t *testing.T) {
 	m.agent.Messages = []llm.Message{{Role: "system", Content: "system prompt"}}
 
 	v := m.View()
-	for _, want := range []string{"kimi-k3-fast", "(high)", "execute", "inference", "ctx 0/128.0k"} {
+	for _, want := range []string{"kimi-k3-fast", "(high)", "execute", "inference", "ctx 8/128.0k"} {
 		if !strings.Contains(v, want) {
 			t.Errorf("status box should show %q\n--- view tail ---\n%s", want, tailLines(v, 8))
 		}
@@ -63,12 +64,12 @@ func TestContextStatusUsesLatestReportedRequest(t *testing.T) {
 	}
 }
 
-func TestContextStatusStartsAtZeroWithoutReportedResponse(t *testing.T) {
+func TestContextStatusEstimatesActiveTokensWithoutReportedResponse(t *testing.T) {
 	m := statusModel()
 	m.agent.ContextLimit = 128000
 	m.agent.Messages = []llm.Message{{Role: "system", Content: strings.Repeat("x", 40000)}}
 
-	if got, want := m.contextStatus(), "ctx 0/128.0k"; got != want {
+	if got, want := m.contextStatus(), "ctx 10.0k/128.0k"; got != want {
 		t.Fatalf("context status = %q, want %q", got, want)
 	}
 }
@@ -401,5 +402,71 @@ func TestSessionCostUsesFetchedPricing(t *testing.T) {
 	// exact: (31100-20700)*4.5e-6 + 20700*4.5e-7 + 360*22.5e-6
 	if want := 0.064215; fast != want {
 		t.Errorf("kimi-k3-fast cost = %v, want %v", fast, want)
+	}
+}
+
+func TestWorkerSnapshotContextTokensOverridesStaleShadowAgent(t *testing.T) {
+	m := statusModel()
+	m.agent.ContextLimit = 128000
+	// Shadow agent has ~10k tokens worth of text
+	m.agent.Messages = []llm.Message{{Role: "system", Content: strings.Repeat("x", 40000)}}
+
+	// Direct execution would say 10.0k
+	if got, want := m.contextStatus(), "ctx 10.0k/128.0k"; got != want {
+		t.Fatalf("pre-worker context status = %q, want %q", got, want)
+	}
+
+	// Apply worker snapshot with authoritative 80617 tokens
+	m.applyWorkerSnapshot(workerSnapshot{
+		State:         "running",
+		ContextTokens: 80617,
+		ContextLimit:  128000,
+	})
+
+	// Should reflect authoritative worker count (~80.6k)
+	if got, want := m.contextStatus(), "ctx 80.6k/128.0k"; got != want {
+		t.Fatalf("worker snapshot context status = %q, want %q", got, want)
+	}
+}
+
+func TestWorkerUsageAndCompactionSynchronizeContextTokens(t *testing.T) {
+	m := statusModel()
+	m.agent.ContextLimit = 128000
+	m.workerState = "running"
+	m.workerContextTokens = 1000
+
+	if got, want := m.contextStatus(), "ctx 1.0k/128.0k"; got != want {
+		t.Fatalf("initial context status = %q, want %q", got, want)
+	}
+
+	// Worker sends usage event for 50k prompt + 2k completion
+	usageJSON, err := json.Marshal(llm.Usage{PromptTokens: 50000, CompletionTokens: 2000})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.workerEvent(workerEvent{Kind: "usage", Data: usageJSON})
+
+	if got, want := m.contextStatus(), "ctx 52.0k/128.0k"; got != want {
+		t.Fatalf("post-usage context status = %q, want %q", got, want)
+	}
+
+	// Worker completes compaction, returning compacted messages (~1k tokens)
+	compactJSON, err := json.Marshal(workerCompactResult{
+		Messages: []llm.Message{
+			{Role: "system", Content: "sys"},
+			{Role: "user", Content: "summary"},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.workerEvent(workerEvent{Kind: "compact_done", Data: compactJSON})
+
+	// Context tokens recomputed from returned compacted messages
+	if m.workerContextTokens >= 52000 || m.workerContextTokens == 0 {
+		t.Fatalf("expected compacted tokens < 52k, got %d", m.workerContextTokens)
+	}
+	if got := m.contextStatus(); strings.Contains(got, "52.0k") {
+		t.Fatalf("expected context status to decrease after compaction, got %q", got)
 	}
 }

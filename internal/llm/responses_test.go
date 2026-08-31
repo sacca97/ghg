@@ -33,6 +33,12 @@ func responseEventType(payload string) string {
 	return event.Type
 }
 
+func TestFirstNonEmpty(t *testing.T) {
+	if got := firstNonEmpty(" \t", "fallback"); got != "fallback" {
+		t.Fatalf("firstNonEmpty() = %q, want fallback", got)
+	}
+}
+
 func TestOpenAIResponsesRequestTranslation(t *testing.T) {
 	tool := NewTool("read", "Read a file", `{"type":"object","properties":{"path":{"type":"string"}}}`)
 	call := ToolCall{ID: "call-1", Type: "function"}

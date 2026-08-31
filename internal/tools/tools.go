@@ -124,7 +124,7 @@ func ExecuteResult(ctx context.Context, ts []Tool, name string, args json.RawMes
 	return result
 }
 
-const maxOutput = 50_000 // bytes of tool output fed back to the model
+const maxOutput = 16 << 10 // bytes of tool output fed back to the model
 
 // Truncate caps tool output at maxOutput with a marker; exported for the MCP
 // bridge, which flattens remote results into the same budget.
@@ -132,11 +132,24 @@ func Truncate(s string) string {
 	return truncate(s)
 }
 
-func truncate(s string) string {
-	if len(s) <= maxOutput {
-		return s
+// TruncateWithSuffix caps the combined preview and trusted suffix at
+// maxOutput, preserving the suffix (for example, an artifact recovery hint).
+func TruncateWithSuffix(s, suffix string) string {
+	if len(s)+len(suffix) <= maxOutput {
+		return s + suffix
 	}
-	return s[:maxOutput] + fmt.Sprintf("\n... [truncated %d bytes]", len(s)-maxOutput)
+	if len(suffix) >= maxOutput {
+		return suffix[len(suffix)-maxOutput:]
+	}
+	return truncateWithMarkerLimit(s, maxOutput-len(suffix), func(omitted int) string {
+		return fmt.Sprintf("\n... [truncated %d bytes]", omitted)
+	}, false) + suffix
+}
+
+func truncate(s string) string {
+	return truncateWithMarker(s, func(omitted int) string {
+		return fmt.Sprintf("\n... [truncated %d bytes]", omitted)
+	}, false)
 }
 
 // lspDiagnostics appends the LSP diagnostics block for a just-written file.
@@ -154,10 +167,34 @@ func lspDiagnostics(ctx context.Context, path string) string {
 // is usually where the error is). Exported for the TUI's `!` shell escape,
 // which formats output exactly like the bash tool.
 func TruncateTail(s string) string {
-	if len(s) <= maxOutput {
+	return truncateWithMarker(s, func(omitted int) string {
+		return fmt.Sprintf("[... first %d bytes truncated]\n", omitted)
+	}, true)
+}
+
+func truncateWithMarker(s string, marker func(omitted int) string, tail bool) string {
+	return truncateWithMarkerLimit(s, maxOutput, marker, tail)
+}
+
+func truncateWithMarkerLimit(s string, limit int, marker func(omitted int) string, tail bool) string {
+	if len(s) <= limit {
 		return s
 	}
-	return fmt.Sprintf("[... first %d bytes truncated]\n", len(s)-maxOutput) + s[len(s)-maxOutput:]
+	keep := limit
+	for {
+		text := marker(len(s) - keep)
+		next := limit - len(text)
+		if next <= 0 {
+			return text[:limit]
+		}
+		if next == keep {
+			if tail {
+				return text + s[len(s)-keep:]
+			}
+			return s[:keep] + text
+		}
+		keep = next
+	}
 }
 
 func bashTool() Tool {

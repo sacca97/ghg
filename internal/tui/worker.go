@@ -344,6 +344,13 @@ func (m *model) handleWorkerFrame(frame workerwire.Frame) (tea.Model, tea.Cmd) {
 		m.applyWorkerSnapshot(snapshot)
 	case workerwire.TypeAttached:
 		return m, nil
+	case workerwire.TypeAck:
+		if strings.HasPrefix(frame.RequestID, "lsp-") {
+			var statuses []workerwire.LSPStatus
+			if err := json.Unmarshal(frame.Payload, &statuses); err == nil {
+				m.renderLSPStatuses(workerLSPStatuses(statuses))
+			}
+		}
 	case workerwire.TypeDetachAck:
 		if frame.RequestID == m.detachRequestID {
 			m.workerDetached = true
@@ -397,6 +404,7 @@ func (m *model) applyWorkerSnapshot(snapshot workerSnapshot) {
 			m.saved = len(m.agent.Messages)
 		}
 	}
+	m.workerContextTokens = snapshot.ContextTokens
 	m.workerState = snapshot.State
 	m.workerDetached = snapshot.Detached
 	m.workerTasks = make(map[string]workerTaskState, len(snapshot.Tasks))
@@ -411,24 +419,15 @@ func (m *model) applyWorkerSnapshot(snapshot workerSnapshot) {
 			m.current = snapshot.LiveText
 		}
 		if snapshot.LiveThink != "" {
-			m.curThink = snapshot.LiveThink
+			if m.thinkStart.IsZero() && m.showThinking {
+				m.thinkStart = m.nowFn()
+			}
 		}
-		// Attaching mid-tool-call: restore the running row the protocol
-		// preserves, then feed the bounded live output into it.
+		// Attaching mid-tool-call: restore the running row the protocol preserves.
 		if snapshot.ActiveTool != "" {
 			id := "attach-active"
-			row := toolStyle.Render("⚒ "+toolVerb(snapshot.ActiveTool)+" ") + dimStyle.Render("(resumed mid-call)")
+			row := toolStyle.Render("⚒ "+snapshot.ActiveTool+" ") + dimStyle.Render("(resumed mid-call)")
 			m.blocks = append(m.blocks, block{kind: blockToolRun, text: row, toolID: id, toolRunning: true})
-			if snapshot.LiveTool != "" {
-				for i := len(m.blocks) - 1; i >= 0; i-- {
-					b := &m.blocks[i]
-					if b.kind == blockToolRun && b.toolRunning && b.toolID == id {
-						b.toolOutput = snapshot.LiveTool
-						b.stale = true
-						break
-					}
-				}
-			}
 		}
 		m.refreshVP()
 	}
@@ -514,11 +513,6 @@ func (m *model) workerEvent(event workerEvent) tea.Cmd {
 		if json.Unmarshal(event.Data, &value) == nil {
 			return func() tea.Msg { return toolStartMsg{value.ID, value.Name, value.Args} }
 		}
-	case "tool_output":
-		var value struct{ ID, Output string }
-		if json.Unmarshal(event.Data, &value) == nil {
-			return func() tea.Msg { return toolOutputMsg{value.ID, value.Output} }
-		}
 	case "tool_end":
 		var value struct{ ID, Name, Result string }
 		if json.Unmarshal(event.Data, &value) == nil {
@@ -529,6 +523,9 @@ func (m *model) workerEvent(event workerEvent) tea.Cmd {
 		if json.Unmarshal(event.Data, &value) == nil {
 			if m.agent != nil {
 				m.agent.AddUsage(value)
+			}
+			if total := value.PromptTokens + value.CompletionTokens; total > 0 {
+				m.workerContextTokens = total
 			}
 			return func() tea.Msg { return usageMsg(value) }
 		}
@@ -559,6 +556,7 @@ func (m *model) workerEvent(event workerEvent) tea.Cmd {
 			}
 			if m.agent != nil && len(value.Messages) > 0 {
 				m.agent.Messages = append([]llm.Message(nil), value.Messages...)
+				m.workerContextTokens = m.agent.ContextTokens()
 			}
 			return func() tea.Msg {
 				return workerCompactDoneMsg{err: err, usage: value.Usage}
@@ -584,6 +582,7 @@ func (m *model) workerEvent(event workerEvent) tea.Cmd {
 			}
 			if m.agent != nil && len(value.Messages) > 0 {
 				m.agent.Messages = append([]llm.Message(nil), value.Messages...)
+				m.workerContextTokens = m.agent.ContextTokens()
 			}
 			return func() tea.Msg {
 				return turnDoneMsg{final: value.Final, err: err, at: value.At, snap: value.Snap, clean: workspaceClean(), goalUsage: value.Usage}

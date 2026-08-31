@@ -7,10 +7,11 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
 	"regexp"
-	"sort"
+	"slices"
 	"strings"
 
 	"github.com/sacca97/ghg/internal/llm"
@@ -44,6 +45,7 @@ type DefinitionLoadOptions struct {
 
 const (
 	builtInPlannerName  = "planner"
+	builtInReviewerName = "reviewer"
 	maxDefinitionRounds = 32
 	maxDefinitionName   = 64
 )
@@ -53,7 +55,7 @@ var definitionNameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
 var knownDefinitionTools = map[string]struct{}{
 	"bash": {}, "read": {}, "write": {}, "edit": {}, "grep": {}, "glob": {}, "find_files": {}, "lsp": {}, "lsp_rename": {},
 	"task": {}, "todowrite": {}, "remember": {}, "forget": {},
-	"artifact_list": {}, "artifact_read": {}, "submit_plan": {},
+	"artifact_list": {}, "artifact_read": {}, "submit_plan": {}, "submit_review": {},
 }
 
 // BuiltInPlannerDefinition is the first agent definition shipped by ghg. It
@@ -66,18 +68,35 @@ func BuiltInPlannerDefinition() Definition {
 		Description: "Read-only implementation planner",
 		Role:        "smart",
 		Tools:       []string{"read", "grep", "glob", "lsp", "submit_plan"},
-		MaxRounds:   4,
+		MaxRounds:   maxDefinitionRounds,
 		Prompt: `You are ghg's planning agent. Produce an implementation plan for the user's goal.
 
 Inspect the repository when useful with read, grep, glob, and bounded lsp navigation. These tools are read-only. Do not use bash, write, edit, lsp_rename, task, MCP, or any other tool. When you have enough information, call submit_plan exactly once with a concrete goal, ordered imperative steps, and independently verifiable acceptance checks. Do not finish with a prose plan: submit_plan is the terminal result.`,
 	}
 }
 
+// BuiltInReviewerDefinition is the code review agent definition shipped by ghg.
+func BuiltInReviewerDefinition() Definition {
+	return Definition{
+		Name:        builtInReviewerName,
+		Description: "Read-only code review agent",
+		Role:        "smart",
+		Tools:       []string{"read", "grep", "glob", "lsp", "submit_review"},
+		MaxRounds:   maxDefinitionRounds,
+		Prompt: `You are ghg's code review agent. Produce a structured review for the requested changes or code.
+
+Inspect the repository when useful with read, grep, glob, and bounded lsp navigation. These tools are read-only. Do not use bash, write, edit, lsp_rename, task, MCP, or any other tool. When you have enough information, call submit_review exactly once with summary, verdict (approve, request_changes, or comment), structured findings (title, severity, file, optional line, evidence, recommendation), and checks_performed. Do not finish with a prose review: submit_review is the terminal result.`,
+	}
+}
+
 // LoadAgentDefinitions discovers project and user Markdown definitions and
-// always includes the built-in planner. A malformed definition or unknown
-// tool is an error; an absent discovery directory is normal.
+// always includes the built-in planner and reviewer. A malformed definition or
+// unknown tool is an error; an absent discovery directory is normal.
 func LoadAgentDefinitions(opts DefinitionLoadOptions) (map[string]Definition, error) {
-	defs := map[string]Definition{builtInPlannerName: BuiltInPlannerDefinition()}
+	defs := map[string]Definition{
+		builtInPlannerName:  BuiltInPlannerDefinition(),
+		builtInReviewerName: BuiltInReviewerDefinition(),
+	}
 	projectDir, userDir := opts.ProjectDir, opts.UserDir
 	if projectDir == "" {
 		if wd, err := os.Getwd(); err == nil {
@@ -119,8 +138,8 @@ func LoadAgentDefinitions(opts DefinitionLoadOptions) (map[string]Definition, er
 			if parseErr != nil {
 				return nil, parseErr
 			}
-			if def.Name == builtInPlannerName {
-				return nil, fmt.Errorf("agent definition %s: name %q is reserved", path, builtInPlannerName)
+			if def.Name == builtInPlannerName || def.Name == builtInReviewerName {
+				return nil, fmt.Errorf("agent definition %s: name %q is reserved", path, def.Name)
 			}
 			if _, exists := defs[def.Name]; exists {
 				// Directories are visited in precedence order and the first
@@ -250,12 +269,7 @@ func (d Definition) Validate() error {
 
 // DefinitionNames returns loaded names in stable display order.
 func DefinitionNames(defs map[string]Definition) []string {
-	names := make([]string, 0, len(defs))
-	for name := range defs {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	return names
+	return slices.Sorted(maps.Keys(defs))
 }
 
 // DefinitionResult is the output of one declarative agent run. A terminal
@@ -288,13 +302,31 @@ func (a *Agent) RunDefinition(ctx context.Context, input string, def Definition,
 		messages = append([]llm.Message{{Role: "system", Content: definitionPrompt(def)}}, messages...)
 	}
 	messages = append(messages, llm.Message{Role: "user", Content: input})
-	requiresTerminal := containsDefinitionTool(def.Tools, "submit_plan")
+	terminalToolName := ""
+	if slices.Contains(def.Tools, "submit_plan") {
+		terminalToolName = "submit_plan"
+	} else if slices.Contains(def.Tools, "submit_review") {
+		terminalToolName = "submit_review"
+	}
+	requiresTerminal := terminalToolName != ""
+	terminalTools, err := a.definitionTools(def.Name, []string{terminalToolName})
+	if requiresTerminal && err != nil {
+		return DefinitionResult{}, err
+	}
 	for round := 0; round < def.MaxRounds; round++ {
+		roundTools := available
+		if requiresTerminal && round == def.MaxRounds-1 {
+			roundTools = terminalTools
+			messages = append(messages, llm.Message{
+				Role:    "user",
+				Content: "Exploration rounds exhausted. Submit your final result now using " + terminalToolName + ".",
+			})
+		}
 		reasoningEffort, reasoningEnabled := a.ReasoningRequest()
 		msg, usage, callErr := a.Complete(ctx, llm.Request{
 			Model:            a.Model,
 			Messages:         messages,
-			Tools:            tools.Defs(available),
+			Tools:            tools.Defs(roundTools),
 			MaxTokens:        a.MaxTokens,
 			ReasoningEffort:  reasoningEffort,
 			ReasoningEnabled: reasoningEnabled,
@@ -310,7 +342,7 @@ func (a *Agent) RunDefinition(ctx context.Context, input string, def Definition,
 			return DefinitionResult{Text: msg.TextContent()}, nil
 		}
 		messages = append(messages, msg)
-		results := a.runToolResultsWithTools(ctx, msg.ToolCalls, ev, available)
+		results := a.runToolResultsWithTools(ctx, msg.ToolCalls, ev, roundTools)
 		for i, call := range msg.ToolCalls {
 			messages = append(messages, llm.Message{
 				Role:       "tool",
@@ -327,7 +359,7 @@ func (a *Agent) RunDefinition(ctx context.Context, input string, def Definition,
 		}
 		if requiresTerminal {
 			for i, call := range msg.ToolCalls {
-				if call.Function.Name == "submit_plan" && results[i].ExitCode == 0 {
+				if call.Function.Name == terminalToolName && results[i].ExitCode == 0 {
 					return DefinitionResult{
 						TerminalName: call.Function.Name,
 						TerminalArgs: json.RawMessage(append([]byte(nil), call.Function.Arguments...)),
@@ -357,6 +389,10 @@ func (a *Agent) definitionTools(definitionName string, names []string) ([]tools.
 			available = append(available, submitPlanTool())
 			continue
 		}
+		if name == "submit_review" {
+			available = append(available, submitReviewTool())
+			continue
+		}
 		tool, ok := byName[name]
 		if !ok {
 			return nil, fmt.Errorf("agent definition %q requested unavailable tool %q", definitionName, name)
@@ -364,15 +400,6 @@ func (a *Agent) definitionTools(definitionName string, names []string) ([]tools.
 		available = append(available, tool)
 	}
 	return available, nil
-}
-
-func containsDefinitionTool(names []string, wanted string) bool {
-	for _, name := range names {
-		if name == wanted {
-			return true
-		}
-	}
-	return false
 }
 
 func definitionPrompt(def Definition) string {
@@ -390,12 +417,26 @@ func submitPlanTool() tools.Tool {
 	return tools.Tool{
 		Def: llm.NewTool("submit_plan",
 			"Submit the validated implementation plan. This is the planner's terminal tool; call it once when repository inspection is complete.",
-			`{"type":"object","properties":{"goal":{"type":"string","description":"Concrete outcome of the work"},"steps":{"type":"array","description":"Ordered imperative implementation steps","items":{"type":"string"}},"acceptance_checks":{"type":"array","description":"Independently verifiable checks","items":{"type":"string"}}},"required":["goal","steps","acceptance_checks"]}`),
+			`{"type":"object","properties":{"goal":{"type":"string","description":"Concrete outcome of the work"},"assumptions":{"type":"array","items":{"type":"string"}},"steps":{"type":"array","description":"Ordered imperative implementation steps","items":{"type":"string"}},"acceptance_checks":{"type":"array","description":"Independently verifiable checks","items":{"type":"string"}},"risks":{"type":"array","items":{"type":"string"}}},"required":["goal","steps","acceptance_checks"]}`),
 		Run: func(_ context.Context, args json.RawMessage) (string, error) {
 			if _, err := ParsePlan(string(args)); err != nil {
 				return "", err
 			}
 			return "Plan accepted.", nil
+		},
+	}
+}
+
+func submitReviewTool() tools.Tool {
+	return tools.Tool{
+		Def: llm.NewTool("submit_review",
+			"Submit the validated code review. This is the reviewer's terminal tool; call it once when inspection is complete.",
+			`{"type":"object","properties":{"summary":{"type":"string","description":"Executive summary of the review"},"verdict":{"type":"string","enum":["approve","request_changes","comment"],"description":"Review verdict"},"findings":{"type":"array","description":"Structured findings","items":{"type":"object","properties":{"title":{"type":"string"},"severity":{"type":"string","enum":["critical","high","medium","low","info"]},"file":{"type":"string"},"line":{"type":"integer"},"evidence":{"type":"string"},"recommendation":{"type":"string"}},"required":["title","severity"]}},"checks_performed":{"type":"array","items":{"type":"string"}}},"required":["summary","verdict","findings"]}`),
+		Run: func(_ context.Context, args json.RawMessage) (string, error) {
+			if _, err := ParseReview(string(args)); err != nil {
+				return "", err
+			}
+			return "Review accepted.", nil
 		},
 	}
 }

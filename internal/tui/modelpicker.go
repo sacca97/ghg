@@ -171,40 +171,40 @@ func (m *model) availableModelItems() []modelItem {
 }
 
 func (m *model) modelRouteConfigured(item modelItem) bool {
-	prov, _, apiID, err := m.cfg.Resolve(item.model, item.provider)
+	route, err := m.cfg.Resolve(item.model, item.provider)
 	if err != nil {
 		return false
 	}
 	resolved, err := m.profiles.ResolveModel(provider.Instance{
-		Name: item.provider, Profile: prov.Profile, BaseURL: prov.BaseURL, Protocol: prov.API,
-	}, apiID)
+		Name: route.ProviderName, Profile: route.Provider.Profile, BaseURL: route.Provider.BaseURL, Protocol: route.Provider.API,
+	}, route.APIID)
 	if err != nil {
 		return false
 	}
 	if !resolved.RequiresAPIKey() {
 		return true
 	}
-	key, err := prov.ResolveKey()
+	key, err := route.Provider.ResolveKey()
 	return err == nil && strings.TrimSpace(key) != ""
 }
 
 func annotateModelAvailability(cfg *config.Config, profiles provider.Profiles, items []modelItem) []modelItem {
 	for i := range items {
-		prov, mdl, apiID, err := cfg.Resolve(items[i].model, items[i].provider)
+		route, err := cfg.Resolve(items[i].model, items[i].provider)
 		if err != nil {
 			continue
 		}
 		resolved, err := profiles.ResolveModel(provider.Instance{
-			Name: items[i].provider, Profile: prov.Profile, BaseURL: prov.BaseURL, Protocol: prov.API,
-		}, apiID)
+			Name: route.ProviderName, Profile: route.Provider.Profile, BaseURL: route.Provider.BaseURL, Protocol: route.Provider.API,
+		}, route.APIID)
 		if err != nil {
 			items[i].unavailable = true
 			items[i].unavailableReason = err.Error()
 			continue
 		}
 		protocol := resolved.Protocol
-		if strings.TrimSpace(mdl.API) != "" {
-			protocol = strings.TrimSpace(mdl.API)
+		if strings.TrimSpace(route.Model.API) != "" {
+			protocol = strings.TrimSpace(route.Model.API)
 		}
 		if _, err := llm.NewBackend(llm.BackendConfig{Protocol: llm.Protocol(protocol), BaseURL: "http://127.0.0.1"}); err != nil {
 			items[i].unavailable = true

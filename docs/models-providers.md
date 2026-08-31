@@ -89,11 +89,14 @@ profile fields fail with the source path in the error. HTTPS is required;
 plain HTTP is limited to explicit loopback endpoints.
 
 The shipped IDs are `inference`, `openrouter`, `generic-openai`, `anthropic`,
-and `opencode`. The single OpenCode Go profile points at one public
-catalog and uses ordered model routes to select chat completions or native
-Messages; the unsupported Responses route is shown as unavailable before a
-turn. Existing JSONC providers without `profile` keep working through
-anonymous in-memory profiles, so no config migration is required. A provider
+`commandcode`, and `opencode`. The CommandCode profile uses Chat Completions
+for non-Claude models and native Messages for `claude-*`; provider API access
+requires an eligible CommandCode plan because the Go plan excludes it. The
+single OpenCode Go profile points at one public catalog and uses ordered model
+routes to select chat completions or native Messages; the unsupported Responses
+route is shown as unavailable before a turn. Existing JSONC providers without
+`profile` keep working through anonymous in-memory profiles, so no config
+migration is required. A provider
 entry that still names the removed `opencode-anthropic` profile is retained
 through a compatibility anonymous route.
 

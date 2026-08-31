@@ -58,7 +58,7 @@ func TestAnthropicRequestTranslation(t *testing.T) {
 		json.RawMessage(`{"type":"thinking","thinking":"decide","signature":"sig-1"}`),
 		json.RawMessage(`{"type":"tool_use","id":"call-1","name":"read","input":{"path":"README.md"}}`),
 	}
-	wire, err := newAnthropicRequest(Request{
+	request := Request{
 		Model: "claude-test",
 		Messages: []Message{
 			{Role: "system", Content: "You are concise."},
@@ -69,7 +69,8 @@ func TestAnthropicRequestTranslation(t *testing.T) {
 		Tools:           []Tool{tool},
 		MaxTokens:       123,
 		ReasoningEffort: "medium",
-	}, true)
+	}
+	wire, err := newAnthropicRequest(request, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -120,6 +121,38 @@ func TestAnthropicRequestTranslation(t *testing.T) {
 	toolResult := got.Messages[2].Content[0]
 	if toolResult["type"] != "tool_result" || toolResult["tool_use_id"] != "call-1" || toolResult["is_error"] != true {
 		t.Fatalf("tool result: %+v", toolResult)
+	}
+	cache, ok := toolResult["cache_control"].(map[string]any)
+	if !ok || cache["type"] != "ephemeral" {
+		t.Fatalf("rolling cache breakpoint missing: %+v", toolResult)
+	}
+
+	request.Messages = append(request.Messages, Message{Role: "user", Content: "Continue."})
+	next, err := newAnthropicRequest(request, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(next.Messages) != 3 || len(next.Messages[2].Content) != 2 {
+		t.Fatalf("next request messages: %+v", next.Messages)
+	}
+	var oldToolResult, nextUser map[string]any
+	if err := json.Unmarshal(next.Messages[2].Content[0], &oldToolResult); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := oldToolResult["cache_control"]; ok {
+		t.Fatalf("old rolling breakpoint remained: %s", next.Messages[2].Content[0])
+	}
+	if err := json.Unmarshal(next.Messages[2].Content[1], &nextUser); err != nil {
+		t.Fatal(err)
+	}
+	lastCache, ok := nextUser["cache_control"].(map[string]any)
+	if !ok || lastCache["type"] != "ephemeral" {
+		t.Fatalf("new rolling cache breakpoint missing: %s", next.Messages[2].Content[1])
+	}
+	for i := range providerBlocks {
+		if string(next.Messages[1].Content[i]) != string(providerBlocks[i]) {
+			t.Fatalf("preserved provider block %d changed: %s", i, next.Messages[1].Content[i])
+		}
 	}
 }
 
@@ -213,6 +246,27 @@ func TestAnthropicStreamParallelToolUses(t *testing.T) {
 	}
 	if msg.ToolCalls[1].ID != "call-b" || msg.ToolCalls[1].Function.Name != "bash" || msg.ToolCalls[1].Function.Arguments != `{"command":"pwd"}` {
 		t.Fatalf("second tool call: %+v", msg.ToolCalls[1])
+	}
+}
+
+func TestAnthropicStreamTerminalUsageMerged(t *testing.T) {
+	client, srv := anthropicClientForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		// Compatibility proxies like OpenCode send empty message_start usage, then report final tokens in message_delta
+		writeAnthropicEvent(w, `{"type":"message_start","message":{"usage":{"input_tokens":0}}}`)
+		writeAnthropicEvent(w, `{"type":"content_block_start","index":0,"content_block":{"type":"text","text":"hello"}}`)
+		writeAnthropicEvent(w, `{"type":"content_block_stop","index":0}`)
+		writeAnthropicEvent(w, `{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":33159,"output_tokens":1194}}`)
+		writeAnthropicEvent(w, `{"type":"message_stop"}`)
+	}))
+	defer srv.Close()
+
+	_, usage, err := client.stream(context.Background(), Request{Model: "qwen3.8-max", Messages: []Message{{Role: "user", Content: "hi"}}}, EventSink{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if usage.PromptTokens != 33159 || usage.CompletionTokens != 1194 {
+		t.Fatalf("expected 33159 prompt tokens and 1194 completion tokens, got %+v", usage)
 	}
 }
 

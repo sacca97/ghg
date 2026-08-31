@@ -169,7 +169,10 @@ func runObservedEdit(ctx context.Context, request editRequest) (ToolResult, erro
 		if operation.Observation != "" {
 			var loadErr error
 			record, loadErr = store.Load(ctx, sessionID, operation.Observation)
-			if loadErr == nil && record.SessionID != "" && record.SessionID != sessionID {
+			if loadErr != nil || record.ID == "" {
+				return ToolResult{}, fmt.Errorf("observation %q not found for %s: read the file first to obtain a valid observation ID", operation.Observation, canonical)
+			}
+			if record.SessionID != "" && record.SessionID != sessionID {
 				return ToolResult{}, errors.New("observation belongs to another session")
 			}
 		}
@@ -177,25 +180,11 @@ func runObservedEdit(ctx context.Context, request editRequest) (ToolResult, erro
 		if record.Path != "" {
 			recordPath, _ = authorizedObservationPath(ctx, record.Path, sandbox.AccessRead, false)
 		}
-		if record.ID == "" || recordPath != canonical || operation.StartLine < record.StartLine || operation.EndLine > record.EndLine {
-			// Auto-healing observation fallback: read current content from disk and synthesize an observation
-			diskBytes, readErr := os.ReadFile(canonical)
-			if readErr != nil {
-				return ToolResult{}, fmt.Errorf("read %s: %w", canonical, readErr)
-			}
-			newID := observation.NewID()
-			spans := lineSpans(diskBytes)
-			record = observation.Record{
-				ID:          newID,
-				SessionID:   sessionID,
-				Path:        canonical,
-				StartLine:   1,
-				EndLine:     max(1, len(spans)),
-				IssuedBytes: len(diskBytes),
-				Content:     string(diskBytes),
-				Complete:    true,
-			}
-			_ = store.Save(ctx, sessionID, record)
+		if recordPath != canonical {
+			return ToolResult{}, fmt.Errorf("observation %q covers %s, not %s", operation.Observation, record.Path, canonical)
+		}
+		if operation.StartLine < record.StartLine || operation.EndLine > record.EndLine {
+			return ToolResult{}, fmt.Errorf("observation %q covers lines %d-%d, but requested range is %d-%d", operation.Observation, record.StartLine, record.EndLine, operation.StartLine, operation.EndLine)
 		}
 		content := operation.Content
 		if content == "" && operation.NewContent != "" {
@@ -262,23 +251,30 @@ func runObservedEdit(ctx context.Context, request editRequest) (ToolResult, erro
 				out.WriteString("(readback failed: " + err.Error() + ")\n")
 			}
 		} else {
-			if store != nil {
-				newObsID := observation.NewID()
-				spans := lineSpans(final)
-				obsRecord := observation.Record{
-					ID:          newObsID,
-					SessionID:   sessionID,
-					Path:        path,
-					StartLine:   1,
-					EndLine:     max(1, len(spans)),
-					IssuedBytes: len(final),
-					Content:     string(final),
-					Complete:    true,
+			startByte := plan.operations[0].start
+			for _, op := range plan.operations[1:] {
+				if op.start < startByte {
+					startByte = op.start
 				}
-				_ = store.Save(ctx, sessionID, obsRecord)
-				fmt.Fprintf(&out, "[observation %s path=%s lines=1-%d]\n", newObsID, filepath.ToSlash(path), max(1, len(spans)))
 			}
-			out.WriteString(editReadback(final, plan.operations))
+			startLine := 1 + bytes.Count(final[:min(startByte, len(final))], []byte{'\n'})
+			readRes, readErr := runObservedRead(ctx, struct {
+				Path   string `json:"path"`
+				Offset int    `json:"offset"`
+				Limit  int    `json:"limit"`
+			}{
+				Path:   path,
+				Offset: startLine,
+				Limit:  maxEditReadbackLines,
+			})
+			if readErr != nil {
+				out.WriteString(editReadback(final, plan.operations))
+			} else {
+				out.WriteString(readRes.Preview)
+				if !strings.HasSuffix(readRes.Preview, "\n") {
+					out.WriteByte('\n')
+				}
+			}
 			if d := editDiff(string(plan.original), string(final)); d != "" {
 				out.WriteString("```diff\n")
 				out.WriteString(d)

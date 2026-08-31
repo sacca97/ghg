@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/sacca97/ghg/internal/agent"
 	"github.com/sacca97/ghg/internal/config"
+	"github.com/sacca97/ghg/internal/session"
 	workerwire "github.com/sacca97/ghg/internal/worker"
 )
 
@@ -24,6 +26,7 @@ func (m *model) planCommand(text string) (tea.Model, tea.Cmd) {
 		m.append(errStyle.Render("usage: /plan <goal>"))
 		return m, nil
 	}
+	m.append(youStyle.Render("❯ ") + linkifyFilePaths("/plan "+goal, realFileExists))
 	if m.busy {
 		m.append(dimStyle.Render("(busy — /plan after this turn)"))
 		return m, nil
@@ -154,6 +157,28 @@ func (m *model) finishPlanProposal(msg planProposalMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	m.proposedPlan = &msg.plan
+	if m.store != nil {
+		if m.sessionID == "" {
+			_ = m.ensureSession()
+		}
+		if m.sessionID != "" {
+			planJSON, _ := json.Marshal(msg.plan)
+			msgSeq := 0
+			if m.agent != nil {
+				msgSeq = len(m.agent.MessagesSnapshot())
+			}
+			_ = m.store.SaveWorkflowResult(context.Background(), session.WorkflowResultRecord{
+				ResultID:   fmt.Sprintf("plan-%x", time.Now().UnixNano()&0xffffffff),
+				SessionID:  m.sessionID,
+				Kind:       "plan",
+				Version:    1,
+				Payload:    string(planJSON),
+				Role:       config.RoleSmart,
+				MessageSeq: msgSeq,
+				CreatedAt:  time.Now().UTC(),
+			})
+		}
+	}
 	m.append(dimStyle.Render(planText(msg.plan)))
 	return m, nil
 }

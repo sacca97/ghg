@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"path/filepath"
 	"time"
 
 	"github.com/sacca97/ghg/internal/config"
@@ -16,7 +17,7 @@ func sessionsCLI() error {
 	if err != nil {
 		return err
 	}
-	st, err := session.Open(dir + "/sessions.db")
+	st, err := session.Open(filepath.Join(dir, "sessions.db"))
 	if err != nil {
 		return err
 	}

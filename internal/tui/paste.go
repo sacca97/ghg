@@ -13,6 +13,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/sacca97/ghg/internal/config"
+	"github.com/sacca97/ghg/internal/tempdir"
 )
 
 // imageExts are the clipboard image formats we accept, in preference order.
@@ -101,7 +102,7 @@ func xselImage() (string, []byte, error) {
 }
 
 func pngpasteImage() (string, []byte, error) {
-	tmp, err := os.CreateTemp("", "ghg-paste-*.png")
+	tmp, err := os.CreateTemp(tempdir.Base(), "ghg-paste-*.png")
 	if err != nil {
 		return "", nil, err
 	}

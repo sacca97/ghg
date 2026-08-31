@@ -1,15 +1,17 @@
 package lsp
 
 import (
+	"cmp"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -166,7 +168,7 @@ func (m *Manager) PreviewRename(ctx context.Context, request tools.RenameRequest
 	if len(stored) == 0 {
 		return tools.RenamePreview{}, errors.New("language server returned no changes")
 	}
-	sort.Slice(stored, func(i, j int) bool { return stored[i].file.Path < stored[j].file.Path })
+	slices.SortFunc(stored, func(a, b renameStoredFile) int { return strings.Compare(a.file.Path, b.file.Path) })
 	id, err := newRenameID()
 	if err != nil {
 		return tools.RenamePreview{}, err
@@ -201,12 +203,7 @@ func decodeWorkspaceEdit(raw json.RawMessage) ([]wireRenameDocument, error) {
 			return nil, fmt.Errorf("decode workspace edit changes: %w", err)
 		}
 		out := make([]wireRenameDocument, 0, len(changes))
-		keys := make([]string, 0, len(changes))
-		for uri := range changes {
-			keys = append(keys, uri)
-		}
-		sort.Strings(keys)
-		for _, uri := range keys {
+		for _, uri := range slices.Sorted(maps.Keys(changes)) {
 			edits, err := decodeTextEdits(changes[uri])
 			if err != nil {
 				return nil, fmt.Errorf("decode workspace edit changes for %s: %w", uri, err)
@@ -256,7 +253,7 @@ func decodeWorkspaceEdit(raw json.RawMessage) ([]wireRenameDocument, error) {
 		edits = append(edits, decodedEdits...)
 		out = append(out, wireRenameDocument{URI: document.TextDocument.URI, Version: document.TextDocument.Version, Edits: edits})
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].URI < out[j].URI })
+	slices.SortFunc(out, func(a, b wireRenameDocument) int { return strings.Compare(a.URI, b.URI) })
 	return out, nil
 }
 
@@ -317,11 +314,11 @@ func applyRenameTextEdits(original []byte, edits []wireTextEdit) ([]byte, error)
 		}
 		converted = append(converted, byteEdit{start: start, end: end, text: edit.NewText})
 	}
-	sort.Slice(converted, func(i, j int) bool {
-		if converted[i].start != converted[j].start {
-			return converted[i].start < converted[j].start
+	slices.SortFunc(converted, func(a, b byteEdit) int {
+		if n := cmp.Compare(a.start, b.start); n != 0 {
+			return n
 		}
-		return converted[i].end < converted[j].end
+		return cmp.Compare(a.end, b.end)
 	})
 	for i := 1; i < len(converted); i++ {
 		previous, current := converted[i-1], converted[i]

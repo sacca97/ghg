@@ -93,6 +93,9 @@ func TestLargeToolResultGetsAnArtifactReference(t *testing.T) {
 	if !strings.Contains(results[0].Preview, "use artifact_read") {
 		t.Fatalf("preview missing recovery hint: %q", results[0].Preview[len(results[0].Preview)-100:])
 	}
+	if len(results[0].Preview) > 16<<10 {
+		t.Fatalf("artifact hint exceeded preview budget: %d", len(results[0].Preview))
+	}
 	if !strings.Contains(tools.ModelText(results[0]), "<untrusted_tool_output") {
 		t.Fatal("an explicitly untrusted result should be delimited for the model")
 	}

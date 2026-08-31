@@ -74,8 +74,8 @@ func TestToolResultFullyVisibleWhenExpanded(t *testing.T) {
 	for i := 1; i <= 12; i++ {
 		sb.WriteString("output row " + strings.Repeat("x", i) + "\n")
 	}
-	tm, _ = m.Update(toolEndMsg{name: "bash", result: sb.String()})
-	m = tm.(*model)
+	m.appendRaw(blockTool, sb.String())
+	m.refreshVP()
 
 	// collapsed: preview + a hint (an ellipsis is fine HERE — it's the
 	// collapse affordance, and it must say how to expand)

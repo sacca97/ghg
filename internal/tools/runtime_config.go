@@ -12,6 +12,7 @@ import (
 
 	"github.com/sacca97/ghg/internal/config"
 	"github.com/sacca97/ghg/internal/sandbox"
+	"github.com/sacca97/ghg/internal/tempdir"
 )
 
 type cacheLeaf struct {
@@ -56,13 +57,13 @@ func NewConfiguredRuntime(workspace string, cfg *config.ExecutionConfig, headles
 		approval = ApprovalNever
 	}
 
-	tempRoot, err := os.MkdirTemp("", "ghg-runtime-")
+	tempRoot, err := os.MkdirTemp(tempdir.Base(), "ghg-runtime-")
 	if err != nil {
 		return nil, func() {}, fmt.Errorf("execution temp root: %w", err)
 	}
 	cleanup := func() { _ = os.RemoveAll(tempRoot) }
 
-	envOverrides, err := discoveredCacheEnvironment()
+	envOverrides, err := discoveredCacheEnvironment(tempRoot)
 	if err != nil {
 		cleanup()
 		return nil, func() {}, err
@@ -392,8 +393,17 @@ func discoveredToolchainRoots(env map[string]string) []string {
 	return out
 }
 
-func discoveredCacheEnvironment() (map[string]string, error) {
+func discoveredCacheEnvironment(tempRoot string) (map[string]string, error) {
 	effective := make(map[string]string)
+	// Relative cache values are redirected into this run's private root so
+	// tools cannot create cache directories in the workspace.
+	tempCachePath := func(key string, index ...int) string {
+		path := filepath.Join(tempRoot, "cache", strings.ToLower(key))
+		if len(index) > 0 {
+			path = filepath.Join(path, fmt.Sprintf("%d", index[0]))
+		}
+		return path
+	}
 	setPath := func(key, value string) error {
 		if value == "" {
 			return nil
@@ -401,6 +411,9 @@ func discoveredCacheEnvironment() (map[string]string, error) {
 		if value == "off" {
 			effective[key] = value
 			return nil
+		}
+		if !filepath.IsAbs(value) {
+			value = tempCachePath(key)
 		}
 		canonical, err := sandbox.CanonicalPath(value, true)
 		if err != nil {
@@ -415,7 +428,10 @@ func discoveredCacheEnvironment() (map[string]string, error) {
 			return nil
 		}
 		canonical := make([]string, 0, len(parts))
-		for _, part := range parts {
+		for i, part := range parts {
+			if !filepath.IsAbs(part) {
+				part = tempCachePath(key, i)
+			}
 			resolved, err := sandbox.CanonicalPath(part, true)
 			if err != nil {
 				return fmt.Errorf("cache path %s=%q: %w", key, part, err)

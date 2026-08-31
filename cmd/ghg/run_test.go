@@ -418,6 +418,23 @@ func TestRunQuietJSON(t *testing.T) {
 	}
 }
 
+func TestRunUnusableSessionDatabaseFailsUnlessNoSession(t *testing.T) {
+	runFixture(t, "ok", nil)
+	home := os.Getenv("GHG_HOME")
+	dbPath := filepath.Join(home, "sessions.db")
+	_ = os.WriteFile(dbPath, []byte("not a sqlite database file"), 0o600)
+
+	_, err := runCapture(t, "", "hello")
+	if err == nil || (!strings.Contains(err.Error(), "session database") && !strings.Contains(err.Error(), "file is not a database")) {
+		t.Fatalf("expected session database error, got: %v", err)
+	}
+
+	_, err = runCapture(t, "", "-no-session", "hello")
+	if err != nil {
+		t.Fatalf("-no-session should bypass session database error, got: %v", err)
+	}
+}
+
 func configDir() (string, error) { return os.Getenv("GHG_HOME"), nil }
 
 func sessionOpen(dir string) (*session.Store, error) { return session.Open(dir + "/sessions.db") }

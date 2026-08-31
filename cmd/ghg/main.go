@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/sacca97/ghg/internal/agent"
 	"github.com/sacca97/ghg/internal/config"
 	"github.com/sacca97/ghg/internal/session"
 	"github.com/sacca97/ghg/internal/tui"
@@ -155,6 +154,14 @@ func main() {
 		return
 	}
 
+	// `ghg export ...` — export structured workflow results (plans, reviews).
+	if flag.NArg() > 0 && flag.Arg(0) == "export" {
+		if err := exportCLI(flag.Args()[1:]); err != nil {
+			die(err)
+		}
+		return
+	}
+
 	// `ghg auth ...` — profile-driven provider key onboarding.
 	if flag.NArg() > 0 && flag.Arg(0) == "auth" {
 		if err := authCLI(flag.Args()[1:]); err != nil {
@@ -174,41 +181,27 @@ func main() {
 	}
 
 	if *benchFlag {
+		profiles, err := loadProviderProfiles()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "ghg:", err)
+			os.Exit(1)
+		}
 		if *modelFlag == "" && *providerFlag == "" {
-			profiles, err := loadProviderProfiles()
-			if err != nil {
-				fmt.Fprintln(os.Stderr, "ghg:", err)
-				os.Exit(1)
-			}
 			if _, _, _, err := newModeAgent(cfg, profiles, config.ModeActing, systemPrompt()); err != nil {
 				fmt.Fprintln(os.Stderr, "ghg:", err)
 				os.Exit(1)
 			}
 			return
 		}
-		prov, mdl, id, err := cfg.Resolve(*modelFlag, *providerFlag)
+		route, err := cfg.Resolve(*modelFlag, *providerFlag)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "ghg:", err)
 			os.Exit(1)
 		}
-		profiles, err := loadProviderProfiles()
-		if err != nil {
+		if _, err := newAgentFromRoute(cfg, profiles, route, config.RoleForMode(config.ModeActing), systemPrompt()); err != nil {
 			fmt.Fprintln(os.Stderr, "ghg:", err)
 			os.Exit(1)
 		}
-		provName := *providerFlag
-		if provName == "" {
-			provName = cfg.DefaultProvider
-			if provName == "" && len(mdl.Providers) > 0 {
-				provName = mdl.Providers[0]
-			}
-		}
-		backend, err := newProviderBackend(profiles, provName, prov, "bench", cfg.MaxRetries, id, mdl.API)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "ghg:", err)
-			os.Exit(1)
-		}
-		_ = agent.New(backend, id, mdl.MaxTokens, systemPrompt())
 		return
 	}
 	if *continueFlag && *resumeFlag != "" {

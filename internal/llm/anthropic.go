@@ -8,9 +8,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/url"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 )
@@ -430,13 +431,35 @@ func anthropicReasoningRequest(req Request) (*anthropicThinking, *anthropicOutpu
 func applyAnthropicCachePolicy(req *anthropicRequest) {
 	// Tools and the first system block are the stable prompt prefix in the
 	// ghg. Per-round todo/summary/artifact blocks are appended later and
-	// intentionally remain after these breakpoints.
+	// intentionally remain after these breakpoints. The final conversation
+	// block is the rolling breakpoint for the completed conversation prefix.
 	if len(req.Tools) > 0 {
 		req.Tools[len(req.Tools)-1].CacheControl = &anthropicCacheControl{Type: "ephemeral"}
 	}
 	if len(req.System) > 0 {
 		req.System[0].CacheControl = &anthropicCacheControl{Type: "ephemeral"}
 	}
+	for i := len(req.Messages) - 1; i >= 0; i-- {
+		if len(req.Messages[i].Content) == 0 {
+			continue
+		}
+		last := &req.Messages[i].Content
+		(*last)[len(*last)-1] = addAnthropicCacheControl((*last)[len(*last)-1])
+		break
+	}
+}
+
+func addAnthropicCacheControl(raw json.RawMessage) json.RawMessage {
+	var block map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &block); err != nil || block == nil {
+		return raw
+	}
+	block["cache_control"] = json.RawMessage(`{"type":"ephemeral"}`)
+	updated, err := json.Marshal(block)
+	if err != nil {
+		return raw
+	}
+	return updated
 }
 
 func anthropicImageBlock(rawURL string) (anthropicBlock, error) {
@@ -633,9 +656,40 @@ func anthropicHTTPError(resp *http.Response) error {
 
 type anthropicUsage struct {
 	InputTokens              int `json:"input_tokens"`
+	PromptTokens             int `json:"prompt_tokens"`
 	OutputTokens             int `json:"output_tokens"`
+	CompletionTokens         int `json:"completion_tokens"`
 	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
 	CacheReadInputTokens     int `json:"cache_read_input_tokens"`
+}
+
+func (u anthropicUsage) inputTokens() int {
+	if u.InputTokens > 0 {
+		return u.InputTokens
+	}
+	return u.PromptTokens
+}
+
+func (u anthropicUsage) outputTokens() int {
+	if u.OutputTokens > 0 {
+		return u.OutputTokens
+	}
+	return u.CompletionTokens
+}
+
+func mergeAnthropicUsage(dst *anthropicUsage, src anthropicUsage) {
+	if in := src.inputTokens(); in > 0 {
+		dst.InputTokens = in
+	}
+	if out := src.outputTokens(); out > 0 {
+		dst.OutputTokens = out
+	}
+	if src.CacheCreationInputTokens > 0 {
+		dst.CacheCreationInputTokens = src.CacheCreationInputTokens
+	}
+	if src.CacheReadInputTokens > 0 {
+		dst.CacheReadInputTokens = src.CacheReadInputTokens
+	}
 }
 
 type anthropicResponse struct {
@@ -646,8 +700,8 @@ type anthropicResponse struct {
 
 func anthropicUsageValue(raw anthropicUsage) Usage {
 	usage := Usage{
-		PromptTokens:        raw.InputTokens + raw.CacheCreationInputTokens + raw.CacheReadInputTokens,
-		CompletionTokens:    raw.OutputTokens,
+		PromptTokens:        raw.inputTokens() + raw.CacheCreationInputTokens + raw.CacheReadInputTokens,
+		CompletionTokens:    raw.outputTokens(),
 		CacheCreationTokens: raw.CacheCreationInputTokens,
 	}
 	if raw.CacheReadInputTokens > 0 {
@@ -748,7 +802,6 @@ type anthropicStreamBlock struct {
 func consumeAnthropicSSE(r io.Reader, onText, onThink func(string)) (Message, Usage, error) {
 	blocks := map[int]*anthropicStreamBlock{}
 	var inputUsage anthropicUsage
-	var outputTokens int
 	stopReason := ""
 	sawStop := false
 
@@ -767,7 +820,7 @@ func consumeAnthropicSSE(r io.Reader, onText, onThink func(string)) (Message, Us
 		switch event.Type {
 		case "message_start":
 			if event.Message != nil {
-				inputUsage = event.Message.Usage
+				mergeAnthropicUsage(&inputUsage, event.Message.Usage)
 				if event.Message.StopReason != "" {
 					stopReason = event.Message.StopReason
 				}
@@ -829,10 +882,13 @@ func consumeAnthropicSSE(r io.Reader, onText, onThink func(string)) (Message, Us
 				stopReason = event.Delta.StopReason
 			}
 			if event.Usage != nil {
-				outputTokens = event.Usage.OutputTokens
+				mergeAnthropicUsage(&inputUsage, *event.Usage)
 			}
 		case "message_stop":
 			sawStop = true
+			if event.Usage != nil {
+				mergeAnthropicUsage(&inputUsage, *event.Usage)
+			}
 		case "error":
 			message := "anthropic stream error"
 			if event.Error != nil {
@@ -857,14 +913,12 @@ func consumeAnthropicSSE(r io.Reader, onText, onThink func(string)) (Message, Us
 	if !sawStop {
 		return Message{}, anthropicUsageValue(inputUsage), io.ErrUnexpectedEOF
 	}
-	indices := make([]int, 0, len(blocks))
 	for index, state := range blocks {
 		if !state.stopped {
 			return Message{}, anthropicUsageValue(inputUsage), nonRetryable{fmt.Errorf("anthropic content block %d did not stop", index)}
 		}
-		indices = append(indices, index)
 	}
-	sort.Ints(indices)
+	indices := slices.Sorted(maps.Keys(blocks))
 	content := make([]json.RawMessage, 0, len(indices))
 	for _, index := range indices {
 		raw, err := finishAnthropicStreamBlock(blocks[index])
@@ -873,7 +927,6 @@ func consumeAnthropicSSE(r io.Reader, onText, onThink func(string)) (Message, Us
 		}
 		content = append(content, raw)
 	}
-	inputUsage.OutputTokens = outputTokens
 	usage := anthropicUsageValue(inputUsage)
 	msg, err := messageFromAnthropicBlocks(content, stopReason)
 	if err != nil {

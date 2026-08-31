@@ -44,6 +44,80 @@ func newProviderBackend(profiles provider.Profiles, name string, p config.Provid
 	})
 }
 
+// newAgentFromRoute constructs a fully configured agent for a resolved route.
+func newAgentFromRoute(cfg *config.Config, profiles provider.Profiles, route config.ResolvedRoute, role, systemPrompt string) (*agent.Agent, error) {
+	key, err := route.Provider.ResolveKey()
+	if err != nil {
+		return nil, err
+	}
+	resolved, err := profiles.ResolveModel(provider.Instance{
+		Name: route.ProviderName, Profile: route.Provider.Profile, BaseURL: route.Provider.BaseURL, Protocol: route.Provider.API,
+	}, route.APIID)
+	if err != nil {
+		return nil, err
+	}
+	backend, err := newProviderBackend(profiles, route.ProviderName, route.Provider, key, cfg.MaxRetries, route.APIID, route.Model.API)
+	if err != nil {
+		return nil, err
+	}
+	catalogs := config.LoadCatalogs()
+	cat, hasCatalog := catalogs[route.ProviderName]
+	contextLimit := route.Model.ContextWindow()
+	if hasCatalog {
+		if n := cat.ContextLength(route.APIID); n > 0 {
+			contextLimit = n
+		}
+	}
+	if contextLimit <= 0 {
+		contextLimit = config.LoadModelsDev().ContextLength(route.APIID, modelsDevProviderIDs(resolved, route.ProviderName)...)
+	}
+	maxOut := route.Model.MaxOut
+	if maxOut <= 0 && hasCatalog {
+		maxOut = cat.MaxCompletionTokens(route.APIID)
+	}
+	if maxOut <= 0 {
+		maxOut = contextLimit
+	}
+	ag := agent.New(backend, route.APIID, maxOut, systemPrompt)
+	ag.ModelName = route.ModelName
+	ag.Provider = route.ProviderName
+	ag.Role = role
+	ag.ContextLimit = contextLimit
+	if hasCatalog {
+		if info := cat.Find(route.APIID); info != nil {
+			ag.ReasoningToggle = info.ReasoningToggle
+		}
+	}
+	if !ag.ReasoningToggle {
+		if info, ok := config.LoadModelsDev().ReasoningFor(route.APIID, modelsDevProviderIDs(resolved, route.ProviderName)...); ok {
+			ag.ReasoningToggle = info.Toggle
+		}
+	}
+	ag.CompactThreshold = config.CompactThreshold(cfg)
+	configureSubagentFactory(ag, cfg, profiles)
+	return ag, nil
+}
+
+func modelsDevProviderIDs(resolved provider.Resolved, instanceName string) []string {
+	ids := make([]string, 0, 3)
+	for _, id := range []string{resolved.Catalog.ModelsDev, resolved.Profile.ID, instanceName} {
+		if id == "" {
+			continue
+		}
+		seen := false
+		for _, existing := range ids {
+			if existing == id {
+				seen = true
+				break
+			}
+		}
+		if !seen {
+			ids = append(ids, id)
+		}
+	}
+	return ids
+}
+
 // newRoleAgent resolves and constructs one of the configured model roles.
 // Role resolution is kept above the wire factory so every role gets the same
 // profile routing, auth policy, and adapter selection as an explicit model.
@@ -52,34 +126,15 @@ func newRoleAgent(cfg *config.Config, profiles provider.Profiles, role, systemPr
 	if err != nil {
 		return nil, "", "", err
 	}
-	prov, mdl, apiID, err := cfg.Resolve(target.Model, target.Provider)
+	route, err := cfg.Resolve(target.Model, target.Provider)
 	if err != nil {
 		return nil, "", "", err
 	}
-	providerName := target.Provider
-	if providerName == "" {
-		providerName = cfg.DefaultProvider
-		if providerName == "" && len(mdl.Providers) > 0 {
-			providerName = mdl.Providers[0]
-		}
-	}
-	key, err := prov.ResolveKey()
+	ag, err := newAgentFromRoute(cfg, profiles, route, target.Role, systemPrompt)
 	if err != nil {
 		return nil, "", "", err
 	}
-	backend, err := newProviderBackend(profiles, providerName, prov, key, cfg.MaxRetries, apiID, mdl.API)
-	if err != nil {
-		return nil, "", "", err
-	}
-	maxOut := mdl.MaxOut
-	if maxOut <= 0 {
-		maxOut = mdl.ContextWindow()
-	}
-	ag := agent.New(backend, apiID, maxOut, systemPrompt)
-	ag.ModelName, ag.Provider, ag.Role = target.Model, providerName, target.Role
-	ag.ContextLimit = mdl.ContextWindow()
-	configureSubagentFactory(ag, cfg, profiles)
-	return ag, target.Model, providerName, nil
+	return ag, route.ModelName, route.ProviderName, nil
 }
 
 func newModeAgent(cfg *config.Config, profiles provider.Profiles, mode, systemPrompt string) (*agent.Agent, string, string, error) {

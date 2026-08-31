@@ -1,10 +1,13 @@
 package tools
 
 import (
+	"context"
+	"encoding/json"
 	"strings"
 	"testing"
 
 	"github.com/sacca97/ghg/internal/artifact"
+	"github.com/sacca97/ghg/internal/llm"
 )
 
 func TestModelTextDelimitsUntrustedBytesAndKeepsArtifactHintOutside(t *testing.T) {
@@ -36,5 +39,28 @@ func TestModelTextDelimitsUntrustedBytesAndKeepsArtifactHintOutside(t *testing.T
 	trusted := ToolResult{Preview: "status"}
 	if ModelText(trusted) != trusted.Preview {
 		t.Fatal("trusted results should remain unchanged")
+	}
+}
+
+func TestNormalizeResultCapsExplicitPreviewWithoutDroppingRetained(t *testing.T) {
+	retained := strings.Repeat("retained", maxOutput)
+	preview := strings.Repeat("preview", maxOutput)
+	tool := Tool{
+		Def: llm.NewTool("preview", "", `{"type":"object"}`),
+		RunResult: func(context.Context, json.RawMessage) (ToolResult, error) {
+			return ToolResult{
+				Preview:       preview,
+				Retained:      retained,
+				OriginalBytes: int64(len(retained)),
+				Complete:      true,
+			}, nil
+		},
+	}
+	result := ExecuteResult(context.Background(), []Tool{tool}, "preview", nil)
+	if len(result.Preview) > maxOutput || !strings.Contains(result.Preview, "truncated") {
+		t.Fatalf("explicit preview was not bounded: len=%d", len(result.Preview))
+	}
+	if result.Retained != retained {
+		t.Fatal("normalizing a preview must preserve retained evidence")
 	}
 }

@@ -75,10 +75,10 @@ func TestHelpersAndEdgeCases(t *testing.T) {
 		t.Fatal("expected 9 tool defs")
 	}
 	long := strings.Repeat("x", maxOutput+10)
-	if out := truncate(long); !strings.Contains(out, "truncated 10 bytes") {
+	if out := truncate(long); len(out) > maxOutput || !strings.Contains(out, "truncated") {
 		t.Fatalf("truncate: %q", out[len(out)-40:])
 	}
-	if out := TruncateTail(long); !strings.HasPrefix(out, "[... first 10 bytes truncated]") {
+	if out := TruncateTail(long); len(out) > maxOutput || !strings.HasPrefix(out, "[... first ") || !strings.Contains(out, "bytes truncated]") {
 		t.Fatalf("truncateTail: %q", out[:40])
 	}
 	// short strings pass through untouched

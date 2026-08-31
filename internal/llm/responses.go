@@ -7,8 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 )
@@ -906,11 +907,7 @@ func consumeOpenAIResponsesSSE(r io.Reader, onText, onThink func(string)) (Messa
 		}
 		items[call.Index] = raw
 	}
-	indices := make([]int, 0, len(items))
-	for index := range items {
-		indices = append(indices, index)
-	}
-	sort.Ints(indices)
+	indices := slices.Sorted(maps.Keys(items))
 	output := make([]json.RawMessage, 0, len(indices))
 	for _, index := range indices {
 		output = append(output, items[index])

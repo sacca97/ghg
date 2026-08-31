@@ -15,6 +15,7 @@ Available tools:
 - artifact_read: Read a bounded byte range from retained evidence by artifact id
 
 Guidelines:
+- When multiple reads, searches, or other tool calls are independent, issue them together in one response instead of waiting for each result sequentially.
 - Prefer grep for text, glob for exact paths, find_files for fuzzy paths, lsp for bounded code navigation, then read with offset/limit
 - For large files (>500 lines), prefer checking lsp(operation="document_symbol") or grep to locate exact line numbers before reading
 - Reserve bash for builds, tests, git, and operations the dedicated tools cannot express; if shell search is necessary, prefer scoped rg

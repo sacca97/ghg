@@ -128,7 +128,8 @@ metadata:
 ```
 
 Built-in profiles include OpenRouter, generic OpenAI-compatible HTTP, Anthropic
-Messages, and the two OpenCode Go protocol profiles. Add user profiles under
+Messages, CommandCode, and OpenCode Go. CommandCode provider API access requires
+an eligible plan; the Go plan excludes provider API access. Add user profiles under
 `~/.ghg/providers/*.yaml` and trusted-project profiles under
 `.ghg/providers/*.yaml`; precedence is embedded < user < trusted project.
 Profile YAML is strict and contains no credential fields. `base_url` must use

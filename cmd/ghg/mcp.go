@@ -4,8 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"os"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 
@@ -51,14 +52,14 @@ func mcpCLI(args []string, version string) error {
 	case "list":
 		wd, _ := os.Getwd()
 		disc := mcp.LoadMergedFiltered(wd, mcp.FromConfigMap(cfg.MCPServers), mcp.ImportPolicyFrom(cfg.MCPImport))
-		names := make([]string, 0, len(disc.Merged)+len(disc.Blocked))
+		allNames := map[string]struct{}{}
 		for name := range disc.Merged {
-			names = append(names, name)
+			allNames[name] = struct{}{}
 		}
 		for name := range disc.Blocked {
-			names = append(names, name)
+			allNames[name] = struct{}{}
 		}
-		sort.Strings(names)
+		names := slices.Sorted(maps.Keys(allNames))
 		if len(names) == 0 {
 			fmt.Println("no MCP servers configured")
 		}
@@ -230,15 +231,11 @@ func mcpImportCLI(args []string) error {
 	if cfg.MCPServers == nil {
 		cfg.MCPServers = map[string]config.MCPServer{}
 	}
-	names := make([]string, 0, len(add))
-	for name, entry := range add {
-		cfg.MCPServers[name] = entry
-		names = append(names, name)
-	}
+	maps.Copy(cfg.MCPServers, add)
 	if err := cfg.Save(); err != nil {
 		return err
 	}
-	sort.Strings(names)
+	names := slices.Sorted(maps.Keys(add))
 	fmt.Printf("imported %d mcp server(s) into ~/.ghg/config.json: %s\n", len(names), strings.Join(names, ", "))
 	return nil
 }

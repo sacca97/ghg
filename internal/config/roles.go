@@ -2,7 +2,7 @@ package config
 
 import (
 	"fmt"
-	"sort"
+	"slices"
 	"strings"
 )
 
@@ -80,11 +80,11 @@ func (c *Config) ResolveRole(role string) (ResolvedRole, error) {
 			return ResolvedRole{}, fmt.Errorf("role %q has no model", role)
 		}
 		provider := strings.TrimSpace(target.Provider)
-		_, mdl, _, err := c.Resolve(model, provider)
+		route, err := c.Resolve(model, provider)
 		if err != nil {
 			return ResolvedRole{}, fmt.Errorf("role %q: %w", role, err)
 		}
-		return ResolvedRole{Role: role, Model: model, Provider: resolvedProviderName(c, model, mdl, provider)}, nil
+		return ResolvedRole{Role: role, Model: route.ModelName, Provider: route.ProviderName}, nil
 	}
 
 	// An empty legacy target is allowed through here so the interactive cold
@@ -95,30 +95,11 @@ func (c *Config) ResolveRole(role string) (ResolvedRole, error) {
 	if model == "" {
 		return ResolvedRole{Role: role}, nil
 	}
-	_, mdl, _, err := c.Resolve(model, provider)
+	route, err := c.Resolve(model, provider)
 	if err != nil {
 		return ResolvedRole{}, err
 	}
-	return ResolvedRole{Role: role, Model: model, Provider: resolvedProviderName(c, model, mdl, provider)}, nil
-}
-
-func resolvedProviderName(c *Config, model string, mdl Model, provider string) string {
-	if provider != "" {
-		return provider
-	}
-	// Catalog fallback records its owning provider in the synthesized model;
-	// that owner must win over a global default provider. Configured model
-	// entries retain the existing defaultProvider override semantics.
-	if _, configured := c.Models[model]; !configured && len(mdl.Providers) > 0 {
-		return mdl.Providers[0]
-	}
-	if c.DefaultProvider != "" {
-		return c.DefaultProvider
-	}
-	if len(mdl.Providers) > 0 {
-		return mdl.Providers[0]
-	}
-	return ""
+	return ResolvedRole{Role: role, Model: route.ModelName, Provider: route.ProviderName}, nil
 }
 
 // ValidateRoles rejects stale or misspelled role keys before they can be
@@ -133,6 +114,6 @@ func (c *Config) ValidateRoles() error {
 	if len(invalid) == 0 {
 		return nil
 	}
-	sort.Strings(invalid)
+	slices.Sort(invalid)
 	return fmt.Errorf("unknown role %q (roles: %s)", invalid[0], strings.Join(SupportedRoles(), ", "))
 }

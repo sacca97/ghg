@@ -23,6 +23,11 @@ func TestCompletions(t *testing.T) {
 	if head != "" || len(cs) != 5 || cs[0].Text != "/mcp" || cs[1].Text != "/me" || cs[2].Text != "/memory" || cs[3].Text != "/model" || cs[4].Text != "/mouse" {
 		t.Fatalf("command completion: %q %v", head, texts(cs))
 	}
+	// export kinds
+	head, cs = completions("/export-result ", models, provs, nil, nil)
+	if head != "/export-result " || len(cs) != 4 || cs[0].Text != "chat" || cs[1].Text != "last" || cs[2].Text != "plan" || cs[3].Text != "review" {
+		t.Fatalf("export completion: %q %v", head, texts(cs))
+	}
 	// every slash command in the switch must be completable — the "I can't
 	// see /context-doctor" regression class: the command exists but the
 	// completion table was never told.

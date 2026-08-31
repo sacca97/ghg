@@ -163,7 +163,7 @@ func NewBackend(cfg BackendConfig) (Backend, error) {
 			client.HTTP = cfg.HTTP
 		}
 		client.MaxRetries = cfg.MaxRetries
-		client.Headers = cloneHeaders(cfg.Headers)
+		client.Headers = maps.Clone(cfg.Headers)
 		client.AuthKind = cfg.AuthKind
 		client.AuthHeader = cfg.AuthHeader
 		backend := NewOpenAIBackend(client)
@@ -181,7 +181,7 @@ func NewBackend(cfg BackendConfig) (Backend, error) {
 		}
 		client.MaxRetries = cfg.MaxRetries
 		if cfg.Headers != nil {
-			client.Headers = cloneHeaders(cfg.Headers)
+			client.Headers = maps.Clone(cfg.Headers)
 		}
 		client.AuthKind = cfg.AuthKind
 		client.AuthHeader = cfg.AuthHeader
@@ -199,7 +199,7 @@ func NewBackend(cfg BackendConfig) (Backend, error) {
 			client.HTTP = cfg.HTTP
 		}
 		client.MaxRetries = cfg.MaxRetries
-		client.Headers = cloneHeaders(cfg.Headers)
+		client.Headers = maps.Clone(cfg.Headers)
 		client.AuthKind = cfg.AuthKind
 		client.AuthHeader = cfg.AuthHeader
 		backend := NewOpenAIResponsesBackend(client)
@@ -381,7 +381,3 @@ func (b *AnthropicBackend) Probe(ctx context.Context, modelID string) error {
 
 var _ Backend = (*AnthropicBackend)(nil)
 var _ CatalogBackend = (*AnthropicBackend)(nil)
-
-func cloneHeaders(headers map[string]string) map[string]string {
-	return maps.Clone(headers)
-}

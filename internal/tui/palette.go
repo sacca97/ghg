@@ -201,6 +201,44 @@ func (m *model) paletteItems() []paletteItem {
 				}
 				return m, nil
 			}},
+		{title: "Export chat", category: "Session",
+			dynDesc: func(m *model) string { return "export the full conversation to Markdown or JSON" },
+			dynHint: func(m *model) string { return "/export-result chat" },
+			run: func(m *model) (tea.Model, tea.Cmd) {
+				m.settings = nil
+				return m.exportResultCommand("/export-result chat")
+			}},
+		{title: "Export latest plan", category: "Session",
+			dynDesc: func(m *model) string { return "export latest plan to Markdown or JSON" },
+			dynHint: func(m *model) string { return "/export-result plan" },
+			run: func(m *model) (tea.Model, tea.Cmd) {
+				m.settings = nil
+				return m.exportResultCommand("/export-result plan")
+			}},
+		{title: "Export latest review", category: "Session",
+			dynDesc: func(m *model) string { return "export latest review to Markdown or JSON" },
+			dynHint: func(m *model) string { return "/export-result review" },
+			run: func(m *model) (tea.Model, tea.Cmd) {
+				m.settings = nil
+				return m.exportResultCommand("/export-result review")
+			}},
+		{title: "Export last message", category: "Session",
+			dynDesc: func(m *model) string { return "export last assistant reply to a file" },
+			dynHint: func(m *model) string { return "/export-result last" },
+			run: func(m *model) (tea.Model, tea.Cmd) {
+				m.settings = nil
+				return m.exportResultCommand("/export-result last")
+			}},
+		{title: "Export workflow result", category: "Session",
+			dynDesc: func(m *model) string { return slashHint(m, "/export-result") },
+			dynHint: func(m *model) string { return "/export-result" },
+			run: func(m *model) (tea.Model, tea.Cmd) {
+				m.settings = nil
+				m.input.SetValue("/export-result ")
+				m.input.CursorEnd()
+				m.refreshMenu()
+				return m, nil
+			}},
 		{title: "Rename session", category: "Session",
 			dynDesc: func(m *model) string {
 				if m.sessionID == "" || m.store == nil {
@@ -289,8 +327,8 @@ func (m *model) paletteItems() []paletteItem {
 				pp := &ppanel{kind: panelGoal, title: "Goal", prepare: m.goal}
 				return pp
 			}},
-		{title: "Thinking tokens", category: "Display",
-			dynDesc: func(m *model) string { return "show or hide model reasoning" },
+		{title: "Thinking timer", category: "Display",
+			dynDesc: func(m *model) string { return "show or hide elapsed thinking time" },
 			dynHint: func(m *model) string { return palHintThinking },
 			run: func(m *model) (tea.Model, tea.Cmd) {
 				m.toggleThinking()
@@ -1114,7 +1152,7 @@ func paletteState(m *model, it paletteItem) string {
 	switch it.title {
 	case "Reasoning effort":
 		return dimStyle.Render("  [" + effortLabel(m.currentEffort()) + "]")
-	case "Thinking tokens":
+	case "Thinking timer":
 		return dimStyle.Render("  [" + onOff(m.showThinking) + "]")
 	case "Mouse capture":
 		return dimStyle.Render("  [" + onOff(m.mouseOn) + "]")

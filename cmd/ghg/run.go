@@ -18,10 +18,12 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/sacca97/ghg/internal/agent"
 	"github.com/sacca97/ghg/internal/artifact"
 	"github.com/sacca97/ghg/internal/config"
+	"github.com/sacca97/ghg/internal/export"
 	"github.com/sacca97/ghg/internal/llm"
 	"github.com/sacca97/ghg/internal/lsp"
 	"github.com/sacca97/ghg/internal/session"
@@ -36,6 +38,8 @@ func runCLI(args []string) error {
 	roleFlag := fs.String("role", "", "model role: default, smart, fast, or tiny (default: fast when -m/-p are omitted)")
 	planFlag := fs.Bool("plan", false, "plan the prompt with smart, then execute the plan with fast")
 	planOnlyFlag := fs.Bool("plan-only", false, "plan the prompt with smart and exit without executing it")
+	exportResultFlag := fs.String("export-result", "", "export structured result (e.g. plan) to this file path")
+	exportFormatFlag := fs.String("export-format", "markdown", "export format when -export-result is set (markdown or json)")
 	resumeFlag := fs.String("resume", "", "continue this session id (see `ghg sessions`) instead of starting fresh")
 	systemFlag := fs.String("system", "", "override the system prompt for this run")
 	systemFileFlag := fs.String("system-file", "", "read the system prompt from this file (wins over -system)")
@@ -47,7 +51,7 @@ func runCLI(args []string) error {
 	quietFlag := fs.Bool("quiet", false, "suppress the stderr tool/session notes (clean stdout for -format json piping)")
 	noSessionFlag := fs.Bool("no-session", false, "run without persisting a session (one-off jobs don't clutter ghg sessions)")
 	fs.Usage = func() {
-		fmt.Fprintln(os.Stderr, "usage: ghg run [--plan | --plan-only] [--format text|json] [--role role] [-m model] [-p provider] [-resume id] [-system text | -system-file path] [-max-turns N] [-timeout dur] [--sandbox mode] [--network mode] [--approval mode] [-quiet] [-no-session] \"prompt\"")
+		fmt.Fprintln(os.Stderr, "usage: ghg run [--plan | --plan-only] [--export-result path] [--export-format markdown|json] [--format text|json] [--role role] [-m model] [-p provider] [-resume id] [-system text | -system-file path] [-max-turns N] [-timeout dur] [--sandbox mode] [--network mode] [--approval mode] [-quiet] [-no-session] \"prompt\"")
 		fs.PrintDefaults()
 	}
 	if err := fs.Parse(args); err != nil {
@@ -265,6 +269,36 @@ func runCLI(args []string) error {
 		} else {
 			fmt.Fprintln(os.Stdout, headlessPlanText(planned))
 		}
+		if *exportResultFlag != "" {
+			var exportData []byte
+			var exportErr error
+			if strings.ToLower(*exportFormatFlag) == export.FormatJSON {
+				record := session.WorkflowResultRecord{
+					ResultID:  fmt.Sprintf("plan-%x", time.Now().UnixNano()&0xffffffff),
+					Kind:      "plan",
+					Version:   1,
+					Role:      config.RoleSmart,
+					Provider:  planner.Provider,
+					Model:     planner.Model,
+					CreatedAt: time.Now().UTC(),
+				}
+				planJSON, _ := json.Marshal(planned)
+				record.Payload = string(planJSON)
+				exportData, exportErr = export.RenderResult(record, export.FormatJSON)
+			} else {
+				exportData = []byte(export.RenderPlanMarkdown(planned))
+			}
+			if exportErr == nil {
+				cwd, _ := os.Getwd()
+				_, exportErr = export.WriteExportFile(*exportResultFlag, exportData, true, cwd)
+			}
+			if exportErr != nil {
+				if emit != nil {
+					emit(map[string]string{"type": "error", "error": "export failed: " + exportErr.Error()})
+				}
+				return fmt.Errorf("export result: %w", exportErr)
+			}
+		}
 		if *planOnlyFlag {
 			if emit != nil {
 				emit(map[string]any{"type": "done", "plan": planned})
@@ -285,33 +319,15 @@ func runCLI(args []string) error {
 			ag, modelName, provName, err = newRoleAgent(cfg, profiles, *roleFlag, sys)
 		}
 	} else {
-		prov, mdl, apiID, resolveErr := cfg.Resolve(*modelFlag, *providerFlag)
+		route, resolveErr := cfg.Resolve(*modelFlag, *providerFlag)
 		if resolveErr != nil {
 			return resolveErr
 		}
-		modelName, provName = *modelFlag, *providerFlag
-		if modelName == "" {
-			modelName = cfg.DefaultModel
+		ag, err = newAgentFromRoute(cfg, profiles, route, config.RoleDefault, sys)
+		if err != nil {
+			return err
 		}
-		if provName == "" {
-			provName = cfg.DefaultProvider
-			if provName == "" && len(mdl.Providers) > 0 {
-				provName = mdl.Providers[0]
-			}
-		}
-		key, keyErr := prov.ResolveKey()
-		if keyErr != nil {
-			return keyErr
-		}
-		backend, backendErr := newProviderBackend(profiles, provName, prov, key, cfg.MaxRetries, apiID, mdl.API)
-		if backendErr != nil {
-			return backendErr
-		}
-		ag = agent.New(backend, apiID, mdl.MaxTokens, sys)
-		ag.ModelName, ag.Provider, ag.Role = modelName, provName, config.RoleDefault
-		ag.ContextLimit = mdl.ContextWindow()
-		ag.CompactThreshold = config.CompactThreshold(cfg)
-		configureSubagentFactory(ag, cfg, profiles)
+		modelName, provName = route.ModelName, route.ProviderName
 	}
 	if err != nil {
 		return err
@@ -366,14 +382,17 @@ func runCLI(args []string) error {
 	var sessionID string
 	saved := 0 // headless sessions persist the system message at sequence zero
 	if !*noSessionFlag {
-		if dir, derr := config.Dir(); derr == nil {
-			if st, serr := session.Open(dir + "/sessions.db"); serr == nil {
-				store = st
-				defer func() { _ = st.Close() }()
-			}
+		dir, derr := config.Dir()
+		if derr != nil {
+			return fmt.Errorf("session directory: %w", derr)
 		}
-	}
-	if store != nil {
+		st, serr := session.Open(filepath.Join(dir, "sessions.db"))
+		if serr != nil {
+			return fmt.Errorf("open session database: %w", serr)
+		}
+		store = st
+		defer func() { _ = st.Close() }()
+
 		if *resumeFlag != "" {
 			meta, msgs, lerr := store.Load(*resumeFlag)
 			if lerr != nil {
@@ -386,10 +405,16 @@ func runCLI(args []string) error {
 			}
 			ag.Messages = append(ag.Messages[:1], loaded...) // keep our system prompt, replay the rest
 			saved = len(ag.Messages)
-		} else if cwd, cerr := os.Getwd(); cerr == nil {
-			if id, ierr := store.Create(cwd, modelName, provName); ierr == nil {
-				sessionID = id
+		} else {
+			cwd, cerr := os.Getwd()
+			if cerr != nil {
+				return fmt.Errorf("session working directory: %w", cerr)
 			}
+			id, ierr := store.Create(cwd, modelName, provName)
+			if ierr != nil {
+				return fmt.Errorf("create session: %w", ierr)
+			}
+			sessionID = id
 		}
 	}
 	if store != nil {
@@ -404,12 +429,7 @@ func runCLI(args []string) error {
 	}
 	if store != nil && sessionID != "" {
 		ev.OnCompactionReady = func(raw []llm.Message, summary string, cutoff int) error {
-			if len(raw) > saved {
-				if err := store.Save(sessionID, saved, raw, modelName, provName); err != nil {
-					return err
-				}
-			}
-			return store.RecordCompaction(sessionID, store.RawCutoff(sessionID, cutoff, raw), summary)
+			return store.PersistCompaction(sessionID, saved, raw, modelName, provName, summary, cutoff)
 		}
 		ev.OnCompacted = func(_ string, _ int) {
 			saved = len(ag.MessagesSnapshot())

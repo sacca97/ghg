@@ -36,6 +36,13 @@ var execNow = map[string]bool{
 	"/execute": true, "/mcp": true, "/model": true, "/mouse": true, "/pwd": true, "/quit": true, "/report": true, "/resume": true, "/tasks": true,
 }
 
+var exportKindCands = []cand{
+	{"chat", "export the full conversation"},
+	{"last", "export the latest assistant message"},
+	{"plan", "export the latest plan"},
+	{"review", "export the latest review"},
+}
+
 // completions splits val into an untouched head and candidates for its last
 // token: slash commands, /model or /effort arguments, $skills, or filesystem
 // paths. nil efforts uses the default /effort candidates.
@@ -68,6 +75,8 @@ func completionsWithAuth(val string, models, providers, authProviders, skillCand
 		cands = filterPrefix(append([]cand{{"off", "compact with the current model"}}, models...), token)
 	case len(fields) == 2 && fields[0] == "/compact":
 		cands = filterPrefix(providers, token)
+	case len(fields) == 1 && (fields[0] == "/export" || fields[0] == "/export-result"):
+		cands = filterPrefix(exportKindCands, token)
 	case strings.HasPrefix(token, "$"): // codex-style skill invocation
 		cands = filterPrefix(skillCands, token)
 	case strings.HasPrefix(token, "@"):

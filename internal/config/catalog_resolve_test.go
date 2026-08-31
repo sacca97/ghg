@@ -37,21 +37,21 @@ func TestResolveCatalogFallbackSingleProvider(t *testing.T) {
 	})
 	cfg := cfgWithProviders("inference")
 
-	p, m, id, err := cfg.Resolve("glm-5.2", "")
+	route, err := cfg.Resolve("glm-5.2", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p.BaseURL != "https://inference" || id != "glm-5.2" {
-		t.Fatalf("route: %+v id=%q", p, id)
+	if route.Provider.BaseURL != "https://inference" || route.APIID != "glm-5.2" || route.ProviderName != "inference" || route.ModelName != "glm-5.2" {
+		t.Fatalf("route: %+v", route)
 	}
-	if m.Context != 1000000 || m.MaxOut != 128000 {
-		t.Errorf("synthetic model should carry catalog context/maxOut, got %+v", m)
+	if route.Model.Context != 1000000 || route.Model.MaxOut != 128000 {
+		t.Errorf("synthetic model should carry catalog context/maxOut, got %+v", route.Model)
 	}
-	if m.Vision {
+	if route.Model.Vision {
 		t.Error("text-only catalog entry must not mark the model vision-capable")
 	}
-	if len(m.Providers) != 1 || m.Providers[0] != "inference" {
-		t.Errorf("routing: %+v", m.Providers)
+	if len(route.Model.Providers) != 1 || route.Model.Providers[0] != "inference" {
+		t.Errorf("routing: %+v", route.Model.Providers)
 	}
 }
 
@@ -63,9 +63,9 @@ func TestResolveCatalogFallbackVision(t *testing.T) {
 		InputModalities: []string{"text", "image"},
 	})
 	cfg := cfgWithProviders("inference")
-	_, m, _, err := cfg.Resolve("kimi-k9", "")
-	if err != nil || !m.Vision {
-		t.Fatalf("image-capable catalog entry should resolve with Vision=true: %+v %v", m, err)
+	route, err := cfg.Resolve("kimi-k9", "")
+	if err != nil || !route.Model.Vision {
+		t.Fatalf("image-capable catalog entry should resolve with Vision=true: %+v %v", route.Model, err)
 	}
 }
 
@@ -81,7 +81,7 @@ func TestResolveCatalogFallbackAmbiguous(t *testing.T) {
 	}
 	cfg := cfgWithProviders("alpha", "beta")
 
-	_, _, _, err := cfg.Resolve("shared-model", "")
+	_, err := cfg.Resolve("shared-model", "")
 	if err == nil || !strings.Contains(err.Error(), "alpha") || !strings.Contains(err.Error(), "beta") {
 		t.Fatalf("ambiguity error must name both providers, got %v", err)
 	}
@@ -89,12 +89,29 @@ func TestResolveCatalogFallbackAmbiguous(t *testing.T) {
 		t.Fatalf("error should instruct how to disambiguate, got %v", err)
 	}
 
-	p, m, _, err := cfg.Resolve("shared-model", "beta")
+	route, err := cfg.Resolve("shared-model", "beta")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p.BaseURL != "https://beta" || m.Context != 2000 {
-		t.Fatalf("pinned provider should win with its catalog entry: %+v %+v", p, m)
+	if route.Provider.BaseURL != "https://beta" || route.Model.Context != 2000 || route.ProviderName != "beta" {
+		t.Fatalf("pinned provider should win with its catalog entry: %+v", route)
+	}
+}
+
+func TestResolveCatalogFallbackOwnerWinsOverDefaultProvider(t *testing.T) {
+	catalogFixture(t, "provider-b", ModelInfoLite{
+		ID:            "b-only-model",
+		ContextLength: 128000,
+	})
+	cfg := cfgWithProviders("provider-a", "provider-b")
+	cfg.DefaultProvider = "provider-a"
+
+	route, err := cfg.Resolve("b-only-model", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if route.ProviderName != "provider-b" || route.Provider.BaseURL != "https://provider-b" {
+		t.Fatalf("expected provider-b to win for b-only-model, got providerName=%q baseURL=%q", route.ProviderName, route.Provider.BaseURL)
 	}
 }
 
@@ -105,15 +122,15 @@ func TestResolveConfigWinsOverCatalog(t *testing.T) {
 	cfg := cfgWithProviders("inference")
 	cfg.Models["kimi-k3"] = Model{Providers: []string{"inference"}, Context: 131072}
 
-	_, m, id, err := cfg.Resolve("kimi-k3", "")
+	route, err := cfg.Resolve("kimi-k3", "")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if m.Context != 131072 || m.MaxOut != 0 {
-		t.Errorf("config entry must win over catalog values, got %+v", m)
+	if route.Model.Context != 131072 || route.Model.MaxOut != 0 {
+		t.Errorf("config entry must win over catalog values, got %+v", route.Model)
 	}
-	if id != "kimi-k3" {
-		t.Errorf("id should default to the map key, got %q", id)
+	if route.APIID != "kimi-k3" {
+		t.Errorf("id should default to the map key, got %q", route.APIID)
 	}
 }
 
@@ -122,10 +139,10 @@ func TestResolveCatalogFallbackMisses(t *testing.T) {
 	catalogFixture(t, "ghost", ModelInfoLite{ID: "phantom-model", ContextLength: 1})
 	cfg := cfgWithProviders("inference")
 
-	if _, _, _, err := cfg.Resolve("nope", ""); err == nil {
+	if _, err := cfg.Resolve("nope", ""); err == nil {
 		t.Fatal("unknown model must still error")
 	}
-	if _, _, _, err := cfg.Resolve("phantom-model", ""); err == nil {
+	if _, err := cfg.Resolve("phantom-model", ""); err == nil {
 		t.Fatal("catalog for an unconfigured provider must not resolve")
 	}
 }

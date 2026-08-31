@@ -1,9 +1,10 @@
 package agent
 
 import (
+	"cmp"
 	"context"
 	"fmt"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -105,11 +106,11 @@ func (r *taskRegistry) List() []BackgroundTask {
 	// share a StartedAt, so tiebreak on the id (task-N is monotonic) — a bare
 	// time sort leaves ties to map iteration order and the dock reshuffles on
 	// every redraw.
-	sort.SliceStable(out, func(i, j int) bool {
-		if !out[i].StartedAt.Equal(out[j].StartedAt) {
-			return out[i].StartedAt.Before(out[j].StartedAt)
+	slices.SortStableFunc(out, func(a, b BackgroundTask) int {
+		if n := a.StartedAt.Compare(b.StartedAt); n != 0 {
+			return n
 		}
-		return taskIDNum(out[i].ID) < taskIDNum(out[j].ID)
+		return cmp.Compare(taskIDNum(a.ID), taskIDNum(b.ID))
 	})
 	return out
 }

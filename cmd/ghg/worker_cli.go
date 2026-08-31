@@ -33,7 +33,7 @@ func workerPSCLI() error {
 		live := ""
 		runtimeFile, runtimeErr := workerwire.NewRuntime(dir, state.SessionID)
 		if runtimeErr == nil {
-			if workerRuntimeLive(runtimeFile) {
+			if runtimeFile.Live() {
 				live = " live"
 			} else if state.State == workerwire.StateRunning || state.State == workerwire.StateWaitingApproval || state.State == workerwire.StateStopping {
 				state.State = workerwire.StateInterrupted
@@ -85,7 +85,7 @@ func workerAttachCLI(args []string) error {
 	// durable session normally, which starts a fresh worker from its persisted
 	// state; a still-present socket keeps the original attach error visible.
 	runtimeFile, runtimeErr := workerwire.NewRuntime(dir, meta.ID)
-	if runtimeErr == nil && !workerRuntimeLive(runtimeFile) {
+	if runtimeErr == nil && !runtimeFile.Live() {
 		// The lock, not the socket pathname, establishes ownership. A crashed
 		// worker can leave the pathname behind; once the lock is available it is
 		// safe to remove that stale endpoint and reopen the durable session.
@@ -94,10 +94,6 @@ func workerAttachCLI(args []string) error {
 		return err
 	}
 	return fmt.Errorf("attach session %s failed: %w", meta.ID, attachErr)
-}
-
-func workerRuntimeLive(runtimeFile workerwire.Runtime) bool {
-	return runtimeFile.Live()
 }
 
 func workerStopCLI(args []string) error {

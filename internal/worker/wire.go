@@ -121,3 +121,12 @@ type Snapshot struct {
 type AppendRequest struct {
 	Content string `json:"content"`
 }
+
+// LSPStatus reports one worker-owned language server without exposing the
+// manager or its process state to the controller.
+type LSPStatus struct {
+	Name  string `json:"name"`
+	Root  string `json:"root,omitempty"`
+	State string `json:"state"`
+	Error string `json:"error,omitempty"`
+}

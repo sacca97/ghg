@@ -9,10 +9,15 @@ import (
 // Plan is the structured result produced by the planning workflow. Steps are
 // deliberately plain text: todowrite owns execution state, while acceptance
 // checks remain part of the acting prompt.
+// Plan is the structured result produced by the planning workflow. Steps are
+// deliberately plain text: todowrite owns execution state, while acceptance
+// checks remain part of the acting prompt.
 type Plan struct {
 	Goal             string   `json:"goal"`
+	Assumptions      []string `json:"assumptions,omitempty"`
 	Steps            []string `json:"steps"`
 	AcceptanceChecks []string `json:"acceptance_checks"`
+	Risks            []string `json:"risks,omitempty"`
 }
 
 // Validate checks the limits shared with the conversation's todowrite plan.
@@ -43,6 +48,16 @@ func (p Plan) Validate() error {
 			return fmt.Errorf("acceptance check %d exceeds %d characters", i+1, maxTodoContent)
 		}
 	}
+	for i, a := range p.Assumptions {
+		if strings.TrimSpace(a) == "" {
+			return fmt.Errorf("assumption %d is empty", i+1)
+		}
+	}
+	for i, r := range p.Risks {
+		if strings.TrimSpace(r) == "" {
+			return fmt.Errorf("risk %d is empty", i+1)
+		}
+	}
 	return nil
 }
 
@@ -62,6 +77,12 @@ func ParsePlan(response string) (Plan, error) {
 	}
 	for i := range p.AcceptanceChecks {
 		p.AcceptanceChecks[i] = strings.TrimSpace(p.AcceptanceChecks[i])
+	}
+	for i := range p.Assumptions {
+		p.Assumptions[i] = strings.TrimSpace(p.Assumptions[i])
+	}
+	for i := range p.Risks {
+		p.Risks[i] = strings.TrimSpace(p.Risks[i])
 	}
 	return p, nil
 }

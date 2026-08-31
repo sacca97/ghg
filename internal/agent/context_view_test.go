@@ -60,7 +60,6 @@ func TestAgingLeavesUnrecoverableToolResultsExact(t *testing.T) {
 func TestAgingSurvivesTodoInjection(t *testing.T) {
 	backend := &fakeBackend{}
 	ag := New(backend, "m", 100, "policy")
-	ag.ResultAging = true
 	ag.Todos = []Todo{{ID: "t1", Content: "finish the task", Status: "in_progress"}}
 	ref := artifact.Ref{ID: "sha256:" + strings.Repeat("b", 64), OriginalBytes: 20_000, StoredBytes: 20_000, Complete: true}
 	call := llm.ToolCall{ID: "old-call"}
@@ -77,6 +76,46 @@ func TestAgingSurvivesTodoInjection(t *testing.T) {
 	}
 	if got := backend.streamRequests[0].Messages[3].Content; !strings.HasPrefix(got, "Aged tool result") {
 		t.Fatalf("todo injection discarded aged result: %q", got)
+	}
+}
+
+func TestAgingDeduplicatesOverlappingReadsWithoutChangingRawMessages(t *testing.T) {
+	old := "<untrusted_tool_output source=\"read\">\n[observation obs-old path=src/file.go lines=1-4 next_offset=0]\n1\tone\n2\ttwo\n3\told-three\n4\told-four\n</untrusted_tool_output>\n"
+	newest := "<untrusted_tool_output source=\"read\">\n[observation obs-new path=src/file.go lines=3-5 next_offset=0]\n3\tnew-three\n4\tnew-four\n5\tfive\n</untrusted_tool_output>\n"
+	failed := "Error: read failed"
+	msgs := []llm.Message{
+		{Role: "system", Content: "policy"},
+		{Role: "user", Content: "inspect"},
+		{Role: "assistant", Content: "reading"},
+		{Role: "tool", Content: old, Name: "read"},
+		{Role: "user", Content: "refresh"},
+		{Role: "assistant", Content: "reading again"},
+		{Role: "tool", Content: newest, Name: "read"},
+		{Role: "tool", Content: failed, Name: "read", ExitCode: 1},
+	}
+
+	view := ageResultMessages(msgs, 1_000_000)
+	if view[6].Content != newest {
+		t.Fatalf("newest observation changed: %q", view[6].Content)
+	}
+	if !strings.Contains(view[3].Content, "1\tone") || !strings.Contains(view[3].Content, "2\ttwo") {
+		t.Fatalf("non-overlapping old lines were lost: %q", view[3].Content)
+	}
+	if strings.Contains(view[3].Content, "3\told-three") || strings.Contains(view[3].Content, "4\told-four") ||
+		!strings.Contains(view[3].Content, "lines 3-4 superseded by observation obs-new") {
+		t.Fatalf("old overlapping lines were not replaced: %q", view[3].Content)
+	}
+	provider := view[3].Content + view[6].Content
+	for _, line := range []string{"1\tone\n", "2\ttwo\n", "3\tnew-three\n", "4\tnew-four\n", "5\tfive\n"} {
+		if strings.Count(provider, line) != 1 {
+			t.Fatalf("provider view contains %q %d times: %q", line, strings.Count(provider, line), provider)
+		}
+	}
+	if view[7].Content != failed {
+		t.Fatalf("failed read changed: %q", view[7].Content)
+	}
+	if msgs[3].Content != old || msgs[6].Content != newest {
+		t.Fatal("raw messages were mutated")
 	}
 }
 

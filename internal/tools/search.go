@@ -33,7 +33,7 @@ const (
 	maxSearchLineBytes      = 1 << 20
 	maxMatchLineBytes       = 4 << 10
 	maxSearchPatternBytes   = 16 << 10
-	searchPreviewBytes      = 8 << 10
+	searchPreviewBytes      = 16 << 10
 	searchPerFileCap        = 4
 )
 

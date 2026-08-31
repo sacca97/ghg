@@ -7,7 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"sort"
+	"slices"
 	"strings"
 	"time"
 	"unicode/utf16"
@@ -344,7 +344,9 @@ func (m *Manager) normalizeLocations(in []wireLocation, limit int) ([]tools.LSPL
 		seen[key] = struct{}{}
 		locations = append(locations, item)
 	}
-	sort.Slice(locations, func(i, j int) bool { return locationKey(locations[i]) < locationKey(locations[j]) })
+	slices.SortFunc(locations, func(a, b tools.LSPLocation) int {
+		return strings.Compare(locationKey(a), locationKey(b))
+	})
 	omitted := max(len(locations)-limit, 0)
 	if len(locations) > limit {
 		locations = locations[:limit]
@@ -470,23 +472,23 @@ func (m *Manager) normalizeSymbols(raw json.RawMessage, sourcePath string, sourc
 			return nil, 0, err
 		}
 	}
-	sort.SliceStable(symbols, func(i, j int) bool {
-		if symbols[i].Path != symbols[j].Path {
-			return symbols[i].Path < symbols[j].Path
+	slices.SortStableFunc(symbols, func(a, b tools.LSPSymbol) int {
+		if n := strings.Compare(a.Path, b.Path); n != 0 {
+			return n
 		}
-		if comparePosition(symbols[i].Range.Start, symbols[j].Range.Start) != 0 {
-			return comparePosition(symbols[i].Range.Start, symbols[j].Range.Start) < 0
+		if n := comparePosition(a.Range.Start, b.Range.Start); n != 0 {
+			return n
 		}
-		if comparePosition(symbols[i].Range.End, symbols[j].Range.End) != 0 {
-			return comparePosition(symbols[i].Range.End, symbols[j].Range.End) < 0
+		if n := comparePosition(a.Range.End, b.Range.End); n != 0 {
+			return n
 		}
-		if comparePosition(symbols[i].SelectionRange.Start, symbols[j].SelectionRange.Start) != 0 {
-			return comparePosition(symbols[i].SelectionRange.Start, symbols[j].SelectionRange.Start) < 0
+		if n := comparePosition(a.SelectionRange.Start, b.SelectionRange.Start); n != 0 {
+			return n
 		}
-		if symbols[i].Name != symbols[j].Name {
-			return symbols[i].Name < symbols[j].Name
+		if n := strings.Compare(a.Name, b.Name); n != 0 {
+			return n
 		}
-		return symbols[i].Kind < symbols[j].Kind
+		return strings.Compare(a.Kind, b.Kind)
 	})
 	deduped := symbols[:0]
 	seen := make(map[string]struct{}, len(symbols))

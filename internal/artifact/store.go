@@ -13,6 +13,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/sacca97/ghg/internal/tempdir"
 )
 
 const (
@@ -136,7 +138,7 @@ func NewTemp() (*Store, error) {
 // used by --no-session so one-off runs obey the same retention policy as
 // persistent sessions.
 func NewTempWithLimit(maxBytes int64) (*Store, error) {
-	root, err := os.MkdirTemp("", "ghg-artifacts-")
+	root, err := os.MkdirTemp(tempdir.Base(), "ghg-artifacts-")
 	if err != nil {
 		return nil, fmt.Errorf("create temporary artifact store: %w", err)
 	}

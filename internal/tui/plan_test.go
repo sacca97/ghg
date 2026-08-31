@@ -64,6 +64,9 @@ func TestPlanThenExecuteUsesProposalAndSeedsTodos(t *testing.T) {
 	if _, _ = m.command("/plan ship it"); m.proposedPlan == nil {
 		t.Fatal("/plan should retain the validated proposal")
 	}
+	if len(m.blocks) == 0 || !strings.Contains(m.blocks[0].text, "❯ /plan ship it") {
+		t.Fatalf("expected /plan prompt to be visible in blocks: %+v", m.blocks)
+	}
 	if m.busy {
 		t.Fatal("planning should be idle after an inline completion")
 	}
@@ -102,5 +105,29 @@ func TestPlanRetriesInvalidProposalOnce(t *testing.T) {
 	defer b.mu.Unlock()
 	if len(b.complete) != 2 {
 		t.Fatalf("invalid output should be retried once, got %d calls", len(b.complete))
+	}
+}
+
+func TestPlanCommandEchoesPromptEvenOnFailure(t *testing.T) {
+	b := &planTestBackend{plans: []string{"not json", "still not json"}}
+	m := &model{agent: agent.New(b, "model", 100, "sys")}
+
+	m.command("/plan ship it")
+
+	if len(m.blocks) < 2 {
+		t.Fatalf("expected at least 2 blocks (prompt and error), got %d", len(m.blocks))
+	}
+	if !strings.Contains(m.blocks[0].text, "❯ /plan ship it") {
+		t.Fatalf("expected prompt echo in first block, got: %s", m.blocks[0].text)
+	}
+	foundFailure := false
+	for _, blk := range m.blocks[1:] {
+		if strings.Contains(blk.text, "planning failed") {
+			foundFailure = true
+			break
+		}
+	}
+	if !foundFailure {
+		t.Fatalf("expected failure block after prompt echo, blocks: %+v", m.blocks)
 	}
 }

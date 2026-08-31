@@ -519,7 +519,9 @@ func newOpenAIRequest(req Request, stream bool) openAIRequest {
 // omit usage leave all fields zero — the session totals just skip those calls.
 type Usage struct {
 	PromptTokens     int `json:"prompt_tokens"`
+	InputTokens      int `json:"input_tokens,omitempty"`
 	CompletionTokens int `json:"completion_tokens"`
+	OutputTokens     int `json:"output_tokens,omitempty"`
 	// CacheCreationTokens is provider-reported prompt-cache write usage. The
 	// existing Cached method continues to expose cache reads for cost/status
 	// accounting; providers without cache-write reporting leave this zero.
@@ -892,7 +894,14 @@ func (c *Client) streamOnce(ctx context.Context, body []byte, onText, onThink fu
 			return Message{}, usage, nonRetryable{fmt.Errorf("api error: %s", ch.Error.Message)}
 		}
 		if ch.Usage != nil {
-			usage = *ch.Usage // the terminal usage chunk carries empty choices
+			u := *ch.Usage // the terminal usage chunk carries empty choices
+			if u.PromptTokens == 0 && u.InputTokens > 0 {
+				u.PromptTokens = u.InputTokens
+			}
+			if u.CompletionTokens == 0 && u.OutputTokens > 0 {
+				u.CompletionTokens = u.OutputTokens
+			}
+			usage = u
 		}
 		if len(ch.Choices) == 0 {
 			continue
@@ -1016,7 +1025,14 @@ func (c *Client) completeOnce(ctx context.Context, body []byte) (Message, Usage,
 	}
 	var usage Usage
 	if out.Usage != nil {
-		usage = *out.Usage
+		u := *out.Usage
+		if u.PromptTokens == 0 && u.InputTokens > 0 {
+			u.PromptTokens = u.InputTokens
+		}
+		if u.CompletionTokens == 0 && u.OutputTokens > 0 {
+			u.CompletionTokens = u.OutputTokens
+		}
+		usage = u
 	}
 	choice := out.Choices[0]
 	role := choice.Message.Role

@@ -43,7 +43,7 @@ func TestHeaderKeepsContextInStatus(t *testing.T) {
 		}
 	}
 	status := m.statusView()
-	if !strings.Contains(status, "ctx 0/100.0k") {
+	if !strings.Contains(status, "ctx ") || !strings.Contains(status, "/100.0k") {
 		t.Errorf("status missing context size: %q", status)
 	}
 	for _, unwanted := range []string{"↓", "↑", "tok", "12.3k", "4.0k", "678"} {

@@ -2,7 +2,6 @@
 package session
 
 import (
-	"context"
 	"crypto/rand"
 	"database/sql"
 	"encoding/hex"
@@ -18,176 +17,6 @@ import (
 	"github.com/sacca97/ghg/internal/goal"
 	"github.com/sacca97/ghg/internal/llm"
 )
-
-const schema = `
-CREATE TABLE IF NOT EXISTS sessions (
-	id         TEXT PRIMARY KEY,
-	created_at TEXT NOT NULL,
-	updated_at TEXT NOT NULL,
-	cwd        TEXT NOT NULL,
-	model      TEXT NOT NULL,
-	provider   TEXT NOT NULL,
-	title      TEXT NOT NULL DEFAULT '',
-	goal       TEXT NOT NULL DEFAULT ''
-);
-CREATE TABLE IF NOT EXISTS messages (
-	session_id TEXT NOT NULL REFERENCES sessions(id),
-	seq        INTEGER NOT NULL,
-	role       TEXT NOT NULL,
-	content    TEXT NOT NULL, -- llm.Message JSON
-	PRIMARY KEY (session_id, seq)
-);
--- Artifact metadata is session-scoped. Payloads are immutable and shared by
--- content hash; the message sequence is only the ownership/fork/rewind index.
-CREATE TABLE IF NOT EXISTS artifacts (
-	session_id    TEXT NOT NULL REFERENCES sessions(id),
-	message_seq   INTEGER NOT NULL,
-	id            TEXT NOT NULL,
-	tool_call_id  TEXT NOT NULL,
-	tool_name     TEXT NOT NULL,
-	media_type    TEXT NOT NULL DEFAULT '',
-	original_bytes INTEGER NOT NULL,
-	stored_bytes   INTEGER NOT NULL,
-	hash          TEXT NOT NULL,
-	path          TEXT NOT NULL,
-	complete      INTEGER NOT NULL,
-	metadata      TEXT NOT NULL DEFAULT '',
-	created_at    TEXT NOT NULL,
-	PRIMARY KEY (session_id, id, tool_call_id)
-);
-CREATE INDEX IF NOT EXISTS artifacts_session_seq ON artifacts(session_id, message_seq);
-CREATE INDEX IF NOT EXISTS artifacts_session_created ON artifacts(session_id, created_at);
-CREATE TABLE IF NOT EXISTS tasks (
-	session_id  TEXT NOT NULL REFERENCES sessions(id),
-	task_id     TEXT NOT NULL,
-	description TEXT NOT NULL,
-	prompt      TEXT NOT NULL,
-	status      TEXT NOT NULL,
-	report      TEXT NOT NULL DEFAULT '',
-	started_at  TEXT NOT NULL,
-	ended_at    TEXT NOT NULL DEFAULT '',
-	PRIMARY KEY (session_id, task_id)
-);
--- Workspace snapshots: one git stash ref per turn (keyed by the conversation
--- index the turn started at), so a conversation rewind can also restore the
--- files that turn changed. Same seq semantics as messages, so DeleteFrom
--- trims both together.
-CREATE TABLE IF NOT EXISTS snapshots (
-	session_id TEXT NOT NULL REFERENCES sessions(id),
-	seq        INTEGER NOT NULL,
-	ref        TEXT NOT NULL,
-	created_at TEXT NOT NULL,
-	PRIMARY KEY (session_id, seq)
-);
--- Scheduled tasks: the wakeup channel's durable records. One row per task,
--- keyed by the session it fires into. The store keeps the schedule
--- expression, anchor, and last fire; the TUI's ticker evaluates due tasks.
-CREATE TABLE IF NOT EXISTS schedules (
-	session_id TEXT NOT NULL REFERENCES sessions(id),
-	id         INTEGER NOT NULL,
-	schedule   TEXT NOT NULL,      -- '@every 10m' | '@at <rfc3339>'
-	prompt     TEXT NOT NULL,      -- the machine-authored turn to submit on fire
-	anchor     TEXT NOT NULL,      -- grid origin (RFC3339)
-	last_fire  TEXT NOT NULL DEFAULT '', -- last fire time ("" = never); one-shots complete here
-	created_at TEXT NOT NULL,
-	PRIMARY KEY (session_id, id)
-);
--- Compaction events: append-only. Each row records a compaction as summary +
--- cutoff (the raw-log seq it folded). The messages table is never rewritten
--- by a compaction — Load derives the compacted view from the latest event,
--- so a bad compaction is inspectable and retryable.
-CREATE TABLE IF NOT EXISTS compactions (
-	session_id TEXT NOT NULL REFERENCES sessions(id),
-	seq        INTEGER NOT NULL, -- compaction generation, 1-based
-	cutoff     INTEGER NOT NULL, -- raw-log seq the summary replaces (1..cutoff-1)
-	summary    TEXT NOT NULL,
-	created_at TEXT NOT NULL,
-	PRIMARY KEY (session_id, seq)
-);
--- Goal state is separate from the legacy sessions.goal mirror so a goal can
--- retain its identity, lifecycle, accounting, and checkpoint history.
-CREATE TABLE IF NOT EXISTS goals (
-	session_id       TEXT NOT NULL REFERENCES sessions(id),
-	goal_id          TEXT NOT NULL,
-	objective        TEXT NOT NULL,
-	status           TEXT NOT NULL,
-	rounds           INTEGER NOT NULL DEFAULT 0,
-	usage_in         INTEGER NOT NULL DEFAULT 0,
-	usage_cached     INTEGER NOT NULL DEFAULT 0,
-	usage_out        INTEGER NOT NULL DEFAULT 0,
-	progress         TEXT NOT NULL DEFAULT '',
-	blocker          TEXT NOT NULL DEFAULT '',
-	created_at       TEXT NOT NULL,
-	updated_at       TEXT NOT NULL,
-	PRIMARY KEY (session_id, goal_id)
-);
-CREATE INDEX IF NOT EXISTS goals_session_updated ON goals(session_id, updated_at DESC);
-CREATE TABLE IF NOT EXISTS goal_checkpoints (
-	session_id       TEXT NOT NULL REFERENCES sessions(id),
-	goal_id          TEXT NOT NULL,
-	seq              INTEGER NOT NULL,
-	status           TEXT NOT NULL,
-	rounds           INTEGER NOT NULL DEFAULT 0,
-	usage_in         INTEGER NOT NULL DEFAULT 0,
-	usage_cached     INTEGER NOT NULL DEFAULT 0,
-	usage_out       INTEGER NOT NULL DEFAULT 0,
-	progress         TEXT NOT NULL DEFAULT '',
-	blocker          TEXT NOT NULL DEFAULT '',
-	created_at       TEXT NOT NULL,
-	PRIMARY KEY (session_id, goal_id, seq)
-);
--- Read observations are exact, bounded byte ranges issued to the model. They
--- are session-owned authorization evidence for stateful edits, not hashes.
-CREATE TABLE IF NOT EXISTS observations (
-	session_id   TEXT NOT NULL REFERENCES sessions(id),
-	observation_id TEXT NOT NULL,
-	path         TEXT NOT NULL,
-	start_line   INTEGER NOT NULL,
-	end_line     INTEGER NOT NULL,
-	next_offset  INTEGER NOT NULL,
-	issued_bytes INTEGER NOT NULL,
-	content      TEXT NOT NULL,
-	complete     INTEGER NOT NULL,
-	created_at   TEXT NOT NULL,
-	PRIMARY KEY (session_id, observation_id)
-);
-CREATE INDEX IF NOT EXISTS observations_session_path ON observations(session_id, path);
--- Search snapshots back cursor pagination with an immutable, bounded result
--- set. The JSON payload is intentionally opaque to SQL.
-CREATE TABLE IF NOT EXISTS search_snapshots (
-	session_id TEXT NOT NULL REFERENCES sessions(id),
-	snapshot_id TEXT NOT NULL,
-	kind       TEXT NOT NULL,
-	snapshot   TEXT NOT NULL,
-	created_at TEXT NOT NULL,
-	PRIMARY KEY (session_id, snapshot_id)
-);
-CREATE INDEX IF NOT EXISTS search_snapshots_session_created ON search_snapshots(session_id, created_at);
--- Derived, rebuildable full-text index for bounded session history recall.
--- Raw messages remain authoritative; this table stores only extracted text.
-CREATE VIRTUAL TABLE IF NOT EXISTS history_fts USING fts5(
-	session_id UNINDEXED,
-	seq        UNINDEXED,
-	role       UNINDEXED,
-	content
-);
-`
-
-// extraColumns are added idempotently after the base schema: SQLite's
-// ADD COLUMN errors if the column already exists, so each is guarded by an
-// information check in migrate(). New per-session bookkeeping lands here, not
-// in the CREATE above (which only runs on a fresh DB).
-var extraColumns = []struct{ name, def string }{
-	{"forked_from", "forked_from TEXT NOT NULL DEFAULT ''"},     // source session id
-	{"fork_seq", "fork_seq INTEGER NOT NULL DEFAULT 0"},         // branch point in the source
-	{"tags", "tags TEXT NOT NULL DEFAULT ''"},                   // comma-separated labels
-	{"pinned", "pinned INTEGER NOT NULL DEFAULT 0"},             // 1 = keep / sort first
-	{"effort", "effort TEXT NOT NULL DEFAULT ''"},               // reasoning effort in effect ("" = global default)
-	{"usage_in", "usage_in INTEGER NOT NULL DEFAULT 0"},         // cumulative input tokens (provider-reported)
-	{"usage_cached", "usage_cached INTEGER NOT NULL DEFAULT 0"}, // of usage_in, tokens served from the prompt cache
-	{"usage_out", "usage_out INTEGER NOT NULL DEFAULT 0"},       // cumulative output tokens
-	{"todos", "todos TEXT NOT NULL DEFAULT ''"},                 // todowrite plan JSON ([]agent.Todo)
-}
 
 // Meta is a session's bookkeeping row.
 type Meta struct {
@@ -233,26 +62,9 @@ func Open(path string) (*Store, error) {
 			return nil, err
 		}
 	}
-	if _, err := db.Exec(schema); err != nil {
-		return nil, err
-	}
-	// migrate pre-goal databases; duplicate-column errors are expected
-	_, _ = db.Exec(`ALTER TABLE sessions ADD COLUMN goal TEXT NOT NULL DEFAULT ''`)
-	// later per-session bookkeeping (fork linkage, tags, pinned); the same
-	// duplicate-column-tolerant migration as goal
-	for _, c := range extraColumns {
-		_, _ = db.Exec(`ALTER TABLE sessions ADD COLUMN ` + c.def)
-	}
-	// The artifact table was introduced after the initial Phase 1 slice; keep
-	// databases created by that slice readable when metadata is added.
-	_, _ = db.Exec(`ALTER TABLE artifacts ADD COLUMN metadata TEXT NOT NULL DEFAULT ''`)
-	if err := migrateLegacyGoals(db); err != nil {
+	if err := applySchema(db); err != nil {
 		_ = db.Close()
 		return nil, err
-	}
-	if err := backfillHistoryFTS(db); err != nil {
-		_ = db.Close()
-		return nil, fmt.Errorf("backfill history index: %w", err)
 	}
 	return &Store{db: db}, nil
 }
@@ -483,149 +295,6 @@ func (s *Store) Save(id string, from int, msgs []llm.Message, model, provider st
 	return tx.Commit()
 }
 
-const (
-	defaultArtifactListLimit = 100
-	maxArtifactListLimit     = 1000
-)
-
-// LookupArtifact returns one artifact reference only when it belongs to the
-// supplied session. The caller still reads the payload through artifact.Store,
-// which derives its path from the validated hash rather than this row's path.
-func (s *Store) LookupArtifact(ctx context.Context, sessionID, id string) (artifact.Metadata, error) {
-	if strings.TrimSpace(sessionID) == "" {
-		return artifact.Metadata{}, fmt.Errorf("session id is required")
-	}
-	if strings.TrimSpace(id) == "" {
-		return artifact.Metadata{}, fmt.Errorf("artifact id is required")
-	}
-	row := s.db.QueryRowContext(ctx, `SELECT session_id, message_seq, id, tool_call_id,
-		tool_name, media_type, original_bytes, stored_bytes, hash, path, complete, metadata, created_at
-		FROM artifacts WHERE session_id=? AND id=?
-		ORDER BY created_at DESC, message_seq DESC, tool_call_id LIMIT 1`, sessionID, id)
-	return scanArtifact(row)
-}
-
-// ListArtifacts returns a bounded, deterministic artifact catalog for one
-// session. Query matches stable text metadata only; it never searches payload
-// contents and never accepts a filesystem path.
-func (s *Store) ListArtifacts(ctx context.Context, sessionID string, filter artifact.Filter, limit int) ([]artifact.Metadata, error) {
-	if strings.TrimSpace(sessionID) == "" {
-		return nil, fmt.Errorf("session id is required")
-	}
-	if limit <= 0 {
-		limit = defaultArtifactListLimit
-	}
-	if limit > maxArtifactListLimit {
-		limit = maxArtifactListLimit
-	}
-	query := `SELECT session_id, message_seq, id, tool_call_id, tool_name,
-		media_type, original_bytes, stored_bytes, hash, path, complete, metadata, created_at
-		FROM artifacts WHERE session_id=?`
-	args := []any{sessionID}
-	if filter.ToolName != "" {
-		query += ` AND tool_name=?`
-		args = append(args, filter.ToolName)
-	}
-	if filter.ToolCallID != "" {
-		query += ` AND tool_call_id=?`
-		args = append(args, filter.ToolCallID)
-	}
-	if filter.Query != "" {
-		like := "%" + filter.Query + "%"
-		query += ` AND (id LIKE ? OR tool_call_id LIKE ? OR tool_name LIKE ? OR media_type LIKE ? OR metadata LIKE ?)`
-		args = append(args, like, like, like, like, like)
-	}
-	if !filter.Since.IsZero() {
-		query += ` AND created_at>=?`
-		args = append(args, filter.Since.UTC().Format(time.RFC3339))
-	}
-	if !filter.Until.IsZero() {
-		query += ` AND created_at<=?`
-		args = append(args, filter.Until.UTC().Format(time.RFC3339))
-	}
-	query += ` ORDER BY created_at DESC, message_seq DESC, id ASC, tool_call_id ASC LIMIT ?`
-	args = append(args, limit)
-	rows, err := s.db.QueryContext(ctx, query, args...)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close() }()
-	var out []artifact.Metadata
-	for rows.Next() {
-		meta, err := scanArtifact(rows)
-		if err != nil {
-			return nil, err
-		}
-		out = append(out, meta)
-	}
-	return out, rows.Err()
-}
-
-type scanner interface {
-	Scan(dest ...any) error
-}
-
-func scanArtifact(row scanner) (artifact.Metadata, error) {
-	var (
-		meta     artifact.Metadata
-		complete int
-		metadata string
-		created  string
-	)
-	if err := row.Scan(&meta.SessionID, &meta.MessageSeq, &meta.ID, &meta.ToolCallID,
-		&meta.ToolName, &meta.MediaType, &meta.OriginalBytes, &meta.StoredBytes,
-		&meta.Hash, &meta.Path, &complete, &metadata, &created); err != nil {
-		return artifact.Metadata{}, err
-	}
-	meta.Complete = complete != 0
-	if metadata != "" {
-		if err := json.Unmarshal([]byte(metadata), &meta.Metadata); err != nil {
-			return artifact.Metadata{}, fmt.Errorf("parse artifact metadata: %w", err)
-		}
-	}
-	var err error
-	meta.CreatedAt, err = time.Parse(time.RFC3339, created)
-	if err != nil {
-		return artifact.Metadata{}, fmt.Errorf("parse artifact timestamp: %w", err)
-	}
-	return meta, nil
-}
-
-// ReferencedArtifactHashes returns the payload hashes still referenced by any
-// session row. Callers can pass the result to artifact.Store.GarbageCollect
-// after removing sessions; payload files are intentionally outside SQLite.
-func (s *Store) ReferencedArtifactHashes(ctx context.Context) (map[string]bool, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT DISTINCT hash FROM artifacts`)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close() }()
-	refs := map[string]bool{}
-	for rows.Next() {
-		var hash string
-		if err := rows.Scan(&hash); err != nil {
-			return nil, err
-		}
-		refs[hash] = true
-	}
-	return refs, rows.Err()
-}
-
-// GarbageCollectArtifacts removes unreferenced payloads after consulting this
-// session database for the complete set of live references. Keeping the
-// reference query and payload deletion in one helper makes the safe cleanup
-// sequence hard to accidentally reverse at a call site.
-func (s *Store) GarbageCollectArtifacts(ctx context.Context, payloads *artifact.Store, maxAge time.Duration, maxBytes int64) (int, error) {
-	if payloads == nil {
-		return 0, fmt.Errorf("artifact store is required")
-	}
-	referenced, err := s.ReferencedArtifactHashes(ctx)
-	if err != nil {
-		return 0, err
-	}
-	return payloads.GarbageCollect(ctx, referenced, maxAge, maxBytes)
-}
-
 // DeleteSession removes a session and its database-owned history. It does not
 // remove immutable payload files; run ReferencedArtifactHashes followed by
 // artifact.Store.GarbageCollect to reclaim payloads no longer referenced by
@@ -636,7 +305,7 @@ func (s *Store) DeleteSession(id string) error {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	for _, table := range []string{"artifacts", "messages", "history_fts", "tasks", "snapshots", "schedules", "compactions", "goal_checkpoints", "goals", "observations", "search_snapshots"} {
+	for _, table := range []string{"artifacts", "messages", "history_fts", "tasks", "snapshots", "schedules", "compactions", "goal_checkpoints", "goals", "observations", "search_snapshots", "workflow_results"} {
 		if _, err := tx.Exec(`DELETE FROM `+table+` WHERE session_id=?`, id); err != nil {
 			return err
 		}
@@ -899,27 +568,6 @@ func (s *Store) LastExchange(id string) (user, assistant string) {
 	return user, assistant
 }
 
-// ClearMessages deletes the stored message rows for a session (the session
-// row is kept). Used after compaction rewrites history: the compacted
-// messages are smaller and re-seqenced from 0, so the old rows must go first.
-func (s *Store) ClearMessages(id string) error {
-	tx, err := s.db.Begin()
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tx.Rollback() }()
-	if _, err := tx.Exec(`DELETE FROM messages WHERE session_id=?`, id); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(`DELETE FROM history_fts WHERE session_id=?`, id); err != nil {
-		return err
-	}
-	if _, err := tx.Exec(`DELETE FROM artifacts WHERE session_id=?`, id); err != nil {
-		return err
-	}
-	return tx.Commit()
-}
-
 // DeleteFrom drops every stored message with seq >= from, plus the workspace
 // snapshots for those turns (their refs stop being restorable once the
 // conversation no longer contains the turn). seq equals the conversation
@@ -942,6 +590,9 @@ func (s *Store) DeleteFrom(id string, from int) error {
 		return err
 	}
 	if _, err := tx.Exec(`DELETE FROM artifacts WHERE session_id=? AND message_seq>=?`, id, from); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM workflow_results WHERE session_id=? AND message_seq>=?`, id, from); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -1043,6 +694,22 @@ type Compaction struct {
 	Seq     int    // generation (1-based)
 	Cutoff  int    // raw-log seq the summary replaces
 	Summary string // the generated summary text
+}
+
+// PersistCompaction performs the canonical compaction persistence sequence:
+// 1. Saves unpersisted messages if msgs is longer than saved.
+// 2. Computes the raw database cutoff for the compaction cutoff.
+// 3. Records the compaction event.
+func (s *Store) PersistCompaction(id string, saved int, msgs []llm.Message, model, provider, summary string, cutoff int) error {
+	if s == nil || id == "" {
+		return nil
+	}
+	if len(msgs) > saved {
+		if err := s.Save(id, saved, msgs, model, provider); err != nil {
+			return err
+		}
+	}
+	return s.RecordCompaction(id, s.RawCutoff(id, cutoff, msgs), summary)
 }
 
 // RecordCompaction appends a compaction event. The raw messages stay.
@@ -1201,6 +868,12 @@ func (s *Store) Fork(srcID string, uptoSeq int, title string) (string, error) {
 		if _, err := tx.Exec(`INSERT INTO compactions (session_id, seq, cutoff, summary, created_at)
 			SELECT ?, seq, cutoff, summary, created_at FROM compactions
 			WHERE session_id=? AND cutoff<=?`, newID, srcID, uptoSeq); err != nil {
+			return "", err
+		}
+		if _, err := tx.Exec(`INSERT INTO workflow_results
+			(session_id, result_id, kind, version, payload, role, provider, model, message_seq, created_at)
+			SELECT ?, result_id, kind, version, payload, role, provider, model, message_seq, created_at
+			FROM workflow_results WHERE session_id=? AND message_seq<=?`, newID, srcID, uptoSeq); err != nil {
 			return "", err
 		}
 	}

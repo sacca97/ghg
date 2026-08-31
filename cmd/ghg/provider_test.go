@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/sacca97/ghg/internal/config"
@@ -63,5 +64,25 @@ capabilities:
 	}
 	if _, err := catalog.Models(context.Background()); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestNewAgentFromRouteRequiresCredentials(t *testing.T) {
+	profiles := provider.Profiles{}
+	cfg := &config.Config{
+		Providers: map[string]config.Provider{
+			"anthropic": {BaseURL: "https://api.anthropic.com", API: "anthropic-messages"},
+		},
+		Models: map[string]config.Model{
+			"claude": {Providers: []string{"anthropic"}},
+		},
+	}
+	route, err := cfg.Resolve("claude", "anthropic")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = newAgentFromRoute(cfg, profiles, route, "acting", "system")
+	if err == nil || !strings.Contains(err.Error(), "no API key") {
+		t.Fatalf("expected missing API key error, got: %v", err)
 	}
 }
