@@ -43,6 +43,8 @@ func TestToolExpand(t *testing.T) {
 	screenY := y0 - m.vp.YOffset + 2
 	tm, _ = m.Update(tea.MouseMsg{Action: tea.MouseActionPress, Button: tea.MouseButtonLeft, X: 5, Y: screenY})
 	m = tm.(*model)
+	tm, _ = m.Update(tea.MouseMsg{Action: tea.MouseActionRelease, Button: tea.MouseButtonLeft, X: 5, Y: screenY})
+	m = tm.(*model)
 	if !m.blocks[0].expanded {
 		t.Fatalf("click at screen Y=%d should expand the tool block", screenY)
 	}

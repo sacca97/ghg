@@ -4,6 +4,8 @@
 package search
 
 import (
+	"cmp"
+	"container/heap"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -191,6 +193,44 @@ func InvalidateFileIndex(root string) {
 	fileIndexes.Unlock()
 }
 
+type fuzzyHit struct {
+	path       string
+	tier       int
+	start      int
+	depth      int
+	pathLength int
+}
+
+func compareHits(a, b fuzzyHit) int {
+	if a.tier != b.tier {
+		return cmp.Compare(a.tier, b.tier)
+	}
+	if a.start != b.start {
+		return cmp.Compare(a.start, b.start)
+	}
+	if a.depth != b.depth {
+		return cmp.Compare(a.depth, b.depth)
+	}
+	if a.pathLength != b.pathLength {
+		return cmp.Compare(a.pathLength, b.pathLength)
+	}
+	return cmp.Compare(a.path, b.path)
+}
+
+type hitMaxHeap []fuzzyHit
+
+func (h hitMaxHeap) Len() int           { return len(h) }
+func (h hitMaxHeap) Less(i, j int) bool { return compareHits(h[i], h[j]) > 0 } // worst match at root
+func (h hitMaxHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
+func (h *hitMaxHeap) Push(x any)        { *h = append(*h, x.(fuzzyHit)) }
+func (h *hitMaxHeap) Pop() any {
+	old := *h
+	n := len(old)
+	x := old[n-1]
+	*h = old[0 : n-1]
+	return x
+}
+
 // FuzzyFiles returns up to limit paths relative to root, ranked after every
 // candidate has been scored. In particular, limit never cuts traversal short:
 // a strong match late in a large tree can still displace an early weak one.
@@ -201,14 +241,29 @@ func FuzzyFiles(root, query string, limit int) []string {
 	}
 	files := indexedFiles(root)
 	q := strings.ToLower(strings.TrimSpace(query))
-	type hit struct {
-		path       string
-		tier       int
-		start      int
-		depth      int
-		pathLength int
+	if limit <= 0 {
+		hits := make([]fuzzyHit, 0, len(files))
+		for _, name := range files {
+			pathLower := strings.ToLower(name)
+			base := pathLower[strings.LastIndexByte(pathLower, '/')+1:]
+			tier, start := fuzzyTier(base, pathLower, q)
+			if tier < 0 {
+				continue
+			}
+			hits = append(hits, fuzzyHit{
+				path: name, tier: tier, start: start,
+				depth: strings.Count(name, "/"), pathLength: len(name),
+			})
+		}
+		slices.SortFunc(hits, compareHits)
+		out := make([]string, len(hits))
+		for i, h := range hits {
+			out[i] = h.path
+		}
+		return out
 	}
-	hits := make([]hit, 0, len(files))
+
+	h := make(hitMaxHeap, 0, limit)
 	for _, name := range files {
 		pathLower := strings.ToLower(name)
 		base := pathLower[strings.LastIndexByte(pathLower, '/')+1:]
@@ -216,32 +271,21 @@ func FuzzyFiles(root, query string, limit int) []string {
 		if tier < 0 {
 			continue
 		}
-		hits = append(hits, hit{
+		cand := fuzzyHit{
 			path: name, tier: tier, start: start,
 			depth: strings.Count(name, "/"), pathLength: len(name),
-		})
+		}
+		if len(h) < limit {
+			heap.Push(&h, cand)
+		} else if compareHits(cand, h[0]) < 0 {
+			h[0] = cand
+			heap.Fix(&h, 0)
+		}
 	}
-	sort.SliceStable(hits, func(i, j int) bool {
-		if hits[i].tier != hits[j].tier {
-			return hits[i].tier < hits[j].tier
-		}
-		if hits[i].start != hits[j].start {
-			return hits[i].start < hits[j].start
-		}
-		if hits[i].depth != hits[j].depth {
-			return hits[i].depth < hits[j].depth
-		}
-		if hits[i].pathLength != hits[j].pathLength {
-			return hits[i].pathLength < hits[j].pathLength
-		}
-		return hits[i].path < hits[j].path
-	})
-	if limit > 0 && len(hits) > limit {
-		hits = hits[:limit]
-	}
-	out := make([]string, len(hits))
-	for i, h := range hits {
-		out[i] = h.path
+	slices.SortFunc(h, compareHits)
+	out := make([]string, len(h))
+	for i, item := range h {
+		out[i] = item.path
 	}
 	return out
 }

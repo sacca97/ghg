@@ -66,6 +66,12 @@ func (c *OpenAIResponsesClient) endpoint(suffix string) (string, error) {
 	return base + suffix, nil
 }
 
+// Note on continuation (previous_response_id):
+// previous_response_id is intentionally deferred:
+// - It requires provider-documented support (OpenCode and CommandCode currently do not document or use it).
+// - It requires preserving response IDs and guaranteeing every subsequent request is a strict append-only continuation.
+// - Compaction, rewind, model/provider switching, system-prompt changes, retries, and resume must invalidate the chain.
+// Stateless full-history replay with a stable prompt prefix and session-scoped prompt_cache_key is the proven production approach.
 type openAIResponsesRequest struct {
 	Model           string                    `json:"model"`
 	Instructions    string                    `json:"instructions,omitempty"`
@@ -74,6 +80,8 @@ type openAIResponsesRequest struct {
 	MaxOutputTokens int                       `json:"max_output_tokens,omitempty"`
 	Reasoning       *openAIResponsesReasoning `json:"reasoning,omitempty"`
 	Stream          bool                      `json:"stream,omitempty"`
+	Store           *bool                     `json:"store,omitempty"`
+	PromptCacheKey  string                    `json:"prompt_cache_key,omitempty"`
 }
 
 type openAIResponsesTool struct {
@@ -126,10 +134,13 @@ type openAIResponsesFunctionCallOutput struct {
 // next tool-call turn's context.
 func newOpenAIResponsesRequest(req Request, stream bool) (openAIResponsesRequest, error) {
 	msgs := repairToolHistory(stripAuthoredPreserveBlocks(req.Messages))
+	storeFalse := false
 	wire := openAIResponsesRequest{
 		Model:           req.Model,
 		MaxOutputTokens: req.MaxTokens,
 		Stream:          stream,
+		Store:           &storeFalse,
+		PromptCacheKey:  strings.TrimSpace(req.SessionID),
 	}
 
 	var instructions []string

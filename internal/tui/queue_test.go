@@ -133,7 +133,7 @@ func TestQueueSelResetsOnSteer(t *testing.T) {
 // forms do) — anything else must queue as a message.
 func TestBusyCmdAllowList(t *testing.T) {
 	runs := []string{
-		"/help", "/theme", "/theme dark", "/mouse", "/effort", "/effort high",
+		"/help", "/theme", "/theme dark", "/effort", "/effort high",
 		"/tasks", "/tasks abc123", "/goal", "/goal clear", "/goal rounds 5",
 		"/cd", "/cd /tmp", "/pwd",
 	}

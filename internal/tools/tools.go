@@ -63,12 +63,6 @@ func Defs(ts []Tool) []llm.Tool {
 	return defs
 }
 
-// Suggester returns the closest known tool names for an unknown one —
-// installed by the agent (which knows the live MCP tool set) so a stale or
-// typo'd tool call nudges the model toward the right name instead of
-// dead-ending the turn.
-var Suggester func(name string) []string
-
 // Execute runs the named tool. Errors are returned as strings so they can be
 // fed back to the model rather than aborting the loop.
 func Execute(ctx context.Context, ts []Tool, name string, args json.RawMessage) string {
@@ -114,10 +108,12 @@ func ExecuteResult(ctx context.Context, ts []Tool, name string, args json.RawMes
 		}
 	}
 	msg := fmt.Sprintf("Error: unknown tool %q", name)
-	if Suggester != nil {
-		if hints := Suggester(name); len(hints) > 0 {
-			msg += " — did you mean " + strings.Join(hints, " or ") + "?"
-		}
+	names := make([]string, len(ts))
+	for i, tool := range ts {
+		names[i] = tool.Def.Function.Name
+	}
+	if hints := SuggestTool(name, names); len(hints) > 0 {
+		msg += " — did you mean " + strings.Join(hints, " or ") + "?"
 	}
 	result := errorToolResult(errors.New(strings.TrimPrefix(msg, "Error: ")))
 	result.Source = name
@@ -298,7 +294,7 @@ func boolToExitCode(success bool) int {
 func readTool() Tool {
 	return resultTool(llm.NewTool("read",
 		"Read a bounded range of complete lines and issue an observation id for later range-authorized edits. Use offset/limit to continue.",
-		`{"type":"object","properties":{"path":{"type":"string","description":"Path to the file"},"offset":{"type":"number","description":"1-based line to start from (default 1)"},"limit":{"type":"number","description":"Max complete lines to return (default 200, maximum 1000)"}},"required":["path"]}`),
+		`{"type":"object","properties":{"path":{"type":"string","description":"Path to the file"},"offset":{"type":"number","description":"1-based line to start from (default 1)"},"limit":{"type":"number","description":"Max complete lines to return (default 250, maximum 1000)"}},"required":["path"]}`),
 		runReadResult)
 }
 
@@ -339,7 +335,13 @@ func runWriteResult(ctx context.Context, args json.RawMessage) (ToolResult, erro
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return ToolResult{}, err
 	}
-	if err := os.WriteFile(path, []byte(a.Content), 0o644); err != nil {
+	mode := os.FileMode(0o644)
+	if info, statErr := os.Stat(path); statErr == nil {
+		mode = info.Mode()
+	} else if !os.IsNotExist(statErr) {
+		return ToolResult{}, statErr
+	}
+	if err := atomicWriteFile(path, []byte(a.Content), mode); err != nil {
 		return ToolResult{}, err
 	}
 	hookReports := runtimePostEditReports(ctx, []string{path})

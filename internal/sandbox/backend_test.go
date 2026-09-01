@@ -215,3 +215,44 @@ func TestRestrictedWrapReportsBackendAvailability(t *testing.T) {
 		}
 	}
 }
+
+func TestCompiledPolicyIsolationAndGrants(t *testing.T) {
+	policy, _, gitRoot := backendTestPolicy(t, NetworkDeny)
+	if policy.compiled == nil {
+		t.Fatal("expected policy.compiled to be non-nil")
+	}
+
+	p1 := seatbeltProfile(policy)
+	p2 := seatbeltProfile(policy)
+	if p1 != p2 {
+		t.Fatalf("seatbeltProfile mismatch on same policy")
+	}
+
+	extraDir := t.TempDir()
+	granted, err := policy.Grant([]string{extraDir}, nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if granted.compiled == nil {
+		t.Fatal("expected granted.compiled to be non-nil")
+	}
+	if granted.compiled == policy.compiled {
+		t.Fatal("granted policy must not share compiled pointer with parent")
+	}
+
+	grantedProfile := seatbeltProfile(granted)
+	if !strings.Contains(grantedProfile, filepath.Clean(extraDir)) {
+		t.Fatalf("granted profile missing extraDir: %s", extraDir)
+	}
+	if strings.Contains(p1, filepath.Clean(extraDir)) {
+		t.Fatalf("parent profile was polluted with extraDir")
+	}
+
+	protectedGranted, err := policy.GrantProtected([]string{gitRoot})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if protectedGranted.compiled == policy.compiled {
+		t.Fatal("protected granted policy must not share compiled pointer with parent")
+	}
+}

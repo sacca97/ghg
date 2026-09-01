@@ -8,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sacca97/ghg/internal/agent"
 	"github.com/sacca97/ghg/internal/session"
 )
 
@@ -151,13 +150,7 @@ func TestExportProposedPlan(t *testing.T) {
 	m.provName = "fast-prov"
 
 	// Propose a plan before any session exists
-	m.finishPlanProposal(planProposalMsg{
-		plan: agent.Plan{
-			Goal:             "Migrate database",
-			Steps:            []string{"step 1: backup", "step 2: apply migrations"},
-			AcceptanceChecks: []string{"check table exists"},
-		},
-	})
+	m.proposedPlanMD = "# Plan: Migrate database\n\n1. step 1: backup\n2. step 2: apply migrations\n"
 
 	outFile := filepath.Join(tempDir, "plan-export.md")
 	m.exportResultCommand("/export-result plan " + outFile)

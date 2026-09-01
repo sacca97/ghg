@@ -601,7 +601,10 @@ func TestTaskUsesTinyRoleFactoryForForegroundAndBackground(t *testing.T) {
 			}
 
 			if background {
-				task := parent.StartBackground(context.Background(), "probe", "check it")
+				task, err := parent.StartBackground(context.Background(), "probe", "check it")
+				if err != nil {
+					t.Fatal(err)
+				}
 				select {
 				case <-task.Done:
 				case <-time.After(2 * time.Second):
@@ -637,6 +640,25 @@ func TestTaskToolBadArgs(t *testing.T) {
 	out := tools.Execute(context.Background(), ag.Tools, "task", json.RawMessage(`{bad`))
 	if !strings.HasPrefix(out, "Error") {
 		t.Fatalf("expected error, got %q", out)
+	}
+}
+
+func TestSubagentsDisabled(t *testing.T) {
+	ag := New(testBackend("http://unused", "k"), "m", 100, "sys")
+	ag.SubagentsDisabled = true
+
+	// AllTools should not include the task tool
+	for _, tool := range ag.AllTools() {
+		if tool.Def.Function.Name == "task" {
+			t.Fatalf("AllTools() should not include task tool when SubagentsDisabled is true")
+		}
+	}
+
+	// Executing the task tool directly should return a clear disabled error
+	out := taskTool(ag)
+	_, err := out.Run(context.Background(), json.RawMessage(`{"prompt":"test"}`))
+	if err == nil || !strings.Contains(err.Error(), "disabled") {
+		t.Fatalf("taskTool run when disabled = %v, want disabled error", err)
 	}
 }
 

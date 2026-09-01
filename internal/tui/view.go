@@ -27,6 +27,7 @@ const (
 	blockAssistant                  // raw markdown: re-render through glamour
 	blockTool                       // raw tool result: collapsed preview, expandable
 	blockToolRun                    // a running tool call: verb line, collapses on completion
+	blockPlan                       // proposed plan markdown: re-render with plan styling
 )
 
 // toolPreviewLines is how many lines of a tool result show when collapsed.
@@ -85,6 +86,13 @@ func (b block) render(width int) string {
 		}
 		body := indentLines(renderMarkdown(b.text, w), 2)
 		return botStyle.Render("● ") + strings.TrimPrefix(body, "  ")
+	case blockPlan:
+		w := width - 2 // body indents under the "◎ " marker
+		if w <= 0 {
+			w = 80 // no terminal size yet: sane default
+		}
+		body := indentLines(renderMarkdown(b.text, w), 2)
+		return botStyle.Render("◎ ") + strings.TrimPrefix(body, "  ")
 	case blockTool:
 		lines := strings.Split(strings.TrimRight(b.text, "\n"), "\n")
 		if b.expanded || len(lines) <= toolPreviewLines {
@@ -139,6 +147,10 @@ func (m *model) appendAssistantBlock(s string) {
 	m.appendRaw(blockAssistant, s)
 }
 
+func (m *model) appendPlanBlock(s string) {
+	m.appendRaw(blockPlan, s)
+}
+
 func (m *model) appendRaw(kind blockKind, text string) {
 	m.blocks = append(m.blocks, block{kind: kind, text: text})
 	m.refreshVP()
@@ -162,7 +174,7 @@ func (m *model) refreshVP() {
 	width := max(m.width, minRenderWidth)
 	var b strings.Builder
 	if n := len(m.blocks); n > 0 {
-		b.Grow(n*24 + 1<<20) // one big allocation up front
+		b.Grow(n * 24)
 	}
 	line := 0
 	for i := range m.blocks {
@@ -180,6 +192,8 @@ func (m *model) refreshVP() {
 	if pad := m.contentPad(); pad > 0 {
 		content = strings.Repeat("\n", pad) + content
 	}
+	m.viewportContent = content
+	m.plainRows = nil
 	m.vp.SetContent(content)
 	if m.follow {
 		m.vp.GotoBottom()
@@ -226,7 +240,11 @@ func (m *model) inputRule() string {
 const maxRuleWidth = 120
 
 func (m *model) viewportView() string {
-	return sanitizeView(m.vp.View())
+	view := m.vp.View()
+	if m.selection != nil && m.selection.hasRange() {
+		view = m.selectedViewportView(view)
+	}
+	return sanitizeView(view)
 }
 
 func onOff(b bool) string {
@@ -375,13 +393,14 @@ func (m *model) contextStatus() string {
 		return "ctx 0"
 	}
 	used := m.agent.ContextTokens()
+	limit := m.agent.ContextLimit
 	if m.workerClient != nil || m.workerProcess != nil || m.workerState != "" {
 		used = m.workerContextTokens
 	}
-	if m.agent.ContextLimit <= 0 {
+	if limit <= 0 {
 		return "ctx " + fmtTok(used)
 	}
-	return fmt.Sprintf("ctx %s/%s", fmtTok(used), fmtTok(m.agent.ContextLimit))
+	return fmt.Sprintf("ctx %s/%s", fmtTok(used), fmtTok(limit))
 }
 
 // sessionCost returns the session's cumulative USD spend at the current
@@ -489,7 +508,7 @@ func indentLines(s string, n int) string {
 }
 
 // toggleThinking flips reasoning timer display (ctrl+o / settings) and persists
-// the choice to the global config, like /mouse does.
+// the choice to the global config.
 func (m *model) toggleThinking() {
 	m.setThinking(!m.showThinking)
 }
@@ -592,7 +611,7 @@ func (m *model) View() string {
 		b.WriteString("\n" + m.permView() + "\n")
 	}
 	if m.busy {
-		hint := " thinking… (enter queues · /theme /mouse /effort run now · esc interrupts · ctrl+c ctrl+c interrupts)"
+		hint := " thinking… (enter queues · /theme /effort run now · esc interrupts · ctrl+c ctrl+c interrupts)"
 		if m.iactive != nil {
 			hint = " bash (interactive) — type to respond · ctrl+c ctrl+c to cancel"
 		} else if m.interrupt1 {
@@ -898,7 +917,11 @@ func (m *model) pickerView() string {
 		rows = append(rows, previewBlock(youStyle.Render("❯ "), prev[0], m.width)...)
 		rows = append(rows, previewBlock(botStyle.Render("● "), prev[1], m.width)...)
 	}
-	rows = append(rows, dimStyle.Render(fmt.Sprintf("  (%d/%d) ↑ older · ↓ newer · enter resume · esc cancel", p.idx+1, len(p.metas))))
+	footer := fmt.Sprintf("  (%d/%d) ↑/k older · ↓/j newer · enter resume · dd delete · esc cancel", p.idx+1, len(p.metas))
+	if p.pendingD {
+		footer = fmt.Sprintf("  (%d/%d) press d again to delete session %s", p.idx+1, len(p.metas), p.metas[p.idx].ID)
+	}
+	rows = append(rows, dimStyle.Render(footer))
 	// pad so the footer stays at the bottom of the screen
 	for len(rows) < m.height-1 {
 		rows = append(rows, "")

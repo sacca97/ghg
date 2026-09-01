@@ -4,6 +4,8 @@ import (
 	"context"
 	"strings"
 	"testing"
+
+	"github.com/sacca97/ghg/internal/llm"
 )
 
 func TestSuggestTool(t *testing.T) {
@@ -58,16 +60,18 @@ func TestLevenshteinCap(t *testing.T) {
 }
 
 func TestExecuteSuggestsOnUnknownTool(t *testing.T) {
-	defer func() { Suggester = nil }()
-	Suggester = func(name string) []string { return []string{"mcp__docs__greet"} }
-	out := Execute(context.Background(), nil, "mcp__doc__greet", nil)
+	docs := Tool{Def: llm.NewTool("mcp__docs__greet", "", `{}`)}
+	out := Execute(context.Background(), []Tool{docs}, "mcp__doc__greet", nil)
 	if !strings.Contains(out, `unknown tool "mcp__doc__greet"`) || !strings.Contains(out, "did you mean mcp__docs__greet") {
 		t.Errorf("got %q", out)
 	}
-	// No suggester → plain error (zero-config path unchanged).
-	Suggester = nil
-	out = Execute(context.Background(), nil, "nope", nil)
+	other := Tool{Def: llm.NewTool("mcp__other__greet", "", `{}`)}
+	out = Execute(context.Background(), []Tool{other}, "mcp__other__grete", nil)
+	if !strings.Contains(out, "did you mean mcp__other__greet") {
+		t.Errorf("current tool set was not used: %q", out)
+	}
+	out = Execute(context.Background(), []Tool{docs}, "nope", nil)
 	if strings.Contains(out, "did you mean") {
-		t.Errorf("no-suggester path should be plain, got %q", out)
+		t.Errorf("unrelated tool should have no suggestion, got %q", out)
 	}
 }

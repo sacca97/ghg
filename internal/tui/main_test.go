@@ -6,7 +6,7 @@ import (
 )
 
 // TestMain is a safety net: several TUI code paths persist through
-// config.Save() (setEffort, switchModel, compactCommand, /mouse). Without
+// config.Save() (setEffort, switchModel, compactCommand). Without
 // isolation those writes land in the REAL ~/.ghg/config.json — this exact
 // bug corrupted the config twice. Point the whole test binary at a scratch
 // GHG_HOME so even a future test that forgets t.Setenv cannot clobber the

@@ -145,6 +145,29 @@ func (r *Registry) Load(ctx context.Context, sessionID, id string) (Record, erro
 	return record, nil
 }
 
+// FindLatest returns the most recent observation matching path and exact line span.
+func (r *Registry) FindLatest(sessionID, path string, startLine, endLine int) (Record, bool) {
+	if r == nil {
+		return Record{}, false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var best Record
+	found := false
+	for key, record := range r.records {
+		if sessionID != "" && !strings.HasPrefix(key, sessionID+"\x00") && !strings.HasPrefix(key, "\x00") {
+			continue
+		}
+		if record.Path == path && record.StartLine == startLine && record.EndLine == endLine {
+			if !found || record.CreatedAt.After(best.CreatedAt) {
+				best = record
+				found = true
+			}
+		}
+	}
+	return best, found
+}
+
 func sessionKey(sessionID, id string) string { return sessionID + "\x00" + id }
 
 // NewID returns a short opaque observation identifier.

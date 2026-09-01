@@ -25,7 +25,7 @@ type workerApprovalFlight struct {
 func (w *workerProcessState) Snapshot(context.Context) (any, error) {
 	w.mu.Lock()
 	state, detached, activeTool := w.state, w.detached, w.activeTool
-	modelName, providerName, role := w.modelName, w.provider, w.role
+	modelName, providerName, role, mode := w.modelName, w.provider, w.role, w.mode
 	ag := w.ag
 	var modelID, protocol, effort string
 	var contextLimit int
@@ -36,16 +36,16 @@ func (w *workerProcessState) Snapshot(context.Context) (any, error) {
 	w.mu.Unlock()
 	live := w.liveSnapshot()
 	if ag == nil {
-		return workerSnapshot{SessionID: w.sessionID, State: state, Detached: detached}, nil
+		return workerSnapshot{SessionID: w.sessionID, State: state, Detached: detached, Mode: mode}, nil
 	}
 	return workerSnapshot{
 		SessionID: w.sessionID, State: state, Detached: detached,
 		Model: modelID, ModelName: modelName, Provider: providerName,
-		Role: role, Protocol: protocol, Effort: effort,
+		Role: role, Protocol: protocol, Effort: effort, Mode: mode,
 		ContextLimit: contextLimit, ContextTokens: ag.ContextTokens(),
 		Usage: ag.Usage(), Messages: boundedWorkerMessages(ag.MessagesSnapshot()),
 		Tasks: w.taskStates(), Pending: w.pendingState(), ActiveTool: activeTool,
-		LiveText: live.text, LiveThink: live.think, LiveTool: live.tool,
+		LiveText: live.text, LiveThink: live.think, LiveTool: live.tool, LivePlan: live.plan,
 	}, nil
 }
 
@@ -88,15 +88,6 @@ func (w *workerProcessState) Command(_ context.Context, command workerwire.Comma
 		return workerwire.CommandResult{Payload: json.RawMessage(`{"accepted":true}`)}, nil
 	case workerwire.CommandCompact:
 		if !w.startCompact() {
-			return workerwire.CommandResult{}, errors.New("worker is busy or stopping")
-		}
-		return workerwire.CommandResult{Payload: json.RawMessage(`{"accepted":true}`)}, nil
-	case workerwire.CommandPlan:
-		var request workerPlanRequest
-		if err := json.Unmarshal(command.Payload, &request); err != nil || strings.TrimSpace(request.Goal) == "" {
-			return workerwire.CommandResult{}, errors.New("worker plan request is invalid")
-		}
-		if !w.startPlan(strings.TrimSpace(request.Goal)) {
 			return workerwire.CommandResult{}, errors.New("worker is busy or stopping")
 		}
 		return workerwire.CommandResult{Payload: json.RawMessage(`{"accepted":true}`)}, nil
@@ -197,11 +188,16 @@ func (w *workerProcessState) configure(request workerConfigureRequest) error {
 	if request.UpdateEffort {
 		w.ag.Effort = request.Effort
 	}
+	if request.Mode != "" {
+		w.mode = request.Mode
+		w.ag.PlanMode = (request.Mode == "plan")
+	}
 	w.modelName, w.provider, w.role = resolvedModel, resolvedProvider, role
 	configureWorkerCompaction(w.ag, w.cfg, w.profiles, systemPrompt)
 	effort := w.ag.Effort
 	protocol := w.ag.Protocol
 	modelID := w.ag.Model
+	mode := w.mode
 	state, detached := w.state, w.detached
 	w.mu.Unlock()
 	if w.store != nil {
@@ -213,6 +209,7 @@ func (w *workerProcessState) configure(request workerConfigureRequest) error {
 	w.publish("route", workerConfigureRequest{
 		Model: modelID, ModelName: resolvedModel, Provider: resolvedProvider,
 		Role: role, Protocol: protocol, Effort: effort, UpdateEffort: true,
+		Mode: mode,
 	}, true)
 	w.setState(state, detached, "route changed")
 	return nil
@@ -337,7 +334,7 @@ func (w *workerProcessState) pendingState() *workerApproval {
 const workerLiveTailBytes = 128 << 10
 
 type workerLiveSnapshot struct {
-	text, think, tool string
+	text, think, tool, plan string
 }
 
 func (w *workerProcessState) appendLive(kind, value string) {
@@ -352,6 +349,8 @@ func (w *workerProcessState) appendLive(kind, value string) {
 		w.liveThink = appendWorkerTail(w.liveThink, value)
 	case "tool_output":
 		w.liveToolOutput = appendWorkerTail(w.liveToolOutput, value)
+	case "plan":
+		w.livePlan = appendWorkerTail(w.livePlan, value)
 	}
 	w.liveMu.Unlock()
 }
@@ -359,12 +358,12 @@ func (w *workerProcessState) appendLive(kind, value string) {
 func (w *workerProcessState) liveSnapshot() workerLiveSnapshot {
 	w.liveMu.Lock()
 	defer w.liveMu.Unlock()
-	return workerLiveSnapshot{text: w.liveText, think: w.liveThink, tool: w.liveToolOutput}
+	return workerLiveSnapshot{text: w.liveText, think: w.liveThink, tool: w.liveToolOutput, plan: w.livePlan}
 }
 
 func (w *workerProcessState) clearLive() {
 	w.liveMu.Lock()
-	w.liveText, w.liveThink, w.liveToolOutput = "", "", ""
+	w.liveText, w.liveThink, w.liveToolOutput, w.livePlan = "", "", "", ""
 	w.liveMu.Unlock()
 }
 

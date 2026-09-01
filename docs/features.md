@@ -100,7 +100,7 @@ truncation, and Bash exploration redirects to JSON consumers.
 ### LSP navigation, safe rename, and post-edit hooks
 
 `internal/lsp/manager.go` owns one lazy language-server manager per TUI or
-headless run. The same `tools.ToolRuntime` is inherited by planners and
+headless run. The same `tools.ToolRuntime` is inherited by Plan mode and
 delegated agents, so server processes, document versions, sandbox policy, and
 hook configuration are not duplicated. The manager synchronizes exact file
 bytes before each request, advertises UTF-16 only, and warms covered files
@@ -110,7 +110,7 @@ The read-only `lsp` tool supports only `definition`, `references`,
 `document_symbol`, and `hover`. Results are canonical, policy-authorized,
 sorted, deduplicated, bounded, and marked untrusted: limits are 20
 definitions, 100 references, 200 flattened symbols, and 8 KiB of hover text.
-The built-in planner can use `lsp`, but not `lsp_rename`.
+Plan mode can use `lsp`, but not `lsp_rename`.
 
 `lsp_rename preview` validates a complete file-only `WorkspaceEdit`, converts
 UTF-16 ranges at exact rune boundaries, and stores the original/updated bytes
@@ -502,14 +502,13 @@ guarded, and a successful auth builds the first agent in place. Headless
   `agent.GoalFromContextMessages`); the TUI command mirrors `/compact`'s
   goroutine + `goalFromContextMsg` pattern, refusing while busy and running
   inline when headless. Tests: `goal_test.go` (`TestGoalFromContext*`).
-- **`/plan <goal>` / `/execute [plan]`** are an explicit two-step workflow. `/plan`
-  runs the built-in declarative planner on the `smart` role. It may inspect the
-  repository with only `read`, `grep`, and `glob`, then must finish with the
-  structured `submit_plan` tool; invalid or incomplete proposals are retried once
-  and displayed without starting an acting turn. `/execute` runs that proposal, or
-  supplied plain text/JSON, through the `fast` role; structured plans seed the
-  existing `todowrite` checklist first. The planner is never invoked for ordinary
-  chat. The command settings is bounded to the terminal height and scrolls with
+- **`/plan [goal]` / `/execute [plan]`** are an explicit two-step workflow. `/plan`
+  enters persistent read-only Plan mode on the `smart` role, where ordinary turns
+  can inspect the repository and either continue conversationally or finish with a
+  Markdown `<proposed_plan>` block. `/execute` runs that Markdown proposal, or
+  supplied plain text, through the `fast` role; the ordinary executor owns its
+  `todowrite` checklist. Plan mode is never invoked for ordinary chat. The command
+  settings is bounded to the terminal height and scrolls with
   ↑/↓ or the mouse wheel. The bottom status box's separate `(effort)` control
   cycles through off and the available effort levels.
 - The bottom status box keeps the active model/provider, a separate `(effort)` indicator,
@@ -533,13 +532,14 @@ guarded, and a successful auth builds the first agent in place. Headless
 `.agents/*.md` and user definitions from `~/.ghg/agents/*.md`. Each file has strict
 frontmatter (`name`, `description`, `role`, `tools`, and `max_rounds`) followed by
 its Markdown prompt. Project definitions take precedence over same-named user
-definitions; unknown tools and malformed files fail loading. The reserved built-in
-`planner` definition is always available and cannot be shadowed.
+definitions; unknown tools and malformed files fail loading. The built-in
+`reviewer` definition remains available and cannot be shadowed.
 
-The TUI `/plan` and headless `ghg run --plan-only` use that same planner runner.
-`ghg run --plan` emits the structured proposal and then executes it explicitly with
+The TUI `/plan` and headless `ghg run --plan-only` use the same ordinary Plan-mode
+turn loop. `ghg run --plan` emits the Markdown proposal and then executes it with
 the `fast` role. `--plan-only` never starts an executor and does not create a
-session. There is no autonomous replan loop.
+session. A missing proposal block is reported with a bounded response preview;
+there is no autonomous replan loop.
 
 Headless JSON output includes `model_call_start` and `model_call_end` events for
 planning, acting, and compaction calls. Each event identifies the role, provider,

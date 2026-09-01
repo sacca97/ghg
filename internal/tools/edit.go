@@ -258,15 +258,7 @@ func runObservedEdit(ctx context.Context, request editRequest) (ToolResult, erro
 				}
 			}
 			startLine := 1 + bytes.Count(final[:min(startByte, len(final))], []byte{'\n'})
-			readRes, readErr := runObservedRead(ctx, struct {
-				Path   string `json:"path"`
-				Offset int    `json:"offset"`
-				Limit  int    `json:"limit"`
-			}{
-				Path:   path,
-				Offset: startLine,
-				Limit:  maxEditReadbackLines,
-			})
+			readRes, readErr := readObservedContent(ctx, path, path, bytes.NewReader(final), startLine, maxEditReadbackLines)
 			if readErr != nil {
 				out.WriteString(editReadback(final, plan.operations))
 			} else {

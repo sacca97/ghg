@@ -71,8 +71,8 @@ func newAgentFromRoute(cfg *config.Config, profiles provider.Profiles, route con
 	if contextLimit <= 0 {
 		contextLimit = config.LoadModelsDev().ContextLength(route.APIID, modelsDevProviderIDs(resolved, route.ProviderName)...)
 	}
-	maxOut := route.Model.MaxOut
-	if maxOut <= 0 && hasCatalog {
+	maxOut := 0
+	if hasCatalog {
 		maxOut = cat.MaxCompletionTokens(route.APIID)
 	}
 	if maxOut <= 0 {
@@ -94,6 +94,7 @@ func newAgentFromRoute(cfg *config.Config, profiles provider.Profiles, route con
 		}
 	}
 	ag.CompactThreshold = config.CompactThreshold(cfg)
+	ag.SubagentsDisabled = !config.SubagentsEnabled(cfg)
 	configureSubagentFactory(ag, cfg, profiles)
 	return ag, nil
 }

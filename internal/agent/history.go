@@ -133,26 +133,30 @@ func runHistorySearch(a *Agent, ctx context.Context, args json.RawMessage) (tool
 		if cursor.offset > len(snapshot.Items) {
 			return tools.ToolResult{}, errors.New("history cursor is expired or invalid")
 		}
-	} else {
-		hits, err := store.SearchHistory(ctx, sessionID, in.Query, in.Role, in.Epoch, historySearchSnapshotLimit)
-		if err != nil {
-			if errors.Is(err, session.ErrInvalidHistoryQuery) {
-				return tools.ToolResult{}, errors.New("history query is invalid")
-			}
-			return tools.ToolResult{}, err
+		res, _ := renderHistorySearch(snapshot, cursor, limit)
+		return res, nil
+	}
+	hits, err := store.SearchHistory(ctx, sessionID, in.Query, in.Role, in.Epoch, historySearchSnapshotLimit)
+	if err != nil {
+		if errors.Is(err, session.ErrInvalidHistoryQuery) {
+			return tools.ToolResult{}, errors.New("history query is invalid")
 		}
-		items := make([]search.Item, 0, len(hits))
-		for _, hit := range hits {
-			data, _ := json.Marshal(historySearchItem{Seq: hit.Seq, Role: hit.Role, Epoch: hit.Epoch, Snippet: hit.Snippet})
-			items = append(items, search.Item{Path: string(data)})
-		}
-		snapshot = search.Snapshot{ID: search.NewID("history"), Kind: "history_search", Items: items, Complete: true}
+		return tools.ToolResult{}, err
+	}
+	items := make([]search.Item, 0, len(hits))
+	for _, hit := range hits {
+		data, _ := json.Marshal(historySearchItem{Seq: hit.Seq, Role: hit.Role, Epoch: hit.Epoch, Snippet: hit.Snippet})
+		items = append(items, search.Item{Path: string(data)})
+	}
+	snapshot = search.Snapshot{ID: search.NewID("history"), Kind: "history_search", Items: items, Complete: true}
+	cursor = historyCursor{kind: snapshot.Kind, id: snapshot.ID}
+	res, hasMore := renderHistorySearch(snapshot, cursor, limit)
+	if hasMore {
 		if err := a.saveHistorySnapshot(ctx, sessionID, snapshot); err != nil {
 			return tools.ToolResult{}, err
 		}
-		cursor = historyCursor{kind: snapshot.Kind, id: snapshot.ID}
 	}
-	return renderHistorySearch(snapshot, cursor, limit), nil
+	return res, nil
 }
 
 func runHistoryRead(a *Agent, ctx context.Context, args json.RawMessage) (tools.ToolResult, error) {
@@ -181,46 +185,50 @@ func runHistoryRead(a *Agent, ctx context.Context, args json.RawMessage) (tools.
 		if cursor.offset > len(snapshot.Items) {
 			return tools.ToolResult{}, errors.New("history cursor is expired or invalid")
 		}
-	} else {
-		if in.Start == nil || in.End == nil {
-			return tools.ToolResult{}, errors.New("start_seq and end_seq are required")
+		res, _ := renderHistoryRead(snapshot, cursor)
+		return res, nil
+	}
+	if in.Start == nil || in.End == nil {
+		return tools.ToolResult{}, errors.New("start_seq and end_seq are required")
+	}
+	if *in.Start < 0 || *in.End < *in.Start {
+		return tools.ToolResult{}, errors.New("history range is invalid")
+	}
+	if *in.End-*in.Start+1 > historyReadRangeLimit {
+		return tools.ToolResult{}, errors.New("history range is too broad; read a narrower range")
+	}
+	messages, diagnostics, err := a.HistoryCatalog.ReadHistory(ctx, sessionID, *in.Start, *in.End, in.Epoch, historyReadSnapshotLimit)
+	if err != nil {
+		return tools.ToolResult{}, err
+	}
+	items := make([]search.Item, 0, len(messages)+len(diagnostics))
+	snapshotBytes := 0
+	for _, item := range messages {
+		data := historyReadItemFromMessage(item)
+		encoded, _ := json.Marshal(data)
+		snapshotBytes += len(encoded)
+		if snapshotBytes > historyReadSnapshotBytes {
+			return tools.ToolResult{}, errors.New("history range is too large; read a narrower range")
 		}
-		if *in.Start < 0 || *in.End < *in.Start {
-			return tools.ToolResult{}, errors.New("history range is invalid")
+		items = append(items, search.Item{Path: string(encoded)})
+	}
+	for _, diagnostic := range diagnostics {
+		data, _ := json.Marshal(historyReadItem{Role: "diagnostic", Text: diagnostic})
+		snapshotBytes += len(data)
+		if snapshotBytes > historyReadSnapshotBytes {
+			return tools.ToolResult{}, errors.New("history range is too large; read a narrower range")
 		}
-		if *in.End-*in.Start+1 > historyReadRangeLimit {
-			return tools.ToolResult{}, errors.New("history range is too broad; read a narrower range")
-		}
-		messages, diagnostics, err := a.HistoryCatalog.ReadHistory(ctx, sessionID, *in.Start, *in.End, in.Epoch, historyReadSnapshotLimit)
-		if err != nil {
-			return tools.ToolResult{}, err
-		}
-		items := make([]search.Item, 0, len(messages)+len(diagnostics))
-		snapshotBytes := 0
-		for _, item := range messages {
-			data := historyReadItemFromMessage(item)
-			encoded, _ := json.Marshal(data)
-			snapshotBytes += len(encoded)
-			if snapshotBytes > historyReadSnapshotBytes {
-				return tools.ToolResult{}, errors.New("history range is too large; read a narrower range")
-			}
-			items = append(items, search.Item{Path: string(encoded)})
-		}
-		for _, diagnostic := range diagnostics {
-			data, _ := json.Marshal(historyReadItem{Role: "diagnostic", Text: diagnostic})
-			snapshotBytes += len(data)
-			if snapshotBytes > historyReadSnapshotBytes {
-				return tools.ToolResult{}, errors.New("history range is too large; read a narrower range")
-			}
-			items = append(items, search.Item{Path: string(data)})
-		}
-		snapshot = search.Snapshot{ID: search.NewID("history-read"), Kind: "history_read", Items: items, Complete: true}
+		items = append(items, search.Item{Path: string(data)})
+	}
+	snapshot = search.Snapshot{ID: search.NewID("history-read"), Kind: "history_read", Items: items, Complete: true}
+	cursor = historyCursor{kind: snapshot.Kind, id: snapshot.ID}
+	res, hasMore := renderHistoryRead(snapshot, cursor)
+	if hasMore {
 		if err := a.saveHistorySnapshot(ctx, sessionID, snapshot); err != nil {
 			return tools.ToolResult{}, err
 		}
-		cursor = historyCursor{kind: snapshot.Kind, id: snapshot.ID}
 	}
-	return renderHistoryRead(snapshot, cursor), nil
+	return res, nil
 }
 
 func (a *Agent) saveHistorySnapshot(ctx context.Context, sessionID string, snapshot search.Snapshot) error {
@@ -260,7 +268,7 @@ func historyCursorString(cursor historyCursor) string {
 	return cursor.kind + "/" + cursor.id + "/" + strconv.Itoa(cursor.offset)
 }
 
-func renderHistorySearch(snapshot search.Snapshot, cursor historyCursor, limit int) tools.ToolResult {
+func renderHistorySearch(snapshot search.Snapshot, cursor historyCursor, limit int) (tools.ToolResult, bool) {
 	var b strings.Builder
 	fmt.Fprintf(&b, "history_search: %d result(s)", len(snapshot.Items))
 	shown := 0
@@ -284,10 +292,11 @@ func renderHistorySearch(snapshot search.Snapshot, cursor historyCursor, limit i
 		shown++
 	}
 	next := cursor.offset + shown
-	if next < len(snapshot.Items) {
+	hasMore := next < len(snapshot.Items)
+	if hasMore {
 		fmt.Fprintf(&b, "\nnext_cursor=%s", historyCursorString(historyCursor{kind: cursor.kind, id: cursor.id, offset: next}))
 	}
-	return tools.MarkUntrusted(tools.TextResult(b.String(), b.String()), "history_search")
+	return tools.MarkUntrusted(tools.TextResult(b.String(), b.String()), "history_search"), hasMore
 }
 
 func historyReadItemFromMessage(item session.HistoryMessage) historyReadItem {
@@ -320,7 +329,7 @@ func boundedHistoryDisplay(value string, limit int) string {
 	return value[:limit-1] + "…"
 }
 
-func renderHistoryRead(snapshot search.Snapshot, cursor historyCursor) tools.ToolResult {
+func renderHistoryRead(snapshot search.Snapshot, cursor historyCursor) (tools.ToolResult, bool) {
 	var b strings.Builder
 	fmt.Fprintf(&b, "history_read: %d message(s)", len(snapshot.Items))
 	shown := 0
@@ -344,10 +353,11 @@ func renderHistoryRead(snapshot search.Snapshot, cursor historyCursor) tools.Too
 		shown++
 	}
 	next := cursor.offset + shown
-	if next < len(snapshot.Items) {
+	hasMore := next < len(snapshot.Items)
+	if hasMore {
 		fmt.Fprintf(&b, "\nnext_cursor=%s", historyCursorString(historyCursor{kind: cursor.kind, id: cursor.id, offset: next}))
 	}
-	return tools.MarkUntrusted(tools.TextResult(b.String(), b.String()), "history_read")
+	return tools.MarkUntrusted(tools.TextResult(b.String(), b.String()), "history_read"), hasMore
 }
 
 func formatHistoryReadItem(item historyReadItem) string {

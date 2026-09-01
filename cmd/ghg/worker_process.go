@@ -35,6 +35,7 @@ const (
 	workerProviderEnv = "GHG_WORKER_PROVIDER"
 	workerRoleEnv     = "GHG_WORKER_ROLE"
 	workerEffortEnv   = "GHG_WORKER_EFFORT"
+	workerModeEnv     = "GHG_WORKER_MODE"
 	workerCautiousEnv = "GHG_WORKER_CAUTIOUS"
 	workerSandboxEnv  = "GHG_WORKER_SANDBOX"
 	workerNetworkEnv  = "GHG_WORKER_NETWORK"
@@ -51,8 +52,6 @@ type (
 	workerApproval          = workerwire.Approval
 	workerApprovalAnswer    = workerwire.ApprovalAnswer
 	workerConfigureRequest  = workerwire.ConfigureRequest
-	workerPlanRequest       = workerwire.PlanRequest
-	workerPlanResult        = workerwire.PlanResult
 	workerSnapshot          = workerwire.Snapshot
 	workerPermissionRequest = workerwire.PermissionRequest
 )
@@ -75,6 +74,7 @@ type workerProcessState struct {
 	modelName       string
 	provider        string
 	role            string
+	mode            string
 	saved           int
 	state           workerwire.State
 	detached        bool
@@ -95,6 +95,7 @@ type workerProcessState struct {
 	liveText        string
 	liveThink       string
 	liveToolOutput  string
+	livePlan        string
 }
 
 func runWorkerProcess() error {
@@ -200,6 +201,14 @@ func newWorkerProcess(runtimeFile workerwire.Runtime) (*workerProcessState, erro
 			role = previous.Role
 		}
 	}
+	mode := os.Getenv(workerModeEnv)
+	if mode == "" {
+		if previous, stateErr := runtimeFile.ReadState(); stateErr == nil && previous.Mode != "" {
+			mode = previous.Mode
+		} else {
+			mode = "execute"
+		}
+	}
 	sysPrompt, err := runtimeFile.ReadPrompt()
 	if err != nil {
 		sysPrompt = systemPromptForProject(true)
@@ -209,6 +218,7 @@ func newWorkerProcess(runtimeFile workerwire.Runtime) (*workerProcessState, erro
 		store.Close()
 		return nil, err
 	}
+	ag.PlanMode = (mode == "plan")
 	configureWorkerCompaction(ag, cfg, profiles, sysPrompt)
 	loaded := msgs
 	if len(loaded) > 0 && loaded[0].Role == "system" {
@@ -240,7 +250,7 @@ func newWorkerProcess(runtimeFile workerwire.Runtime) (*workerProcessState, erro
 		cfg: cfg, profiles: profiles, definitions: definitions, ag: ag, store: store, artifacts: artifactStore, runtime: configuredRuntime,
 		runtimeClean: runtimeCleanup,
 		runtimeFile:  runtimeFile, sessionID: sessionID, modelName: modelName,
-		provider: providerName, role: role, saved: len(ag.Messages), state: workerwire.StateIdle,
+		provider: providerName, role: role, mode: mode, saved: len(ag.Messages), state: workerwire.StateIdle,
 		pending: make(map[string]*workerApprovalFlight), done: make(chan struct{}),
 	}
 	ag.Runtime = configuredRuntime
@@ -249,6 +259,7 @@ func newWorkerProcess(runtimeFile workerwire.Runtime) (*workerProcessState, erro
 	ag.ArtifactCatalog = store
 	ag.HistoryCatalog = store
 	ag.ArtifactsDisabled = artifactsDisabled
+	ag.SubagentsDisabled = !config.SubagentsEnabled(cfg)
 	ag.SetObservationStore(store.ObservationRegistryStore())
 	ag.SetSearchStore(store.SearchRegistryStore())
 	ag.SetSessionID(sessionID)
@@ -372,6 +383,7 @@ func (w *workerProcessState) transition(mutate func() (newState workerwire.State
 	w.state = state
 	w.detached = detached
 	role := w.role
+	mode := w.mode
 	sessionID := w.sessionID
 	w.mu.Unlock()
 
@@ -380,10 +392,11 @@ func (w *workerProcessState) transition(mutate func() (newState workerwire.State
 		State:     state,
 		Detached:  detached,
 		Role:      role,
+		Mode:      mode,
 		PID:       os.Getpid(),
 		Detail:    detail,
 	})
-	w.publish("state", map[string]any{"state": state, "detached": detached}, true)
+	w.publish("state", map[string]any{"state": state, "detached": detached, "mode": mode}, true)
 	return true
 }
 

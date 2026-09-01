@@ -5,7 +5,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"slices"
@@ -68,11 +67,6 @@ type goalFromContextMsg struct {
 
 type goalUpdateMsg struct{ update agent.GoalUpdate }
 
-type planProposalMsg struct {
-	plan agent.Plan
-	err  error
-}
-
 type compactMsg struct {
 	took, kept int // messages removed / kept after compaction
 	summary    string
@@ -94,6 +88,7 @@ type quitArmMsg struct{}                   // the idle ctrl+c arm window expired
 type taskUpdateMsg struct{}                // a background subagent started/settled — redraw
 type mcpStatusMsg struct{}                 // an MCP server changed state — redraw
 type thinkMsg string                       // streamed reasoning tokens
+type planDeltaMsg string                   // streamed proposed plan markdown tokens
 type imageMsg struct {                     // ctrl+v clipboard image result
 	path string // clipboard image saved to disk
 	err  error
@@ -135,10 +130,12 @@ type model struct {
 	cfgExtra map[string]string
 	cfgMod   time.Time // last observed config.json mod time (watcher baseline)
 
-	input  textarea.Model
-	spin   spinner.Model
-	vp     viewport.Model
-	blocks []block // finalized transcript (raw; rendered at the current width)
+	input           textarea.Model
+	spin            spinner.Model
+	vp              viewport.Model
+	blocks          []block // finalized transcript (raw; rendered at the current width)
+	viewportContent string
+	plainRows       []string // ANSI-free transcript rows, built only while selecting
 	// msgBlock[i] is the block index rendering agent.Messages[i] (-1: none) —
 	// rewind live-scroll uses it to jump to a message's transcript position.
 	msgBlock []int
@@ -179,14 +176,17 @@ type model struct {
 	interrupt1 bool     // first ctrl+c pressed while busy; second cancels
 	quit1      bool     // first ctrl+c pressed while idle; second quits (armed briefly)
 
-	goal         string // compatibility mirror of the active structured goal
-	goalRounds   int    // compatibility mirror of the structured goal rounds
-	goalRecord   *goalstate.Record
-	titled       bool        // an auto-title has been attempted for this session
-	proposedPlan *agent.Plan // latest /plan result, waiting for /execute
-	mode         string      // user-visible operating mode: plan or execute
+	goal           string // compatibility mirror of the active structured goal
+	goalRounds     int    // compatibility mirror of the structured goal rounds
+	goalRecord     *goalstate.Record
+	titled         bool   // an auto-title has been attempted for this session
+	proposedPlanMD string // latest /plan proposal (Markdown), waiting for /execute
+	planCurrent    string // partial line of streamed plan markdown
+	mode           string // user-visible operating mode: plan or execute
+	wheel          wheelState
+	selection      *selectionState
 
-	mouseOn       bool   // runtime mouse-capture state (toggle with /mouse)
+	mouseOn       bool   // startup mouse setting; nil config means enabled
 	themeHow      string // how auto theme detection resolved (env var, OSC query, …) — captured at startup/theme change for /report; never re-queried
 	compactModel  string // config model name for compaction summaries; "" = the built-in default
 	compactProv   string
@@ -206,6 +206,7 @@ type model struct {
 	// the real model): a field so the context doctor can be tested against
 	// temp-dir skills instead of whatever the test machine happens to have.
 	skillScan    func() []skills.Skill
+	skillsCache  []skills.Skill
 	skillsLoaded int
 
 	irunner *interactiveRunner // installed on tools.InteractiveBash at startup
@@ -247,6 +248,7 @@ type picker struct {
 	metas    []session.Meta
 	idx      int                  // selected index into metas (0 = newest)
 	previews map[string][2]string // id -> last user, last assistant
+	pendingD bool                 // first 'd' pressed; second deletes the selected session
 }
 
 // Run starts the interactive session. It returns the id of the session that
@@ -329,13 +331,9 @@ func runTUI(cfg *config.Config, modelName, provName, sysPrompt, resumeID string,
 			ag.Effort = "medium"
 		}
 	}
-	// Mouse capture ON by default so the wheel scrolls the transcript viewport
-	// and status/tool clicks work — but only wheel+click reporting (?1000), NOT
-	// cell-motion (?1002). With capture off, tmux's WheelUpPane binding sees
-	// mouse_any_flag=0 and runs 'copy-mode -e', scrolling tmux's own scrollback
-	// instead of the transcript. We don't report motion, so drags aren't sent
-	// to ghg; the tmux drag override (applyTmuxMouseFix) routes MouseDrag1Pane
-	// to copy-mode so plain drag-to-copy keeps working. Explicit config wins.
+	// Mouse capture is on by default. Explicit config wins and remains a
+	// startup-only escape hatch for terminals where application mouse capture
+	// is undesirable.
 	mouseOn := true
 	if cfg.Mouse != nil {
 		mouseOn = *cfg.Mouse
@@ -382,7 +380,7 @@ func runTUI(cfg *config.Config, modelName, provName, sysPrompt, resumeID string,
 		m.agent.CompactThreshold = compactThresholdFor(cfg)
 	}
 	m.wireTasks() // redraw the UI when background subagents start/settle
-	// LSP shares the same runtime and manager across the TUI, planners, and
+	// LSP shares the same runtime and manager across the TUI, Plan mode, and
 	// delegated agents. Servers still spawn lazily on covered file access.
 	m.lspMgr = lsp.NewManager(lsp.FromConfigMap(cfg.LSPServers))
 	m.lspMgr.SetRuntime(runtime)
@@ -466,31 +464,10 @@ func runTUI(cfg *config.Config, modelName, provName, sysPrompt, resumeID string,
 	// status chrome cannot remain as an inline frame after exit. The viewport
 	// still owns chat scrolling while the TUI is active.
 	//
-	// Mouse capture is ON but wheel+click only (?1000, no motion ?1002): the
-	// wheel scrolls the viewport (capture off → tmux eats it into copy-mode),
-	// status clicks work, and a plain drag selects/copies natively (no motion
-	// reporting means the terminal/tmux keeps drag-selection; we never see the
-	// drag bytes). We keep the real TTY as the output and enable click/wheel
-	// reporting directly on it so Bubble Tea still receives terminal sizing.
 	opts := []tea.ProgramOption{tea.WithoutSignalHandler(), tea.WithAltScreen()}
 	if m.mouseOn {
-		enableClickWheelMouse(os.Stdout)
-		applyTmuxMouseFix()
+		opts = append(opts, tea.WithMouseCellMotion())
 	}
-	// Bubble Tea restores raw input and the alternate screen itself. This
-	// cleanup covers the separate click/wheel mode we enable directly because
-	// we intentionally do not use tea.WithMouseCellMotion (it captures drag
-	// motion and breaks native terminal selection). Keep it idempotent for
-	// startup failures and the normal return path.
-	var mouseCleanupOnce sync.Once
-	cleanupMouse := func() {
-		mouseCleanupOnce.Do(func() {
-			if m.mouseOn {
-				disableClickWheelMouse(os.Stdout)
-			}
-		})
-	}
-	defer cleanupMouse()
 	// pick the glamour style that matches the pick/detection resolution;
 	// keep how detection resolved so /report can name the source
 	m.themeHow = m.applyTheme(cfg.Theme)
@@ -554,7 +531,6 @@ func runTUI(cfg *config.Config, modelName, provName, sysPrompt, resumeID string,
 	// watcher, a daemon) outlives ghg. KillAll SIGKILLs every tracked process
 	// group and waits for them.
 	bashrun.KillAll()
-	cleanupMouse()
 	return m.sessionID, err
 }
 
@@ -565,6 +541,7 @@ func runTUI(cfg *config.Config, modelName, provName, sysPrompt, resumeID string,
 // already carries the past).
 func (m *model) startupReport() {
 	sk, problems := skills.ScanDetailed(skills.DefaultDirs()...)
+	m.skillsCache = sk
 	m.skillsLoaded = len(sk)
 	var b strings.Builder
 	var warned bool
@@ -631,21 +608,6 @@ func (m *model) requireAgent() bool {
 	}
 	m.append(m.degradedProviderNote())
 	return false
-}
-
-// enableClickWheelMouse turns on click+wheel mouse reporting (?1000) with SGR
-// coordinates (?1006), WITHOUT motion reporting (?1002/?1003). Writing directly
-// to the real TTY keeps bubbletea's output a terminal so terminal-size detection
-// still works (unlike piping output through an os.Pipe). With ?1000 the wheel
-// and clicks reach ghg, but drags are not reported, so the terminal/tmux keeps
-// native drag-selection for copy.
-func enableClickWheelMouse(w *os.File) {
-	fmt.Fprint(w, "\x1b[?1006h\x1b[?1000h")
-}
-
-// disableClickWheelMouse releases the mouse reporting enableClickWheelMouse set.
-func disableClickWheelMouse(w *os.File) {
-	fmt.Fprint(w, "\x1b[?1000l\x1b[?1006l")
 }
 
 // forwardSignals keeps signal handling alive for the whole TUI lifetime. A
@@ -715,25 +677,6 @@ func captureTTYState() func() {
 			}
 		})
 	}
-}
-
-// applyTmuxMouseFix makes plain drag-to-copy work inside tmux while ghg
-// captures the mouse for wheel/clicks. tmux's default MouseDrag1Pane binding
-// checks mouse_any_flag (set by our ?1000) and forwards the drag to the app,
-// which ignores it — so no highlight ever starts. Rebinding it to copy-mode -M
-// (only when the pane isn't already in a mode and isn't full mouse-tracking)
-// makes the drag open tmux copy-mode selection instead, restoring drag-to-copy.
-// Wheel still reaches ghg: WheelUpPane stays bound to send -M. No-op outside
-// tmux or if tmux isn't available.
-func applyTmuxMouseFix() {
-	if os.Getenv("TMUX") == "" {
-		return
-	}
-	// Only override when the pane can still use copy-mode: not in alt-screen,
-	// not already in a mode, and not full/all mouse tracking (in which case the
-	// app genuinely wants the drag). Then select via copy-mode -M.
-	_ = exec.Command("tmux", "bind-key", "-T", "root", "MouseDrag1Pane", "if-shell", "-F",
-		"#{||:#{alternate_on},#{pane_in_mode},#{mouse_all_flag}}", "send-keys -M", "copy-mode -M").Run()
 }
 
 // fetchCatalogs refreshes each provider's cached model list in the background,
@@ -975,7 +918,8 @@ func (m *model) resume(id string) error {
 	m.blocks = nil
 	m.msgBlock = nil
 	m.future = nil // a different session's tail isn't this session's redo
-	m.proposedPlan = nil
+	m.proposedPlanMD = ""
+	m.planCurrent = ""
 	m.goalRecord = nil
 	if hasGoal {
 		m.applyGoalRecord(restoredGoal)
@@ -1296,6 +1240,7 @@ func (m *model) configureArtifactAgent(ag *agent.Agent) {
 		ag.SetSearchStore(m.store.SearchRegistryStore())
 	}
 	ag.ArtifactsDisabled = artifactsDisabled(m.cfg)
+	ag.SubagentsDisabled = !config.SubagentsEnabled(m.cfg)
 	if !ag.ArtifactsDisabled {
 		ag.ArtifactWriter = m.artifactStore
 	} else {
@@ -1432,8 +1377,8 @@ func buildAgentWithProfilesMode(cfg *config.Config, modelName, provName, sysProm
 			ctxLimit = n
 		}
 	}
-	maxOut := mdl.MaxOut
-	if maxOut <= 0 && hasCat {
+	maxOut := 0
+	if hasCat {
 		maxOut = cat.MaxCompletionTokens(apiID)
 	}
 	if maxOut <= 0 {
@@ -1750,23 +1695,83 @@ func (m *model) pickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	p := m.picker
 	switch msg.Type {
 	case tea.KeyEsc, tea.KeyCtrlC:
+		p.pendingD = false
 		m.picker = nil
 	case tea.KeyUp, tea.KeyCtrlP, tea.KeyShiftTab: // older sessions sit above
+		p.pendingD = false
 		if p.idx < len(p.metas)-1 {
 			p.idx++
 			p.loadPreview(m.store)
 		}
 	case tea.KeyDown, tea.KeyCtrlN, tea.KeyTab: // newer sessions sit below
+		p.pendingD = false
 		if p.idx > 0 {
 			p.idx--
 			p.loadPreview(m.store)
 		}
 	case tea.KeyEnter:
+		p.pendingD = false
+		if len(p.metas) == 0 {
+			m.picker = nil
+			return m, nil
+		}
 		id := p.metas[p.idx].ID
 		m.picker = nil
 		if err := m.resume(id); err != nil {
 			m.append(errStyle.Render(err.Error()))
 		}
+	case tea.KeyRunes:
+		switch string(msg.Runes) {
+		case "k":
+			p.pendingD = false
+			if p.idx < len(p.metas)-1 {
+				p.idx++
+				p.loadPreview(m.store)
+			}
+		case "j":
+			p.pendingD = false
+			if p.idx > 0 {
+				p.idx--
+				p.loadPreview(m.store)
+			}
+		case "d":
+			if !p.pendingD {
+				p.pendingD = true
+				return m, nil
+			}
+			p.pendingD = false
+			if len(p.metas) == 0 {
+				return m, nil
+			}
+			toDelete := p.metas[p.idx]
+			if m.store != nil {
+				if err := m.store.DeleteSession(toDelete.ID); err != nil {
+					m.append(errStyle.Render("delete session failed: " + err.Error()))
+					return m, nil
+				}
+			}
+			if m.sessionID == toDelete.ID {
+				m.sessionID = ""
+				m.saved = 0
+				m.workerContextTokens = 0
+			}
+			p.metas = slices.Delete(p.metas, p.idx, p.idx+1)
+			delete(p.previews, toDelete.ID)
+			if len(p.metas) == 0 {
+				m.picker = nil
+				m.append(dimStyle.Render("◎ deleted session " + toDelete.ID))
+				return m, nil
+			}
+			if p.idx >= len(p.metas) {
+				p.idx = len(p.metas) - 1
+			}
+			p.loadPreview(m.store)
+			m.append(dimStyle.Render("◎ deleted session " + toDelete.ID))
+		default:
+			p.pendingD = false
+		}
+	default:
+		p.pendingD = false
 	}
 	return m, nil
 }
@@ -1856,8 +1861,8 @@ func (m *model) acceptPreview() {
 // menuCycle moves the tab-cycle selection by delta, previewing the new
 // candidate from the pre-cycle input. The cycle set is frozen on the first
 // tab so cycling covers every candidate for the token's common prefix
-// ("/m" tabs through /model and /mouse even though /model doesn't filter
-// to /mouse).
+// ("/m" tabs through all matching commands even when a command's own
+// argument completion would use a narrower prefix).
 func (m *model) menuCycle(delta int) {
 	mu := m.menu
 	if mu.frozen == nil {
@@ -1939,12 +1944,18 @@ func (m *model) authProviderCands() []cand {
 	return out
 }
 
-// skillCands rescans skill dirs so newly added skills appear immediately.
-// ponytail: full rescan per keystroke; cache with a TTL if a huge skill tree drags
+// skillCands uses the startup snapshot while the completion menu is open.
+// prepareTurn is the explicit refresh point for newly added skills.
 func (m *model) skillCands() []cand {
-	sk := skills.Scan(skills.DefaultDirs()...)
-	out := make([]cand, 0, len(sk))
-	for _, s := range sk {
+	if m.skillsCache == nil {
+		m.skillsCache = skills.Scan(skills.DefaultDirs()...)
+		if m.skillsCache == nil {
+			m.skillsCache = []skills.Skill{}
+		}
+		m.skillsLoaded = len(m.skillsCache)
+	}
+	out := make([]cand, 0, len(m.skillsCache))
+	for _, s := range m.skillsCache {
 		d := s.Description
 		if len(d) > 80 {
 			d = d[:80] + "…"
@@ -1961,6 +1972,11 @@ func (m *model) skillCands() []cand {
 // extracted from @image tags.
 func (m *model) prepareTurn(text string) (string, []llm.ContentPart) {
 	sk := skills.Scan(skills.DefaultDirs()...)
+	if sk == nil {
+		sk = []skills.Skill{}
+	}
+	m.skillsCache = sk
+	m.skillsLoaded = len(sk)
 	sys := m.sysPrompt + skills.PromptBlock(sk)
 	if m.mcpMgr != nil {
 		sys += m.mcpMgr.InstructionsBlock()
@@ -2091,7 +2107,7 @@ func (m *model) submitTurn(text string, authored bool) (tea.Model, tea.Cmd) {
 	// thinking and answer text never interleave within one update; both drain
 	// on the same timer.
 	var mu sync.Mutex
-	var pend, thinkPend string
+	var pend, thinkPend, pendPlan string
 	var goalUpdates []agent.GoalUpdate
 	var goalUsage llm.Usage
 	var timer *time.Timer
@@ -2101,14 +2117,17 @@ func (m *model) submitTurn(text string, authored bool) (tea.Model, tea.Cmd) {
 			timer.Stop()
 			timer = nil
 		}
-		text, think := pend, thinkPend
-		pend, thinkPend = "", ""
+		text, think, plan := pend, thinkPend, pendPlan
+		pend, thinkPend, pendPlan = "", "", ""
 		mu.Unlock()
 		if think != "" {
 			send(thinkMsg(think))
 		}
 		if text != "" {
 			send(textMsg(text))
+		}
+		if plan != "" {
+			send(planDeltaMsg(plan))
 		}
 	}
 	schedule := func() {
@@ -2128,11 +2147,18 @@ func (m *model) submitTurn(text string, authored bool) (tea.Model, tea.Cmd) {
 		schedule()
 		mu.Unlock()
 	}
+	onPlanDelta := func(d string) {
+		mu.Lock()
+		pendPlan += d
+		schedule()
+		mu.Unlock()
+	}
 
 	go func() {
 		events := agent.Events{
-			OnText:  onText,
-			OnThink: onThink,
+			OnText:      onText,
+			OnThink:     onThink,
+			OnPlanDelta: onPlanDelta,
 			OnToolStart: func(id, n, a string) {
 				flush()
 				send(toolStartMsg{id, n, a})
@@ -2230,7 +2256,7 @@ func busyCmd(text string) bool {
 		return false
 	}
 	switch fields[0] {
-	case "/help", "/theme", "/mouse", "/effort", "/tasks", "/cd", "/pwd", "/report", "/detach":
+	case "/help", "/theme", "/effort", "/tasks", "/cd", "/pwd", "/report", "/detach":
 		return true
 	case "/plan", "/execute": // handled immediately so a slash command is not sent as chat text
 		return true
@@ -2286,7 +2312,8 @@ func (m *model) command(text string) (tea.Model, tea.Cmd) {
 		m.blocks = nil
 		m.msgBlock = nil
 		m.future = nil // no redo across a cleared conversation
-		m.proposedPlan = nil
+		m.proposedPlanMD = ""
+		m.planCurrent = ""
 		m.setGoal("") // clear before detaching so the old session's goal is dropped too
 		m.goalRecord = nil
 		m.sessionID = "" // next turn starts a fresh session
@@ -2402,38 +2429,6 @@ func (m *model) command(text string) (tea.Model, tea.Cmd) {
 			}
 		} else {
 			m.openPaletteOn("theme") // bare: open the switcher, don't toggle blind
-		}
-		return m, nil
-	case "/mouse":
-		next := !m.mouseOn
-		if len(fields) > 1 {
-			switch strings.ToLower(fields[1]) {
-			case "on":
-				next = true
-			case "off":
-				next = false
-			default:
-				m.append(errStyle.Render("usage: /mouse [on|off]"))
-				return m, nil
-			}
-		}
-		m.mouseOn = next
-		cfg := m.cfg
-		if cfg != nil {
-			b := m.mouseOn
-			cfg.Mouse = &b
-			if err := cfg.Save(); err != nil {
-				m.append(errStyle.Render("config save failed: " + err.Error()))
-			}
-		}
-		// We manage click/wheel reporting directly (no motion ?1002), so toggle
-		// the escape ourselves rather than tea.EnableMouseCellMotion (which would
-		// turn motion back on and break native drag-to-copy).
-		if m.mouseOn {
-			enableClickWheelMouse(os.Stdout)
-			applyTmuxMouseFix()
-		} else {
-			disableClickWheelMouse(os.Stdout)
 		}
 		return m, nil
 	case "/effort":

@@ -5,10 +5,25 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
 )
+
+func compilePolicy(p *Policy) *compiledPolicy {
+	if p == nil || p.mode == ModeDangerFull {
+		return nil
+	}
+	cp := &compiledPolicy{}
+	switch runtime.GOOS {
+	case "darwin":
+		cp.seatbeltProfile = buildSeatbeltProfile(p)
+	case "linux":
+		cp.bubblewrapBase = buildBubblewrapBase(p)
+	}
+	return cp
+}
 
 // WrapCommand applies the selected OS sandbox to an executable argv. A
 // missing or unusable backend is an error for restricted modes; callers must
@@ -61,6 +76,13 @@ func (p *Policy) WrapCommand(spec CommandSpec) (WrappedCommand, error) {
 }
 
 func seatbeltProfile(p *Policy) string {
+	if p != nil && p.compiled != nil && p.compiled.seatbeltProfile != "" {
+		return p.compiled.seatbeltProfile
+	}
+	return buildSeatbeltProfile(p)
+}
+
+func buildSeatbeltProfile(p *Policy) string {
 	var b strings.Builder
 	b.WriteString("(version 1)\n")
 	b.WriteString("(deny default)\n")
@@ -164,6 +186,19 @@ func seatbeltAncestorRoots(roots []string) []string {
 }
 
 func bubblewrapArgs(p *Policy, spec CommandSpec) []string {
+	var args []string
+	if p != nil && p.compiled != nil && len(p.compiled.bubblewrapBase) > 0 {
+		args = slices.Clone(p.compiled.bubblewrapBase)
+	} else {
+		args = buildBubblewrapBase(p)
+	}
+	if spec.Dir != "" {
+		args = append(args, "--chdir", spec.Dir)
+	}
+	return args
+}
+
+func buildBubblewrapBase(p *Policy) []string {
 	args := []string{
 		"--die-with-parent",
 		"--new-session",
@@ -207,9 +242,6 @@ func bubblewrapArgs(p *Policy, spec CommandSpec) []string {
 	}
 	for _, root := range orderedMountRoots(p.ImmutableRoots()) {
 		mounts.bind("--ro-bind", root)
-	}
-	if spec.Dir != "" {
-		args = append(args, "--chdir", spec.Dir)
 	}
 	return args
 }

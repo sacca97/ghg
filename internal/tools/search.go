@@ -18,6 +18,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/sacca97/ghg/internal/llm"
@@ -26,7 +27,7 @@ import (
 )
 
 const (
-	defaultSearchMaxResults = 60
+	defaultSearchMaxResults = 25
 	maxSearchResults        = 10000
 	maxSearchEntries        = 100000
 	maxBinaryProbeBytes     = 8 << 10
@@ -149,8 +150,9 @@ func runFindFilesResult(ctx context.Context, args json.RawMessage) (ToolResult, 
 	if err != nil {
 		return ToolResult{}, fmt.Errorf("resolve find_files path: %w", err)
 	}
+	authorized := abs
 	if runtime := RuntimeFromContext(ctx); runtime != nil && runtime.Policy != nil {
-		abs, err = runtime.Policy.Authorize(root, sandbox.AccessRead, false)
+		authorized, err = runtime.Policy.Authorize(root, sandbox.AccessRead, true)
 		if err != nil {
 			return ToolResult{}, err
 		}
@@ -162,6 +164,7 @@ func runFindFilesResult(ctx context.Context, args json.RawMessage) (ToolResult, 
 	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 		return ToolResult{}, fmt.Errorf("find_files path %q is not a real directory", root)
 	}
+	abs = authorized
 	resolved, err := filepath.EvalSymlinks(abs)
 	if err != nil {
 		return ToolResult{}, fmt.Errorf("resolve find_files path %q: %w", root, err)
@@ -266,7 +269,10 @@ func collectGrepSnapshot(ctx context.Context, args grepArgs) (search.Snapshot, e
 	if err != nil && !errors.Is(err, errSearchLimit) {
 		return search.Snapshot{}, err
 	}
-	modified := gitModifiedPaths(ctx, scope.rootPath)
+	var modified map[string]struct{}
+	if len(collector.items) > 0 {
+		modified = gitModifiedPaths(ctx, scope.rootPath)
+	}
 	rankSearchItems(collector.items, scope, args.Path, searchHintsFor(ctx), modified)
 	snapshot := search.Snapshot{
 		ID:        search.NewID("grep"),
@@ -634,23 +640,17 @@ func grepSnapshotFile(ctx context.Context, fsys fs.FS, name, display string, mat
 	if err != nil {
 		return fmt.Errorf("open %s: %w", display, err)
 	}
-	binary, probeErr := binaryFile(f)
-	closeErr := f.Close()
-	if probeErr != nil {
+	defer func() { _ = f.Close() }()
+
+	reader := bufio.NewReaderSize(f, 64<<10)
+	probe, probeErr := reader.Peek(maxBinaryProbeBytes)
+	if probeErr != nil && !errors.Is(probeErr, io.EOF) {
 		return fmt.Errorf("inspect %s: %w", display, probeErr)
 	}
-	if closeErr != nil {
-		return fmt.Errorf("close %s: %w", display, closeErr)
-	}
-	if binary {
+	if bytes.IndexByte(probe, 0) >= 0 {
 		return nil
 	}
-	f, err = fsys.Open(name)
-	if err != nil {
-		return fmt.Errorf("open %s: %w", display, err)
-	}
-	defer func() { _ = f.Close() }()
-	reader := bufio.NewReaderSize(f, 64<<10)
+
 	lineNumber := 0
 	for {
 		line, eof, lineTruncated, err := readSearchLine(reader)
@@ -680,9 +680,15 @@ func grepSnapshotFile(ctx context.Context, fsys fs.FS, name, display string, mat
 
 func rankSearchItems(items []search.Item, scope *searchScope, requested string, hints SearchHints, modified map[string]struct{}) {
 	touched := canonicalPathSet(hints.Touched)
+	ranks := make(map[string]searchRank, len(items))
+	for _, item := range items {
+		if _, ok := ranks[item.Path]; !ok {
+			ranks[item.Path] = searchItemRank(item.Path, scope, requested, touched, modified)
+		}
+	}
 	sort.SliceStable(items, func(i, j int) bool {
 		a, b := items[i], items[j]
-		ra, rb := searchItemRank(a.Path, scope, requested, touched, modified), searchItemRank(b.Path, scope, requested, touched, modified)
+		ra, rb := ranks[a.Path], ranks[b.Path]
 		if ra.priority != rb.priority {
 			return ra.priority < rb.priority
 		}
@@ -759,7 +765,104 @@ func canonicalPathHintForSearch(name string) string {
 	return filepath.Clean(abs)
 }
 
+const defaultGitStatusTTL = 1500 * time.Millisecond
+
+type gitStatusEntry struct {
+	paths     map[string]struct{}
+	expiresAt time.Time
+}
+
+type gitStatusFlight struct {
+	done  chan struct{}
+	paths map[string]struct{}
+}
+
+type gitStatusCache struct {
+	mu       sync.Mutex
+	entries  map[string]gitStatusEntry
+	inflight map[string]*gitStatusFlight
+	ttl      time.Duration
+	now      func() time.Time
+	loader   func(ctx context.Context, root string) map[string]struct{}
+}
+
+func newGitStatusCache(ttl time.Duration, loader func(ctx context.Context, root string) map[string]struct{}, now func() time.Time) *gitStatusCache {
+	if now == nil {
+		now = time.Now
+	}
+	return &gitStatusCache{
+		entries:  make(map[string]gitStatusEntry),
+		inflight: make(map[string]*gitStatusFlight),
+		ttl:      ttl,
+		now:      now,
+		loader:   loader,
+	}
+}
+
+var defaultGitStatusCache = newGitStatusCache(defaultGitStatusTTL, uncachedGitModifiedPaths, time.Now)
+
 func gitModifiedPaths(ctx context.Context, root string) map[string]struct{} {
+	return defaultGitStatusCache.get(ctx, root)
+}
+
+func (c *gitStatusCache) get(ctx context.Context, root string) map[string]struct{} {
+	if strings.TrimSpace(root) == "" {
+		return make(map[string]struct{})
+	}
+	canonical := canonicalPathHintForSearch(root)
+	if canonical == "" {
+		canonical = filepath.Clean(root)
+	}
+
+	c.mu.Lock()
+	now := c.now()
+	// Never retain entries indefinitely: prune expired entries on access.
+	for k, entry := range c.entries {
+		if !now.Before(entry.expiresAt) {
+			delete(c.entries, k)
+		}
+	}
+
+	if entry, ok := c.entries[canonical]; ok && now.Before(entry.expiresAt) {
+		c.mu.Unlock()
+		return entry.paths
+	}
+
+	if flight, ok := c.inflight[canonical]; ok {
+		c.mu.Unlock()
+		select {
+		case <-flight.done:
+			return flight.paths
+		case <-ctx.Done():
+			return make(map[string]struct{})
+		}
+	}
+
+	flight := &gitStatusFlight{done: make(chan struct{})}
+	c.inflight[canonical] = flight
+	c.mu.Unlock()
+
+	var paths map[string]struct{}
+	defer func() {
+		c.mu.Lock()
+		if paths == nil {
+			paths = make(map[string]struct{})
+		}
+		flight.paths = paths
+		close(flight.done)
+		delete(c.inflight, canonical)
+		c.entries[canonical] = gitStatusEntry{
+			paths:     paths,
+			expiresAt: c.now().Add(c.ttl),
+		}
+		c.mu.Unlock()
+	}()
+
+	paths = c.loader(ctx, root)
+	return paths
+}
+
+func uncachedGitModifiedPaths(ctx context.Context, root string) map[string]struct{} {
 	set := make(map[string]struct{})
 	gitCtx, cancel := context.WithTimeout(ctx, 250*time.Millisecond)
 	defer cancel()
@@ -886,6 +989,13 @@ func openSearchScope(ctx context.Context, requested string) (*searchScope, error
 	if err != nil {
 		return nil, fmt.Errorf("resolve search path: %w", err)
 	}
+	authorized := abs
+	if runtime := RuntimeFromContext(ctx); runtime != nil && runtime.Policy != nil {
+		authorized, err = runtime.Policy.Authorize(abs, sandbox.AccessRead, true)
+		if err != nil {
+			return nil, err
+		}
+	}
 	info, err := os.Lstat(abs)
 	if err != nil {
 		return nil, fmt.Errorf("search path %q: %w", requested, err)
@@ -893,12 +1003,7 @@ func openSearchScope(ctx context.Context, requested string) (*searchScope, error
 	if info.Mode()&os.ModeSymlink != 0 {
 		return nil, fmt.Errorf("search path %q is a symlink; symlinks are not followed", requested)
 	}
-	if runtime := RuntimeFromContext(ctx); runtime != nil && runtime.Policy != nil {
-		abs, err = runtime.Policy.Authorize(abs, sandbox.AccessRead, false)
-		if err != nil {
-			return nil, err
-		}
-	}
+	abs = authorized
 	resolved, err := filepath.EvalSymlinks(abs)
 	if err != nil {
 		return nil, fmt.Errorf("resolve search path %q: %w", requested, err)
@@ -1019,15 +1124,6 @@ func (w *searchWalker) walk(ctx context.Context, visit func(name string, entry f
 
 func isRegularEntry(entry fs.DirEntry) bool {
 	return entry.Type().IsRegular()
-}
-
-func binaryFile(f fs.File) (bool, error) {
-	buf := make([]byte, maxBinaryProbeBytes)
-	n, err := f.Read(buf)
-	if err != nil && !errors.Is(err, io.EOF) {
-		return false, err
-	}
-	return bytes.IndexByte(buf[:n], 0) >= 0, nil
 }
 
 func readSearchLine(reader *bufio.Reader) (line []byte, eof, truncated bool, err error) {

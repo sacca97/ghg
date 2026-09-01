@@ -14,7 +14,7 @@ import (
 )
 
 const (
-	defaultReadLines   = 500
+	defaultReadLines   = 250
 	maxReadLines       = 1000
 	maxReadBytes       = 16 << 10
 	maxReadLineBytes   = 1 << 20
@@ -33,17 +33,6 @@ func runObservedRead(ctx context.Context, args struct {
 	if strings.TrimSpace(args.Path) == "" {
 		return ToolResult{}, fmt.Errorf("path is required")
 	}
-	start := args.Offset
-	if start <= 0 {
-		start = 1
-	}
-	limit := args.Limit
-	if limit <= 0 {
-		limit = defaultReadLines
-	}
-	if limit > maxReadLines {
-		limit = maxReadLines
-	}
 
 	canonical, err := authorizedObservationPath(ctx, args.Path, sandbox.AccessRead, false)
 	if err != nil {
@@ -55,7 +44,25 @@ func runObservedRead(ctx context.Context, args struct {
 	}
 	defer func() { _ = f.Close() }()
 
-	reader := bufio.NewReaderSize(f, 64<<10)
+	return readObservedContent(ctx, canonical, args.Path, f, args.Offset, args.Limit)
+}
+
+func readObservedContent(ctx context.Context, canonical, display string, r io.Reader, offset, limit int) (ToolResult, error) {
+	if err := ctx.Err(); err != nil {
+		return ToolResult{}, err
+	}
+	start := offset
+	if start <= 0 {
+		start = 1
+	}
+	if limit <= 0 {
+		limit = defaultReadLines
+	}
+	if limit > maxReadLines {
+		limit = maxReadLines
+	}
+
+	reader := bufio.NewReaderSize(r, 64<<10)
 	var numbered strings.Builder
 	var content strings.Builder
 	payloadBudget := maxReadBytes - len(canonical) - readHeaderBudget
@@ -72,7 +79,7 @@ func runObservedRead(ctx context.Context, args struct {
 		}
 		line, eof, err := readCompleteLine(reader, maxReadLineBytes)
 		if err != nil {
-			return ToolResult{}, fmt.Errorf("read %s: %w", args.Path, err)
+			return ToolResult{}, fmt.Errorf("read %s: %w", display, err)
 		}
 		if line == nil && eof {
 			break
@@ -110,7 +117,7 @@ func runObservedRead(ctx context.Context, args struct {
 		}
 	}
 	if lineNo < start || selected == 0 {
-		return ToolResult{}, fmt.Errorf("offset %d past end of file (%d lines)", args.Offset, lineNo)
+		return ToolResult{}, fmt.Errorf("offset %d past end of file (%d lines)", offset, lineNo)
 	}
 	if nextOffset > 0 && !limitedByBytes && selected < limit {
 		nextOffset = 0
@@ -137,6 +144,13 @@ func runObservedRead(ctx context.Context, args struct {
 	}
 	sessionID, store := observationContextFor(ctx)
 	if store != nil {
+		if finder, ok := store.(interface {
+			FindLatest(string, string, int, int) (observation.Record, bool)
+		}); ok {
+			if prior, found := finder.FindLatest(sessionID, canonical, start, start+selected-1); found && prior.Content == content.String() {
+				id = prior.ID
+			}
+		}
 		if err := store.Save(ctx, sessionID, record); err != nil {
 			return ToolResult{}, fmt.Errorf("persist read observation: %w", err)
 		}

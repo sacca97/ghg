@@ -5,18 +5,15 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/sacca97/ghg/internal/agent"
 	"github.com/sacca97/ghg/internal/llm"
 )
 
 type planTestBackend struct {
-	mu       sync.Mutex
-	plans    []string
-	complete []llm.Request
-	stream   chan llm.Request
-	done     chan struct{}
+	mu     sync.Mutex
+	stream chan llm.Request
+	done   chan struct{}
 }
 
 func (b *planTestBackend) Stream(_ context.Context, req llm.Request, sink llm.EventSink) (llm.Message, llm.Usage, error) {
@@ -24,110 +21,73 @@ func (b *planTestBackend) Stream(_ context.Context, req llm.Request, sink llm.Ev
 		b.stream <- req
 	}
 	if sink.OnText != nil {
-		sink.OnText("done")
+		sink.OnText("plan text\n<proposed_plan>\n# Plan: ship it\n1. write code\n2. run tests\n</proposed_plan>")
 	}
 	if b.done != nil {
-		close(b.done)
+		select {
+		case b.done <- struct{}{}:
+		default:
+		}
 	}
-	return llm.Message{Role: "assistant", Content: "done"}, llm.Usage{}, nil
+	return llm.Message{Role: "assistant", Content: "plan text\n<proposed_plan>\n# Plan: ship it\n1. write code\n2. run tests\n</proposed_plan>"}, llm.Usage{}, nil
 }
 
 func (b *planTestBackend) Complete(_ context.Context, req llm.Request) (llm.Message, llm.Usage, error) {
-	b.mu.Lock()
-	b.complete = append(b.complete, req)
-	if len(b.plans) == 0 {
-		b.mu.Unlock()
-		return llm.Message{}, llm.Usage{}, nil
-	}
-	response := b.plans[0]
-	b.plans = b.plans[1:]
-	b.mu.Unlock()
-	if strings.TrimSpace(response) != "not json" {
-		var call llm.ToolCall
-		call.ID = "plan"
-		call.Type = "function"
-		call.Function.Name = "submit_plan"
-		call.Function.Arguments = response
-		return llm.Message{Role: "assistant", ToolCalls: []llm.ToolCall{call}}, llm.Usage{}, nil
-	}
-	return llm.Message{Role: "assistant", Content: response}, llm.Usage{}, nil
+	return llm.Message{Role: "assistant", Content: "done"}, llm.Usage{}, nil
 }
 
-func TestPlanThenExecuteUsesProposalAndSeedsTodos(t *testing.T) {
+func TestPlanThenExecuteConversational(t *testing.T) {
 	b := &planTestBackend{
-		plans:  []string{`{"goal":"ship it","steps":["write code","run tests"],"acceptance_checks":["tests pass"]}`},
-		stream: make(chan llm.Request),
+		stream: make(chan llm.Request, 2),
 		done:   make(chan struct{}),
 	}
-	m := &model{agent: agent.New(b, "model", 100, "sys")}
-
-	if _, _ = m.command("/plan ship it"); m.proposedPlan == nil {
-		t.Fatal("/plan should retain the validated proposal")
-	}
-	if len(m.blocks) == 0 || !strings.Contains(m.blocks[0].text, "❯ /plan ship it") {
-		t.Fatalf("expected /plan prompt to be visible in blocks: %+v", m.blocks)
-	}
-	if m.busy {
-		t.Fatal("planning should be idle after an inline completion")
+	m := &model{
+		agent: agent.New(b, "model", 100, "sys"),
+		input: newInput(),
 	}
 
-	_, _ = m.command("/execute")
-	select {
-	case req := <-b.stream:
-		if req.Model != "model" {
-			t.Fatalf("execution request model: %q", req.Model)
-		}
-		if len(req.Tools) == 0 {
-			t.Fatal("execution should use the normal acting tool set")
-		}
-	case <-time.After(time.Second):
-		t.Fatal("execution did not reach the backend")
-	}
-	<-b.done
-	if m.agent.Role != "fast" {
-		t.Fatalf("execution should select the fast role, got %q", m.agent.Role)
-	}
-	if len(m.agent.Todos) != 2 || m.agent.Todos[0].Status != "in_progress" || m.agent.Todos[1].Status != "pending" {
-		t.Fatalf("execution todos: %+v", m.agent.Todos)
-	}
-}
-
-func TestPlanRetriesInvalidProposalOnce(t *testing.T) {
-	b := &planTestBackend{plans: []string{
-		"not json",
-		`{"goal":"ship it","steps":["write code"],"acceptance_checks":["tests pass"]}`,
-	}}
-	planner := agent.New(b, "smart-model", 100, "sys")
-	if _, err := requestPlanWithDefinition(context.Background(), planner, nil, "ship it", agent.BuiltInPlannerDefinition()); err != nil {
-		t.Fatal(err)
-	}
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if len(b.complete) != 2 {
-		t.Fatalf("invalid output should be retried once, got %d calls", len(b.complete))
-	}
-}
-
-func TestPlanCommandEchoesPromptEvenOnFailure(t *testing.T) {
-	b := &planTestBackend{plans: []string{"not json", "still not json"}}
-	m := &model{agent: agent.New(b, "model", 100, "sys")}
-
+	// 1. /plan switches to plan mode and submits goal
 	m.command("/plan ship it")
+	if m.uiMode() != uiModePlan {
+		t.Fatalf("expected mode plan, got %q", m.uiMode())
+	}
+	if !m.agent.PlanMode {
+		t.Fatal("expected agent.PlanMode to be true")
+	}
 
-	if len(m.blocks) < 2 {
-		t.Fatalf("expected at least 2 blocks (prompt and error), got %d", len(m.blocks))
+	// Simulate turn completion
+	finalMsg := "Here is the plan:\n<proposed_plan>\n# Plan: ship it\n1. write code\n2. run tests\n</proposed_plan>"
+	m.Update(turnDoneMsg{final: finalMsg})
+
+	if m.proposedPlanMD == "" || !strings.Contains(m.proposedPlanMD, "# Plan: ship it") {
+		t.Fatalf("expected proposedPlanMD to contain plan, got: %q", m.proposedPlanMD)
 	}
-	if !strings.Contains(m.blocks[0].text, "❯ /plan ship it") {
-		t.Fatalf("expected prompt echo in first block, got: %s", m.blocks[0].text)
+
+	// 2. /execute switches to execute mode and submits approved plan
+	m.command("/execute")
+	if m.uiMode() != uiModeExecute {
+		t.Fatalf("expected mode execute, got %q", m.uiMode())
 	}
-	foundFailure := false
-	for _, blk := range m.blocks[1:] {
-		if strings.Contains(blk.text, "planning failed") {
-			foundFailure = true
+	if m.agent.PlanMode {
+		t.Fatal("expected agent.PlanMode to be false after /execute")
+	}
+}
+
+func TestExecuteWithoutPlanFails(t *testing.T) {
+	m := &model{
+		agent: agent.New(&planTestBackend{}, "model", 100, "sys"),
+		input: newInput(),
+	}
+
+	m.command("/execute")
+	var foundErr bool
+	for _, blk := range m.blocks {
+		if strings.Contains(blk.text, "no plan to execute") {
+			foundErr = true
 			break
 		}
 	}
-	if !foundFailure {
-		t.Fatalf("expected failure block after prompt echo, blocks: %+v", m.blocks)
+	if !foundErr {
+		t.Fatalf("expected 'no plan to execute' error, got blocks: %+v", m.blocks)
 	}
 }

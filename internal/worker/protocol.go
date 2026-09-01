@@ -30,13 +30,16 @@ const (
 )
 
 const (
+	EventPlanDelta = "plan_delta"
+)
+
+const (
 	CommandDetach    = "detach"
 	CommandCancel    = "cancel"
 	CommandInput     = "input"
 	CommandApprove   = "approve"
 	CommandConfigure = "configure"
 	CommandCompact   = "compact"
-	CommandPlan      = "plan"
 	CommandStop      = "stop"
 	CommandPing      = "ping"
 	CommandLSPStatus = "lsp_status"
@@ -243,7 +246,7 @@ func knownType(kind string) bool {
 func knownCommand(name string) bool {
 	switch name {
 	case CommandDetach, CommandCancel, CommandInput, CommandApprove,
-		CommandConfigure, CommandCompact, CommandPlan,
+		CommandConfigure, CommandCompact,
 		CommandStop, CommandPing, CommandLSPStatus, CommandChdir, CommandAppend:
 		return true
 	default:

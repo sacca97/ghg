@@ -98,12 +98,25 @@ func isAuthenticationError(body []byte) bool {
 	var envelope struct {
 		Error struct {
 			Type string `json:"type"`
+			Code any    `json:"code"`
 		} `json:"error"`
+		Type string `json:"type"`
 	}
 	if err := json.Unmarshal(body, &envelope); err != nil {
 		return false
 	}
-	return strings.ToLower(strings.TrimSpace(envelope.Error.Type)) == probeAuthErrorType
+	errType := strings.ToLower(strings.TrimSpace(envelope.Error.Type))
+	if errType == "" {
+		errType = strings.ToLower(strings.TrimSpace(envelope.Type))
+	}
+	switch errType {
+	case "autherror", "authentication_error", "invalid_api_key", "unauthorized", "auth_error":
+		return true
+	}
+	if code, ok := envelope.Error.Code.(string); ok && strings.ToLower(strings.TrimSpace(code)) == "invalid_api_key" {
+		return true
+	}
+	return false
 }
 
 func probeModel(modelID, fallback string) string {

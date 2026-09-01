@@ -91,7 +91,12 @@ func WithSearchHints(ctx context.Context, hints SearchHints) context.Context {
 	return context.WithValue(ctx, searchHintsKey{}, hints)
 }
 
-func searchHintsFor(ctx context.Context) SearchHints {
+// SearchHintsFor returns non-authoritative ranking hints attached to ctx.
+func SearchHintsFor(ctx context.Context) SearchHints {
 	hints, _ := ctx.Value(searchHintsKey{}).(SearchHints)
 	return hints
+}
+
+func searchHintsFor(ctx context.Context) SearchHints {
+	return SearchHintsFor(ctx)
 }

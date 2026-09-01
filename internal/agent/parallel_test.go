@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -161,6 +162,57 @@ func TestMultiFileMutationsWithReversePathOrderDoNotDeadlock(t *testing.T) {
 	}
 }
 
+func TestParallelToolBatchSharesSearchHints(t *testing.T) {
+	ag := New(testBackend("http://unused", "k"), "m", 100, "sys")
+	var (
+		mu     sync.Mutex
+		hints1 tools.SearchHints
+		hints2 tools.SearchHints
+	)
+	tool1 := tools.Tool{
+		Def: llm.NewTool("write", "w", `{"type":"object"}`),
+		Run: func(ctx context.Context, _ json.RawMessage) (string, error) {
+			mu.Lock()
+			hints1 = tools.SearchHintsFor(ctx)
+			mu.Unlock()
+			return "ok", nil
+		},
+	}
+	tool2 := tools.Tool{
+		Def: llm.NewTool("read", "r", `{"type":"object"}`),
+		Run: func(ctx context.Context, _ json.RawMessage) (string, error) {
+			mu.Lock()
+			hints2 = tools.SearchHintsFor(ctx)
+			mu.Unlock()
+			return "ok", nil
+		},
+	}
+	ag.Tools = []tools.Tool{tool1, tool2}
+
+	call1 := llm.ToolCall{ID: "c1", Function: struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	}{Name: "write", Arguments: `{"path":"/tmp/a.go"}`}}
+	call2 := llm.ToolCall{ID: "c2", Function: struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	}{Name: "read", Arguments: `{"path":"/tmp/b.go"}`}}
+
+	ag.runToolResultsWithTools(context.Background(), []llm.ToolCall{call1, call2}, Events{}, ag.AllTools())
+
+	canonicalA := canonicalPathHint("/tmp/a.go")
+	canonicalB := canonicalPathHint("/tmp/b.go")
+	wantHints := []string{canonicalA, canonicalB}
+	slices.Sort(wantHints)
+
+	if !slices.Equal(hints1.Touched, wantHints) {
+		t.Fatalf("call 1 hints = %v, want %v", hints1.Touched, wantHints)
+	}
+	if !slices.Equal(hints2.Touched, wantHints) {
+		t.Fatalf("call 2 hints = %v, want %v", hints2.Touched, wantHints)
+	}
+}
+
 func TestTaskDoneWaitsForSettlementCallbacks(t *testing.T) {
 	r := newTaskRegistry()
 	task := &BackgroundTask{ID: "task-callbacks", Status: TaskRunning, Done: make(chan struct{})}
@@ -207,14 +259,24 @@ func TestTaskDoneWaitsForSettlementCallbacks(t *testing.T) {
 	}
 }
 
+func mustStartBackground(t *testing.T, ag *Agent, desc, prompt string) *BackgroundTask {
+	t.Helper()
+	task, err := ag.StartBackground(context.Background(), desc, prompt)
+	if err != nil {
+		t.Fatalf("StartBackground(%q, %q): %v", desc, prompt, err)
+	}
+	return task
+}
+
 // Background tasks run concurrently with the parent and deliver their report
-// via the Done channel + a steered message.
+// via the Done channel + a steered message. Large reports are bounded before Steer.
 func TestBackgroundTaskDeliversReport(t *testing.T) {
-	srv := textServer(t, func(n int, req llm.Request) string { return "report-body" })
+	bigReport := strings.Repeat("report-body-line-data\n", 1500) // ~33 KiB > 16 KiB
+	srv := textServer(t, func(n int, req llm.Request) string { return bigReport })
 	defer srv.Close()
 
 	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
-	task := ag.StartBackground(context.Background(), "probe", "do the thing")
+	task := mustStartBackground(t, ag, "probe", "do the thing")
 
 	// wait on the Done channel — closes exactly once on settle
 	select {
@@ -226,8 +288,8 @@ func TestBackgroundTaskDeliversReport(t *testing.T) {
 	if !ok {
 		t.Fatal("task not in registry")
 	}
-	if snap.Status != TaskDone || snap.Report != "report-body" {
-		t.Fatalf("settled task: %+v", snap)
+	if snap.Status != TaskDone || snap.Report != bigReport {
+		t.Fatalf("settled task report mismatch or status not done: status=%s, len=%d", snap.Status, len(snap.Report))
 	}
 
 	// the report should be queued for steering into the parent. Steer runs in
@@ -239,9 +301,63 @@ func TestBackgroundTaskDeliversReport(t *testing.T) {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	if len(pending) != 1 || !strings.Contains(pending[0].text, "report-body") {
-		t.Fatalf("expected steered report, got %v", pending)
+	if len(pending) != 1 {
+		t.Fatalf("expected 1 steered report, got %v", pending)
 	}
+	steered := pending[0].text
+	if len(steered) > 17*1024 {
+		t.Fatalf("steered report exceeded bounded budget: %d bytes", len(steered))
+	}
+	recoveryNotice := fmt.Sprintf("[full report for %s remains in task record]", task.ID)
+	if !strings.Contains(steered, recoveryNotice) {
+		t.Fatalf("steered report missing recovery notice %q: %q", recoveryNotice, steered)
+	}
+}
+
+func TestBackgroundSubagentConcurrencyLimit(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+
+	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
+	// Start three blocking background tasks
+	t1, err := ag.StartBackground(context.Background(), "t1", "p")
+	if err != nil {
+		t.Fatalf("t1 failed: %v", err)
+	}
+	t2, err := ag.StartBackground(context.Background(), "t2", "p")
+	if err != nil {
+		t.Fatalf("t2 failed: %v", err)
+	}
+	t3, err := ag.StartBackground(context.Background(), "t3", "p")
+	if err != nil {
+		t.Fatalf("t3 failed: %v", err)
+	}
+
+	// 4th task must be rejected
+	t4, err := ag.StartBackground(context.Background(), "t4", "p")
+	if err == nil || !strings.Contains(err.Error(), "concurrency limit reached") {
+		t.Fatalf("expected concurrency limit error on 4th task, got: %v (task=%v)", err, t4)
+	}
+
+	// Release one task by cancelling it
+	ag.Tasks().Cancel(t1.ID)
+	select {
+	case <-t1.Done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("t1 never settled")
+	}
+
+	// Now another task can start
+	t5, err := ag.StartBackground(context.Background(), "t5", "p")
+	if err != nil {
+		t.Fatalf("expected 5th task to start after 1 was released: %v", err)
+	}
+	defer ag.Tasks().Cancel(t2.ID)
+	defer ag.Tasks().Cancel(t3.ID)
+	defer ag.Tasks().Cancel(t5.ID)
 }
 
 // Multiple waiters all get woken by the single channel close — the property
@@ -254,7 +370,7 @@ func TestBackgroundTaskBroadcastsToManyWaiters(t *testing.T) {
 	defer srv.Close()
 
 	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
-	task := ag.StartBackground(context.Background(), "d", "p")
+	task := mustStartBackground(t, ag, "d", "p")
 
 	const waiters = 8
 	var woken atomic.Int32
@@ -286,7 +402,7 @@ func TestBackgroundTaskCancel(t *testing.T) {
 	defer srv.Close()
 
 	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
-	task := ag.StartBackground(context.Background(), "d", "p")
+	task := mustStartBackground(t, ag, "d", "p")
 	if !ag.Tasks().Cancel(task.ID) {
 		t.Fatal("cancel should succeed on a running task")
 	}
@@ -412,7 +528,7 @@ func TestBackgroundTaskSubscribersSeeLiveStream(t *testing.T) {
 	defer srv.Close()
 
 	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
-	task := ag.StartBackground(context.Background(), "d", "p")
+	task := mustStartBackground(t, ag, "d", "p")
 
 	var got atomic.Int32
 	ok := ag.Tasks().Subscribe(task.ID, Events{OnText: func(s string) { got.Add(int32(len(s))) }})
@@ -477,7 +593,7 @@ func TestBackgroundTaskSubscriberSeesToolEvents(t *testing.T) {
 	defer srv.Close()
 
 	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
-	task := ag.StartBackground(context.Background(), "d", "p")
+	task := mustStartBackground(t, ag, "d", "p")
 
 	var mu sync.Mutex
 	var seq []string
@@ -514,7 +630,7 @@ func TestBackgroundTaskManySubscribers(t *testing.T) {
 	defer srv.Close()
 
 	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
-	task := ag.StartBackground(context.Background(), "d", "p")
+	task := mustStartBackground(t, ag, "d", "p")
 
 	const subs = 4
 	var counts [subs]atomic.Int32
@@ -555,7 +671,7 @@ func TestBackgroundTaskUsageRollsIntoParent(t *testing.T) {
 	defer srv.Close()
 
 	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
-	task := ag.StartBackground(context.Background(), "d", "p")
+	task := mustStartBackground(t, ag, "d", "p")
 	select {
 	case <-task.Done:
 	case <-time.After(5 * time.Second):
@@ -616,7 +732,7 @@ func TestBroadcastBlockingSubscriberCannotDeadlock(t *testing.T) {
 	defer srv.Close()
 
 	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
-	task := ag.StartBackground(context.Background(), "probe", "p")
+	task := mustStartBackground(t, ag, "probe", "p")
 
 	inCallback := make(chan struct{})
 	notify := sync.OnceFunc(func() { close(inCallback) })

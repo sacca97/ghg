@@ -19,6 +19,10 @@ type Events struct {
 	OnModelCallStart func(ModelCallStart)
 	OnPromptView     func(PromptView)
 	OnModelCallEnd   func(ModelCallEnd)
+	// OnPlanDelta receives the streamed body of the <proposed_plan> block while
+	// the agent is in Plan mode, as it is generated. The surrounding normal text
+	// continues to stream through OnText.
+	OnPlanDelta func(delta string)
 	// OnCompactionReady receives the exact pre-cutover view after checkpoint
 	// generation succeeds, but before Agent.Messages is replaced. Persistence
 	// adapters must save the raw messages and compaction event or return an error.
@@ -188,6 +192,13 @@ func FanIn(evs ...Events) Events {
 			for _, e := range evs {
 				if e.OnModelCallEnd != nil {
 					e.OnModelCallEnd(call)
+				}
+			}
+		},
+		OnPlanDelta: func(delta string) {
+			for _, e := range evs {
+				if e.OnPlanDelta != nil {
+					e.OnPlanDelta(delta)
 				}
 			}
 		},

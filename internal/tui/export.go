@@ -109,13 +109,13 @@ func (m *model) exportResultCommand(text string) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 		}
-		if !ok && (kind == "plan" || kind == "") && m.proposedPlan != nil {
-			planJSON, _ := json.Marshal(m.proposedPlan)
+		if !ok && (kind == "plan" || kind == "") && m.proposedPlanMD != "" {
+			planJSON, _ := json.Marshal(map[string]string{"markdown": m.proposedPlanMD})
 			rec = session.WorkflowResultRecord{
 				ResultID:  fmt.Sprintf("plan-%x", time.Now().UnixNano()&0xffffffff),
 				SessionID: m.sessionID,
 				Kind:      "plan",
-				Version:   1,
+				Version:   2,
 				Payload:   string(planJSON),
 				Role:      config.RoleSmart,
 				CreatedAt: time.Now().UTC(),

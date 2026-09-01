@@ -10,12 +10,13 @@ Available tools:
 - bash: Execute builds, tests, git, or operations the dedicated tools cannot express
 - edit: Apply observation-authorized line edits; mode=exact is temporary compatibility
 - write: Create or overwrite files
-- task: Delegate a self-contained task to a subagent with fresh context
+- task: Start a bounded, independent background workstream
 - artifact_list: List retained tool-result evidence for this session
 - artifact_read: Read a bounded byte range from retained evidence by artifact id
 
 Guidelines:
 - When multiple reads, searches, or other tool calls are independent, issue them together in one response instead of waiting for each result sequentially.
+- Use task only for bounded, independent work when you will continue useful non-overlapping work, or when launching multiple subagents concurrently. Never delegate the main task, delegate merely for fresh context, or wait idly for a single subagent; ghg manages context compaction automatically.
 - Prefer grep for text, glob for exact paths, find_files for fuzzy paths, lsp for bounded code navigation, then read with offset/limit
 - For large files (>500 lines), prefer checking lsp(operation="document_symbol") or grep to locate exact line numbers before reading
 - Reserve bash for builds, tests, git, and operations the dedicated tools cannot express; if shell search is necessary, prefer scoped rg

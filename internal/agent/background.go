@@ -10,6 +10,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/sacca97/ghg/internal/tools"
 )
 
 // TaskStatus is the lifecycle of a background subagent.
@@ -21,6 +23,8 @@ const (
 	TaskError     TaskStatus = "error"
 	TaskCancelled TaskStatus = "cancelled"
 )
+
+const maxActiveBackgroundTasks = 3
 
 // BackgroundTask is one backgrounded subagent. Done is closed exactly once
 // after settlement callbacks finish — closing a channel broadcasts to every
@@ -51,11 +55,8 @@ type BackgroundTask struct {
 type taskRegistry struct {
 	mu    sync.Mutex
 	tasks map[string]*BackgroundTask
-	// subs are live event subscribers per task id (the TUI's per-task view).
-	// Events is all callbacks, so fan-out is a slice the worker walks per
-	// event — no channel to close, no per-subscriber goroutine. Kept here
-	// (not on the task) because List/Get snapshot tasks by value.
-	subs map[string][]Events
+	subs  map[string][]Events
+	slots chan struct{}
 	// OnChange fires (from the worker goroutine) when a task starts or settles;
 	// the TUI installs it to redraw the task list live.
 	OnChange func(*BackgroundTask)
@@ -91,7 +92,11 @@ func (r *taskRegistry) recordSession() string {
 }
 
 func newTaskRegistry() *taskRegistry {
-	return &taskRegistry{tasks: map[string]*BackgroundTask{}, subs: map[string][]Events{}}
+	return &taskRegistry{
+		tasks: map[string]*BackgroundTask{},
+		subs:  map[string][]Events{},
+		slots: make(chan struct{}, maxActiveBackgroundTasks),
+	}
 }
 
 // List returns a snapshot of all tasks, oldest first.
@@ -198,10 +203,16 @@ var taskIDCounter atomic.Int64
 // tool-call half of the background-subagent novelty: instead of blocking the
 // turn on a subagent, the parent keeps working and the registry's Done channel
 // delivers the report back through Steer when the subagent settles.
-func (a *Agent) StartBackground(ctx context.Context, description, prompt string) *BackgroundTask {
+func (a *Agent) StartBackground(ctx context.Context, description, prompt string) (*BackgroundTask, error) {
 	if a.bg == nil {
 		a.bg = newTaskRegistry()
 	}
+	select {
+	case a.bg.slots <- struct{}{}:
+	default:
+		return nil, fmt.Errorf("concurrency limit reached: maximum of %d active background tasks running; continue your own work or retry after a task completes", maxActiveBackgroundTasks)
+	}
+
 	id := fmt.Sprintf("task-%d", taskIDCounter.Add(1))
 	taskCtx, cancel := context.WithCancel(context.Background()) // NOT tied to the turn's ctx: a background task outlives the current turn
 	t := &BackgroundTask{
@@ -220,6 +231,9 @@ func (a *Agent) StartBackground(ctx context.Context, description, prompt string)
 	}
 
 	go func() {
+		defer func() {
+			<-a.bg.slots
+		}()
 		sub, err := a.newSubagent(taskCtx, "tiny")
 		status := TaskDone
 		text := ""
@@ -245,9 +259,11 @@ func (a *Agent) StartBackground(ctx context.Context, description, prompt string)
 		// sees it on the next loop boundary — settlement callbacks → channel
 		// close → Steer.
 		// text/status are locals (not the shared task struct), so no race.
-		a.Steer(fmt.Sprintf("[background task %s %s] %s\n\n%s", id, status, description, text))
+		recoveryNotice := fmt.Sprintf("\n\n[full report for %s remains in task record]", id)
+		steeredReport := tools.TruncateWithSuffix(text, recoveryNotice)
+		a.Steer(fmt.Sprintf("[background task %s %s] %s\n\n%s", id, status, description, steeredReport))
 	}()
-	return t
+	return t, nil
 }
 
 // Subscribe registers a live event subscriber for a running task. Returns

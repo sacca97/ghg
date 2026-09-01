@@ -48,7 +48,7 @@ func TestLoadEmbeddedProfiles(t *testing.T) {
 	if commandcode.BaseURL != "https://api.commandcode.ai/provider/v1" || commandcode.Auth.Kind != AuthBearer || commandcode.Auth.Header != "Authorization" || commandcode.Auth.EnvVar != "CMD_API_KEY" {
 		t.Fatalf("commandcode profile/auth: %+v", commandcode)
 	}
-	if commandcode.Docs.KeysURL != "https://commandcode.ai/settings/keys" || commandcode.Catalog.Kind != CatalogOpenAIModels || commandcode.Catalog.Public {
+	if commandcode.Docs.KeysURL != "https://commandcode.ai/settings/keys" || commandcode.Catalog.Kind != CatalogOpenAIModels || !commandcode.Catalog.Public {
 		t.Fatalf("commandcode docs/catalog: %+v", commandcode)
 	}
 

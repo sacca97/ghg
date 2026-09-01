@@ -28,6 +28,7 @@ const (
 	workerProviderEnv = "GHG_WORKER_PROVIDER"
 	workerRoleEnv     = "GHG_WORKER_ROLE"
 	workerEffortEnv   = "GHG_WORKER_EFFORT"
+	workerModeEnv     = "GHG_WORKER_MODE"
 	workerCautiousEnv = "GHG_WORKER_CAUTIOUS"
 	workerSandboxEnv  = "GHG_WORKER_SANDBOX"
 	workerNetworkEnv  = "GHG_WORKER_NETWORK"
@@ -44,8 +45,6 @@ type (
 	workerApproval          = workerwire.Approval
 	workerApprovalAnswer    = workerwire.ApprovalAnswer
 	workerConfigureRequest  = workerwire.ConfigureRequest
-	workerPlanRequest       = workerwire.PlanRequest
-	workerPlanResult        = workerwire.PlanResult
 	workerSnapshot          = workerwire.Snapshot
 	workerPermissionRequest = workerwire.PermissionRequest
 )
@@ -99,6 +98,7 @@ func (m *model) startWorkerProcess(cautious bool) error {
 		workerProviderEnv: m.provName,
 		workerRoleEnv:     m.agent.Role,
 		workerEffortEnv:   m.agent.Effort,
+		workerModeEnv:     m.uiMode(),
 		workerCautiousEnv: strconv.FormatBool(cautious),
 	}
 	if m.cfg != nil && m.cfg.Execution != nil {
@@ -203,6 +203,7 @@ func (m *model) syncWorkerConfiguration(updateEffort bool) {
 	if err := m.workerClient.Send(workerwire.CommandConfigure, workerRequestID("configure"), workerConfigureRequest{
 		Model: m.modelName, Provider: m.provName, Role: m.agent.Role,
 		Effort: m.agent.Effort, UpdateEffort: updateEffort,
+		Mode: m.uiMode(),
 	}); err != nil {
 		m.append(errStyle.Render("worker configuration failed: " + err.Error()))
 	}
@@ -311,6 +312,7 @@ func (m *model) submitWorkerTurn(text string, authored bool, prepared string, pa
 	if err := m.workerClient.Send(workerwire.CommandInput, requestID, workerInput{
 		Input: prepared, Authored: authored, Parts: parts, Goal: goalCtx,
 		SystemPrompt: systemPrompt, At: at, Snap: snap,
+		PlanMode: m.uiMode() == uiModePlan,
 	}); err != nil {
 		m.cancel = nil
 		m.busy = false
@@ -404,6 +406,12 @@ func (m *model) applyWorkerSnapshot(snapshot workerSnapshot) {
 			m.saved = len(m.agent.Messages)
 		}
 	}
+	if snapshot.Mode != "" {
+		m.mode = snapshot.Mode
+		if m.agent != nil {
+			m.agent.PlanMode = (snapshot.Mode == uiModePlan)
+		}
+	}
 	m.workerContextTokens = snapshot.ContextTokens
 	m.workerState = snapshot.State
 	m.workerDetached = snapshot.Detached
@@ -417,6 +425,9 @@ func (m *model) applyWorkerSnapshot(snapshot workerSnapshot) {
 	if m.busy {
 		if snapshot.LiveText != "" {
 			m.current = snapshot.LiveText
+		}
+		if snapshot.LivePlan != "" {
+			m.planCurrent = snapshot.LivePlan
 		}
 		if snapshot.LiveThink != "" {
 			if m.thinkStart.IsZero() && m.showThinking {
@@ -456,28 +467,29 @@ func (m *model) workerEvent(event workerEvent) tea.Cmd {
 				if value.UpdateEffort {
 					m.agent.Effort = value.Effort
 				}
+				if value.Mode != "" {
+					m.mode = value.Mode
+					m.agent.PlanMode = (value.Mode == uiModePlan)
+				}
 			}
 			m.modelName, m.provName = value.ModelName, value.Provider
-		}
-		return nil
-	case "plan_done":
-		var value workerPlanResult
-		if json.Unmarshal(event.Data, &value) == nil {
-			var err error
-			if value.Error != "" {
-				err = errors.New(value.Error)
-			}
-			return func() tea.Msg { return planProposalMsg{plan: value.Plan, err: err} }
 		}
 		return nil
 	case "state":
 		var value struct {
 			State    workerwire.State `json:"state"`
 			Detached bool             `json:"detached"`
+			Mode     string           `json:"mode"`
 		}
 		if json.Unmarshal(event.Data, &value) == nil {
 			m.workerState = value.State
 			m.workerDetached = value.Detached
+			if value.Mode != "" {
+				m.mode = value.Mode
+				if m.agent != nil {
+					m.agent.PlanMode = (value.Mode == uiModePlan)
+				}
+			}
 			m.busy = value.State == workerwire.StateRunning || value.State == workerwire.StateWaitingApproval
 			m.workerLiveWork = m.busy || m.workerHasLiveTask()
 		}
@@ -502,6 +514,11 @@ func (m *model) workerEvent(event workerEvent) tea.Cmd {
 		var value string
 		if json.Unmarshal(event.Data, &value) == nil {
 			return func() tea.Msg { return thinkMsg(value) }
+		}
+	case workerwire.EventPlanDelta:
+		var value string
+		if json.Unmarshal(event.Data, &value) == nil {
+			return func() tea.Msg { return planDeltaMsg(value) }
 		}
 	case "steer":
 		var value string

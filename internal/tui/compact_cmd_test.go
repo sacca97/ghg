@@ -24,7 +24,7 @@ func compactCmdModel() *model {
 	}))
 	m := &model{
 		input:   newInput(),
-		mouseOn: true, // matches the Run() default (wheel scroll + native drag-copy)
+		mouseOn: true, // matches the Run() default (wheel scroll + app selection)
 		agent:   agent.New(testBackend(srv.URL, "k"), "kimi-k3-fast", 100, "sys"),
 		cfg: &config.Config{
 			DefaultModel: "kimi-k3-fast",

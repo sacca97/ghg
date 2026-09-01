@@ -192,7 +192,7 @@ func (m *model) applyAuthResult(res authResultMsg) {
 		} else {
 			catalogSeeded = true
 			m.catalogs = config.LoadCatalogs()
-			m.prog.Send(catalogsMsg(m.catalogs))
+			m.updateCatalogs(m.catalogs)
 		}
 	}
 
@@ -267,9 +267,8 @@ func (m *model) applyAuthResult(res authResultMsg) {
 			m.wireTasks()
 		}
 	}
-	if m.agent != nil && m.prog != nil && m.workerClient == nil {
-		m.workerStartFailed = false
-		m.ensureWorker()
+	if m.workerClient != nil {
+		m.syncWorkerConfiguration(true)
 	}
 	if res.catalogErr != nil {
 		m.append(dimStyle.Render("(catalog prefetch failed; /model refresh will retry)"))

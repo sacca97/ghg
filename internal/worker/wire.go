@@ -7,7 +7,6 @@ package worker
 import (
 	"time"
 
-	"github.com/sacca97/ghg/internal/agent"
 	goalstate "github.com/sacca97/ghg/internal/goal"
 	"github.com/sacca97/ghg/internal/llm"
 )
@@ -21,6 +20,7 @@ type Input struct {
 	SystemPrompt string            `json:"system_prompt,omitempty"`
 	At           int               `json:"at"`
 	Snap         string            `json:"snap,omitempty"`
+	PlanMode     bool              `json:"plan_mode,omitempty"`
 }
 
 // TurnResult reports a finished turn.
@@ -31,6 +31,7 @@ type TurnResult struct {
 	At       int           `json:"at"`
 	Snap     string        `json:"snap,omitempty"`
 	Messages []llm.Message `json:"messages,omitempty"`
+	Plan     string        `json:"plan,omitempty"`
 }
 
 // CompactResult reports a finished compaction.
@@ -75,17 +76,7 @@ type ConfigureRequest struct {
 	Protocol     string `json:"protocol,omitempty"`
 	Effort       string `json:"effort,omitempty"`
 	UpdateEffort bool   `json:"update_effort,omitempty"`
-}
-
-// PlanRequest asks for a detached plan proposal.
-type PlanRequest struct {
-	Goal string `json:"goal"`
-}
-
-// PlanResult reports the plan proposal (or its failure).
-type PlanResult struct {
-	Plan  agent.Plan `json:"plan"`
-	Error string     `json:"error,omitempty"`
+	Mode         string `json:"mode,omitempty"`
 }
 
 // PermissionRequest announces one pending approval on the event stream.
@@ -114,6 +105,8 @@ type Snapshot struct {
 	LiveText      string        `json:"live_text,omitempty"`
 	LiveThink     string        `json:"live_think,omitempty"`
 	LiveTool      string        `json:"live_tool_output,omitempty"`
+	Mode          string        `json:"mode,omitempty"`
+	LivePlan      string        `json:"live_plan,omitempty"`
 }
 
 // AppendRequest carries a local context message (shell-escape output) to the

@@ -20,4 +20,4 @@ routes:
 
 catalog:
   kind: openai-models
-  public: false
+  public: true

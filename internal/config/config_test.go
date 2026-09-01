@@ -515,3 +515,40 @@ func TestArtifactConfigRoundTripAndExplicitDisable(t *testing.T) {
 		t.Fatalf("artifact config did not round-trip: %+v", reloaded.Artifacts)
 	}
 }
+
+func TestSubagentsConfigRoundTripAndDisable(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	dir := filepath.Join(home, ".ghg")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(`{
+  "defaultModel": "m1",
+  "providers": { "a": { "baseUrl": "https://a", "api": "openai-completions" } },
+  "models": { "m1": { "providers": ["a"] } },
+  "subagents": false
+}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Subagents == nil || *cfg.Subagents || SubagentsEnabled(cfg) {
+		t.Fatalf("subagents config did not parse: %+v", cfg.Subagents)
+	}
+	if err := cfg.Save(); err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.Subagents == nil || *reloaded.Subagents || SubagentsEnabled(reloaded) {
+		t.Fatalf("subagents config did not round-trip: %+v", reloaded.Subagents)
+	}
+	if !SubagentsEnabled(nil) {
+		t.Fatalf("nil config should enable subagents by default")
+	}
+}

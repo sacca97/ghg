@@ -127,6 +127,12 @@ const DefaultCompactModel = "deepseek-v4-flash-0731"
 // 40% keeps compaction deterministic instead of letting the context bloat (see Uber guidelines of compacting at ~400K, we use mostly 1M).
 const DefaultCompactPct = 40
 
+// SubagentsEnabled reports whether subagent delegation is allowed. Defaults
+// to true when unspecified (nil).
+func SubagentsEnabled(c *Config) bool {
+	return c == nil || c.Subagents == nil || *c.Subagents
+}
+
 // CompactThreshold returns the configured compaction fraction, clamped to the
 // supported 10–90% range. Zero selects DefaultCompactPct.
 func CompactThreshold(c *Config) float64 {
@@ -147,6 +153,7 @@ type Config struct {
 	CompactPct      int                   `json:"compactPct,omitempty"`      // compact at this % of the context window; 0 = DefaultCompactPct
 	Theme           string                `json:"theme,omitempty"`           // "light", "dark", or "" (auto-detect at startup)
 	Mouse           *bool                 `json:"mouse,omitempty"`           // false disables capture so native terminal selection works
+	Subagents       *bool                 `json:"subagents,omitempty"`       // false disables task tool and subagent delegation
 	Thinking        *bool                 `json:"thinking,omitempty"`        // nil defaults to on; false hides reasoning tokens (ctrl+o)
 	CollapsePaste   *bool                 `json:"collapsePaste,omitempty"`   // nil/false: pastes land verbatim; true collapses ≥3-line pastes into a [Pasted ~N lines] placeholder
 	GoalMaxRounds   int                   `json:"goalMaxRounds,omitempty"`   // global goal-loop round cap; 0 = DefaultGoalMaxRounds; projects.json may override per folder

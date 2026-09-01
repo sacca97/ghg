@@ -21,7 +21,7 @@ import (
 
 // Definition is the declarative contract for a named agent. The Markdown body
 // is the prompt; the frontmatter only selects the route, tools, and round
-// budget. Path is empty for the built-in planner.
+// budget. Path is empty for the built-in reviewer.
 type Definition struct {
 	Name        string
 	Description string
@@ -44,7 +44,6 @@ type DefinitionLoadOptions struct {
 }
 
 const (
-	builtInPlannerName  = "planner"
 	builtInReviewerName = "reviewer"
 	maxDefinitionRounds = 32
 	maxDefinitionName   = 64
@@ -55,24 +54,7 @@ var definitionNameRE = regexp.MustCompile(`^[a-z0-9][a-z0-9-]*$`)
 var knownDefinitionTools = map[string]struct{}{
 	"bash": {}, "read": {}, "write": {}, "edit": {}, "grep": {}, "glob": {}, "find_files": {}, "lsp": {}, "lsp_rename": {},
 	"task": {}, "todowrite": {}, "remember": {}, "forget": {},
-	"artifact_list": {}, "artifact_read": {}, "submit_plan": {}, "submit_review": {},
-}
-
-// BuiltInPlannerDefinition is the first agent definition shipped by ghg. It
-// is intentionally a value rather than a special execution branch: the same
-// validation, tool resolution, and bounded runner used by loaded definitions
-// runs it. User files cannot shadow the reserved planner definition.
-func BuiltInPlannerDefinition() Definition {
-	return Definition{
-		Name:        builtInPlannerName,
-		Description: "Read-only implementation planner",
-		Role:        "smart",
-		Tools:       []string{"read", "grep", "glob", "lsp", "submit_plan"},
-		MaxRounds:   maxDefinitionRounds,
-		Prompt: `You are ghg's planning agent. Produce an implementation plan for the user's goal.
-
-Inspect the repository when useful with read, grep, glob, and bounded lsp navigation. These tools are read-only. Do not use bash, write, edit, lsp_rename, task, MCP, or any other tool. When you have enough information, call submit_plan exactly once with a concrete goal, ordered imperative steps, and independently verifiable acceptance checks. Do not finish with a prose plan: submit_plan is the terminal result.`,
-	}
+	"artifact_list": {}, "artifact_read": {}, "submit_review": {},
 }
 
 // BuiltInReviewerDefinition is the code review agent definition shipped by ghg.
@@ -90,11 +72,10 @@ Inspect the repository when useful with read, grep, glob, and bounded lsp naviga
 }
 
 // LoadAgentDefinitions discovers project and user Markdown definitions and
-// always includes the built-in planner and reviewer. A malformed definition or
+// always includes the built-in reviewer. A malformed definition or
 // unknown tool is an error; an absent discovery directory is normal.
 func LoadAgentDefinitions(opts DefinitionLoadOptions) (map[string]Definition, error) {
 	defs := map[string]Definition{
-		builtInPlannerName:  BuiltInPlannerDefinition(),
 		builtInReviewerName: BuiltInReviewerDefinition(),
 	}
 	projectDir, userDir := opts.ProjectDir, opts.UserDir
@@ -138,7 +119,7 @@ func LoadAgentDefinitions(opts DefinitionLoadOptions) (map[string]Definition, er
 			if parseErr != nil {
 				return nil, parseErr
 			}
-			if def.Name == builtInPlannerName || def.Name == builtInReviewerName {
+			if def.Name == builtInReviewerName {
 				return nil, fmt.Errorf("agent definition %s: name %q is reserved", path, def.Name)
 			}
 			if _, exists := defs[def.Name]; exists {
@@ -230,7 +211,7 @@ func cleanDefinitionTools(names []string) []string {
 
 // Validate checks both the declarative shape and the static tool allowlist.
 // Dynamic MCP tools are deliberately not accepted here: definitions must be
-// reviewable from their Markdown files and the built-in planner must never
+// reviewable from their Markdown files and built-in definitions must never
 // inherit arbitrary MCP capabilities.
 func (d Definition) Validate() error {
 	if strings.TrimSpace(d.Name) == "" {
@@ -282,8 +263,8 @@ type DefinitionResult struct {
 }
 
 // RunDefinition executes a definition with only the tools named by its
-// frontmatter. Definitions that advertise submit_plan stop after a successful
-// submit_plan call; all other definitions return the model's final text.
+// frontmatter. Definitions that advertise submit_review stop after a
+// successful submit_review call; all other definitions return final text.
 func (a *Agent) RunDefinition(ctx context.Context, input string, def Definition, ev Events) (DefinitionResult, error) {
 	if err := def.Validate(); err != nil {
 		return DefinitionResult{}, err
@@ -303,9 +284,7 @@ func (a *Agent) RunDefinition(ctx context.Context, input string, def Definition,
 	}
 	messages = append(messages, llm.Message{Role: "user", Content: input})
 	terminalToolName := ""
-	if slices.Contains(def.Tools, "submit_plan") {
-		terminalToolName = "submit_plan"
-	} else if slices.Contains(def.Tools, "submit_review") {
+	if slices.Contains(def.Tools, "submit_review") {
 		terminalToolName = "submit_review"
 	}
 	requiresTerminal := terminalToolName != ""
@@ -385,10 +364,6 @@ func (a *Agent) definitionTools(definitionName string, names []string) ([]tools.
 	}
 	available := make([]tools.Tool, 0, len(names))
 	for _, name := range names {
-		if name == "submit_plan" {
-			available = append(available, submitPlanTool())
-			continue
-		}
 		if name == "submit_review" {
 			available = append(available, submitReviewTool())
 			continue
@@ -413,20 +388,6 @@ func appendDefinitionPrompt(system string, def Definition) string {
 	return system + "\n\n" + definitionPrompt(def)
 }
 
-func submitPlanTool() tools.Tool {
-	return tools.Tool{
-		Def: llm.NewTool("submit_plan",
-			"Submit the validated implementation plan. This is the planner's terminal tool; call it once when repository inspection is complete.",
-			`{"type":"object","properties":{"goal":{"type":"string","description":"Concrete outcome of the work"},"assumptions":{"type":"array","items":{"type":"string"}},"steps":{"type":"array","description":"Ordered imperative implementation steps","items":{"type":"string"}},"acceptance_checks":{"type":"array","description":"Independently verifiable checks","items":{"type":"string"}},"risks":{"type":"array","items":{"type":"string"}}},"required":["goal","steps","acceptance_checks"]}`),
-		Run: func(_ context.Context, args json.RawMessage) (string, error) {
-			if _, err := ParsePlan(string(args)); err != nil {
-				return "", err
-			}
-			return "Plan accepted.", nil
-		},
-	}
-}
-
 func submitReviewTool() tools.Tool {
 	return tools.Tool{
 		Def: llm.NewTool("submit_review",
@@ -439,48 +400,4 @@ func submitReviewTool() tools.Tool {
 			return "Review accepted.", nil
 		},
 	}
-}
-
-const maxPlanAttempts = 2
-
-// ProposePlan runs the built-in planner definition. It is the shared planning
-// entry point for the TUI and headless CLI, so both surfaces enforce the same
-// terminal tool, read-only allowlist, and retry budget.
-func ProposePlan(ctx context.Context, planner *Agent, goal string, ev Events) (Plan, error) {
-	return ProposePlanWithDefinition(ctx, planner, goal, BuiltInPlannerDefinition(), ev)
-}
-
-// ProposePlanWithDefinition is the definition-aware planning entry point. The
-// caller may select a loaded definition, but the definition itself still
-// controls the model-visible tools and round budget.
-func ProposePlanWithDefinition(ctx context.Context, planner *Agent, goal string, def Definition, ev Events) (Plan, error) {
-	var lastErr error
-	for attempt := 0; attempt < maxPlanAttempts; attempt++ {
-		input := plannerInput(goal, attempt > 0)
-		result, err := planner.RunDefinition(ctx, input, def, ev)
-		if err != nil {
-			return Plan{}, err
-		}
-		if result.TerminalName != "submit_plan" {
-			lastErr = errors.New("planner did not call submit_plan")
-			continue
-		}
-		plan, err := ParsePlan(string(result.TerminalArgs))
-		if err == nil {
-			return plan, nil
-		}
-		lastErr = err
-	}
-	if lastErr == nil {
-		lastErr = errors.New("planner returned no plan")
-	}
-	return Plan{}, fmt.Errorf("invalid planner output after %d attempts: %w", maxPlanAttempts, lastErr)
-}
-
-func plannerInput(goal string, retry bool) string {
-	input := fmt.Sprintf("Plan this implementation goal:\n\n%s\n\nInspect the repository as needed, then submit the plan with submit_plan.", strings.TrimSpace(goal))
-	if retry {
-		input += "\n\nYour previous proposal was invalid or did not use the terminal tool. Correct it and call submit_plan now."
-	}
-	return input
 }

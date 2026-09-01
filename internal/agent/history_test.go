@@ -51,10 +51,23 @@ func TestHistoryToolsSearchPaginateAndReadAsUntrustedEvidence(t *testing.T) {
 		t.Fatalf("second history page = %q", second.Preview)
 	}
 
+	// Single-page search returns without a cursor.
+	singlePageArgs, _ := json.Marshal(map[string]any{"query": "needle", "limit": 10})
+	singlePage := tools.ExecuteResult(context.Background(), ag.AllTools(), "history_search", singlePageArgs)
+	if !tools.IsUntrusted(singlePage) || strings.Contains(singlePage.Preview, "next_cursor=") {
+		t.Fatalf("single page search should not contain next_cursor: %q", singlePage.Preview)
+	}
+	if !strings.Contains(singlePage.Preview, "history_search: 3 result(s)") {
+		t.Fatalf("single page search missing expected results: %q", singlePage.Preview)
+	}
+
 	readArgs, _ := json.Marshal(map[string]any{"start_seq": 1, "end_seq": 4})
 	read := tools.ExecuteResult(context.Background(), ag.AllTools(), "history_read", readArgs)
 	if !tools.IsUntrusted(read) || !strings.Contains(read.Preview, `role=tool`) || !strings.Contains(read.Preview, `calls=`) {
 		t.Fatalf("history read = %+v", read)
+	}
+	if strings.Contains(read.Preview, "next_cursor=") {
+		t.Fatalf("single page read should not contain next_cursor: %q", read.Preview)
 	}
 	if strings.Contains(read.Preview, `"tool_calls"`) || strings.Contains(read.Preview, "old-call") {
 		t.Fatalf("history read leaked provider protocol data: %q", read.Preview)

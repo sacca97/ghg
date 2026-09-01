@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -15,6 +16,7 @@ import (
 	"github.com/sacca97/ghg/internal/config"
 	goalstate "github.com/sacca97/ghg/internal/goal"
 	"github.com/sacca97/ghg/internal/mcp"
+	"github.com/sacca97/ghg/internal/session"
 	"github.com/sacca97/ghg/internal/tools"
 	workerwire "github.com/sacca97/ghg/internal/worker"
 )
@@ -39,7 +41,89 @@ func scrollMouseWheel(vp *viewport.Model, msg tea.MouseMsg) bool {
 	return true
 }
 
+type wheelState struct {
+	last         time.Time
+	dir          int
+	velocity     float64
+	fraction     float64
+	pending      int
+	framePending bool
+}
+
+type wheelFrameMsg struct{}
+
+const wheelIdle = 120 * time.Millisecond
+
+// scrollTranscriptWheel keeps isolated detents precise and coalesces rapid
+// detents into one small frame. This avoids a repaint for every event without
+// introducing momentum or a continuously running animation.
+func (m *model) scrollTranscriptWheel(msg tea.MouseMsg) tea.Cmd {
+	if msg.Action != tea.MouseActionPress || msg.Shift {
+		return nil
+	}
+	dir := 0
+	switch msg.Button {
+	case tea.MouseButtonWheelUp:
+		dir = -1
+	case tea.MouseButtonWheelDown:
+		dir = 1
+	default:
+		return nil
+	}
+	if m.selection != nil {
+		m.selection = nil
+	}
+	now := m.nowFn()
+	elapsed := now.Sub(m.wheel.last)
+	if m.wheel.last.IsZero() || elapsed < 0 || elapsed > wheelIdle || dir != m.wheel.dir {
+		m.wheel = wheelState{last: now, dir: dir, velocity: 1}
+		m.applyTranscriptWheel(dir)
+		return nil
+	}
+	m.wheel.last = now
+	m.wheel.velocity = min(m.wheel.velocity+0.75, 6.0)
+	m.wheel.fraction += m.wheel.velocity
+	move := int(m.wheel.fraction)
+	m.wheel.fraction -= float64(move)
+	if move > 0 {
+		m.wheel.pending += dir * move
+	}
+	if m.wheel.pending == 0 || m.wheel.framePending {
+		return nil
+	}
+	m.wheel.framePending = true
+	return tea.Tick(16*time.Millisecond, func(time.Time) tea.Msg { return wheelFrameMsg{} })
+}
+
+func (m *model) applyTranscriptWheel(delta int) {
+	if delta < 0 {
+		m.vp.ScrollUp(-delta)
+	} else {
+		m.vp.ScrollDown(delta)
+	}
+	m.follow = m.vp.AtBottom()
+}
+
+func (m *model) applyWheelFrame() {
+	delta := m.wheel.pending
+	m.wheel.pending = 0
+	m.wheel.framePending = false
+	if delta != 0 {
+		m.applyTranscriptWheel(delta)
+	}
+}
+
 func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	// Spinner ticks only change the busy indicator. Avoid relaying them through
+	// layout, which otherwise recomputes the whole TUI on every animation frame.
+	if tick, ok := msg.(spinner.TickMsg); ok {
+		if !m.busy {
+			return m, nil
+		}
+		var cmd tea.Cmd
+		m.spin, cmd = m.spin.Update(tick)
+		return m, cmd
+	}
 	defer m.layout()
 
 	if vp, ok := msg.(viewProbe); ok { // tests read model state race-safely
@@ -47,6 +131,21 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	switch msg := msg.(type) {
+	case selectionCopyMsg:
+		if msg.err != nil {
+			m.append(errStyle.Render("copy failed: " + msg.err.Error()))
+		} else {
+			m.selection = nil
+		}
+		return m, nil
+
+	case selectionEdgeMsg:
+		return m, m.selectionEdgeTick()
+
+	case wheelFrameMsg:
+		m.applyWheelFrame()
+		return m, nil
+
 	case cfgSyncTick:
 		return m.cfgSync()
 
@@ -121,12 +220,6 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.key(msg)
 
 	case tea.MouseMsg:
-		// shift+click/drag must pass through so the terminal's native
-		// selection (copy) works while mouse capture is on — consuming the
-		// event here is what breaks drag-to-copy
-		if msg.Shift {
-			return m, nil
-		}
 		// The middle row of the bottom status box owns the model, effort, and mode
 		// controls, so clicks there must not fall through to transcript scrolling.
 		if m.settings == nil && m.picker == nil && m.mpicker == nil && m.taskVP == nil &&
@@ -184,30 +277,16 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m, nil
 				}
 			}
-			// click on a collapsed tool result expands it (and vice versa)
-			if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft &&
-				msg.Y > 1 && m.settings == nil {
-				row := m.vp.YOffset + msg.Y - 2 // viewport starts 2 rows below the header
-				if pad := m.contentPad(); row < pad {
-					row = -1 // top padding: above the first block
-				} else {
-					row -= pad
-				}
-				for i := range m.blocks {
-					if row >= m.blocks[i].y0 && row <= m.blocks[i].y1 && m.blocks[i].toggle() {
-						m.refreshVP()
-						return m, nil
-					}
-				}
-			}
 			if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft && msg.Y >= m.height-3 {
 				m.follow = true
 				m.vp.GotoBottom()
 				return m, nil
 			}
-			if scrollMouseWheel(&m.vp, msg) {
-				m.follow = m.vp.AtBottom()
-				return m, nil
+			if msg.Button == tea.MouseButtonWheelUp || msg.Button == tea.MouseButtonWheelDown {
+				return m, m.scrollTranscriptWheel(msg)
+			}
+			if handled, cmd := m.handleTranscriptMouse(msg); handled {
+				return m, cmd
 			}
 			var cmd tea.Cmd
 			m.vp, cmd = m.vp.Update(msg)
@@ -225,6 +304,17 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			done := m.current[:i]
 			m.current = m.current[i+1:]
 			m.appendAssistant(done)
+		}
+		return m, nil
+
+	case planDeltaMsg:
+		m.flushThink()
+		m.flushCurrent()
+		m.planCurrent += string(msg)
+		if i := strings.LastIndexByte(m.planCurrent, '\n'); i >= 0 {
+			done := m.planCurrent[:i]
+			m.planCurrent = m.planCurrent[i+1:]
+			m.appendPlanBlock(done)
 		}
 		return m, nil
 
@@ -364,9 +454,6 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
-	case planProposalMsg:
-		return m.finishPlanProposal(msg)
-
 	case compactMsg:
 		// compaction lands between turns after its event is durable; note it
 		// inline. The raw message log stays on disk — Load derives the
@@ -437,6 +524,28 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.append(dimStyle.Render("(interrupted — any running tool calls will be recorded as interrupted; ghg can retry them next turn)"))
 		}
 		continueGoal := m.goalTurnFinished(msg, canceled)
+		if m.uiMode() == uiModePlan && msg.final != "" {
+			if planMD, ok := agent.ExtractProposedPlan(msg.final); ok {
+				m.proposedPlanMD = planMD
+				if m.store != nil && m.sessionID != "" {
+					planJSON, _ := json.Marshal(map[string]string{"markdown": planMD})
+					msgSeq := 0
+					if m.agent != nil {
+						msgSeq = len(m.agent.MessagesSnapshot())
+					}
+					_ = m.store.SaveWorkflowResult(context.Background(), session.WorkflowResultRecord{
+						ResultID:   fmt.Sprintf("plan-%x", time.Now().UnixNano()&0xffffffff),
+						SessionID:  m.sessionID,
+						Kind:       "plan",
+						Version:    2,
+						Payload:    string(planJSON),
+						Role:       config.RoleSmart,
+						MessageSeq: msgSeq,
+						CreatedAt:  time.Now().UTC(),
+					})
+				}
+			}
+		}
 		m.persist()
 		switch {
 		case msg.snap != "" && msg.clean:
@@ -487,8 +596,6 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case usageMsg:
-		// Turn already folds usage into the agent's session totals (header
-		// reads those); this message just forces a redraw mid-stream.
 		return m, nil
 
 	case quitArmMsg:
@@ -575,14 +682,6 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.refreshMenu()
 		}
 		return m, nil
-
-	case spinner.TickMsg:
-		if !m.busy {
-			return m, nil
-		}
-		var cmd tea.Cmd
-		m.spin, cmd = m.spin.Update(msg)
-		return m, cmd
 
 	case scheduleTickMsg:
 		if m.agent == nil {

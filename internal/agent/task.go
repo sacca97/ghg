@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 
@@ -30,6 +31,9 @@ func taskTool(parent *Agent) tools.Tool {
 			"Launch a subagent to handle a self-contained task with its own fresh context. It has grep, glob, find_files, read, lsp, lsp_rename, bash, write, and edit; prefer the bounded dedicated tools for exploration and use observed edit ranges. It returns only its final report. Set background=true to run it concurrently while you keep working — you'll be notified with the report automatically when it finishes; do NOT poll or sleep waiting for it.",
 			`{"type":"object","properties":{"description":{"type":"string","description":"Short 3-8 word summary of the task"},"prompt":{"type":"string","description":"Complete instructions for the subagent; it cannot ask follow-up questions"},"background":{"type":"boolean","description":"Run concurrently and get notified on completion (default false = block until done)"}},"required":["prompt"]}`),
 		Run: func(ctx context.Context, args json.RawMessage) (string, error) {
+			if parent != nil && parent.SubagentsDisabled {
+				return "", errors.New("subagents are disabled by configuration")
+			}
 			var a struct {
 				Description string `json:"description"`
 				Prompt      string `json:"prompt"`
@@ -43,7 +47,10 @@ func taskTool(parent *Agent) tools.Tool {
 				desc = "subagent task"
 			}
 			if a.Background {
-				t := parent.StartBackground(ctx, desc, a.Prompt)
+				t, err := parent.StartBackground(ctx, desc, a.Prompt)
+				if err != nil {
+					return "", err
+				}
 				return fmt.Sprintf("Started background task %s: %s. Keep working on something else; the report will arrive as a message when it finishes. Do not poll for it.", t.ID, desc), nil
 			}
 			sub, err := parent.newSubagent(ctx, "tiny")

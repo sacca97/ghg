@@ -17,7 +17,7 @@ import (
 )
 
 const (
-	defaultAnthropicMaxTokens = 4096
+	defaultAnthropicMaxTokens = 8192
 	anthropicModelsPageSize   = 1000
 	maxAnthropicModels        = 10000
 	maxAnthropicSSELine       = 10 * 1024 * 1024
@@ -897,6 +897,9 @@ func consumeAnthropicSSE(r io.Reader, onText, onThink func(string)) (Message, Us
 					message = event.Error.Type + ": " + message
 				}
 			}
+			if isTransientErrorMessage(message) {
+				return errors.New(message)
+			}
 			return nonRetryable{errors.New(message)}
 		case "ping":
 			// Keep-alive event; no state change.
@@ -921,7 +924,7 @@ func consumeAnthropicSSE(r io.Reader, onText, onThink func(string)) (Message, Us
 	indices := slices.Sorted(maps.Keys(blocks))
 	content := make([]json.RawMessage, 0, len(indices))
 	for _, index := range indices {
-		raw, err := finishAnthropicStreamBlock(blocks[index])
+		raw, err := finishAnthropicStreamBlock(blocks[index], stopReason)
 		if err != nil {
 			return Message{}, anthropicUsageValue(inputUsage), nonRetryable{err}
 		}
@@ -951,7 +954,7 @@ func rawString(raw json.RawMessage) string {
 	return ""
 }
 
-func finishAnthropicStreamBlock(state *anthropicStreamBlock) (json.RawMessage, error) {
+func finishAnthropicStreamBlock(state *anthropicStreamBlock, stopReason string) (json.RawMessage, error) {
 	if state.raw == nil {
 		state.raw = map[string]json.RawMessage{"type": json.RawMessage(`"unknown"`)}
 	}
@@ -968,9 +971,14 @@ func finishAnthropicStreamBlock(state *anthropicStreamBlock) (json.RawMessage, e
 	case "tool_use":
 		if state.partial != "" {
 			if !json.Valid([]byte(state.partial)) {
-				return nil, fmt.Errorf("malformed anthropic tool input")
+				if stopReason == "max_tokens" {
+					state.raw["input"] = json.RawMessage(`{}`)
+				} else {
+					return nil, fmt.Errorf("malformed anthropic tool input")
+				}
+			} else {
+				state.raw["input"] = json.RawMessage(state.partial)
 			}
-			state.raw["input"] = json.RawMessage(state.partial)
 		} else if len(state.raw["input"]) == 0 {
 			state.raw["input"] = json.RawMessage(`{}`)
 		}

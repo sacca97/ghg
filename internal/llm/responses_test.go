@@ -58,6 +58,7 @@ func TestOpenAIResponsesRequestTranslation(t *testing.T) {
 		Tools:           []Tool{tool},
 		MaxTokens:       123,
 		ReasoningEffort: "high",
+		SessionID:       "sess-test",
 	}, true)
 	if err != nil {
 		t.Fatal(err)
@@ -74,12 +75,20 @@ func TestOpenAIResponsesRequestTranslation(t *testing.T) {
 		MaxOutputTokens int              `json:"max_output_tokens"`
 		Reasoning       map[string]any   `json:"reasoning"`
 		Stream          bool             `json:"stream"`
+		Store           *bool            `json:"store"`
+		PromptCacheKey  string           `json:"prompt_cache_key"`
 	}
 	if err := json.Unmarshal(data, &got); err != nil {
 		t.Fatal(err)
 	}
 	if got.Model != "grok-test" || got.Instructions != "Be concise." || got.MaxOutputTokens != 123 || !got.Stream {
 		t.Fatalf("request fields: %+v", got)
+	}
+	if got.Store == nil || *got.Store != false {
+		t.Fatalf("store: got %v, want false", got.Store)
+	}
+	if got.PromptCacheKey != "sess-test" {
+		t.Fatalf("prompt_cache_key: got %q, want sess-test", got.PromptCacheKey)
 	}
 	if got.Reasoning["effort"] != "high" {
 		t.Fatalf("reasoning effort: %+v", got.Reasoning)

@@ -6,9 +6,8 @@ import (
 	"github.com/sacca97/ghg/internal/config"
 )
 
-// Mouse capture defaults ON (wheel scroll + clicks work) using click/wheel-only
-// reporting (?1000, no motion) so native drag-to-copy still works. A config
-// "mouse": false opts back into no capture.
+// Mouse capture defaults ON (wheel scroll + clicks work). A config "mouse":
+// false opts back into no capture for terminals that need native selection.
 func TestMouseDefaultsOn(t *testing.T) {
 	cfg := config.Default()
 	if cfg.Mouse != nil {

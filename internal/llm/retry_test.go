@@ -265,3 +265,40 @@ func TestRetryRespectsCancellation(t *testing.T) {
 		t.Fatalf("cancellation took %v; backoff should have been interrupted", elapsed)
 	}
 }
+
+func TestStreamRetriesUpstreamStreamEndedError(t *testing.T) {
+	noSleep(t)
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		if calls.Add(1) < 3 {
+			fmt.Fprint(w, "data: {\"error\":{\"message\":\"upstream stream ended before terminal chunk\"}}\n\n")
+			return
+		}
+		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"recovered\"}}]}\n\ndata: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	c := New(srv.URL, "k")
+	var retried int
+	c.OnRetry = func(ev RetryEvent) {
+		retried++
+		if ev.Delay != 1*time.Second {
+			t.Errorf("delay = %v, want 1s", ev.Delay)
+		}
+	}
+
+	msg, _, err := c.Stream(context.Background(), Request{Model: "m"}, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if msg.Content != "recovered" {
+		t.Fatalf("content: %q, want 'recovered'", msg.Content)
+	}
+	if calls.Load() != 3 {
+		t.Fatalf("attempts = %d, want 3", calls.Load())
+	}
+	if retried != 2 {
+		t.Fatalf("retried %d times, want 2", retried)
+	}
+}

@@ -196,6 +196,14 @@ func RenderResult(record session.WorkflowResultRecord, format string) ([]byte, e
 	case FormatMarkdown, "md", "text", "txt", "":
 		switch record.Kind {
 		case "plan":
+			if record.Version >= 2 {
+				var obj struct {
+					Markdown string `json:"markdown"`
+				}
+				if err := json.Unmarshal([]byte(record.Payload), &obj); err == nil && obj.Markdown != "" {
+					return []byte(strings.TrimRight(obj.Markdown, "\n") + "\n"), nil
+				}
+			}
 			plan, err := agent.ParsePlan(record.Payload)
 			if err != nil {
 				return nil, fmt.Errorf("parse plan payload: %w", err)

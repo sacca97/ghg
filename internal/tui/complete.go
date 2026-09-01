@@ -33,7 +33,7 @@ func completionTable() []cand {
 // sensibly with no arguments); others insert themselves for arguments.
 var execNow = map[string]bool{
 	"/clear": true, "/compact": true, "/context-doctor": true, "/detach": true, "/effort": true, "/goal": true, "/goal-from-context": true, "/help": true,
-	"/execute": true, "/mcp": true, "/model": true, "/mouse": true, "/pwd": true, "/quit": true, "/report": true, "/resume": true, "/tasks": true,
+	"/execute": true, "/mcp": true, "/model": true, "/pwd": true, "/quit": true, "/report": true, "/resume": true, "/tasks": true,
 }
 
 var exportKindCands = []cand{

@@ -73,14 +73,13 @@ type Agent struct {
 	// ArtifactsDisabled distinguishes an intentional config opt-out from a
 	// session store that is simply unavailable.
 	ArtifactsDisabled bool
+	// SubagentsDisabled suppresses the task tool so the model cannot launch subagents.
+	SubagentsDisabled bool
 
 	// ContextLimit is the model's context window in tokens, as advertised by
 	// the provider's GET /models (0 when unadvertised — proactive compaction
 	// is then disabled and only the reactive context-limit retry applies).
 	ContextLimit int
-	// ResultAging enables the deterministic derived prompt view for older tool
-	// results. It never rewrites Agent.Messages or the durable raw log.
-	ResultAging bool
 	// Checkpointing and HistoryRecall are independent switches. New agents
 	// enable both; callers can disable either without changing the other.
 	Checkpointing bool
@@ -102,6 +101,12 @@ type Agent struct {
 	// MaxTurns caps the tool-call loop (rounds of model→tools→model) so a
 	// scripted run can't run away. 0 = uncapped (the TUI default).
 	MaxTurns int
+
+	// PlanMode restricts the agent to a read-only tool allowlist and injects a
+	// planning prompt. It is a collaboration mode on the same agent, not a
+	// separate definition: the conversation and its message history carry over
+	// between planning and execution.
+	PlanMode bool
 
 	mu        sync.Mutex
 	pending   []pendingSteer // steered user messages awaiting injection
@@ -275,7 +280,6 @@ func New(backend llm.Backend, model string, maxTokens int, systemPrompt string) 
 		Messages:      []llm.Message{{Role: "system", Content: systemPrompt}},
 		Checkpointing: true,
 		HistoryRecall: true,
-		ResultAging:   true,
 	}
 	if p, ok := backend.(llm.ProtocolBackend); ok {
 		a.Protocol = string(p.AdapterProtocol())
@@ -321,7 +325,6 @@ func (a *Agent) newSubagent(ctx context.Context, role string) (*Agent, error) {
 	sub.stateMu.Unlock()
 	sub.Checkpointing = a.Checkpointing
 	sub.HistoryRecall = a.HistoryRecall
-	sub.ResultAging = a.ResultAging
 	sub.Effort = a.Effort
 	if a.SubagentFactory == nil {
 		sub.ReasoningToggle = a.ReasoningToggle
@@ -343,6 +346,7 @@ func (a *Agent) newSubagent(ctx context.Context, role string) (*Agent, error) {
 	sub.ArtifactStore = a.ArtifactStore
 	sub.HistoryCatalog = a.HistoryCatalog
 	sub.ArtifactsDisabled = a.ArtifactsDisabled
+	sub.SubagentsDisabled = a.SubagentsDisabled
 	sub.SetSessionID(a.currentSessionID())
 	sub.Tools = append(sub.Tools, artifactTools(sub)...)
 	return sub, nil
@@ -535,28 +539,10 @@ func (a *Agent) SetSystemPrompt(prompt string) {
 // SetMCPTools swaps in the current MCP tool set (called by the MCP manager's
 // OnChange whenever a server settles). MCP tools live separately from
 // a.Tools so a settle mid-turn never mutates the slice a Turn is reading.
-// A Suggester is installed on first use so a stale/typo'd mcp__ call gets a
-// "did you mean?" nudge instead of a dead end.
 func (a *Agent) SetMCPTools(ts []tools.Tool) {
 	a.toolsMu.Lock()
 	a.mcpTools = ts
 	a.toolsMu.Unlock()
-	if tools.Suggester == nil {
-		tools.Suggester = func(name string) []string { return a.suggest(name) }
-	}
-}
-
-// suggest lists candidate names for tools.Suggester: built-ins + live MCP
-// tools, filtered by the mcp package's edit-distance logic.
-func (a *Agent) suggest(name string) []string {
-	a.toolsMu.Lock()
-	all := append(append([]tools.Tool(nil), a.Tools...), a.mcpTools...)
-	a.toolsMu.Unlock()
-	names := make([]string, len(all))
-	for i, t := range all {
-		names[i] = t.Def.Function.Name
-	}
-	return tools.SuggestTool(name, names)
 }
 
 // AllTools returns built-ins + the current MCP set.
@@ -566,6 +552,15 @@ func (a *Agent) AllTools() []tools.Tool {
 	all := append(append([]tools.Tool(nil), a.Tools...), a.mcpTools...)
 	if a.HistoryRecall && a.HistoryCatalog != nil && a.currentSessionID() != "" {
 		all = append(all, historyTools(a)...)
+	}
+	if a.SubagentsDisabled {
+		filtered := make([]tools.Tool, 0, len(all))
+		for _, t := range all {
+			if t.Def.Function.Name != "task" {
+				filtered = append(filtered, t)
+			}
+		}
+		return filtered
 	}
 	return all
 }
@@ -718,6 +713,51 @@ func (a *Agent) TurnWithImagesAndGoal(ctx context.Context, input string, parts [
 	return a.turn(ctx, input, parts, true, &goal, ev)
 }
 
+// assembleRequestMessages constructs the model request messages while keeping
+// a byte-stable prefix across turns and tool rounds:
+//   1. Base system prompt (history[0])
+//   2. Stable collaboration-mode prompt (planModePrompt, if PlanMode)
+//   3. Budget reminder (if non-empty)
+//   4. Conversation history (history[1:])
+//   5. Trailing transient blocks (todoContent, goalContent)
+func (a *Agent) assembleRequestMessages(history []llm.Message, todoContent, goalContent, budgetReminder string) []llm.Message {
+	if len(history) == 0 {
+		return history
+	}
+	prefixCount := 1
+	if a.PlanMode {
+		prefixCount++
+		if budgetReminder != "" {
+			prefixCount++
+		}
+	}
+	suffixCount := 0
+	if todoContent != "" {
+		suffixCount++
+	}
+	if goalContent != "" {
+		suffixCount++
+	}
+	reqMsgs := make([]llm.Message, 0, prefixCount+len(history)-1+suffixCount)
+	reqMsgs = append(reqMsgs, history[0])
+	if a.PlanMode {
+		reqMsgs = append(reqMsgs, llm.Message{Role: "system", Content: planModePrompt})
+		if budgetReminder != "" {
+			reqMsgs = append(reqMsgs, llm.Message{Role: "system", Content: budgetReminder})
+		}
+	}
+	if len(history) > 1 {
+		reqMsgs = append(reqMsgs, history[1:]...)
+	}
+	if todoContent != "" {
+		reqMsgs = append(reqMsgs, llm.Message{Role: "system", Content: todoContent})
+	}
+	if goalContent != "" {
+		reqMsgs = append(reqMsgs, llm.Message{Role: "system", Content: goalContent})
+	}
+	return reqMsgs
+}
+
 func (a *Agent) turn(ctx context.Context, input string, parts []llm.ContentPart, authored bool, goalCtx *goalstate.Record, ev Events) (string, error) {
 	var activeGoal *goalstate.Record
 	if goalCtx != nil {
@@ -744,6 +784,12 @@ func (a *Agent) turn(ctx context.Context, input string, parts []llm.ContentPart,
 		a.Messages = append(a.Messages, msg)
 	}
 	a.msgsMu.Unlock()
+
+	var planBudget *rolloutBudget
+	if a.PlanMode && authored {
+		planBudget = newPlanRolloutBudget()
+	}
+
 	rounds := 0
 	for {
 		if a.MaxTurns > 0 && rounds >= a.MaxTurns {
@@ -753,43 +799,68 @@ func (a *Agent) turn(ctx context.Context, input string, parts []llm.ContentPart,
 		if err := a.maybeCompact(ctx, ev); err != nil {
 			return "", err
 		}
-		msgs := a.Messages
-		if a.ResultAging {
-			msgs = ageResultMessages(msgs, a.ContextLimit)
+
+		var budgetReminder string
+		if planBudget != nil {
+			budgetReminder = planBudget.ReminderBlock()
 		}
-		if block := a.todoBlock(); block != "" {
-			// Open plan items ride along as an ephemeral system message each
-			// round: a.Messages stays clean, and the plan survives long tool
-			// loops and compaction because it is re-derived, not stored.
-			msgs = append(append([]llm.Message(nil), msgs...),
-				llm.Message{Role: "system", Content: block})
-		}
-		available := a.AllTools()
+		todoContent := a.todoBlock()
+		var goalContent string
 		if activeGoal != nil {
-			// The goal tool is request-local. Ordinary conversations, planner
-			// definitions, and subagents never receive this control surface.
+			goalContent = goalContextBlock(*activeGoal)
+		}
+		msgs := a.assembleRequestMessages(a.Messages, todoContent, goalContent, budgetReminder)
+
+		available := a.AllTools()
+		if a.PlanMode {
+			if planBudget != nil && planBudget.IsReserveCrossed() {
+				available = nil // Reserve crossed: disable tools for final synthesis request
+			} else {
+				available = a.planTools()
+			}
+		}
+		if activeGoal != nil {
+			// The goal tool is request-local. Ordinary conversations, Plan mode,
+			// declarative definitions, and subagents never receive this control surface.
 			available = append(available, goalUpdateTool(*activeGoal))
-			msgs = append(append([]llm.Message(nil), msgs...),
-				llm.Message{Role: "system", Content: goalContextBlock(*activeGoal)})
 		}
 		// Surface transient-request retries through the event hook so the UI
 		// shows "retrying" instead of looking hung. The sink is request-local;
 		// the backend remains safe to share with foreground and background turns.
 		reasoningEffort, reasoningEnabled := a.ReasoningRequest()
+		var parser *planStreamParser
+		sink := llm.EventSink{
+			OnThink: ev.OnThink,
+			OnRetry: ev.OnRetry,
+		}
+		if a.PlanMode {
+			// Plan mode routes streamed text through a block parser so the
+			// proposed-plan artifact is surfaced via OnPlanDelta while the
+			// surrounding conversational text still streams via OnText.
+			parser = &planStreamParser{}
+			parser.visible = ev.OnText
+			parser.onPlan = ev.OnPlanDelta
+			sink.OnText = parser.feed
+		} else {
+			sink.OnText = ev.OnText
+		}
 		msg, usage, err := a.Stream(ctx, llm.Request{
 			Model:            a.Model,
 			Messages:         msgs,
 			Tools:            tools.Defs(available),
 			ReasoningEffort:  reasoningEffort,
 			ReasoningEnabled: reasoningEnabled,
-		}, llm.EventSink{
-			OnText:  ev.OnText,
-			OnThink: ev.OnThink,
-			OnRetry: ev.OnRetry,
-		}, ev)
+			SessionID:        a.currentSessionID(),
+		}, sink, ev)
+		if a.PlanMode && parser != nil {
+			parser.close()
+		}
 		a.AddUsage(usage)
 		if ev.OnUsage != nil {
 			ev.OnUsage(usage)
+		}
+		if planBudget != nil {
+			planBudget.RecordUsage(usage, EstimateTokens(msgs))
 		}
 		if err != nil {
 			if errors.Is(err, context.Canceled) || ctx.Err() != nil {
@@ -836,6 +907,15 @@ func (a *Agent) turn(ctx context.Context, input string, parts []llm.ContentPart,
 					ev.OnCompacted(sum, cutoff)
 				}
 				continue // retry the (now-smaller) request
+			}
+			if planBudget != nil && planBudget.Remaining() <= 0 {
+				return "", &ErrPlanBudgetExhausted{
+					Calls:        planBudget.calls,
+					UsedUnits:    planBudget.usedUnits,
+					FreshInput:   planBudget.freshInput,
+					CachedInput:  planBudget.cachedInput,
+					OutputTokens: planBudget.outputTokens,
+				}
 			}
 			return "", err
 		}
@@ -934,6 +1014,11 @@ func (a *Agent) ReasoningRequest() (string, *bool) {
 // one structured result per call in the original order.
 
 func (a *Agent) runToolResultsWithTools(ctx context.Context, calls []llm.ToolCall, ev Events, available []tools.Tool) []tools.ToolResult {
+	for _, tc := range calls {
+		a.recordTouched(tc.Function.Name, tc.Function.Arguments)
+	}
+	hints := a.searchHints()
+
 	results := make([]tools.ToolResult, len(calls))
 	type outcome struct {
 		i      int
@@ -948,7 +1033,6 @@ func (a *Agent) runToolResultsWithTools(ctx context.Context, calls []llm.ToolCal
 		go func(i int, tc llm.ToolCall) {
 			defer wg.Done()
 			name, args := tc.Function.Name, tc.Function.Arguments
-			a.recordTouched(name, args)
 			fingerprint := a.operationFingerprint(name, args)
 			duplicate := a.seenOperationCount(fingerprint) > 1
 
@@ -980,10 +1064,17 @@ func (a *Agent) runToolResultsWithTools(ctx context.Context, calls []llm.ToolCal
 			observations, searchState, _, _ := a.stateSnapshot()
 			toolCtx = tools.WithObservationStore(toolCtx, a.currentSessionID(), observations)
 			toolCtx = tools.WithSearchStore(toolCtx, a.currentSessionID(), searchState)
-			toolCtx = tools.WithSearchHints(toolCtx, a.searchHints())
+			toolCtx = tools.WithSearchHints(toolCtx, hints)
 			toolCtx = tools.WithSessionID(toolCtx, a.currentSessionID())
 			toolCtx = tools.WithRuntime(toolCtx, a.Runtime)
 			result := tools.ExecuteResult(toolCtx, available, name, json.RawMessage(args))
+			if duplicate && (name == "read" || name == "grep" || name == "glob" || name == "find_files") {
+				if result.ExitCode == 0 && len(result.Preview) > 0 {
+					note := "\n[Notice: Exact duplicate query already executed earlier in this session. Use the evidence already gathered; proceed to synthesize or take action.]"
+					result.Preview += note
+					result.Retained += note
+				}
+			}
 			result = a.attachArtifact(ctx, result)
 			ms := time.Since(start).Milliseconds()
 			if ev.OnToolTelemetry != nil {
@@ -1028,9 +1119,8 @@ func (a *Agent) runToolResultsWithTools(ctx context.Context, calls []llm.ToolCal
 // delivered. Artifact failures never fail a tool call: the bounded preview is
 // still useful and remains the model-facing result.
 func (a *Agent) attachArtifact(ctx context.Context, result tools.ToolResult) tools.ToolResult {
-	agingCandidate := a.ResultAging && result.Complete && len(result.Preview) > agedPreviewBytes
 	if result.Artifact != nil || result.Retained == "" ||
-		(result.Complete && result.OriginalBytes <= int64(len(result.Preview)) && !agingCandidate) {
+		(result.Complete && result.OriginalBytes <= int64(len(result.Preview))) {
 		return result
 	}
 	if a.ArtifactWriter == nil {

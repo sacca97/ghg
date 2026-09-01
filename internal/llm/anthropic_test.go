@@ -270,6 +270,30 @@ func TestAnthropicStreamTerminalUsageMerged(t *testing.T) {
 	}
 }
 
+func TestAnthropicStreamMaxTokensTruncatedToolDiscard(t *testing.T) {
+	client, srv := anthropicClientForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		writeAnthropicEvent(w, `{"type":"message_start","message":{"usage":{"input_tokens":10}}}`)
+		writeAnthropicEvent(w, `{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call-trunc","name":"write","input":{}}}`)
+		writeAnthropicEvent(w, `{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"path\":\"foo.go\",\"content\":\"incomplete..."}}`)
+		writeAnthropicEvent(w, `{"type":"content_block_stop","index":0}`)
+		writeAnthropicEvent(w, `{"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":8192}}`)
+		writeAnthropicEvent(w, `{"type":"message_stop"}`)
+	}))
+	defer srv.Close()
+
+	msg, usage, err := client.stream(context.Background(), Request{Model: "claude-3-7-sonnet", Messages: []Message{{Role: "user", Content: "write code"}}}, EventSink{})
+	if err != nil {
+		t.Fatalf("expected stream truncation recovery, got error: %v", err)
+	}
+	if len(msg.ToolCalls) != 0 || !strings.Contains(msg.Content, "truncated by max_tokens") {
+		t.Fatalf("expected truncated tool call to be safely discarded, got msg: %+v", msg)
+	}
+	if usage.CompletionTokens != 8192 {
+		t.Fatalf("expected 8192 completion tokens, got %+v", usage)
+	}
+}
+
 func TestAnthropicCompleteAndMaxTokenToolDiscard(t *testing.T) {
 	var streamField any
 	client, srv := anthropicClientForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

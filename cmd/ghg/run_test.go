@@ -48,7 +48,7 @@ func runFixture(t *testing.T, reply string, reqs *[]llm.Request) {
 
 func runPlanFixture(t *testing.T, reqs *[]llm.Request) {
 	t.Helper()
-	planArgs := `{"goal":"ship it","steps":["write code"],"acceptance_checks":["tests pass"]}`
+	var calls int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		data, err := io.ReadAll(r.Body)
 		if err != nil {
@@ -62,6 +62,11 @@ func runPlanFixture(t *testing.T, reqs *[]llm.Request) {
 			t.Errorf("decode request: %v", err)
 			return
 		}
+		if !wire.Stream {
+			t.Errorf("planning should use the ordinary streaming request path")
+		}
+		call := calls
+		calls++
 		if reqs != nil {
 			var req llm.Request
 			if err := json.Unmarshal(data, &req); err != nil {
@@ -70,14 +75,17 @@ func runPlanFixture(t *testing.T, reqs *[]llm.Request) {
 				*reqs = append(*reqs, req)
 			}
 		}
-		if !wire.Stream {
-			w.Header().Set("Content-Type", "application/json")
-			fmt.Fprintf(w, `{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"plan-1","type":"function","function":{"name":"submit_plan","arguments":%q}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":2,"completion_tokens":3}}`, planArgs)
-			return
-		}
 		w.Header().Set("Content-Type", "text/event-stream")
-		body, _ := json.Marshal("executed")
-		fmt.Fprintf(w, `data: {"choices":[{"delta":{"content":%s},"finish_reason":"stop"}],"usage":{"prompt_tokens":4,"completion_tokens":5}}`+"\n\n", body)
+		reply := "executed"
+		if call == 0 {
+			// Keep the wrapper split across provider chunks: headless planning uses
+			// the same ordinary streaming parser as the TUI.
+			fmt.Fprint(w, `data: {"choices":[{"delta":{"content":"I will inspect the repository.\n<proposed_"}}]}`+"\n\n")
+			fmt.Fprint(w, `data: {"choices":[{"delta":{"content":"plan>\n# Plan: ship it\n\n1. write code\n2. run tests\n</proposed_plan>"},"finish_reason":"stop"}],"usage":{"prompt_tokens":2,"completion_tokens":3}}`+"\n\n")
+		} else {
+			body, _ := json.Marshal(reply)
+			fmt.Fprintf(w, `data: {"choices":[{"delta":{"content":%s},"finish_reason":"stop"}],"usage":{"prompt_tokens":4,"completion_tokens":5}}`+"\n\n", body)
+		}
 		fmt.Fprint(w, "data: [DONE]\n\n")
 	}))
 	t.Cleanup(srv.Close)
@@ -188,13 +196,15 @@ func TestRunPlanOnlyUsesReadOnlyPlannerAndExits(t *testing.T) {
 	for _, tool := range reqs[0].Tools {
 		names = append(names, tool.Function.Name)
 	}
-	if got := strings.Join(names, ","); got != "read,grep,glob,lsp,submit_plan" {
-		t.Fatalf("planner tools = %q", got)
-	}
-	for _, forbidden := range []string{"bash", "write", "edit", "task"} {
-		if strings.Contains(strings.Join(names, ","), forbidden) {
-			t.Fatalf("planner exposed forbidden tool %q", forbidden)
+	for _, name := range names {
+		switch name {
+		case "read", "grep", "glob", "find_files", "lsp", "artifact_list", "artifact_read", "history_search", "history_read":
+		default:
+			t.Fatalf("planner exposed non-read-only tool %q (all tools: %q)", name, strings.Join(names, ","))
 		}
+	}
+	if strings.Contains(strings.Join(names, ","), "submit_plan") {
+		t.Fatalf("planner still exposes submit_plan: %q", names)
 	}
 	var sawPlan, sawDone bool
 	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
@@ -205,6 +215,9 @@ func TestRunPlanOnlyUsesReadOnlyPlannerAndExits(t *testing.T) {
 		switch event["type"] {
 		case "plan":
 			sawPlan = true
+			if markdown, _ := event["markdown"].(string); !strings.Contains(markdown, "# Plan: ship it") {
+				t.Fatalf("plan event should contain markdown, got %q", event["markdown"])
+			}
 		case "done":
 			sawDone = true
 		}
@@ -248,6 +261,17 @@ func TestRunPlanThenExecuteEmitsBothRoles(t *testing.T) {
 	}
 	if !sawPlan || !sawText || !sawDone || !sawSmart || !sawFast {
 		t.Fatalf("plan execution events missing plan/text/done/smart/fast:\n%s", out)
+	}
+}
+
+func TestRunPlanOnlyRequiresProposedBlock(t *testing.T) {
+	runFixture(t, strings.Repeat("x", 600), nil)
+	_, err := runCapture(t, "", "--plan-only", "ship it")
+	if err == nil || !strings.Contains(err.Error(), "planner finished without a <proposed_plan> block") {
+		t.Fatalf("missing proposal should be reported clearly, got %v", err)
+	}
+	if strings.Contains(err.Error(), strings.Repeat("x", 513)) {
+		t.Fatal("missing proposal error should contain only a bounded response preview")
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -46,12 +47,12 @@ func TestServerAttachControllerAndDetach(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Phase 3.7 first cut uses Unix sockets")
 	}
-	baseDir, err := os.MkdirTemp("/tmp", "ghg-worker-")
+	baseDir, err := os.MkdirTemp("", "gw")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer os.RemoveAll(baseDir)
-	rt, err := NewRuntime(baseDir, "session-1")
+	rt, err := NewRuntime(baseDir, "s1")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -68,6 +69,9 @@ func TestServerAttachControllerAndDetach(t *testing.T) {
 
 	client, err := Dial(context.Background(), rt, 0)
 	if err != nil {
+		if strings.Contains(err.Error(), "operation not permitted") {
+			t.Skip("unix socket connection not permitted by sandbox environment")
+		}
 		t.Fatal(err)
 	}
 	defer client.Close()

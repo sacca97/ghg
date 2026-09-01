@@ -75,9 +75,34 @@ func (m *model) setMode(mode string) error {
 		}[mode]); err != nil {
 			return err
 		}
+		m.agent.PlanMode = (mode == uiModePlan)
 	}
 	m.mode = mode
 	return nil
+}
+
+// switchRole replaces the live route while preserving the conversation and
+// cumulative usage. Unlike /model, this is an execution detail and does not
+// rewrite the user's configured default route.
+func (m *model) switchRole(role string) error {
+	if m.agent == nil {
+		return fmt.Errorf("no agent configured")
+	}
+	if m.agent.Role == role {
+		return nil
+	}
+	if m.cfg == nil {
+		m.agent.Role = role
+		return nil
+	}
+	target, err := m.cfg.ResolveRole(role)
+	if err != nil {
+		return err
+	}
+	if target.Model == "" {
+		return fmt.Errorf("role %q has no configured agent", role)
+	}
+	return m.activateRoute(target.Model, target.Provider, role)
 }
 
 // activateRoute installs a concrete role route while preserving the current
@@ -89,6 +114,7 @@ func (m *model) activateRoute(modelName, providerName, role string) error {
 			return fmt.Errorf("no agent configured")
 		}
 		m.agent.Role = role
+		m.agent.PlanMode = (m.uiMode() == uiModePlan)
 		return nil
 	}
 	if m.workerClient != nil && m.workerLiveWork {
@@ -102,6 +128,7 @@ func (m *model) activateRoute(modelName, providerName, role string) error {
 		return fmt.Errorf("role %q has no configured agent", role)
 	}
 	ag.Role = role
+	ag.PlanMode = (m.uiMode() == uiModePlan)
 	ag.ReasoningToggle = m.reasoningToggleFor(pn, ag.Model)
 	if old := m.agent; old != nil {
 		ag.Effort = old.Effort

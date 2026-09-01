@@ -93,11 +93,6 @@ func runCLI(args []string) error {
 	if err != nil {
 		return err
 	}
-	definitions, err := agent.LoadAgentDefinitions(agent.DefinitionLoadOptions{ProjectTrusted: true})
-	if err != nil {
-		return err
-	}
-
 	// System prompt: -system-file wins over -system (a file is the deliberate
 	// choice; a stray -system alongside it is almost certainly stale).
 	// Headless mode is explicitly trusted automation, so it receives the same
@@ -138,6 +133,7 @@ func runCLI(args []string) error {
 
 	ev := agent.Events{}
 	var emit func(any) // set only for --format json
+	planDeltaSeen := false
 	note := func(format string, a ...any) {
 		if !*quietFlag {
 			fmt.Fprintf(os.Stderr, format+"\n", a...)
@@ -197,6 +193,17 @@ func runCLI(args []string) error {
 		ev.OnText = func(d string) { fmt.Fprint(os.Stdout, d) }
 		ev.OnToolStart = func(_, name, args string) { note("⚒ %s", name) }
 	}
+	if emit != nil {
+		ev.OnPlanDelta = func(delta string) {
+			planDeltaSeen = true
+			emit(map[string]string{"type": "plan_delta", "delta": delta})
+		}
+	} else {
+		ev.OnPlanDelta = func(delta string) {
+			planDeltaSeen = true
+			fmt.Fprint(os.Stdout, delta)
+		}
+	}
 	runtime, runtimeCleanup, err := tools.NewConfiguredRuntime(".", cfg.Execution, true, cfg.PostEdit)
 	if err != nil {
 		return err
@@ -250,11 +257,9 @@ func runCLI(args []string) error {
 		if planner.Effort == "" {
 			planner.Effort = "medium"
 		}
-		definition := agent.BuiltInPlannerDefinition()
-		if loaded, ok := definitions[definition.Name]; ok {
-			definition = loaded
-		}
-		planned, planErr := agent.ProposePlanWithDefinition(ctx, planner, prompt, definition, ev)
+		planner.PlanMode = true
+		planner.MaxTurns = *maxTurnsFlag
+		final, planErr := planner.Turn(ctx, prompt, ev)
 		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 			planErr = fmt.Errorf("run timed out after %s", *timeoutFlag)
 		}
@@ -264,30 +269,32 @@ func runCLI(args []string) error {
 			}
 			return planErr
 		}
+		planMD, ok := agent.ExtractProposedPlan(final)
+		if !ok {
+			planErr = fmt.Errorf("planner finished without a <proposed_plan> block; response preview: %q", boundedPlanPreview(final))
+			if emit != nil {
+				emit(map[string]string{"type": "error", "error": planErr.Error()})
+			}
+			return planErr
+		}
 		if emit != nil {
-			emit(map[string]any{"type": "plan", "plan": planned})
-		} else {
-			fmt.Fprintln(os.Stdout, headlessPlanText(planned))
+			emit(map[string]string{"type": "plan", "markdown": planMD})
+		} else if !planDeltaSeen {
+			fmt.Fprintln(os.Stdout, planMD)
 		}
 		if *exportResultFlag != "" {
-			var exportData []byte
-			var exportErr error
-			if strings.ToLower(*exportFormatFlag) == export.FormatJSON {
-				record := session.WorkflowResultRecord{
-					ResultID:  fmt.Sprintf("plan-%x", time.Now().UnixNano()&0xffffffff),
-					Kind:      "plan",
-					Version:   1,
-					Role:      config.RoleSmart,
-					Provider:  planner.Provider,
-					Model:     planner.Model,
-					CreatedAt: time.Now().UTC(),
-				}
-				planJSON, _ := json.Marshal(planned)
-				record.Payload = string(planJSON)
-				exportData, exportErr = export.RenderResult(record, export.FormatJSON)
-			} else {
-				exportData = []byte(export.RenderPlanMarkdown(planned))
+			planJSON, _ := json.Marshal(map[string]string{"markdown": planMD})
+			record := session.WorkflowResultRecord{
+				ResultID:  fmt.Sprintf("plan-%x", time.Now().UnixNano()&0xffffffff),
+				Kind:      "plan",
+				Version:   2,
+				Payload:   string(planJSON),
+				Role:      config.RoleSmart,
+				Provider:  planner.Provider,
+				Model:     planner.Model,
+				CreatedAt: time.Now().UTC(),
 			}
+			exportData, exportErr := export.RenderResult(record, *exportFormatFlag)
 			if exportErr == nil {
 				cwd, _ := os.Getwd()
 				_, exportErr = export.WriteExportFile(*exportResultFlag, exportData, true, cwd)
@@ -301,16 +308,13 @@ func runCLI(args []string) error {
 		}
 		if *planOnlyFlag {
 			if emit != nil {
-				emit(map[string]any{"type": "done", "plan": planned})
+				emit(map[string]string{"type": "done", "markdown": planMD})
 			}
 			return nil
 		}
 		ag, modelName, provName, err = newModeAgent(cfg, profiles, config.ModeActing, sys)
 		if err == nil {
-			err = ag.SetTodos(planned.Todos())
-			if err == nil {
-				prompt = executionPrompt(planned)
-			}
+			prompt = fmt.Sprintf("Execute the following approved plan. Create and maintain a todowrite\nchecklist while implementing it.\n\n%s", planMD)
 		}
 	} else if *modelFlag == "" && *providerFlag == "" {
 		if *roleFlag == "" {
@@ -375,6 +379,7 @@ func runCLI(args []string) error {
 	ag.ArtifactStore = artifactStore
 	ag.ArtifactWriter = artifactStore
 	ag.ArtifactsDisabled = artifactsDisabled
+	ag.SubagentsDisabled = !config.SubagentsEnabled(cfg)
 
 	// Session: resume an existing one, or create a fresh one — unless
 	// -no-session (a one-off cron job shouldn't clutter ghg sessions).
@@ -466,27 +471,11 @@ func runCLI(args []string) error {
 	return err
 }
 
-func executionPrompt(p agent.Plan) string {
-	var b strings.Builder
-	b.WriteString("Execute this validated plan now. Use the available tools to make the changes and verify the acceptance checks; do not merely describe what should be done. Keep the todowrite checklist updated.\n\n")
-	writePlanBody(&b, p, "Ordered steps")
-	return b.String()
-}
-
-func headlessPlanText(p agent.Plan) string {
-	var b strings.Builder
-	b.WriteString("Plan\n")
-	writePlanBody(&b, p, "Steps")
-	return strings.TrimRight(b.String(), "\n")
-}
-
-func writePlanBody(b *strings.Builder, p agent.Plan, stepsLabel string) {
-	b.WriteString("Goal: " + p.Goal + "\n\n" + stepsLabel + ":\n")
-	for i, step := range p.Steps {
-		fmt.Fprintf(b, "%d. %s\n", i+1, step)
+func boundedPlanPreview(text string) string {
+	const maxPreviewRunes = 512
+	runes := []rune(strings.TrimSpace(text))
+	if len(runes) > maxPreviewRunes {
+		return string(runes[:maxPreviewRunes]) + "…"
 	}
-	b.WriteString("\nAcceptance checks:\n")
-	for _, check := range p.AcceptanceChecks {
-		b.WriteString("- " + check + "\n")
-	}
+	return string(runes)
 }

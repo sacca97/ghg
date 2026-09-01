@@ -8,7 +8,7 @@ import (
 
 // The view contains only application content; terminal control sequences are
 // owned by Run, which uses Bubble Tea's alternate-screen lifecycle. Mouse
-// capture remains ON by default for wheel scroll and clicks.
+// capture remains ON by default for wheel scroll and app-owned selection.
 func TestViewRendersTranscript(t *testing.T) {
 	m := compactCmdModel()
 	m.Update(mkWinSize(80, 30))

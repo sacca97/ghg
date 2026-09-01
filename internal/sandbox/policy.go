@@ -98,6 +98,11 @@ type PolicyConfig struct {
 	ProtectedRoots []string
 }
 
+type compiledPolicy struct {
+	seatbeltProfile string
+	bubblewrapBase  []string
+}
+
 // Policy is immutable after construction. Grant returns a new policy instead
 // of mutating one that may be shared by concurrent child agents.
 type Policy struct {
@@ -114,6 +119,7 @@ type Policy struct {
 	// protectedWriteRoots is populated only on a call-scoped policy after an
 	// explicit human approval. The session policy never grants this access.
 	protectedWriteRoots []string
+	compiled            *compiledPolicy
 }
 
 // ParseMode validates a user/configuration value. Empty mode selects the
@@ -224,6 +230,7 @@ func NewPolicy(cfg PolicyConfig) (*Policy, error) {
 			p.protectedRoots = appendUnique(p.protectedRoots, canonical)
 		}
 	}
+	p.compiled = compilePolicy(p)
 	return p, nil
 }
 
@@ -358,6 +365,7 @@ func (p *Policy) Grant(readRoots, writeRoots []string, network bool) (*Policy, e
 	if network {
 		clone.network = NetworkHost
 	}
+	clone.compiled = compilePolicy(&clone)
 	return &clone, nil
 }
 
@@ -390,6 +398,7 @@ func (p *Policy) GrantProtected(writeRoots []string) (*Policy, error) {
 		}
 		clone.protectedWriteRoots = appendUnique(clone.protectedWriteRoots, canonical)
 	}
+	clone.compiled = compilePolicy(&clone)
 	return &clone, nil
 }
 

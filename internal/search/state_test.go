@@ -45,3 +45,54 @@ func TestRegistryScopesSnapshotsBySession(t *testing.T) {
 		t.Fatalf("scoped snapshot = %+v, %v", got, err)
 	}
 }
+
+func TestFuzzyFilesTopKEqualsFullSortPrefix(t *testing.T) {
+	root := t.TempDir()
+	sampleFiles := []string{
+		"cmd/ghg/main.go",
+		"cmd/ghg/run.go",
+		"internal/agent/agent.go",
+		"internal/agent/task.go",
+		"internal/agent/background.go",
+		"internal/search/state.go",
+		"internal/search/state_test.go",
+		"internal/sandbox/policy.go",
+		"internal/sandbox/backend.go",
+		"internal/tui/tui.go",
+		"internal/tui/input.go",
+		"internal/tools/search.go",
+		"internal/tools/read.go",
+		"pkg/util/helper.go",
+		"README.md",
+		"roadmap.md",
+	}
+	for _, rel := range sampleFiles {
+		full := filepath.Join(root, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(full, []byte("content"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	InvalidateFileIndex(root)
+
+	queries := []string{"", "go", "agent", "state", "search", "main", "md", "nonexistent"}
+	limits := []int{1, 3, 5, 8, 20}
+
+	for _, q := range queries {
+		all := FuzzyFiles(root, q, 0)
+		for _, lim := range limits {
+			limited := FuzzyFiles(root, q, lim)
+			expectedLen := min(lim, len(all))
+			if len(limited) != expectedLen {
+				t.Fatalf("query %q limit %d: got %d hits, want %d", q, lim, len(limited), expectedLen)
+			}
+			for i := 0; i < expectedLen; i++ {
+				if limited[i] != all[i] {
+					t.Fatalf("query %q limit %d at index %d: got %q, want %q", q, lim, i, limited[i], all[i])
+				}
+			}
+		}
+	}
+}

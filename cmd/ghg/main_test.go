@@ -241,3 +241,82 @@ func TestWorkerConcurrentStartStopNeverPublishesStaleRunning(t *testing.T) {
 		}
 	}
 }
+
+type workerTestBackend struct {
+	planText string
+}
+
+func (b *workerTestBackend) Stream(_ context.Context, _ llm.Request, sink llm.EventSink) (llm.Message, llm.Usage, error) {
+	if sink.OnText != nil {
+		sink.OnText(b.planText)
+	}
+	return llm.Message{Role: "assistant", Content: b.planText}, llm.Usage{PromptTokens: 10, CompletionTokens: 20}, nil
+}
+
+func (b *workerTestBackend) Complete(_ context.Context, _ llm.Request) (llm.Message, llm.Usage, error) {
+	return llm.Message{Role: "assistant", Content: b.planText}, llm.Usage{}, nil
+}
+
+func TestWorkerPlanTurnAndSnapshot(t *testing.T) {
+	baseDir := t.TempDir()
+	runtimeFile, err := workerwire.NewRuntime(baseDir, "s-plan-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := session.Open(filepath.Join(baseDir, "sessions.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+
+	planText := "I will create a plan.\n<proposed_plan>\n# Step 1\nDo the work\n</proposed_plan>"
+	backend := &workerTestBackend{planText: planText}
+	ag := agent.New(backend, "mock-model", 1000, "system prompt")
+
+	w := &workerProcessState{
+		runtimeFile: runtimeFile,
+		sessionID:   "s-plan-1",
+		state:       workerwire.StateIdle,
+		ag:          ag,
+		store:       store,
+		mode:        "plan",
+		pending:     make(map[string]*workerApprovalFlight),
+		done:        make(chan struct{}),
+	}
+	ag.PlanMode = true
+
+	snapAny, err := w.Snapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap, ok := snapAny.(workerSnapshot)
+	if !ok {
+		t.Fatalf("expected workerSnapshot, got %T", snapAny)
+	}
+	if snap.Mode != "plan" {
+		t.Fatalf("expected snapshot mode 'plan', got %q", snap.Mode)
+	}
+
+	w.startTurn(workerInput{Input: "make a plan", PlanMode: true})
+	w.turns.Wait()
+
+	// Verify plan was persisted to workflow results
+	results, err := store.ListWorkflowResults(context.Background(), "s-plan-1", "plan")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("expected 1 workflow result, got %d", len(results))
+	}
+	if results[0].Kind != "plan" || results[0].Version != 2 {
+		t.Fatalf("expected kind 'plan' version 2, got kind %q version %d", results[0].Kind, results[0].Version)
+	}
+	var payload map[string]string
+	if err := json.Unmarshal([]byte(results[0].Payload), &payload); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(payload["markdown"], "# Step 1") {
+		t.Fatalf("expected markdown to contain '# Step 1', got %q", payload["markdown"])
+	}
+}

@@ -11,7 +11,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"math/rand/v2"
 	"net/http"
 	"slices"
 	"strconv"
@@ -423,6 +422,9 @@ func (c *Client) setRequestHeaders(hr *http.Request) error {
 // applyRequestHeaders applies the profile-derived static headers and auth
 // policy shared by the compiled wire adapters.
 func applyRequestHeaders(hr *http.Request, headers map[string]string, apiKey, authKind, authHeader string) error {
+	if hr.Header.Get("User-Agent") == "" {
+		hr.Header.Set("User-Agent", "ghg")
+	}
 	for name, value := range headers {
 		hr.Header.Set(name, value)
 	}
@@ -459,6 +461,7 @@ type Request struct {
 	Tools           []Tool    `json:"tools,omitempty"`
 	MaxTokens       int       `json:"max_tokens,omitempty"`
 	ReasoningEffort string    `json:"reasoning_effort,omitempty"`
+	SessionID       string    `json:"session_id,omitempty"`
 	// ReasoningEnabled is an internal capability signal. Adapters lower it to
 	// their protocol-specific toggle field; it must never be sent verbatim.
 	ReasoningEnabled *bool `json:"-"`
@@ -584,7 +587,7 @@ func (e *HTTPError) Error() string { return e.Status + ": " + e.Body }
 // DefaultMaxAttempts is the built-in retry budget for transient request
 // failures (one initial try plus retries). Client.MaxRetries overrides it;
 // exported so the UI can show "attempt N/M".
-const DefaultMaxAttempts = 8
+const DefaultMaxAttempts = 3
 
 // RetryEvent describes one failed attempt that is about to be retried. It is
 // passed to the Client.OnRetry hook so the UI can show "retrying in Ns"
@@ -600,6 +603,22 @@ type RetryEvent struct {
 // limits and server/gateway errors are transient; 4xx client errors are not.
 func retryableStatus(code int) bool {
 	return code == http.StatusTooManyRequests || code >= 500
+}
+
+// isTransientErrorMessage reports whether a mid-stream provider/gateway error
+// is an upstream network/socket/server failure rather than a model fault.
+func isTransientErrorMessage(msg string) bool {
+	low := strings.ToLower(msg)
+	return strings.Contains(low, "upstream") ||
+		strings.Contains(low, "server error") ||
+		strings.Contains(low, "service unavailable") ||
+		strings.Contains(low, "overloaded") ||
+		strings.Contains(low, "rate limit") ||
+		strings.Contains(low, "temporarily unavailable") ||
+		strings.Contains(low, "stream ended") ||
+		strings.Contains(low, "connection reset") ||
+		strings.Contains(low, "gateway") ||
+		strings.Contains(low, "timeout")
 }
 
 // nonRetryable wraps an error the retry loop must not repeat (mid-stream
@@ -633,14 +652,9 @@ func retryable(err error) bool {
 	return true
 }
 
-// backoff returns the sleep before the next attempt: 1s, 2s, 4s… capped at
-// 20s, plus up to 25% jitter so concurrent sessions don't retry in lockstep.
+// backoff returns the 1s sleep before the next attempt.
 func backoff(attempt int) time.Duration {
-	d := time.Second << (attempt - 1)
-	if d > 20*time.Second {
-		d = 20 * time.Second
-	}
-	return d + time.Duration(rand.Int64N(int64(d/4)+1))
+	return 1 * time.Second
 }
 
 // sleep blocks for d or returns ctx's error if the caller cancels first.
@@ -888,9 +902,9 @@ func (c *Client) streamOnce(ctx context.Context, body []byte, onText, onThink fu
 			continue
 		}
 		if ch.Error != nil {
-			// The provider accepted the request (200) then failed mid-stream.
-			// These are provider-logic errors (content filter, model faults),
-			// not transport blips — surface them, don't retry.
+			if isTransientErrorMessage(ch.Error.Message) {
+				return Message{}, usage, fmt.Errorf("api error: %s", ch.Error.Message)
+			}
 			return Message{}, usage, nonRetryable{fmt.Errorf("api error: %s", ch.Error.Message)}
 		}
 		if ch.Usage != nil {

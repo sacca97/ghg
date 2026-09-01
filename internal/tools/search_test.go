@@ -3,13 +3,17 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
+	"github.com/sacca97/ghg/internal/sandbox"
 	"github.com/sacca97/ghg/internal/search"
 )
 
@@ -195,6 +199,57 @@ func TestSearchLimitsCancellationAndInvalidArguments(t *testing.T) {
 	}
 }
 
+func TestSearchUsesBoundedDefaultLimit(t *testing.T) {
+	dir := t.TempDir()
+	for i := 0; i < 30; i++ {
+		writeSearchFile(t, dir, fmt.Sprintf("%02d.txt", i), "needle\n")
+	}
+	result := ExecuteResult(context.Background(), All(), "grep", json.RawMessage(fmt.Sprintf(`{"pattern":"needle","path":%q}`, dir)))
+	if result.ExitCode != 0 {
+		t.Fatalf("default grep = %+v", result)
+	}
+	if result.Metadata["search_displayed"] != "25" || result.Metadata["search_remaining"] != "5" {
+		t.Fatalf("default grep metadata = %+v", result.Metadata)
+	}
+}
+
+func TestSearchRejectsOutsidePathsBeforeInspection(t *testing.T) {
+	workspace := t.TempDir()
+	outside := t.TempDir()
+	existing := writeSearchFile(t, outside, "secret.txt", "needle\n")
+	missing := filepath.Join(outside, "missing.txt")
+	policy, err := sandbox.NewPolicy(sandbox.PolicyConfig{Workspace: workspace, Mode: sandbox.ModeWorkspaceWrite})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := NewToolRuntime(policy, ApprovalNever, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := WithRuntime(context.Background(), runtime)
+	for _, tc := range []struct {
+		name string
+		run  func(context.Context, json.RawMessage) (ToolResult, error)
+		args func(string) json.RawMessage
+	}{
+		{name: "grep", run: runGrepResult, args: func(path string) json.RawMessage {
+			return json.RawMessage(fmt.Sprintf(`{"pattern":"needle","path":%q}`, path))
+		}},
+		{name: "find_files", run: runFindFilesResult, args: func(path string) json.RawMessage {
+			return json.RawMessage(fmt.Sprintf(`{"query":"secret","path":%q}`, path))
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, path := range []string{existing, missing} {
+				_, err := tc.run(ctx, tc.args(path))
+				if !errors.Is(err, sandbox.ErrOutsideRoot) {
+					t.Errorf("%s path error = %v, want ErrOutsideRoot", path, err)
+				}
+			}
+		})
+	}
+}
+
 func TestMalformedGitignore(t *testing.T) {
 	dir := t.TempDir()
 	writeSearchFile(t, dir, ".gitignore", "[\n")
@@ -362,4 +417,112 @@ func nonEmptySearchLines(s string) []string {
 		}
 	}
 	return lines
+}
+
+func TestGitStatusCacheCoalescingAndExpiry(t *testing.T) {
+	var (
+		mu          sync.Mutex
+		loadCount   int
+		currentTime = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	)
+	nowFn := func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+		return currentTime
+	}
+	advance := func(d time.Duration) {
+		mu.Lock()
+		defer mu.Unlock()
+		currentTime = currentTime.Add(d)
+	}
+
+	started := make(chan struct{})
+	unblock := make(chan struct{})
+
+	loader := func(ctx context.Context, root string) map[string]struct{} {
+		mu.Lock()
+		loadCount++
+		currentCount := loadCount
+		mu.Unlock()
+
+		if currentCount == 1 {
+			close(started)
+			<-unblock
+		}
+
+		return map[string]struct{}{
+			fmt.Sprintf("%s/file%d.go", root, currentCount): {},
+		}
+	}
+
+	cache := newGitStatusCache(2*time.Second, loader, nowFn)
+
+	// 1. Issue concurrent requests for one root
+	const concurrent = 5
+	var wg sync.WaitGroup
+	results := make([]map[string]struct{}, concurrent)
+	for i := 0; i < concurrent; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			if idx > 0 {
+				<-started
+			}
+			results[idx] = cache.get(context.Background(), "/repo")
+		}(i)
+	}
+
+	<-started
+	close(unblock)
+	wg.Wait()
+
+	mu.Lock()
+	initialLoads := loadCount
+	mu.Unlock()
+	if initialLoads != 1 {
+		t.Fatalf("expected 1 loader execution for concurrent requests, got %d", initialLoads)
+	}
+	for i, res := range results {
+		if _, ok := res["/repo/file1.go"]; !ok {
+			t.Fatalf("result[%d] missing expected path: %+v", i, res)
+		}
+	}
+
+	// 2. Assert another request inside the TTL uses the cached value
+	advance(1 * time.Second)
+	cachedRes := cache.get(context.Background(), "/repo")
+	if _, ok := cachedRes["/repo/file1.go"]; !ok {
+		t.Fatalf("cached result missing expected path: %+v", cachedRes)
+	}
+	mu.Lock()
+	afterCachedLoads := loadCount
+	mu.Unlock()
+	if afterCachedLoads != 1 {
+		t.Fatalf("expected 1 total loader execution within TTL, got %d", afterCachedLoads)
+	}
+
+	// 3. Assert a request after expiry refreshes it
+	advance(2 * time.Second)
+	refreshedRes := cache.get(context.Background(), "/repo")
+	if _, ok := refreshedRes["/repo/file2.go"]; !ok {
+		t.Fatalf("refreshed result missing new path: %+v", refreshedRes)
+	}
+	mu.Lock()
+	afterExpiryLoads := loadCount
+	mu.Unlock()
+	if afterExpiryLoads != 2 {
+		t.Fatalf("expected 2 total loader executions after expiry, got %d", afterExpiryLoads)
+	}
+
+	// 4. Assert different repository roots do not share results
+	diffRootRes := cache.get(context.Background(), "/other-repo")
+	if _, ok := diffRootRes["/other-repo/file3.go"]; !ok {
+		t.Fatalf("different root result missing its own path: %+v", diffRootRes)
+	}
+	mu.Lock()
+	diffRootLoads := loadCount
+	mu.Unlock()
+	if diffRootLoads != 3 {
+		t.Fatalf("expected 3 total loader executions for different root, got %d", diffRootLoads)
+	}
 }

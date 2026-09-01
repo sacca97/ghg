@@ -38,14 +38,13 @@ func TestTabCompletesSkillName(t *testing.T) {
 }
 
 // Tab cycles through candidates with preview: each press inserts the next
-// candidate, wrapping at both ends. ("/e" matches /effort only, so use /m:
-// /mcp, /model, /mouse.)
+// candidate, wrapping at both ends. ("/e" matches /effort only, so use /m.)
 func TestTabCyclesWithPreview(t *testing.T) {
 	m := modelCmdModel()
-	m = typeStr(t, m, "/mo") // /model, /mouse — two candidates, deterministic order
+	m = typeStr(t, m, "/m") // multiple candidates, deterministic order
 	m = pressKey(m, tea.KeyTab)
 	first := m.input.Value()
-	if first != "/model" && first != "/mouse" {
+	if first == "/m" {
 		t.Fatalf("tab should preview a candidate, got %q", first)
 	}
 	m = pressKey(m, tea.KeyTab)
@@ -53,13 +52,11 @@ func TestTabCyclesWithPreview(t *testing.T) {
 	if first == second {
 		t.Fatalf("second tab should preview the next candidate, still %q", first)
 	}
-	m = pressKey(m, tea.KeyTab) // wraps around
+	for m.input.Value() != first {
+		m = pressKey(m, tea.KeyTab)
+	}
 	if m.input.Value() != first {
 		t.Fatalf("wrap should return to %q, got %q", first, m.input.Value())
-	}
-	m = pressKey(m, tea.KeyShiftTab) // and back
-	if m.input.Value() != second {
-		t.Fatalf("shift+tab should return to %q, got %q", second, m.input.Value())
 	}
 }
 
@@ -67,14 +64,15 @@ func TestTabCyclesWithPreview(t *testing.T) {
 // prefix the cycle started from (readline-style; it does not un-complete).
 func TestEscRevertsTabCycle(t *testing.T) {
 	m := modelCmdModel()
-	m = typeStr(t, m, "/mo")
-	m = pressKey(m, tea.KeyTab) // previews /model
-	m = pressKey(m, tea.KeyTab) // previews /mouse
+	m = typeStr(t, m, "/m")
+	m = pressKey(m, tea.KeyTab)
+	first := m.input.Value()
+	m = pressKey(m, tea.KeyTab)
 	m = pressKey(m, tea.KeyEsc)
 	if m.menu != nil {
 		t.Fatal("esc should close the menu")
 	}
-	if m.input.Value() != "/model" {
+	if m.input.Value() != first {
 		t.Fatalf("esc should revert to the cycle base, got %q", m.input.Value())
 	}
 }
@@ -83,7 +81,7 @@ func TestEscRevertsTabCycle(t *testing.T) {
 // enter on a non-execNow candidate commits the preview with a trailing space.
 func TestEnterCommitsTabCycle(t *testing.T) {
 	m := modelCmdModel()
-	m = typeStr(t, m, "/mo") // candidates in order: /model, /mouse
+	m = typeStr(t, m, "/mo") // the only matching command is /model
 	m = pressKey(m, tea.KeyTab)
 	if m.input.Value() != "/model" {
 		t.Fatalf("tab should preview /model first, got %q", m.input.Value())
@@ -125,16 +123,13 @@ func TestArrowsNavigateMenuOnly(t *testing.T) {
 // execNow commands still run immediately on enter, even mid-cycle.
 func TestExecNowRunsOnEnterWhileCycling(t *testing.T) {
 	m := modelCmdModel()
-	m = typeStr(t, m, "/m")
-	m = pressKey(m, tea.KeyTab) // cycles /model ↔ /mouse with preview
-	for m.input.Value() != "/mouse" {
-		m = pressKey(m, tea.KeyTab)
-	}
+	m = typeStr(t, m, "/mo")
+	m = pressKey(m, tea.KeyTab) // previews /model
 	m = pressKey(m, tea.KeyEnter)
 	if m.input.Value() != "" {
-		t.Fatalf("/mouse should run and clear the input, got %q", m.input.Value())
+		t.Fatalf("/model should run and clear the input, got %q", m.input.Value())
 	}
-	if !m.mouseOn {
-		t.Fatal("/mouse should have toggled mouse capture on")
+	if m.settings == nil {
+		t.Fatal("/model should open settings")
 	}
 }

@@ -70,6 +70,51 @@ func TestReadConsumesAndBoundsAnOversizedSingleLine(t *testing.T) {
 	}
 }
 
+func TestReadUsesBoundedDefaultLimit(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "many-lines.txt")
+	lines := make([]string, 300)
+	for i := range lines {
+		lines[i] = fmt.Sprintf("line %d", i+1)
+	}
+	if err := os.WriteFile(path, []byte(strings.Join(lines, "\n")+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	result := ExecuteResult(context.Background(), All(), "read", json.RawMessage(fmt.Sprintf(`{"path":%q}`, path)))
+	if result.ExitCode != 0 {
+		t.Fatalf("default read = %+v", result)
+	}
+	if result.Metadata["observation_end"] != "250" || result.Metadata["observation_next_offset"] != "251" {
+		t.Fatalf("default read metadata = %+v", result.Metadata)
+	}
+}
+
+func TestWritePreservesExistingMode(t *testing.T) {
+	dir := t.TempDir()
+	existing := filepath.Join(dir, "existing.txt")
+	if err := os.WriteFile(existing, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if out := run(t, "write", fmt.Sprintf(`{"path":%q,"content":"new"}`, existing)); strings.HasPrefix(out, "Error") {
+		t.Fatal(out)
+	}
+	if got, err := os.ReadFile(existing); err != nil || string(got) != "new" {
+		t.Fatalf("existing write = %q, %v", got, err)
+	}
+	if mode := fileMode(t, existing); mode != 0o600 {
+		t.Fatalf("existing write changed mode to %o", mode)
+	}
+
+	created := filepath.Join(dir, "nested", "created.txt")
+	if out := run(t, "write", fmt.Sprintf(`{"path":%q,"content":"new"}`, created)); strings.HasPrefix(out, "Error") {
+		t.Fatal(out)
+	}
+	if mode := fileMode(t, created); mode != 0o644 {
+		t.Fatalf("new write mode = %o, want 644", mode)
+	}
+}
+
 func TestHelpersAndEdgeCases(t *testing.T) {
 	if len(Defs(All())) != 9 {
 		t.Fatal("expected 9 tool defs")
@@ -199,5 +244,28 @@ func TestBashToolInteractiveHook(t *testing.T) {
 	}
 	if !strings.Contains(out, "nohook") {
 		t.Fatalf("non-interactive output wrong: %q", out)
+	}
+}
+
+func TestReadObservedContentFromReader(t *testing.T) {
+	data := "first line\nsecond line\nthird line\n"
+	res, err := readObservedContent(context.Background(), "/canonical/path.go", "path.go", strings.NewReader(data), 2, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(res.Preview, "2\tsecond line") {
+		t.Fatalf("expected second line in preview, got %q", res.Preview)
+	}
+	if strings.Contains(res.Preview, "first line") || strings.Contains(res.Preview, "third line") {
+		t.Fatalf("unexpected line in bounded preview: %q", res.Preview)
+	}
+	if res.Metadata["observation_start"] != "2" || res.Metadata["observation_end"] != "2" {
+		t.Fatalf("unexpected observation line range in metadata: %+v", res.Metadata)
+	}
+
+	// Past EOF
+	_, err = readObservedContent(context.Background(), "/canonical/path.go", "path.go", strings.NewReader(data), 10, 1)
+	if err == nil || !strings.Contains(err.Error(), "offset 10 past end of file") {
+		t.Fatalf("expected past EOF error, got: %v", err)
 	}
 }

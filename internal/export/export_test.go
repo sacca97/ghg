@@ -109,6 +109,18 @@ func TestRenderResultJSONAndMarkdown(t *testing.T) {
 	if !strings.Contains(string(jsonBytes), `"goal": "My goal"`) || !strings.Contains(string(jsonBytes), `"id": "res-1"`) {
 		t.Fatalf("rendered json mismatch: %s", string(jsonBytes))
 	}
+
+	v2 := record
+	v2.Version = 2
+	v2.Payload = `{"markdown":"# Markdown plan\n\n1. inspect\n"}`
+	v2MD, err := RenderResult(v2, FormatMarkdown)
+	if err != nil || string(v2MD) != "# Markdown plan\n\n1. inspect\n" {
+		t.Fatalf("rendered v2 markdown = %q, err = %v", string(v2MD), err)
+	}
+	v2JSON, err := RenderResult(v2, FormatJSON)
+	if err != nil || !strings.Contains(string(v2JSON), `"markdown": "# Markdown plan\n\n1. inspect\n"`) {
+		t.Fatalf("rendered v2 json = %s, err = %v", string(v2JSON), err)
+	}
 }
 
 func TestWriteExportFileAtomicAndPermissions(t *testing.T) {

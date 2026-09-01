@@ -6,25 +6,49 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 )
 
-// shift+mouse must pass through unconsumed so the terminal's native
-// selection (drag-to-copy) works while capture is on.
-func TestShiftMousePassesThrough(t *testing.T) {
+func TestTranscriptSelectionUsesDisplayCells(t *testing.T) {
+	m := compactCmdModel()
+	m.Update(mkWinSize(8, 30))
+	m.appendRaw(blockText, "a界🙂z tail")
+	m.refreshVP()
+	y := m.blocks[0].y0 + m.contentPad() - m.vp.YOffset + 2
+	tm, _ := m.Update(tea.MouseMsg{Action: tea.MouseActionPress, Button: tea.MouseButtonLeft, X: 0, Y: y})
+	m = tm.(*model)
+	tm, _ = m.Update(tea.MouseMsg{Action: tea.MouseActionMotion, Button: tea.MouseButtonLeft, X: 2, Y: y + 1})
+	m = tm.(*model)
+	tm, cmd := m.Update(tea.MouseMsg{Action: tea.MouseActionRelease, Button: tea.MouseButtonLeft, X: 2, Y: y + 1})
+	m = tm.(*model)
+	if cmd == nil {
+		t.Fatal("a non-empty selection should copy asynchronously")
+	}
+	if got := m.selectedText(); got != "a界🙂z\nta" {
+		t.Fatalf("wrapped display-cell selection = %q, want %q", got, "a界🙂z\nta")
+	}
+}
+
+// A drag over a tool row is a selection, not a click. Only a stationary
+// release toggles the tool block.
+func TestTranscriptDragDoesNotToggleTool(t *testing.T) {
 	m := compactCmdModel()
 	m.Update(mkWinSize(80, 30))
 	m.appendRaw(blockTool, "line1\nline2")
-	m.refreshVP()
-	before := m.blocks[0].expanded
-	// shift+click on the tool block must NOT expand it (native selection owns it)
-	tm, _ := m.Update(tea.MouseMsg{Action: tea.MouseActionPress, Button: tea.MouseButtonLeft, Shift: true, X: 5, Y: m.blocks[0].y0 + m.contentPad() - m.vp.YOffset + 2})
+	y := m.blocks[0].y0 + m.contentPad() - m.vp.YOffset + 2
+	tm, _ := m.Update(tea.MouseMsg{Action: tea.MouseActionPress, Button: tea.MouseButtonLeft, X: 0, Y: y})
 	m = tm.(*model)
-	if m.blocks[0].expanded != before {
-		t.Fatal("shift+click must not toggle the block — it belongs to native selection")
+	tm, _ = m.Update(tea.MouseMsg{Action: tea.MouseActionMotion, Button: tea.MouseButtonLeft, X: 3, Y: y + 1})
+	m = tm.(*model)
+	tm, _ = m.Update(tea.MouseMsg{Action: tea.MouseActionRelease, Button: tea.MouseButtonLeft, X: 3, Y: y + 1})
+	m = tm.(*model)
+	if m.blocks[0].expanded {
+		t.Fatal("dragging across a tool row must not toggle it")
 	}
-	// plain click still toggles
-	tm, _ = m.Update(tea.MouseMsg{Action: tea.MouseActionPress, Button: tea.MouseButtonLeft, X: 5, Y: m.blocks[0].y0 + m.contentPad() - m.vp.YOffset + 2})
+
+	tm, _ = m.Update(tea.MouseMsg{Action: tea.MouseActionPress, Button: tea.MouseButtonLeft, X: 0, Y: y})
 	m = tm.(*model)
-	if m.blocks[0].expanded == before {
-		t.Fatal("plain click should toggle the block")
+	tm, _ = m.Update(tea.MouseMsg{Action: tea.MouseActionRelease, Button: tea.MouseButtonLeft, X: 0, Y: y})
+	m = tm.(*model)
+	if !m.blocks[0].expanded {
+		t.Fatal("a stationary tool click should toggle it")
 	}
 }
 

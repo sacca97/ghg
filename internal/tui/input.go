@@ -107,6 +107,9 @@ func (m *model) key(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.mpicker != nil {
 		return m.modelPickerKey(msg)
 	}
+	// Keyboard input cancels a pending transcript selection and any edge-scroll
+	// tick attached to it.
+	m.selection = nil
 	// newline keys (ctrl+j / shift+enter / alt+enter) never submit; they go
 	// straight to the textarea, which splits the line via InsertNewline.
 	// Note: KeyCtrlM is NOT here — it shares KeyEnter's byte (CR=13), so

@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -19,10 +18,6 @@ import (
 
 func (w *workerProcessState) startCompact() bool {
 	return w.startOperation("compaction", func(ctx context.Context) { w.runCompact(ctx) })
-}
-
-func (w *workerProcessState) startPlan(goal string) bool {
-	return w.startOperation("planning", func(ctx context.Context) { w.runPlan(ctx, goal) })
 }
 
 func (w *workerProcessState) startTurn(input workerInput) bool {
@@ -75,72 +70,6 @@ func (w *workerProcessState) finishOperation(detail string) {
 	}
 }
 
-func (w *workerProcessState) plan(ctx context.Context, goal string) (agent.Plan, error) {
-	if w.cfg == nil {
-		return agent.Plan{}, errors.New("worker configuration is unavailable")
-	}
-	target, targetErr := w.cfg.ResolveRole(config.RoleSmart)
-	if targetErr != nil {
-		return agent.Plan{}, targetErr
-	}
-	if target.Model == "" {
-		return agent.Plan{}, errors.New("smart role has no configured model")
-	}
-	systemPrompt := ""
-	if messages := w.ag.MessagesSnapshot(); len(messages) > 0 {
-		systemPrompt = messages[0].Content
-	}
-	planner, _, _, buildErr := newWorkerAgent(w.cfg, w.profiles, target.Model, target.Provider, config.RoleSmart, systemPrompt)
-	if buildErr != nil {
-		return agent.Plan{}, buildErr
-	}
-	planner.Runtime = w.runtime
-	planner.ArtifactWriter = w.artifacts
-	planner.ArtifactCatalog = w.store
-	planner.ArtifactStore = w.artifacts
-	planner.HistoryCatalog = w.store
-	planner.SetSessionID(w.sessionID)
-	definition := agent.BuiltInPlannerDefinition()
-	if loaded, ok := w.definitions[definition.Name]; ok {
-		definition = loaded
-	}
-	events := agent.Events{
-		OnUsage: func(usage llm.Usage) {
-			w.ag.AddUsage(usage)
-			w.publish("usage", usage, true)
-		},
-		OnRetry: func(retry llm.RetryEvent) { w.publish("retry", retry, true) },
-	}
-	return agent.ProposePlanWithDefinition(ctx, planner, goal, definition, events)
-}
-
-func (w *workerProcessState) runPlan(ctx context.Context, goal string) {
-	plan, err := w.plan(ctx, goal)
-	w.persist()
-	if err == nil && w.store != nil && w.sessionID != "" {
-		planJSON, _ := json.Marshal(plan)
-		msgSeq := 0
-		if w.ag != nil {
-			msgSeq = len(w.ag.MessagesSnapshot())
-		}
-		_ = w.store.SaveWorkflowResult(context.Background(), session.WorkflowResultRecord{
-			ResultID:   fmt.Sprintf("plan-%x", time.Now().UnixNano()&0xffffffff),
-			SessionID:  w.sessionID,
-			Kind:       "plan",
-			Version:    1,
-			Payload:    string(planJSON),
-			Role:       config.RoleSmart,
-			MessageSeq: msgSeq,
-			CreatedAt:  time.Now().UTC(),
-		})
-	}
-	result := workerPlanResult{Plan: plan}
-	if err != nil {
-		result.Error = err.Error()
-	}
-	w.publish("plan_done", result, true)
-}
-
 func (w *workerProcessState) runCompact(ctx context.Context) {
 	before := len(w.ag.MessagesSnapshot())
 	var summary string
@@ -178,6 +107,11 @@ func (w *workerProcessState) runTurn(ctx context.Context, input workerInput) {
 	if input.SystemPrompt != "" {
 		w.ag.SetSystemPrompt(input.SystemPrompt)
 	}
+	if input.PlanMode || w.mode == "plan" {
+		w.ag.PlanMode = true
+	} else {
+		w.ag.PlanMode = false
+	}
 	var turnUsage llm.Usage
 	addUsage := func(u llm.Usage) {
 		turnUsage.PromptTokens += u.PromptTokens
@@ -200,6 +134,10 @@ func (w *workerProcessState) runTurn(ctx context.Context, input workerInput) {
 		OnThink: func(s string) {
 			w.appendLive("think", s)
 			w.publish("think", s, false)
+		},
+		OnPlanDelta: func(s string) {
+			w.appendLive("plan", s)
+			w.publish(workerwire.EventPlanDelta, s, false)
 		},
 		OnToolStart: func(id, name, args string) {
 			w.mu.Lock()
@@ -253,9 +191,30 @@ func (w *workerProcessState) runTurn(ctx context.Context, input workerInput) {
 	}
 	w.persist()
 	w.persistGoalTurn(input.Goal, turnUsage, err)
+	var planMD string
+	if w.ag.PlanMode && final != "" {
+		if extracted, ok := agent.ExtractProposedPlan(final); ok {
+			planMD = extracted
+			if w.store != nil && w.sessionID != "" {
+				planJSON, _ := json.Marshal(map[string]string{"markdown": planMD})
+				msgSeq := len(w.ag.MessagesSnapshot())
+				_ = w.store.SaveWorkflowResult(context.Background(), session.WorkflowResultRecord{
+					ResultID:   fmt.Sprintf("plan-%x", time.Now().UnixNano()&0xffffffff),
+					SessionID:  w.sessionID,
+					Kind:       "plan",
+					Version:    2,
+					Payload:    string(planJSON),
+					Role:       config.RoleSmart,
+					MessageSeq: msgSeq,
+					CreatedAt:  time.Now().UTC(),
+				})
+			}
+		}
+	}
 	result := workerTurnResult{
 		Final: final, Usage: turnUsage, At: input.At, Snap: input.Snap,
 		Messages: boundedWorkerMessages(w.ag.MessagesSnapshot()),
+		Plan:     planMD,
 	}
 	if err != nil {
 		result.Error = err.Error()

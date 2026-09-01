@@ -111,6 +111,13 @@ func TestNewConfiguredRuntimeRedirectsRelativeScratchPathsAndCleans(t *testing.T
 	if !filepath.IsAbs(rt.TempDir) || pathEqualOrWithin(filepath.Clean(rt.TempDir), filepath.Clean(wd)) {
 		t.Fatalf("runtime temp directory=%q must be outside the working directory", rt.TempDir)
 	}
+	canonicalTemp, err := sandbox.CanonicalPath(rt.TempDir, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !containsPath(rt.Policy.TempRoots(), canonicalTemp) {
+		t.Fatalf("policy does not allow runtime temp root %q: %v", canonicalTemp, rt.Policy.TempRoots())
+	}
 	env := make(map[string]string)
 	for _, pair := range rt.ChildEnv(nil) {
 		key, value, ok := strings.Cut(pair, "=")
@@ -122,6 +129,9 @@ func TestNewConfiguredRuntimeRedirectsRelativeScratchPathsAndCleans(t *testing.T
 		for _, value := range splitPathList(env[key]) {
 			if !pathEqualOrWithin(filepath.Clean(value), filepath.Clean(rt.TempDir)) {
 				t.Fatalf("child %s=%q escaped runtime temp %q", key, value, rt.TempDir)
+			}
+			if _, err := rt.Policy.Authorize(filepath.Join(value, "probe"), sandbox.AccessWrite, true); err != nil {
+				t.Fatalf("policy rejected child %s scratch path %q: %v", key, value, err)
 			}
 		}
 	}

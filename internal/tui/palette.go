@@ -356,14 +356,6 @@ func (m *model) paletteItems() []paletteItem {
 			},
 			stepBack: func(m *model) { m.setTheme("light") },
 			stepFwd:  func(m *model) { m.setTheme("dark") }},
-		{title: "Mouse capture", category: "Display",
-			dynDesc: func(m *model) string { return slashHint(m, "/mouse") },
-			dynHint: func(m *model) string { return "/mouse" },
-			run: func(m *model) (tea.Model, tea.Cmd) {
-				return m.command("/mouse")
-			},
-			stepBack: func(m *model) { m.setMouse(false) },
-			stepFwd:  func(m *model) { m.setMouse(true) }},
 		{title: "Help", category: "App",
 			dynDesc: func(m *model) string { return slashHint(m, "/help") },
 			dynHint: func(m *model) string { return "/help" },
@@ -376,15 +368,6 @@ func (m *model) paletteItems() []paletteItem {
 			dynHint: func(m *model) string { return "/quit · " + palHintQuit },
 			run:     func(m *model) (tea.Model, tea.Cmd) { return m, tea.Quit }},
 	}
-}
-
-// setMouse applies a mouse-capture state (the settings's reversible steppers
-// need to set an explicit value; /mouse toggles).
-func (m *model) setMouse(on bool) {
-	if m.mouseOn == on {
-		return
-	}
-	m.command("/mouse")
 }
 
 func (m *model) openPalette() {
@@ -1154,8 +1137,6 @@ func paletteState(m *model, it paletteItem) string {
 		return dimStyle.Render("  [" + effortLabel(m.currentEffort()) + "]")
 	case "Thinking timer":
 		return dimStyle.Render("  [" + onOff(m.showThinking) + "]")
-	case "Mouse capture":
-		return dimStyle.Render("  [" + onOff(m.mouseOn) + "]")
 	case "Goal":
 		if m.goal != "" {
 			return dimStyle.Render("  [on]")

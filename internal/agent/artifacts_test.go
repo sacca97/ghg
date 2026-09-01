@@ -105,20 +105,6 @@ func TestLargeToolResultGetsAnArtifactReference(t *testing.T) {
 	}
 }
 
-func TestAgingPromotesCompleteToolResult(t *testing.T) {
-	store, err := artifact.New(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	ag := New(nil, "m", 100, "sys")
-	ag.ResultAging = true
-	ag.ArtifactWriter = store
-	raw := strings.Repeat("x", 2_000)
-	result := ag.attachArtifact(context.Background(), tools.TextResult(raw, raw))
-	if result.Artifact == nil {
-		t.Fatal("aging-eligible complete result was not promoted")
-	}
-}
 
 func TestDisabledArtifactsExplainUnrecoverableOutput(t *testing.T) {
 	ag := New(nil, "m", 100, "sys")

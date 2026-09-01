@@ -312,59 +312,59 @@ func TestSegmentShellHandlesDescriptorRedirectionsAndDeviceSinks(t *testing.T) {
 	policy := permissionPolicyForWorkspace(t, workspace)
 
 	tests := []struct {
-		name        string
-		command     string
-		wantSegs    int
-		wantDisp    commandDisposition
-		wantReadReq int
+		name         string
+		command      string
+		wantSegs     int
+		wantDisp     commandDisposition
+		wantReadReq  int
 		wantWriteReq int
 	}{
 		{
-			name:        "redirect to dev null with 2>&1",
-			command:     "git status > /dev/null 2>&1",
-			wantSegs:    2, // "git status", "/dev/null"
-			wantDisp:    dispositionRoutine,
-			wantReadReq: 0,
+			name:         "redirect to dev null with 2>&1",
+			command:      "git status > /dev/null 2>&1",
+			wantSegs:     2, // "git status", "/dev/null"
+			wantDisp:     dispositionRoutine,
+			wantReadReq:  0,
 			wantWriteReq: 0,
 		},
 		{
-			name:        "redirect stderr to dev null",
-			command:     "git status 2>/dev/null",
-			wantSegs:    2,
-			wantDisp:    dispositionRoutine,
-			wantReadReq: 0,
+			name:         "redirect stderr to dev null",
+			command:      "git status 2>/dev/null",
+			wantSegs:     2,
+			wantDisp:     dispositionRoutine,
+			wantReadReq:  0,
 			wantWriteReq: 0,
 		},
 		{
-			name:        "duplicate stderr to stdout",
-			command:     "git status 2>&1",
-			wantSegs:    1,
-			wantDisp:    dispositionRoutine,
-			wantReadReq: 0,
+			name:         "duplicate stderr to stdout",
+			command:      "git status 2>&1",
+			wantSegs:     1,
+			wantDisp:     dispositionRoutine,
+			wantReadReq:  0,
 			wantWriteReq: 0,
 		},
 		{
-			name:        "redirect stdout to stderr and pipe",
-			command:     "echo hi >&2 | grep hi",
-			wantSegs:    2,
-			wantDisp:    dispositionRoutine,
-			wantReadReq: 0,
+			name:         "redirect stdout to stderr and pipe",
+			command:      "echo hi >&2 | grep hi",
+			wantSegs:     2,
+			wantDisp:     dispositionRoutine,
+			wantReadReq:  0,
 			wantWriteReq: 0,
 		},
 		{
-			name:        "write to workspace file with 2>&1",
-			command:     "echo hello > " + filepath.Join(workspace, "out.txt") + " 2>&1",
-			wantSegs:    2,
-			wantDisp:    dispositionRoutine,
-			wantReadReq: 0,
+			name:         "write to workspace file with 2>&1",
+			command:      "echo hello > " + filepath.Join(workspace, "out.txt") + " 2>&1",
+			wantSegs:     2,
+			wantDisp:     dispositionRoutine,
+			wantReadReq:  0,
 			wantWriteReq: 0,
 		},
 		{
-			name:        "read from dev null",
-			command:     "cat < /dev/null",
-			wantSegs:    2,
-			wantDisp:    dispositionRoutine,
-			wantReadReq: 0,
+			name:         "read from dev null",
+			command:      "cat < /dev/null",
+			wantSegs:     2,
+			wantDisp:     dispositionRoutine,
+			wantReadReq:  0,
 			wantWriteReq: 0,
 		},
 	}
@@ -393,4 +393,3 @@ func TestSegmentShellHandlesDescriptorRedirectionsAndDeviceSinks(t *testing.T) {
 		})
 	}
 }
-
