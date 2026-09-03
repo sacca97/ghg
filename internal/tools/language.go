@@ -8,7 +8,7 @@ import (
 	"os"
 	"strings"
 
-	"github.com/sacca97/ghg/internal/llm"
+	"github.com/sacca97/ghg/internal/models"
 	"github.com/sacca97/ghg/internal/sandbox"
 )
 
@@ -122,11 +122,11 @@ func SessionIDFromContext(ctx context.Context) string {
 }
 
 func lspTool() Tool {
-	return resultTool(llm.NewTool("lsp", "Use the language server for bounded definitions, references, document symbols, or hover information. Paths and positions are workspace-authorized; columns are one-based Unicode-rune columns.", `{"type":"object","properties":{"operation":{"type":"string","enum":["definition","references","document_symbol","hover"]},"path":{"type":"string"},"line":{"type":"integer","description":"One-based line; required except document_symbol"},"column":{"type":"integer","description":"One-based Unicode-rune column; required except document_symbol"},"include_declaration":{"type":"boolean","description":"References only"}},"required":["operation","path"]}`), runLSPResult)
+	return resultTool(models.NewTool("lsp", "Use the language server for bounded definitions, references, document symbols, or hover information. Paths and positions are workspace-authorized; columns are one-based Unicode-rune columns.", `{"type":"object","properties":{"operation":{"type":"string","enum":["definition","references","document_symbol","hover"]},"path":{"type":"string"},"line":{"type":"integer","description":"One-based line; required except document_symbol"},"column":{"type":"integer","description":"One-based Unicode-rune column; required except document_symbol"},"include_declaration":{"type":"boolean","description":"References only"}},"required":["operation","path"]}`), runLSPResult)
 }
 
 func lspRenameTool() Tool {
-	return resultTool(llm.NewTool("lsp_rename", "Preview or apply a safe, session-bound language-server rename. Preview before apply; apply accepts only the exact stored preview.", `{"type":"object","properties":{"operation":{"type":"string","enum":["preview","apply"]},"path":{"type":"string"},"line":{"type":"integer"},"column":{"type":"integer"},"new_name":{"type":"string"},"rename_id":{"type":"string"}},"required":["operation"]}`), runLSPRenameResult)
+	return resultTool(models.NewTool("lsp_rename", "Preview or apply a safe, session-bound language-server rename. Preview before apply; apply accepts only the exact stored preview.", `{"type":"object","properties":{"operation":{"type":"string","enum":["preview","apply"]},"path":{"type":"string"},"line":{"type":"integer"},"column":{"type":"integer"},"new_name":{"type":"string"},"rename_id":{"type":"string"}},"required":["operation"]}`), runLSPRenameResult)
 }
 
 func runLSPResult(ctx context.Context, args json.RawMessage) (ToolResult, error) {
@@ -244,7 +244,7 @@ func authorizeRenamePlan(ctx context.Context, plan RenamePlan) error {
 		if _, err := AuthorizePath(ctx, file.Path, sandbox.AccessWrite, false); err != nil {
 			return err
 		}
-		if deny := checkGate("lsp_rename", file.Path); deny != "" {
+		if deny := checkGate(ctx, "lsp_rename", file.Path); deny != "" {
 			return errors.New(deny)
 		}
 	}

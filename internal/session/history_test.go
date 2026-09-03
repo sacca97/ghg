@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/sacca97/ghg/internal/llm"
+	"github.com/sacca97/ghg/internal/models"
 )
 
 func TestHistoryIndexSearchReplaceBackfillForkAndRead(t *testing.T) {
@@ -22,13 +22,13 @@ func TestHistoryIndexSearchReplaceBackfillForkAndRead(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	call := llm.ToolCall{ID: "call-1"}
+	call := models.ToolCall{ID: "call-1"}
 	call.Function.Name = "read"
 	call.Function.Arguments = `{"path":"needle.go"}`
-	msgs := []llm.Message{
+	msgs := []models.Message{
 		{Role: "system", Content: "policy"},
 		{Role: "user", Content: "needle from the user", Authored: true},
-		{Role: "assistant", Content: "needle answer", ToolCalls: []llm.ToolCall{call}},
+		{Role: "assistant", Content: "needle answer", ToolCalls: []models.ToolCall{call}},
 		{Role: "tool", Content: "needle tool result", Source: "read", ToolCallID: "call-1", Name: "read"},
 		{Role: "user", Content: "follow up"},
 	}
@@ -52,7 +52,7 @@ func TestHistoryIndexSearchReplaceBackfillForkAndRead(t *testing.T) {
 	}
 
 	// Save replaces the raw row and must replace, not duplicate, its derived hit.
-	if err := st.Save(id, 1, []llm.Message{{}, {Role: "user", Content: "replaced text"}}, "m", "p"); err != nil {
+	if err := st.Save(id, 1, []models.Message{{}, {Role: "user", Content: "replaced text"}}, "m", "p"); err != nil {
 		t.Fatal(err)
 	}
 	hits, err = st.SearchHistory(ctx, id, "needle", "", nil, 200)
@@ -117,7 +117,7 @@ func TestHistorySearchConcurrentWithSaveDoesNotLockDatabase(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	msgs := []llm.Message{
+	msgs := []models.Message{
 		{Role: "user", Content: "concurrent search query text", Authored: true},
 	}
 	if err := st.Save(id, 0, msgs, "m", "p"); err != nil {
@@ -128,7 +128,7 @@ func TestHistorySearchConcurrentWithSaveDoesNotLockDatabase(t *testing.T) {
 	go func() {
 		defer close(done)
 		for i := 0; i < 20; i++ {
-			_ = st.Save(id, 1, []llm.Message{{Role: "assistant", Content: "assistant reply"}}, "m", "p")
+			_ = st.Save(id, 1, []models.Message{{Role: "assistant", Content: "assistant reply"}}, "m", "p")
 		}
 	}()
 

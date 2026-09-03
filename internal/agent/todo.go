@@ -10,7 +10,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/sacca97/ghg/internal/llm"
+	"github.com/sacca97/ghg/internal/models"
 	"github.com/sacca97/ghg/internal/tools"
 )
 
@@ -108,7 +108,7 @@ func (a *Agent) LoadTodosJSON(s string) {
 // todoTool registers the model-facing todowrite tool on the agent.
 func todoTool(a *Agent) tools.Tool {
 	return tools.Tool{
-		Def: llm.NewTool("todowrite",
+		Def: models.NewTool("todowrite",
 			"Record and update your plan for this conversation. Rewrite the FULL list on every call — the list you send replaces the previous one and open items are shown back to you each round. Use it for any task needing 3 or more steps; skip it for trivial one-step work. Keep exactly one item in_progress and mark items completed only after verifying they are actually done. Send an empty list to clear it.",
 			`{"type":"object","properties":{"todos":{"type":"array","description":"The full, updated plan.","items":{"type":"object","properties":{"id":{"type":"string","description":"Stable id, e.g. t1 (assigned if omitted)"},"content":{"type":"string","description":"The step, phrased as an imperative"},"status":{"type":"string","enum":["pending","in_progress","completed","cancelled"]}},"required":["content","status"]}}},"required":["todos"]}`),
 		Run: func(ctx context.Context, args json.RawMessage) (string, error) {

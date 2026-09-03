@@ -15,14 +15,19 @@ import (
 
 	"github.com/sacca97/ghg/internal/agent"
 	"github.com/sacca97/ghg/internal/config"
-	"github.com/sacca97/ghg/internal/llm"
+	"github.com/sacca97/ghg/internal/models"
 	"github.com/sacca97/ghg/internal/session"
 )
 
-func testBackend(baseURL, apiKey string) llm.Backend {
-	client := llm.New(baseURL, apiKey)
-	client.MaxRetries = 1
-	return llm.NewOpenAIBackend(client)
+func testBackend(baseURL, apiKey string) models.Backend {
+	backend, err := models.NewBackend(models.Resolved{
+		BaseURL:  baseURL,
+		Protocol: models.ProtocolOpenAIChatCompletions,
+	}, models.BackendOptions{APIKey: apiKey, MaxRetries: 1})
+	if err != nil {
+		panic(err)
+	}
+	return backend
 }
 
 func startBg(t *testing.T, ag *agent.Agent, desc, prompt string) *agent.BackgroundTask {
@@ -92,7 +97,7 @@ func TestResumeRestoresTasks(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	msgs := []llm.Message{{Role: "system", Content: "sys"}, {Role: "user", Content: "q", Authored: true}, {Role: "assistant", Content: "a"}}
+	msgs := []models.Message{{Role: "system", Content: "sys"}, {Role: "user", Content: "q", Authored: true}, {Role: "assistant", Content: "a"}}
 	if err := m.store.Save(id, 1, msgs, "m", "p"); err != nil {
 		t.Fatal(err)
 	}
@@ -150,7 +155,7 @@ func TestResumeHistorySkipsUnauthoredMessages(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	msgs := []llm.Message{
+	msgs := []models.Message{
 		{Role: "system", Content: "sys"},
 		{Role: "user", Content: "typed by the human", Authored: true},
 		{Role: "assistant", Content: "a"},

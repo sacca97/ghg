@@ -21,12 +21,13 @@ import (
 	"time"
 
 	"github.com/sacca97/ghg/internal/agent"
-	"github.com/sacca97/ghg/internal/artifact"
 	"github.com/sacca97/ghg/internal/config"
 	"github.com/sacca97/ghg/internal/export"
-	"github.com/sacca97/ghg/internal/llm"
 	"github.com/sacca97/ghg/internal/lsp"
+	"github.com/sacca97/ghg/internal/memory"
+	"github.com/sacca97/ghg/internal/models"
 	"github.com/sacca97/ghg/internal/session"
+	"github.com/sacca97/ghg/internal/skills"
 	"github.com/sacca97/ghg/internal/tools"
 )
 
@@ -108,6 +109,10 @@ func runCLI(args []string) error {
 		}
 		sys = string(data)
 	}
+	sys = agent.CompileSystemPrompt(sys,
+		skills.PromptBlock(skills.Scan(skills.DefaultDirs()...)),
+		memory.PromptBlock(memory.Installation(), memory.Session(*resumeFlag)),
+	)
 
 	if *roleFlag != "" && !config.IsRole(*roleFlag) {
 		return fmt.Errorf("unknown role %q (roles: %s)", *roleFlag, strings.Join(config.SupportedRoles(), ", "))
@@ -149,56 +154,12 @@ func runCLI(args []string) error {
 				fmt.Fprintln(os.Stderr, "ghg: json encode:", err)
 			}
 		}
-		ev.OnText = func(d string) { emit(map[string]string{"type": "text", "delta": d}) }
-		ev.OnToolStart = func(_, name, args string) {
-			emit(map[string]string{"type": "tool_start", "name": name, "args": args})
-		}
-		ev.OnToolOutput = func(id, output string) {
-			emit(map[string]string{"type": "tool_output", "id": id, "output": output})
-		}
-		ev.OnToolEnd = func(_, name, result string) {
-			emit(map[string]string{"type": "tool_end", "name": name, "result": result})
-		}
-		ev.OnToolTelemetry = func(telemetry agent.ToolTelemetry) {
-			emit(map[string]any{
-				"type": "tool_telemetry", "id": telemetry.ID, "name": telemetry.Name,
-				"preview_bytes": telemetry.PreviewBytes, "retained_bytes": telemetry.RetainedBytes,
-				"original_bytes": telemetry.OriginalBytes, "truncated": telemetry.Truncated,
-				"bash_redirect": telemetry.BashRedirect, "fingerprint": telemetry.Fingerprint,
-				"duplicate": telemetry.Duplicate, "metadata": telemetry.Metadata,
-			})
-		}
-		ev.OnModelCallStart = func(call agent.ModelCallStart) {
-			emit(map[string]any{
-				"type": "model_call_start", "role": call.Role, "provider": call.Provider,
-				"model": call.Model, "protocol": call.Protocol, "purpose": call.Purpose,
-			})
-		}
-		ev.OnModelCallEnd = func(call agent.ModelCallEnd) {
-			emit(map[string]any{
-				"type": "model_call_end", "role": call.Role, "provider": call.Provider,
-				"model": call.Model, "protocol": call.Protocol, "latency_ms": call.LatencyMS,
-				"purpose": call.Purpose, "finish_reason": call.FinishReason, "usage": call.Usage, "error": call.Error,
-			})
-		}
-		ev.OnPromptView = func(view agent.PromptView) {
-			emit(map[string]any{
-				"type": "prompt_view", "role": view.Role, "provider": view.Provider,
-				"model": view.Model, "protocol": view.Protocol, "purpose": view.Purpose,
-				"message_count": view.MessageCount, "estimated_tokens": view.EstimatedTokens,
-				"serialized_bytes": view.SerializedBytes, "context_limit": view.ContextLimit,
-			})
-		}
+		setupWireEvents(&ev, emit)
 	} else {
 		ev.OnText = func(d string) { fmt.Fprint(os.Stdout, d) }
 		ev.OnToolStart = func(_, name, args string) { note("⚒ %s", name) }
 	}
-	if emit != nil {
-		ev.OnPlanDelta = func(delta string) {
-			planDeltaSeen = true
-			emit(map[string]string{"type": "plan_delta", "delta": delta})
-		}
-	} else {
+	if emit == nil {
 		ev.OnPlanDelta = func(delta string) {
 			planDeltaSeen = true
 			fmt.Fprint(os.Stdout, delta)
@@ -242,7 +203,16 @@ func runCLI(args []string) error {
 	var ag *agent.Agent
 	var modelName, provName string
 	if *planFlag || *planOnlyFlag {
-		planner, _, _, planErr := newRoleAgent(cfg, profiles, config.RoleSmart, sys)
+		var planner *agent.Agent
+		var planErr error
+		if *modelFlag == "" && *providerFlag == "" {
+			planner, _, _, planErr = agent.NewConfiguredForRole(cfg, profiles, config.RoleSmart, sys, false)
+		} else {
+			planner, _, _, planErr = agent.NewConfigured(agent.BuildOptions{
+				Config: cfg, Profiles: profiles, Model: *modelFlag, Provider: *providerFlag,
+				Role: config.RoleDefault, SystemPrompt: sys,
+			})
+		}
 		if planErr != nil {
 			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 				planErr = fmt.Errorf("run timed out after %s", *timeoutFlag)
@@ -253,10 +223,7 @@ func runCLI(args []string) error {
 			return planErr
 		}
 		planner.Runtime = runtime
-		planner.Effort = cfg.DefaultEffort
-		if planner.Effort == "" {
-			planner.Effort = "medium"
-		}
+		planner.Effort = defaultEffort(cfg)
 		planner.PlanMode = true
 		planner.MaxTurns = *maxTurnsFlag
 		final, planErr := planner.Turn(ctx, prompt, ev)
@@ -285,11 +252,11 @@ func runCLI(args []string) error {
 		if *exportResultFlag != "" {
 			planJSON, _ := json.Marshal(map[string]string{"markdown": planMD})
 			record := session.WorkflowResultRecord{
-				ResultID:  fmt.Sprintf("plan-%x", time.Now().UnixNano()&0xffffffff),
+				ResultID:  fmt.Sprintf("plan-%x", time.Now().UnixNano()),
 				Kind:      "plan",
 				Version:   2,
 				Payload:   string(planJSON),
-				Role:      config.RoleSmart,
+				Role:      planner.Role,
 				Provider:  planner.Provider,
 				Model:     planner.Model,
 				CreatedAt: time.Now().UTC(),
@@ -312,26 +279,24 @@ func runCLI(args []string) error {
 			}
 			return nil
 		}
-		ag, modelName, provName, err = newModeAgent(cfg, profiles, config.ModeActing, sys)
+		ag, modelName, provName, err = agent.NewConfiguredForRole(cfg, profiles, config.RoleForMode(config.ModeActing), sys, false)
 		if err == nil {
 			prompt = fmt.Sprintf("Execute the following approved plan. Create and maintain a todowrite\nchecklist while implementing it.\n\n%s", planMD)
 		}
 	} else if *modelFlag == "" && *providerFlag == "" {
 		if *roleFlag == "" {
-			ag, modelName, provName, err = newModeAgent(cfg, profiles, config.ModeActing, sys)
+			ag, modelName, provName, err = agent.NewConfiguredForRole(cfg, profiles, config.RoleForMode(config.ModeActing), sys, false)
 		} else {
-			ag, modelName, provName, err = newRoleAgent(cfg, profiles, *roleFlag, sys)
+			ag, modelName, provName, err = agent.NewConfiguredForRole(cfg, profiles, *roleFlag, sys, false)
 		}
 	} else {
-		route, resolveErr := cfg.Resolve(*modelFlag, *providerFlag)
-		if resolveErr != nil {
-			return resolveErr
-		}
-		ag, err = newAgentFromRoute(cfg, profiles, route, config.RoleDefault, sys)
+		ag, modelName, provName, err = agent.NewConfigured(agent.BuildOptions{
+			Config: cfg, Profiles: profiles, Model: *modelFlag, Provider: *providerFlag,
+			Role: config.RoleDefault, SystemPrompt: sys,
+		})
 		if err != nil {
 			return err
 		}
-		modelName, provName = route.ModelName, route.ProviderName
 	}
 	if err != nil {
 		return err
@@ -340,45 +305,44 @@ func runCLI(args []string) error {
 	if runtime.ApprovalMode == tools.ApprovalAutoReview {
 		runtime.Reviewer = ag.ApproveForMe
 	}
-	ag.Effort = cfg.DefaultEffort
-	if ag.Effort == "" {
-		ag.Effort = "medium"
-	}
+	ag.Effort = defaultEffort(cfg)
 	ag.MaxTurns = *maxTurnsFlag
 
-	// Artifact payloads are durable for session runs and private temporary
+	// Output payloads are durable for session runs and private temporary
 	// files for --no-session runs. The latter are cleaned up when this process
 	// exits; the agent's live message slice still makes them readable during
 	// the run.
-	artifactsDisabled := cfg.Artifacts != nil && cfg.Artifacts.Enabled != nil && !*cfg.Artifacts.Enabled
-	var artifactStore *artifact.Store
-	if !artifactsDisabled {
-		maxBytes := artifact.DefaultMaxBytes
-		if cfg.Artifacts != nil && cfg.Artifacts.MaxBytes > 0 {
-			maxBytes = cfg.Artifacts.MaxBytes
+	outputConfig := cfg.Outputs
+	if outputConfig == nil {
+		outputConfig = cfg.Artifacts
+	}
+	outputsDisabled := outputConfig != nil && outputConfig.Enabled != nil && !*outputConfig.Enabled
+	var outputStore *session.OutputStore
+	if !outputsDisabled {
+		maxBytes := session.DefaultMaxBytes
+		if outputConfig != nil && outputConfig.MaxBytes > 0 {
+			maxBytes = outputConfig.MaxBytes
 		}
 		if *noSessionFlag {
-			artifactStore, err = artifact.NewTempWithLimit(maxBytes)
+			outputStore, err = session.NewTempOutputStoreWithLimit(maxBytes)
 		} else if dir, derr := config.Dir(); derr == nil {
-			artifactStore, err = artifact.NewWithLimit(filepath.Join(dir, "artifacts"), maxBytes)
+			outputStore, err = session.NewOutputStoreWithLimit(filepath.Join(dir, "outputs"), maxBytes)
 		} else {
 			err = derr
 		}
 		if err != nil {
-			config.LogEvent("artifact.open", "FAILED: "+err.Error())
-			artifactStore = nil
+			config.LogEvent("output.open", "FAILED: "+err.Error())
+			outputStore = nil
 		}
 	}
-	if artifactStore != nil {
+	if outputStore != nil {
 		defer func() {
 			if *noSessionFlag {
-				_ = artifactStore.Cleanup()
+				_ = outputStore.Cleanup()
 			}
 		}()
 	}
-	ag.ArtifactStore = artifactStore
-	ag.ArtifactWriter = artifactStore
-	ag.ArtifactsDisabled = artifactsDisabled
+	ag.Outputs = outputStore
 	ag.SubagentsDisabled = !config.SubagentsEnabled(cfg)
 
 	// Session: resume an existing one, or create a fresh one — unless
@@ -396,6 +360,7 @@ func runCLI(args []string) error {
 			return fmt.Errorf("open session database: %w", serr)
 		}
 		store = st
+		store.Outputs = outputStore
 		defer func() { _ = st.Close() }()
 
 		if *resumeFlag != "" {
@@ -423,7 +388,7 @@ func runCLI(args []string) error {
 		}
 	}
 	if store != nil {
-		ag.ArtifactCatalog = store
+		ag.OutputCatalog = store
 		ag.HistoryCatalog = store
 		ag.SetObservationStore(store.ObservationRegistryStore())
 		ag.SetSearchStore(store.SearchRegistryStore())
@@ -433,7 +398,7 @@ func runCLI(args []string) error {
 		return fmt.Errorf("bind session tool state: %w", err)
 	}
 	if store != nil && sessionID != "" {
-		ev.OnCompactionReady = func(raw []llm.Message, summary string, cutoff int) error {
+		ev.OnCompactionReady = func(raw []models.Message, summary string, cutoff int) error {
 			return store.PersistCompaction(sessionID, saved, raw, modelName, provName, summary, cutoff)
 		}
 		ev.OnCompacted = func(_ string, _ int) {
@@ -478,4 +443,55 @@ func boundedPlanPreview(text string) string {
 		return string(runes[:maxPreviewRunes]) + "…"
 	}
 	return string(runes)
+}
+
+func setupWireEvents(ev *agent.Events, emit func(any)) {
+	if ev == nil || emit == nil {
+		return
+	}
+	ev.OnText = func(delta string) {
+		emit(map[string]any{"type": "text", "delta": delta})
+	}
+	ev.OnToolStart = func(id, name, args string) {
+		emit(map[string]any{"type": "tool_start", "id": id, "name": name, "args": args})
+	}
+	ev.OnToolOutput = func(id, output string) {
+		emit(map[string]any{"type": "tool_output", "id": id, "output": output})
+	}
+	ev.OnToolEnd = func(id, name, result string) {
+		emit(map[string]any{"type": "tool_end", "id": id, "name": name, "result": result})
+	}
+	ev.OnToolTelemetry = func(telemetry agent.ToolTelemetry) {
+		emit(map[string]any{
+			"type": "tool_telemetry", "id": telemetry.ID, "name": telemetry.Name,
+			"preview_bytes": telemetry.PreviewBytes, "retained_bytes": telemetry.RetainedBytes,
+			"original_bytes": telemetry.OriginalBytes, "truncated": telemetry.Truncated,
+			"bash_redirect": telemetry.BashRedirect, "fingerprint": telemetry.Fingerprint,
+			"duplicate": telemetry.Duplicate, "metadata": telemetry.Metadata,
+		})
+	}
+	ev.OnModelCallStart = func(call agent.ModelCallStart) {
+		emit(map[string]any{
+			"type": "model_call_start", "role": call.Role, "provider": call.Provider,
+			"model": call.Model, "protocol": call.Protocol, "purpose": call.Purpose,
+		})
+	}
+	ev.OnModelCallEnd = func(call agent.ModelCallEnd) {
+		emit(map[string]any{
+			"type": "model_call_end", "role": call.Role, "provider": call.Provider,
+			"model": call.Model, "protocol": call.Protocol, "latency_ms": call.LatencyMS,
+			"purpose": call.Purpose, "finish_reason": call.FinishReason, "usage": call.Usage, "error": call.Error,
+		})
+	}
+	ev.OnPromptView = func(view agent.PromptView) {
+		emit(map[string]any{
+			"type": "prompt_view", "role": view.Role, "provider": view.Provider,
+			"model": view.Model, "protocol": view.Protocol, "purpose": view.Purpose,
+			"message_count": view.MessageCount, "estimated_tokens": view.EstimatedTokens,
+			"serialized_bytes": view.SerializedBytes, "context_limit": view.ContextLimit,
+		})
+	}
+	ev.OnPlanDelta = func(delta string) {
+		emit(map[string]any{"type": "plan_delta", "delta": delta})
+	}
 }

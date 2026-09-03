@@ -10,8 +10,7 @@ import (
 	"time"
 
 	"github.com/sacca97/ghg/internal/config"
-	"github.com/sacca97/ghg/internal/llm"
-	"github.com/sacca97/ghg/internal/provider"
+	"github.com/sacca97/ghg/internal/models"
 )
 
 // ValidationTimeout bounds the authenticated request made by an auth flow.
@@ -22,8 +21,8 @@ const ValidationTimeout = 15 * time.Second
 // short-lived key they received from the masked/CLI input boundary.
 type Result struct {
 	Name              string
-	Profile           provider.Resolved
-	Models            []llm.ModelInfo
+	Profile           models.Resolved
+	Models            []models.ModelInfo
 	Validated         bool
 	NeedsConfirmation bool
 	// CatalogErr is a non-fatal failure fetching an optional public catalog
@@ -33,15 +32,15 @@ type Result struct {
 
 // ResolveProfile resolves an auth command's profile id and includes the
 // available IDs in an unknown-id error so the user can correct the command.
-func ResolveProfile(profiles provider.Profiles, id string) (provider.Resolved, error) {
+func ResolveProfile(profiles models.Profiles, id string) (models.Resolved, error) {
 	id = strings.TrimSpace(id)
 	if id == "" {
-		return provider.Resolved{}, fmt.Errorf("provider profile id is required (available: %s)", availableProfiles(profiles))
+		return models.Resolved{}, fmt.Errorf("provider profile id is required (available: %s)", availableProfiles(profiles))
 	}
 	if _, ok := profiles.Lookup(id); !ok {
-		return provider.Resolved{}, fmt.Errorf("unknown provider %q (available: %s)", id, availableProfiles(profiles))
+		return models.Resolved{}, fmt.Errorf("unknown provider %q (available: %s)", id, availableProfiles(profiles))
 	}
-	return profiles.Resolve(provider.Instance{Name: id, Profile: id})
+	return profiles.Resolve(models.Instance{Name: id, Profile: id})
 }
 
 // Authenticate validates key against the selected profile. Catalog-enabled
@@ -49,7 +48,7 @@ func ResolveProfile(profiles provider.Profiles, id string) (provider.Resolved, e
 // cache seeding. Catalog-less profiles use ProbeBackend and return no models.
 // A backend with neither capability returns NeedsConfirmation instead of
 // silently claiming the credential works.
-func Authenticate(ctx context.Context, profiles provider.Profiles, id, key string, maxRetries int) (Result, error) {
+func Authenticate(ctx context.Context, profiles models.Profiles, id, key string, maxRetries int) (Result, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -66,7 +65,7 @@ func Authenticate(ctx context.Context, profiles provider.Profiles, id, key strin
 		return result, fmt.Errorf("provider %q needs an API key (%s)", resolved.Name, KeyHint(resolved))
 	}
 
-	backend, err := newBackend(resolved, key, maxRetries)
+	backend, err := NewBackend(resolved, key, "", maxRetries)
 	if err != nil {
 		return result, fmt.Errorf("provider %q: %w", resolved.Name, err)
 	}
@@ -74,22 +73,22 @@ func Authenticate(ctx context.Context, profiles provider.Profiles, id, key strin
 	validationCtx, cancel := context.WithTimeout(ctx, ValidationTimeout)
 	defer cancel()
 	if resolved.Catalog.Public {
-		probe, ok := backend.(llm.ProbeBackend)
+		probe, ok := backend.(models.ProbeBackend)
 		if !ok {
 			result.NeedsConfirmation = true
 			return result, nil
 		}
-		var models []llm.ModelInfo
+		var modelInfos []models.ModelInfo
 		var catalogErr error
-		if catalog, ok := backend.(llm.CatalogBackend); ok && catalogEnabled(resolved.Catalog.Kind) {
+		if catalog, ok := backend.(models.CatalogBackend); ok && catalogEnabled(resolved.Catalog.Kind) {
 			// Public catalogs do not authenticate. Fetch one before probing so
 			// the probe can use a real model ID instead of a sentinel that some
 			// providers reject as an authentication failure.
-			models, catalogErr = catalog.Models(validationCtx)
+			modelInfos, catalogErr = catalog.Models(validationCtx)
 		}
 		probeModel := ""
-		if len(models) > 0 {
-			probe, probeModel, err = routedProbe(profiles, resolved, key, maxRetries, models)
+		if len(modelInfos) > 0 {
+			probe, probeModel, err = routedProbe(profiles, resolved, key, maxRetries, modelInfos)
 			if err != nil {
 				return result, newValidationError(resolved.Name, key, err)
 			}
@@ -98,14 +97,14 @@ func Authenticate(ctx context.Context, profiles provider.Profiles, id, key strin
 			return result, newValidationError(resolved.Name, key, err)
 		}
 		result.Validated = true
-		result.Models = models
+		result.Models = modelInfos
 		if catalogErr != nil {
 			result.CatalogErr = newValidationError(resolved.Name, key, catalogErr)
 		}
 		return result, nil
 	}
 	if catalogEnabled(resolved.Catalog.Kind) {
-		if catalog, ok := backend.(llm.CatalogBackend); ok {
+		if catalog, ok := backend.(models.CatalogBackend); ok {
 			models, err := catalog.Models(validationCtx)
 			if err != nil {
 				return result, newValidationError(resolved.Name, key, err)
@@ -115,7 +114,7 @@ func Authenticate(ctx context.Context, profiles provider.Profiles, id, key strin
 			return result, nil
 		}
 	}
-	if probe, ok := backend.(llm.ProbeBackend); ok {
+	if probe, ok := backend.(models.ProbeBackend); ok {
 		if err := probe.Probe(validationCtx, ""); err != nil {
 			return result, newValidationError(resolved.Name, key, err)
 		}
@@ -126,32 +125,20 @@ func Authenticate(ctx context.Context, profiles provider.Profiles, id, key strin
 	return result, nil
 }
 
-func newBackend(resolved provider.Resolved, key string, maxRetries int) (llm.Backend, error) {
-	return llm.NewBackend(llm.BackendConfig{
-		Protocol:   llm.Protocol(resolved.Protocol),
-		BaseURL:    resolved.BaseURL,
-		APIKey:     key,
-		Headers:    resolved.DefaultHeaders,
-		AuthKind:   resolved.Auth.Kind,
-		AuthHeader: resolved.Auth.Header,
-		MaxRetries: maxRetries,
-	})
-}
-
 // routedProbe selects the first advertised model whose profile route has a
 // compiled probe-capable adapter. Public catalogs can contain models for a
 // protocol ghg does not support yet (for example OpenAI Responses), so those
 // entries must not prevent auth from validating against a supported sibling.
-func routedProbe(profiles provider.Profiles, resolved provider.Resolved, key string, maxRetries int, models []llm.ModelInfo) (llm.ProbeBackend, string, error) {
+func routedProbe(profiles models.Profiles, resolved models.Resolved, key string, maxRetries int, modelInfos []models.ModelInfo) (models.ProbeBackend, string, error) {
 	var lastErr error
 	hadModel := false
-	for _, model := range models {
+	for _, model := range modelInfos {
 		modelID := strings.TrimSpace(model.ID)
 		if modelID == "" {
 			continue
 		}
 		hadModel = true
-		probeResolved, err := profiles.ResolveModel(provider.Instance{
+		probeResolved, err := profiles.ResolveModel(models.Instance{
 			Name:     resolved.Name,
 			Profile:  resolved.Profile.ID,
 			BaseURL:  resolved.BaseURL,
@@ -160,12 +147,12 @@ func routedProbe(profiles provider.Profiles, resolved provider.Resolved, key str
 		if err != nil {
 			return nil, "", err
 		}
-		probeBackend, err := newBackend(probeResolved, key, maxRetries)
+		probeBackend, err := NewBackend(probeResolved, key, "", maxRetries)
 		if err != nil {
 			lastErr = err
 			continue
 		}
-		probe, ok := probeBackend.(llm.ProbeBackend)
+		probe, ok := probeBackend.(models.ProbeBackend)
 		if !ok {
 			lastErr = fmt.Errorf("protocol %q has no authentication probe", probeResolved.Protocol)
 			continue
@@ -182,14 +169,14 @@ func routedProbe(profiles provider.Profiles, resolved provider.Resolved, key str
 }
 
 // KeyHint returns a safe setup hint that contains no credential material.
-func KeyHint(resolved provider.Resolved) string {
+func KeyHint(resolved models.Resolved) string {
 	if resolved.Docs.KeysURL != "" {
 		return "get one at " + resolved.Docs.KeysURL
 	}
 	return "configure credentials for " + resolved.Profile.DisplayName
 }
 
-func availableProfiles(profiles provider.Profiles) string {
+func availableProfiles(profiles models.Profiles) string {
 	ids := profiles.IDs()
 	if len(ids) == 0 {
 		return "none"
@@ -198,7 +185,7 @@ func availableProfiles(profiles provider.Profiles) string {
 }
 
 func catalogEnabled(kind string) bool {
-	return kind == provider.CatalogOpenAIModels || kind == provider.CatalogAnthropicModels
+	return kind == models.CatalogOpenAIModels || kind == models.CatalogAnthropicModels
 }
 
 type validationError struct {

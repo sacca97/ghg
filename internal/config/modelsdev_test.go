@@ -2,12 +2,26 @@ package config
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 )
+
+func modelsDevTestServer(t *testing.T, handler http.Handler) *httptest.Server {
+	t.Helper()
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			if strings.Contains(fmt.Sprint(recovered), "operation not permitted") {
+				t.Skip("loopback listener not permitted by sandbox environment")
+			}
+			panic(recovered)
+		}
+	}()
+	return httptest.NewServer(handler)
+}
 
 func TestParseModelsDevContext(t *testing.T) {
 	data := []byte(`{
@@ -161,7 +175,7 @@ func TestModelsDevReasoningFallbackRequiresAgreement(t *testing.T) {
 }
 
 func TestFetchModelsDev(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := modelsDevTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Accept") != "application/json" {
 			t.Errorf("Accept = %q", r.Header.Get("Accept"))
 		}
@@ -185,7 +199,7 @@ func TestFetchModelsDev(t *testing.T) {
 }
 
 func TestFetchModelsDevRejectsBadResponses(t *testing.T) {
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	server := modelsDevTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadGateway)
 		_, _ = w.Write([]byte("upstream unavailable"))
 	}))

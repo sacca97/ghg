@@ -7,21 +7,79 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/sacca97/ghg/internal/artifact"
+	"github.com/sacca97/ghg/internal/models"
 )
 
-const maxArtifactBytes = artifact.DefaultMaxBytes
+const maxOutputBytes int64 = 10 << 20
+const maxOutput = 16 << 10
 
-// ToolResult is the internal result of one tool invocation. Preview is the
-// bounded text sent to the model; Retained is the bounded evidence available
-// to the artifact writer before the preview is shortened. Legacy tools may
-// leave the extra fields empty and are normalized by ExecuteResult.
+func Truncate(s string) string {
+	return truncate(s)
+}
+
+func TruncateWithSuffix(s, suffix string) string {
+	if len(s)+len(suffix) <= maxOutput {
+		return s + suffix
+	}
+	if len(suffix) >= maxOutput {
+		return suffix[len(suffix)-maxOutput:]
+	}
+	return truncateWithMarkerLimit(s, maxOutput-len(suffix), func(omitted int) string {
+		return fmt.Sprintf("\n... [truncated %d bytes]", omitted)
+	}, false) + suffix
+}
+
+func truncate(s string) string {
+	return truncateWithMarker(s, func(omitted int) string {
+		return fmt.Sprintf("\n... [truncated %d bytes]", omitted)
+	}, false)
+}
+
+func TruncateTail(s string) string {
+	return truncateWithMarker(s, func(omitted int) string {
+		return fmt.Sprintf("[... first %d bytes truncated]\n", omitted)
+	}, true)
+}
+
+func truncateWithMarker(s string, marker func(omitted int) string, tail bool) string {
+	return truncateWithMarkerLimit(s, maxOutput, marker, tail)
+}
+
+func truncateWithMarkerLimit(s string, limit int, marker func(omitted int) string, tail bool) string {
+	if len(s) <= limit {
+		return s
+	}
+	keep := limit
+	for {
+		text := marker(len(s) - keep)
+		next := limit - len(text)
+		if next <= 0 {
+			return text[:limit]
+		}
+		if next == keep {
+			if tail {
+				return text + s[len(s)-keep:]
+			}
+			return s[:keep] + text
+		}
+		keep = next
+	}
+}
+
+// ToolResult is the internal result of one tool invocation.
+// Explicit bounded-output invariants:
+//   - Preview: bounded model-visible output.
+//   - Retained: bounded evidence available to the output store / debugging.
+//   - OriginalBytes: total unbounded source size where known.
+//   - Complete: whether Retained represents all source output without omission.
+//
+// Legacy tools may leave extra fields empty and are normalized by ExecuteResult.
 type ToolResult struct {
 	Preview       string
 	Retained      string
 	OriginalBytes int64
 	Complete      bool
-	Artifact      *artifact.Ref
+	Output        *models.OutputRef
 	ExitCode      int
 	// Source identifies the tool/integration that produced the bytes. It is
 	// assigned by ExecuteResult so MCP and future network tools share the same
@@ -73,10 +131,10 @@ func capturedResult(retained, preview string, original int64, complete bool, exi
 }
 
 func retainText(s string) (string, bool) {
-	if int64(len(s)) <= artifact.DefaultMaxBytes {
+	if int64(len(s)) <= maxOutputBytes {
 		return s, true
 	}
-	data := retainBytes([]byte(s), artifact.DefaultMaxBytes)
+	data := retainBytes([]byte(s), maxOutputBytes)
 	return string(data), false
 }
 
@@ -94,7 +152,7 @@ func retainBytes(data []byte, limit int64) []byte {
 
 // TextCapture is the string-side equivalent of the bash runner's bounded
 // capture. It lets file/MCP adapters count a large result without retaining
-// more than the artifact ceiling in memory.
+// more than the output ceiling in memory.
 type TextCapture struct {
 	limit     int
 	total     int64
@@ -105,10 +163,10 @@ type TextCapture struct {
 }
 
 // NewTextCapture creates a bounded capture. A non-positive limit uses the
-// default artifact ceiling.
+// default output ceiling.
 func NewTextCapture(limit int64) *TextCapture {
 	if limit <= 0 {
-		limit = maxArtifactBytes
+		limit = maxOutputBytes
 	}
 	return &TextCapture{limit: int(limit)}
 }
@@ -228,7 +286,7 @@ func IsUntrusted(result ToolResult) bool {
 
 // ModelText renders the model-facing form of a tool result. Untrusted bytes
 // are explicitly delimited and the source is quoted as data. A trusted
-// artifact reference, when present, stays outside the delimiters so the
+// output reference, when present, stays outside the delimiters so the
 // recovery instruction cannot be confused with bytes returned by the tool.
 func ModelText(result ToolResult) string {
 	if !IsUntrusted(result) {
@@ -239,8 +297,8 @@ func ModelText(result ToolResult) string {
 		source = "tool"
 	}
 	body, reference := result.Preview, ""
-	if result.Artifact != nil {
-		candidate := ArtifactReference(*result.Artifact)
+	if result.Output != nil {
+		candidate := OutputReference(*result.Output)
 		if strings.HasSuffix(body, candidate) {
 			body = strings.TrimSuffix(body, candidate)
 			reference = candidate
@@ -277,13 +335,13 @@ func errorToolResult(err error) ToolResult {
 	return result
 }
 
-// ArtifactReference is appended to a model-facing preview after the artifact is
+// OutputReference is appended to a model-facing preview after the output is
 // durably written. The reference deliberately contains no filesystem path.
-func ArtifactReference(ref artifact.Ref) string {
+func OutputReference(ref models.OutputRef) string {
 	retention := "full result retained"
 	if !ref.Complete {
 		retention = "only deterministic head/tail retained; middle omitted"
 	}
-	return fmt.Sprintf("\n[artifact %s: %d bytes original, %d bytes stored; %s; use artifact_read with this id]",
+	return fmt.Sprintf("\n[output %s: %d bytes original, %d bytes stored; %s; use output_read with this id]",
 		ref.ID, ref.OriginalBytes, ref.StoredBytes, retention)
 }

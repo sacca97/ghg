@@ -194,7 +194,7 @@ explicitly empty option list exposes `off` only.
 ## Cost tracking
 
 When the provider advertises `pricing` in `GET /models`, the status line
-shows session spend: `llm.Usage` (prompt/completion/cached) comes off each
+shows session spend: `models.Usage` (prompt/completion/cached) comes off each
 streamed response, cached input is billed at the cache-read rate, and totals
 accumulate per session. Hidden entirely when pricing isn't advertised.
 

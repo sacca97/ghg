@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sacca97/ghg/internal/llm"
+	"github.com/sacca97/ghg/internal/models"
 	"github.com/sacca97/ghg/internal/session"
 )
 
@@ -100,7 +100,7 @@ func TestExportCLI(t *testing.T) {
 	}
 
 	// 5. Export last message
-	msgs := []llm.Message{
+	msgs := []models.Message{
 		{Role: "user", Content: "hello"},
 		{Role: "assistant", Content: "This is the final assistant response text."},
 	}

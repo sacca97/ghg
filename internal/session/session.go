@@ -7,15 +7,14 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"io"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	_ "modernc.org/sqlite"
 
-	"github.com/sacca97/ghg/internal/artifact"
-	"github.com/sacca97/ghg/internal/goal"
-	"github.com/sacca97/ghg/internal/llm"
+	"github.com/sacca97/ghg/internal/models"
 )
 
 // Meta is a session's bookkeeping row.
@@ -39,7 +38,10 @@ type Meta struct {
 
 const sessionMetaColumns = `id, title, model, provider, cwd, goal, forked_from, fork_seq, tags, pinned, effort, usage_in, usage_cached, usage_out, updated_at`
 
-type Store struct{ db *sql.DB }
+type Store struct {
+	db      *sql.DB
+	Outputs *OutputStore
+}
 
 // Open opens (creating if needed) the sessions database at path.
 func Open(path string) (*Store, error) {
@@ -80,11 +82,11 @@ func (s *Store) SetGoal(id, objective string) error {
 		return err
 	}
 	if !ok {
-		record = goal.New(objective)
+		record = NewGoal(objective)
 		record.ID = "legacy-" + id
 	} else {
 		record.Objective = objective
-		record.Status = goal.StatusActive
+		record.Status = GoalStatusActive
 		record.Blocker = ""
 		record.UpdatedAt = time.Now().UTC()
 	}
@@ -131,58 +133,6 @@ func (s *Store) SetRoute(id, model, provider string) error {
 	return err
 }
 
-// Task is one background subagent's persisted record. It deliberately
-// mirrors agent.BackgroundTask's exported fields without importing agent
-// (session is a leaf; the TUI converts between them).
-type Task struct {
-	ID          string
-	Description string
-	Prompt      string
-	Status      string // "running", "done", "error", "cancelled"
-	Report      string
-	StartedAt   time.Time
-	EndedAt     time.Time
-}
-
-// SaveTask upserts a background subagent's record for a session. Called on
-// start and on settle, so the final row holds the settled status/report.
-func (s *Store) SaveTask(sessionID string, t Task) error {
-	ended := ""
-	if !t.EndedAt.IsZero() {
-		ended = t.EndedAt.UTC().Format(time.RFC3339)
-	}
-	_, err := s.db.Exec(`INSERT OR REPLACE INTO tasks
-		(session_id, task_id, description, prompt, status, report, started_at, ended_at)
-		VALUES (?,?,?,?,?,?,?,?)`,
-		sessionID, t.ID, t.Description, t.Prompt, t.Status, t.Report,
-		t.StartedAt.UTC().Format(time.RFC3339), ended)
-	return err
-}
-
-// LoadTasks returns a session's persisted background subagents, oldest first.
-func (s *Store) LoadTasks(sessionID string) ([]Task, error) {
-	rows, err := s.db.Query(`SELECT task_id, description, prompt, status, report, started_at, ended_at
-		FROM tasks WHERE session_id=? ORDER BY started_at`, sessionID)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close() }()
-	var out []Task
-	for rows.Next() {
-		var t Task
-		var started, ended string
-		if err := rows.Scan(&t.ID, &t.Description, &t.Prompt, &t.Status, &t.Report, &started, &ended); err != nil {
-			return nil, err
-		}
-		t.StartedAt, _ = time.Parse(time.RFC3339, started)
-		if ended != "" {
-			t.EndedAt, _ = time.Parse(time.RFC3339, ended)
-		}
-		out = append(out, t)
-	}
-	return out, rows.Err()
-}
-
 func (s *Store) Close() error { return s.db.Close() }
 
 func now() string { return time.Now().UTC().Format(time.RFC3339) }
@@ -199,7 +149,7 @@ func (s *Store) Create(cwd, model, provider string) (string, error) {
 
 // Save persists msgs[from:] (the conversation without the system prompt) and
 // refreshes the session's metadata.
-func (s *Store) Save(id string, from int, msgs []llm.Message, model, provider string) error {
+func (s *Store) Save(id string, from int, msgs []models.Message, model, provider string) error {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
@@ -233,7 +183,7 @@ func (s *Store) Save(id string, from int, msgs []llm.Message, model, provider st
 			nextSeq++
 		}
 		// A re-save can replace a tool message with a version that no longer
-		// carries an artifact. Remove the old index rows before inserting the
+		// carries an output. Remove the old index rows before inserting the
 		// current message, while leaving payload files untouched.
 		if _, err := tx.Exec(`DELETE FROM artifacts WHERE session_id=? AND message_seq=?`, id, seq); err != nil {
 			return err
@@ -249,11 +199,11 @@ func (s *Store) Save(id string, from int, msgs []llm.Message, model, provider st
 		if err := replaceHistoryFTS(tx, id, seq, msgs[i]); err != nil {
 			return err
 		}
-		if msgs[i].Artifact != nil {
-			ref := *msgs[i].Artifact
-			relPath, err := artifact.RelativePath(ref)
+		if msgs[i].Output != nil {
+			ref := *msgs[i].Output
+			relPath, err := RelativePath(ref)
 			if err != nil {
-				return fmt.Errorf("message %d artifact: %w", seq, err)
+				return fmt.Errorf("message %d output: %w", seq, err)
 			}
 			complete := 0
 			if ref.Complete {
@@ -263,7 +213,7 @@ func (s *Store) Save(id string, from int, msgs []llm.Message, model, provider st
 			if len(ref.Metadata) > 0 {
 				data, err := json.Marshal(ref.Metadata)
 				if err != nil {
-					return fmt.Errorf("message %d artifact metadata: %w", seq, err)
+					return fmt.Errorf("message %d output metadata: %w", seq, err)
 				}
 				metadata = string(data)
 			}
@@ -284,7 +234,7 @@ func (s *Store) Save(id string, from int, msgs []llm.Message, model, provider st
 	title := ""
 	for _, m := range msgs {
 		if m.Role == "user" {
-			title = truncate(strings.Join(strings.Fields(m.TextContent()), " "), 64)
+			title = DeterministicTitle(m.TextContent())
 			break
 		}
 	}
@@ -295,9 +245,27 @@ func (s *Store) Save(id string, from int, msgs []llm.Message, model, provider st
 	return tx.Commit()
 }
 
+func DeterministicTitle(text string) string {
+	text = strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			if unicode.IsSpace(r) {
+				return ' '
+			}
+			return -1
+		}
+		return r
+	}, text)
+	title := strings.Join(strings.Fields(text), " ")
+	if utf8.RuneCountInString(title) > 64 {
+		runes := []rune(title)
+		title = strings.TrimSpace(string(runes[:64]))
+	}
+	return title
+}
+
 // DeleteSession removes a session and its database-owned history. It does not
-// remove immutable payload files; run ReferencedArtifactHashes followed by
-// artifact.Store.GarbageCollect to reclaim payloads no longer referenced by
+// remove immutable payload files; run ReferencedOutputHashes followed by
+// OutputStore.GarbageCollect to reclaim payloads no longer referenced by
 // any session.
 func (s *Store) DeleteSession(id string) error {
 	tx, err := s.db.Begin()
@@ -317,7 +285,7 @@ func (s *Store) DeleteSession(id string) error {
 }
 
 // Load resolves idOrPrefix to a session and returns its metadata and messages.
-func (s *Store) Load(idOrPrefix string) (Meta, []llm.Message, error) {
+func (s *Store) Load(idOrPrefix string) (Meta, []models.Message, error) {
 	rows, err := s.db.Query(`SELECT `+sessionMetaColumns+` FROM sessions WHERE id LIKE ?||'%' LIMIT 3`, idOrPrefix)
 	if err != nil {
 		return Meta{}, nil, err
@@ -352,126 +320,13 @@ func (s *Store) Load(idOrPrefix string) (Meta, []llm.Message, error) {
 		if err := mrows.Scan(&seq, &data); err != nil {
 			return Meta{}, nil, err
 		}
-		var m llm.Message
+		var m models.Message
 		if err := json.Unmarshal([]byte(data), &m); err != nil {
 			return Meta{}, nil, err
 		}
 		stored = append(stored, storedMessage{seq: seq, msg: m})
 	}
 	return meta, answerDanglingToolCalls(applyCompactionRows(s.db, meta.ID, stored)), mrows.Err()
-}
-
-type storedMessage struct {
-	seq int
-	msg llm.Message
-}
-
-// applyCompaction derives the compacted view from the raw log: the latest
-// compaction event's summary replaces raw messages [1, cutoff), keeping the
-// system prompt (seq 0) and the raw tail. "Raw" matters: a stored row that is
-// itself a summary (system role past index 0) is a *derived* row saved after
-// a compaction — folding it again would nest summaries — so the cutoff only
-// ever applies to non-system rows. No event → the log loads verbatim. This is
-// what makes a compaction non-destructive: the event is metadata, the raw
-// rows are the history.
-func applyCompactionRows(db *sql.DB, sessionID string, rows []storedMessage) []llm.Message {
-	var cutoff int
-	var summary string
-	err := db.QueryRow(`SELECT cutoff, summary FROM compactions WHERE session_id=? ORDER BY seq DESC LIMIT 1`,
-		sessionID).Scan(&cutoff, &summary)
-	if err != nil || cutoff <= 0 {
-		return storedMessages(rows) // no event
-	}
-	// The cutoff is a raw SQLite sequence, not an index in the loaded slice.
-	// This matters because normal TUI saves omit the system prompt (seq 0),
-	// while a few low-level callers persist it for round-trip tests.
-	fold := len(rows)
-	for i, row := range rows {
-		if row.seq >= cutoff {
-			fold = i
-			break
-		}
-	}
-	// A cutover at the next raw sequence is valid even when the just-submitted
-	// tail has not been persisted yet (for example, an interrupted TUI turn).
-	// Only ignore an event that skips beyond a genuinely missing raw range.
-	if fold == len(rows) && (len(rows) == 0 || rows[len(rows)-1].seq+1 < cutoff) {
-		return storedMessages(rows) // the event post-dates the raw log
-	}
-	out := make([]llm.Message, 0, len(rows)+1)
-	start := 0
-	if len(rows) > 0 && rows[0].seq == 0 && rows[0].msg.Role == "system" {
-		out = append(out, rows[0].msg)
-		start = 1
-	}
-	out = append(out, llm.Message{Role: "system", Content: "Summary of the conversation so far:\n\n" + summary})
-	// keep the last derived summary before the fold (a second compaction's
-	// saved row — it summarizes history the new summary doesn't reach)
-	var prior []llm.Message
-	for i := start; i < fold; i++ {
-		if rows[i].msg.Role == "system" {
-			prior = append(prior, rows[i].msg)
-		}
-	}
-	if len(prior) > 0 {
-		out = append(out, prior[len(prior)-1])
-	}
-	for _, row := range rows[fold:] {
-		out = append(out, row.msg)
-	}
-	return out
-}
-
-func storedMessages(rows []storedMessage) []llm.Message {
-	msgs := make([]llm.Message, 0, len(rows))
-	for _, row := range rows {
-		msgs = append(msgs, row.msg)
-	}
-	return msgs
-}
-
-// answerDanglingToolCalls appends a synthetic error result for every
-// persisted tool call that has none — a ctrl+c or crash mid-turn interrupts
-// between the assistant message and its results, and the API rejects a
-// resumed conversation with an unanswered tool_call. Results go right after
-// the assistant message (the API wants them before the next non-tool
-// message); a fully-answered history is returned unchanged.
-func answerDanglingToolCalls(msgs []llm.Message) []llm.Message {
-	answered := make(map[string]bool, len(msgs))
-	dangling := false
-	for _, m := range msgs {
-		if m.Role == "tool" {
-			answered[m.ToolCallID] = true
-		}
-	}
-	for _, m := range msgs {
-		if m.Role == "assistant" {
-			for _, tc := range m.ToolCalls {
-				dangling = dangling || !answered[tc.ID]
-			}
-		}
-	}
-	if !dangling {
-		return msgs
-	}
-	out := make([]llm.Message, 0, len(msgs)+4)
-	for _, m := range msgs {
-		out = append(out, m)
-		if m.Role != "assistant" {
-			continue
-		}
-		for _, tc := range m.ToolCalls {
-			if !answered[tc.ID] {
-				out = append(out, llm.Message{
-					Role:       "tool",
-					Content:    "Error: tool call interrupted — the session ended before a result was recorded",
-					ToolCallID: tc.ID,
-					Name:       tc.Function.Name,
-				})
-			}
-		}
-	}
-	return out
 }
 
 // Recent returns up to n sessions, newest first.
@@ -529,7 +384,7 @@ func (s *Store) UserHistory(limit int) ([]string, error) {
 		if err := rows.Scan(&data); err != nil {
 			return nil, err
 		}
-		var msg llm.Message
+		var msg models.Message
 		if err := json.Unmarshal([]byte(data), &msg); err != nil {
 			continue // skip malformed rows rather than fail the whole recall
 		}
@@ -559,7 +414,7 @@ func (s *Store) LastExchange(id string) (user, assistant string) {
 		var data string
 		if err := s.db.QueryRow(`SELECT content FROM messages WHERE session_id=? AND role=? ORDER BY seq DESC LIMIT 1`,
 			id, q.role).Scan(&data); err == nil {
-			var m llm.Message
+			var m models.Message
 			if json.Unmarshal([]byte(data), &m) == nil {
 				*q.dst = m.TextContent()
 			}
@@ -598,311 +453,10 @@ func (s *Store) DeleteFrom(id string, from int) error {
 	return tx.Commit()
 }
 
-// SetSnapshot records the workspace snapshot ref for the turn starting at
-// conversation index seq ("" deletes: the turn's files were restored away).
-func (s *Store) SetSnapshot(id string, seq int, ref string) error {
-	if ref == "" {
-		_, err := s.db.Exec(`DELETE FROM snapshots WHERE session_id=? AND seq=?`, id, seq)
-		return err
-	}
-	_, err := s.db.Exec(`INSERT OR REPLACE INTO snapshots (session_id, seq, ref, created_at) VALUES (?,?,?,?)`,
-		id, seq, ref, now())
-	return err
-}
-
-// Snapshots returns the session's workspace snapshot refs keyed by
-// conversation index.
-func (s *Store) Snapshots(id string) map[int]string {
-	rows, err := s.db.Query(`SELECT seq, ref FROM snapshots WHERE session_id=?`, id)
-	if err != nil {
-		return nil
-	}
-	defer func() { _ = rows.Close() }()
-	out := map[int]string{}
-	for rows.Next() {
-		var seq int
-		var ref string
-		if rows.Scan(&seq, &ref) == nil {
-			out[seq] = ref
-		}
-	}
-	return out
-}
-
-// Schedule is one scheduled task's durable record.
-type Schedule struct {
-	ID       int
-	Schedule string    // '@every 10m' | '@at <rfc3339>'
-	Prompt   string    // the machine-authored turn submitted on fire
-	Anchor   time.Time // grid origin
-	LastFire time.Time // zero = never fired
-}
-
-// AddSchedule records a scheduled task and returns its id.
-func (s *Store) AddSchedule(sessionID, schedule, prompt string, anchor time.Time) (int, error) {
-	var id int
-	err := s.db.QueryRow(`INSERT INTO schedules (session_id, id, schedule, prompt, anchor, created_at)
-		SELECT ?, COALESCE(MAX(id),0)+1, ?, ?, ?, ? FROM schedules WHERE session_id=? RETURNING id`,
-		sessionID, schedule, prompt, anchor.UTC().Format(time.RFC3339), now(), sessionID).Scan(&id)
-	return id, err
-}
-
-// Schedules returns a session's scheduled tasks, id order.
-func (s *Store) Schedules(sessionID string) []Schedule {
-	rows, err := s.db.Query(`SELECT id, schedule, prompt, anchor, last_fire FROM schedules WHERE session_id=? ORDER BY id`, sessionID)
-	if err != nil {
-		return nil
-	}
-	defer func() { _ = rows.Close() }()
-	var out []Schedule
-	for rows.Next() {
-		var sc Schedule
-		var anchor, lastFire string
-		if rows.Scan(&sc.ID, &sc.Schedule, &sc.Prompt, &anchor, &lastFire) != nil {
-			continue
-		}
-		sc.Anchor, _ = time.Parse(time.RFC3339, anchor)
-		sc.LastFire, _ = time.Parse(time.RFC3339, lastFire)
-		out = append(out, sc)
-	}
-	return out
-}
-
-// MarkFired stamps a task's last fire (a fired one-shot stays listed but
-// never fires again).
-func (s *Store) MarkFired(sessionID string, id int, at time.Time) error {
-	_, err := s.db.Exec(`UPDATE schedules SET last_fire=? WHERE session_id=? AND id=?`,
-		at.UTC().Format(time.RFC3339), sessionID, id)
-	return err
-}
-
-// DeleteSchedule removes a scheduled task.
-func (s *Store) DeleteSchedule(sessionID string, id int) error {
-	_, err := s.db.Exec(`DELETE FROM schedules WHERE session_id=? AND id=?`, sessionID, id)
-	return err
-}
-
-// ClearSnapshots drops all of a session's workspace snapshot rows (compaction
-// re-seqs messages, so the keys stop mapping to turns).
-func (s *Store) ClearSnapshots(id string) error {
-	_, err := s.db.Exec(`DELETE FROM snapshots WHERE session_id=?`, id)
-	return err
-}
-
-// Compaction is one recorded compaction event.
-type Compaction struct {
-	Seq     int    // generation (1-based)
-	Cutoff  int    // raw-log seq the summary replaces
-	Summary string // the generated summary text
-}
-
-// PersistCompaction performs the canonical compaction persistence sequence:
-// 1. Saves unpersisted messages if msgs is longer than saved.
-// 2. Computes the raw database cutoff for the compaction cutoff.
-// 3. Records the compaction event.
-func (s *Store) PersistCompaction(id string, saved int, msgs []llm.Message, model, provider, summary string, cutoff int) error {
-	if s == nil || id == "" {
-		return nil
-	}
-	if len(msgs) > saved {
-		if err := s.Save(id, saved, msgs, model, provider); err != nil {
-			return err
-		}
-	}
-	return s.RecordCompaction(id, s.RawCutoff(id, cutoff, msgs), summary)
-}
-
-// RecordCompaction appends a compaction event. The raw messages stay.
-func (s *Store) RecordCompaction(id string, cutoff int, summary string) error {
-	_, err := s.db.Exec(`INSERT INTO compactions (session_id, seq, cutoff, summary, created_at)
-		SELECT ?, COALESCE(MAX(seq),0)+1, ?, ?, ? FROM compactions WHERE session_id=?`,
-		id, cutoff, summary, now(), id)
-	return err
-}
-
-// Compactions returns a session's compaction events, oldest first.
-func (s *Store) Compactions(id string) []Compaction {
-	rows, err := s.db.Query(`SELECT seq, cutoff, summary FROM compactions WHERE session_id=? ORDER BY seq`, id)
-	if err != nil {
-		return nil
-	}
-	defer func() { _ = rows.Close() }()
-	var out []Compaction
-	for rows.Next() {
-		var c Compaction
-		if rows.Scan(&c.Seq, &c.Cutoff, &c.Summary) == nil {
-			out = append(out, c)
-		}
-	}
-	return out
-}
-
-// RawCutoff maps an agent-reported compaction cutoff (an index into its
-// current, possibly already-compacted Messages view) to raw-log coordinates so
-// RecordCompaction always names the raw row the kept tail begins at — a second
-// compaction after an earlier one must not resurrect or fold the wrong
-// history. before is the pre-compaction message view; the leading system
-// messages (summary + optional artifact manifest) are derived rows, not raw
-// log rows, so they are skipped when measuring the offset.
-func (s *Store) RawCutoff(id string, cutoff int, before []llm.Message) int {
-	events := s.Compactions(id)
-	if len(events) == 0 {
-		return cutoff
-	}
-	firstRaw := 1
-	for firstRaw < len(before) && before[firstRaw].Role == "system" {
-		firstRaw++
-	}
-	return events[len(events)-1].Cutoff + cutoff - firstRaw
-}
-
-// DeleteCompaction removes one compaction event by generation (retry drops
-// the bad event before re-compacting from the raw log).
-func (s *Store) DeleteCompaction(id string, seq int) error {
-	_, err := s.db.Exec(`DELETE FROM compactions WHERE session_id=? AND seq=?`, id, seq)
-	return err
-}
-
-// RawMessages returns the full stored log (no compaction view applied) —
-// the inspection/retry surface for compactions.
-func (s *Store) RawMessages(id string) []llm.Message {
-	rows, err := s.db.Query(`SELECT content FROM messages WHERE session_id=? ORDER BY seq`, id)
-	if err != nil {
-		return nil
-	}
-	defer func() { _ = rows.Close() }()
-	var msgs []llm.Message
-	for rows.Next() {
-		var data string
-		if rows.Scan(&data) != nil {
-			continue
-		}
-		var m llm.Message
-		if json.Unmarshal([]byte(data), &m) == nil {
-			msgs = append(msgs, m)
-		}
-	}
-	return msgs
-}
-
 // SetTitle retitles a session (/rename).
 func (s *Store) SetTitle(id, title string) error {
 	_, err := s.db.Exec(`UPDATE sessions SET title=? WHERE id=?`, title, id)
 	return err
-}
-
-// Fork copies a session's stored rows with seq <= uptoSeq (pass len(msgs)
-// for a full copy — one past the last row) into a new session titled title,
-// carrying over cwd/model/provider/goal, and returns the new id. seq equals
-// the conversation index (the system prompt is never persisted). The source
-// session is untouched. The rows are cloned in one INSERT…SELECT, so the DB
-// does the copy; nothing round-trips through Go.
-func (s *Store) Fork(srcID string, uptoSeq int, title string) (string, error) {
-	b := make([]byte, 4)
-	rand.Read(b)
-	newID := hex.EncodeToString(b)
-	tx, err := s.db.Begin()
-	if err != nil {
-		return "", err
-	}
-	defer func() { _ = tx.Rollback() }()
-	if _, err := tx.Exec(`INSERT INTO sessions (id, created_at, updated_at, cwd, model, provider, title, goal, forked_from, fork_seq, effort)
-		SELECT ?, ?, ?, cwd, model, provider, ?, goal, ?, ?, effort FROM sessions WHERE id=?`,
-		newID, now(), now(), title, srcID, uptoSeq, srcID); err != nil {
-		return "", err
-	}
-	if _, err := tx.Exec(`INSERT INTO goals
-		(session_id, goal_id, objective, status, rounds, usage_in, usage_cached,
-		 usage_out, progress, blocker, created_at, updated_at)
-		SELECT ?, goal_id, objective, status, rounds, usage_in, usage_cached,
-		 usage_out, progress, blocker, created_at, updated_at
-		FROM goals WHERE session_id=?`, newID, srcID); err != nil {
-		return "", err
-	}
-	if _, err := tx.Exec(`INSERT INTO goal_checkpoints
-		(session_id, goal_id, seq, status, rounds, usage_in, usage_cached,
-		 usage_out, progress, blocker, created_at)
-		SELECT ?, goal_id, seq, status, rounds, usage_in, usage_cached,
-		 usage_out, progress, blocker, created_at
-		FROM goal_checkpoints WHERE session_id=?`, newID, srcID); err != nil {
-		return "", err
-	}
-	if uptoSeq > 0 {
-		if _, err := tx.Exec(`INSERT INTO messages (session_id, seq, role, content)
-			SELECT ?, seq, role, content FROM messages WHERE session_id=? AND seq <= ?`,
-			newID, srcID, uptoSeq); err != nil {
-			return "", err
-		}
-		if _, err := tx.Exec(`INSERT INTO history_fts (session_id, seq, role, content)
-			SELECT ?, seq, role, content FROM history_fts WHERE session_id=? AND seq <= ?`,
-			newID, srcID, uptoSeq); err != nil {
-			return "", err
-		}
-		artifactIDs, err := artifactIDsInMessages(tx, srcID, uptoSeq)
-		if err != nil {
-			return "", err
-		}
-		query := `INSERT INTO artifacts
-			(session_id, message_seq, id, tool_call_id, tool_name, media_type,
-			 original_bytes, stored_bytes, hash, path, complete, metadata, created_at)
-			SELECT ?, message_seq, id, tool_call_id, tool_name, media_type,
-			 original_bytes, stored_bytes, hash, path, complete, metadata, created_at
-			FROM artifacts WHERE session_id=? AND (message_seq <= ?`
-		args := []any{newID, srcID, uptoSeq}
-		if len(artifactIDs) > 0 {
-			placeholders := make([]string, len(artifactIDs))
-			for i, id := range artifactIDs {
-				placeholders[i] = "?"
-				args = append(args, id)
-			}
-			query += ` OR id IN (` + strings.Join(placeholders, ",") + ")"
-		}
-		query += ")"
-		if _, err := tx.Exec(query, args...); err != nil {
-			return "", err
-		}
-		// A full/raw fork should retain the derived prompt view. The payloads
-		// and raw messages are already copied above; copying only events whose
-		// cutoff is inside the branch keeps a partial fork independently
-		// loadable without inventing a new cutoff.
-		if _, err := tx.Exec(`INSERT INTO compactions (session_id, seq, cutoff, summary, created_at)
-			SELECT ?, seq, cutoff, summary, created_at FROM compactions
-			WHERE session_id=? AND cutoff<=?`, newID, srcID, uptoSeq); err != nil {
-			return "", err
-		}
-		if _, err := tx.Exec(`INSERT INTO workflow_results
-			(session_id, result_id, kind, version, payload, role, provider, model, message_seq, created_at)
-			SELECT ?, result_id, kind, version, payload, role, provider, model, message_seq, created_at
-			FROM workflow_results WHERE session_id=? AND message_seq<=?`, newID, srcID, uptoSeq); err != nil {
-			return "", err
-		}
-	}
-	return newID, tx.Commit()
-}
-
-func artifactIDsInMessages(tx *sql.Tx, sessionID string, uptoSeq int) ([]string, error) {
-	rows, err := tx.Query(`SELECT content FROM messages WHERE session_id=? AND seq<=?`, sessionID, uptoSeq)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close() }()
-	seen := map[string]bool{}
-	var ids []string
-	for rows.Next() {
-		var data string
-		if err := rows.Scan(&data); err != nil {
-			return nil, err
-		}
-		var msg llm.Message
-		if err := json.Unmarshal([]byte(data), &msg); err != nil || msg.Artifact == nil {
-			continue
-		}
-		if !seen[msg.Artifact.ID] {
-			seen[msg.Artifact.ID] = true
-			ids = append(ids, msg.Artifact.ID)
-		}
-	}
-	return ids, rows.Err()
 }
 
 // SetTags replaces a session's label set (comma-separated storage).
@@ -919,64 +473,6 @@ func (s *Store) SetPinned(id string, pinned bool) error {
 	}
 	_, err := s.db.Exec(`UPDATE sessions SET pinned=? WHERE id=?`, v, id)
 	return err
-}
-
-// ForksOf lists sessions forked from id, newest first — the session tree's
-// children of one node.
-func (s *Store) ForksOf(id string) ([]Meta, error) {
-	rows, err := s.db.Query(`SELECT `+sessionMetaColumns+`
-		FROM sessions WHERE forked_from=? ORDER BY updated_at DESC`, id)
-	if err != nil {
-		return nil, err
-	}
-	return scanMetas(rows)
-}
-
-// ForkTitle derives the default fork name: "<title> (fork #N)" with N
-// incremented past any existing fork of the same base (opencode's
-// getForkedTitle — packages/opencode/src/session/session.ts:162). Falls back
-// to "session (fork #1)" for untitled sessions.
-func (s *Store) ForkTitle(base string) (string, error) {
-	if base == "" {
-		base = "session"
-	}
-	// unwrap an existing "(fork #N)" suffix so forks of forks increment
-	// instead of nesting: "x (fork #2)" → "x (fork #3)", not "x (fork #2) (fork #1)"
-	base = strings.TrimSpace(base)
-	if i := strings.LastIndex(base, " (fork #"); i > 0 {
-		var n0 int
-		var rest string
-		n, err := fmt.Sscanf(base[i:], " (fork #%d)%s", &n0, &rest)
-		if n0 > 0 && rest == "" && (err == nil || err == io.EOF) && n >= 1 {
-			base = base[:i]
-		}
-	}
-	rows, err := s.db.Query(`SELECT title FROM sessions WHERE title = ? OR title LIKE ? ESCAPE '\'`,
-		base, likeEscape(base)+` (fork #%)`)
-	if err != nil {
-		return "", err
-	}
-	defer func() { _ = rows.Close() }()
-	n := 0
-	for rows.Next() {
-		var t string
-		if err := rows.Scan(&t); err != nil {
-			return "", err
-		}
-		var num int
-		var rest string
-		// exact suffix match only: a manually renamed "x (fork #9) notes"
-		// must not inflate the numbering
-		if nf, err := fmt.Sscanf(t, base+" (fork #%d)%s", &num, &rest); num > n && rest == "" && nf >= 1 && (err == nil || err == io.EOF) {
-			n = num
-		}
-	}
-	return fmt.Sprintf("%s (fork #%d)", base, n+1), rows.Err()
-}
-
-func likeEscape(s string) string {
-	r := strings.NewReplacer(`\`, `\\`, `%`, `\%`, `_`, `\_`)
-	return r.Replace(s)
 }
 
 func scanMetas(rows *sql.Rows) ([]Meta, error) {

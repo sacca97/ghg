@@ -1,2 +1,4 @@
 /ghg
 /vendor/
+debug.*
+chat-*

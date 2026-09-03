@@ -59,7 +59,7 @@ under the model-facing 8 KiB ceiling. The cursor advances only past entries
 actually displayed, so `search_displayed`, `search_remaining`, and later-page
 counts cannot skip an unseen result; an entry that cannot fit leaves the cursor
 unchanged and asks for a narrower search. Pages paginate over a bounded
-immutable snapshot retained in the session/artifact path. Snapshots cap at
+immutable snapshot retained in the session/output path. Snapshots cap at
 10,000 results and a 100,000-entry scan limit, with explicit displayed/remaining
 and incomplete-retention metadata. All filesystem walks honor the call context.
 The TUI's fuzzy `@` completion uses the same shared index, so strong matches
@@ -153,25 +153,33 @@ LLM-generated summary. Two triggers:
 
 - **Proactive**: `maybeCompact` runs before each request once the latest
   successful request's provider-reported context size (`PromptTokens +
-  CompletionTokens`) crosses the compaction threshold — a percent of the
-  advertised context window, default 50% (`compactPct` in config, clamped
-  10–90; `Agent.CompactThreshold` holds the fraction). The value is zero until
-  the first successful response. Slide it in the settings's "Compaction level"
-  row (←/→ steps ±10%).
+  CompletionTokens`) crosses the adaptive threshold — $\min(0.80 \times \text{window}, 400000, \text{window} - \text{reserve})$.
+  When explicit `compactPct` is set in config (clamped 10–90; `Agent.CompactThreshold`
+  holds the fraction), the chosen percentage is honored while respecting output reserves.
+  The value is zero until the first successful response. Slide it in the settings's
+  "Compaction level" row (←/→ steps ±10%).
 - **Reactive**: if the provider still rejects a request with a context-limit
   error (`context_length_exceeded`, `prompt_too_long`, HTTP 413), `Turn`
   compacts once and retries. A `compacted` guard prevents retry loops.
 
-`compact()` keeps the system prompt and a recent tail, and is **orphan-safe**:
-a kept tail that begins with a `tool`-role message walks back to its owning
-assistant message so no tool result references an erased call ID. The summary
-runs as a non-streaming `Complete` on the configured `tiny` role when a roles
+`compact()` uses cumulative, dedicated summarization:
+- **Cumulative Checkpoints**: reuses the prior checkpoint inside `<previous_checkpoint>`
+  tags so the summarizer updates existing facts rather than re-folding from scratch.
+- **Dedicated System Prompt**: runs under a focused prompt instructing the model to produce
+  state checkpoints without attempting task completion or tool execution.
+- **Truncated Summary Rejection**: responses truncated by token limits or returning empty
+  checkpoints are rejected to safeguard context integrity.
+- **Bounded Tail & Atomic Groups**: keeps the system prompt and a recent tail bounded at
+  $\min(\text{ContextLimit}/4, 24000)$ tokens. Kept groups are selected atomically so tool
+  results are never severed from their assistant calls.
+
+The summary runs as a non-streaming `Complete` on the configured `tiny` role when a roles
 block is present. A legacy config without roles uses the built-in
 `deepseek-v4-flash-0731` (`config.DefaultCompactModel`). An explicit
 `compactModel` / `compactProvider` remains the per-session override, and an
 unavailable fallback leaves compaction on the conversation's own model.
 
-Token bookkeeping: `llm.Usage` (prompt/completion/cached) is read off the
+Token bookkeeping: `models.Usage` (prompt/completion/cached) is read off the
 terminal stream chunk (`stream_options: include_usage`) and folded into session
 totals via `AddUsage`. `ContextTokens()` falls back to `EstimateTokens` when unmetered
 or before the first provider response, so the status bar is never stuck at zero.
@@ -187,6 +195,18 @@ built-in default). The settings's
 "default (…)" row that restores the default; "Compaction level" steps the
 threshold ←/→.
 
+### Plan runaway guard & per-turn tool lifecycle
+
+- **Tool Freezing**: `AllTools()` and tool definitions are computed once at the start
+  of `Turn()`, ensuring stable definitions across all tool rounds.
+- **Plan Budget Ceilings**: in Plan mode, weighted token expenditure is tracked with a
+  128 model-call ceiling. Reaching reserve disables tools and
+  forces a final synthesis request for `<proposed_plan>`.
+- **Sparse Events**: `FanIn` leaves unprovided callbacks `nil`, avoiding unnecessary
+  JSON marshaling or token estimations for background workers.
+- **Cheap Review Correction**: invalid code reviews trigger a bounded 2-round correction
+  definition exposing only `submit_review` with the validation error.
+
 ### Session-scoped history search and recall
 
 `internal/agent/history.go`, `internal/session/history.go` — historical conversation
@@ -200,13 +220,13 @@ active context window, but all previous turns remain queryable:
 
 Tests: `internal/agent/history_test.go` and `internal/session/history_test.go`.
 
-### Recoverable tool-result artifacts
+### Recoverable tool-result outputs
 
-`internal/tools/result.go`, `internal/artifact/`, `internal/session/` — tool
+`internal/tools/result.go`, `internal/session/` — tool
 execution has a structured result path. Every result keeps a model-sized
 `Preview`, bounded retained evidence, original/stored byte counts, completion
 state, exit code, and source metadata. Bash, file reads, native search, MCP,
-and artifact reads mark returned bytes as untrusted; the agent wraps those
+and output reads mark returned bytes as untrusted; the agent wraps those
 bytes in one `<untrusted_tool_output>` block before sending them to a
 provider. Direct legacy `tools.Execute` callers still receive the old plain
 preview.
@@ -214,24 +234,23 @@ preview.
 Retained evidence is capped at 10 MiB per result by default. Overflow keeps a
 deterministic head/tail, hashes the retained bytes with SHA-256, and appends a
 path-free recovery hint. Persistent runs store payloads under
-`~/.ghg/artifacts/sha256/<prefix>/<hash>` with private directory/file
+`~/.ghg/outputs/sha256/<prefix>/<hash>` with private directory/file
 permissions and index references in `sessions.db`; `--no-session` uses a
-private temporary store removed on exit. Set `{"artifacts":{"enabled":false}}`
-to opt out; bounded previews remain available and explicitly say omitted data
-is unrecoverable. `maxBytes` changes the per-result retention ceiling.
+private temporary store removed on exit. Set `{"outputs":{"enabled":false}}`
+to opt out; bounded previews remain available. `maxBytes` changes the
+per-result retention ceiling. The legacy `artifacts` config key remains accepted.
 
-The agent exposes `artifact_list` and `artifact_read` as session-scoped,
+The agent exposes `output_list` and `output_read` as session-scoped,
 read-only operations. Listing is metadata-only and bounded; reading accepts
-an artifact id plus a bounded byte range, never a path or another session id.
-`ghg artifacts gc --max-age … --max-bytes N` removes only unreferenced
+an output id plus a bounded byte range, never a path or another session id.
+`ghg outputs gc --max-age … --max-bytes N` removes only unreferenced
 payloads, so forks can share immutable content safely. Compaction preserves
 the raw message log, keeps atomic tool-call groups, carries a metadata-only
-artifact manifest for cited/recent references, and shrinks an oversized
-recent result without dropping its recovery id.
+output manifest for cited/recent references, and shrinks an oversized recent
+result without dropping its recovery id.
 
-Tests: `internal/artifact/store_test.go`, `internal/tools/result_test.go`,
-`internal/agent/artifacts_test.go`, `internal/session/artifact_test.go`, and
-`cmd/ghg/artifacts_test.go`.
+The legacy `artifact_list`/`artifact_read` tool names and `ghg artifacts gc`
+command remain accepted aliases.
 
 ### Background subagents
 
@@ -326,24 +345,23 @@ per-token `pricing` (OpenAI-compatible catalog shape — `prompt`,
 parsed rates and the bottom status box appends the session's cumulative cost to the
 context display (`ctx 31.1k/128k · $0.0134`): fresh input at the prompt
 rate, cached input at the cache-read rate (full prompt rate when none is
-advertised), output at the completion rate — `llm.SessionCost`. Providers
-without pricing hide the segment entirely. Tests: `llm/openai_test.go`
+advertised), output at the completion rate — `models.SessionCost`. Providers
+without pricing hide the segment entirely. Tests: `models/openai_test.go`
 (`TestSessionCost`, pricing unmarshal), `config/catalog_test.go`,
 `tui/status_test.go` (`TestStatusLineShowsCost`, `TestStatusLineHidesCostWithoutPricing`).
 
-`internal/llm/backend.go` — the agent-facing `Backend` contract is deliberately
+`internal/models/backend.go` — the agent-facing `Backend` contract is deliberately
 smaller than a provider client: `Stream` accepts a request-local `EventSink`
 and returns the assembled assistant `Message` plus usage; `Complete` returns a
-message plus usage for one-shot work such as compaction. `OpenAIBackend`,
-`OpenAIResponsesBackend`, and `AnthropicBackend` adapt their respective wire
-clients, while `NewBackend` selects the compiled adapter from the provider protocol
+message plus usage for one-shot work such as compaction. The protocol adapters
+implement `Backend` directly, while `NewBackend` selects the compiled adapter from the provider protocol
 (`openai-completions` remains a compatible legacy spelling). Retry callbacks
 supplied by a turn stay in the request-local sink, so foreground and background
 subagents can share a backend without mutating a client hook. `CatalogBackend`
 is an optional capability: a configured local endpoint can work without
 implementing `/models`.
 
-`internal/provider/profile.go` — declarative provider profiles are strict YAML
+`internal/models/profile.go` — declarative provider profiles are strict YAML
 metadata with embedded, user, and trusted-project precedence. Config entries
 keep credentials and can override a profile's URL or protocol; legacy entries
 without `profile` become anonymous in-memory profiles. URLs normalize trailing
@@ -354,8 +372,8 @@ authentication. Ordered `routes` use `path.Match` globs to override only
 protocol, auth mode/header, and default headers for a model; first match wins.
 Default headers are static and never resolve secrets. The OpenAI-compatible,
 OpenAI Responses, and Anthropic Messages adapters honor that auth/header policy.
-Tests: `provider/profile_test.go`, `llm/backend_test.go`, `llm/responses_test.go`,
-`llm/anthropic_test.go`.
+Tests: `models/profile_test.go`, `models/backend_test.go`, `models/responses_test.go`,
+`models/anthropic_test.go`.
 
 ### Model roles
 
@@ -367,19 +385,19 @@ error. Acting sessions default to `fast`, planning sessions to `smart`, while
 compaction and foreground/background `task` calls use `tiny`. The TUI bottom
 status bar exposes clickable `execute`/`plan` modes (`plan` maps to `smart`) and
 a role-first model settings flow (`default`, `plan`, `fast`, `tiny` → one-line
-`provider/model` routes). Routes from providers without a configured
+`models/model` routes). Routes from providers without a configured
 credential are omitted. `ghg run --role` selects a role for a headless run, and
 explicit model/provider flags remain route overrides. Tests:
 `config/roles_test.go`, `tui/provider_route_test.go`, `tui/mode_test.go`,
 `agent/agent_test.go` (`TestTaskUsesTinyRoleFactory`), and
 `tui/compact_cmd_test.go` (`TestCompactModelUsesTinyRole`).
 
-`internal/llm/openai.go` — the streaming client. Typed `HTTPError` (keeps the
+`internal/models/openai.go` — the streaming client. Typed `HTTPError` (keeps the
 `<status>: <body>` shape), `IsContextLimit()` classifies context-overflow
 errors for the compaction retry, `Stream` returns the message + usage, and
 `Complete` is the non-streaming round-trip used by compaction.
 
-`internal/llm/anthropic.go` — the native Anthropic Messages adapter. It maps
+`internal/models/anthropic.go` — the native Anthropic Messages adapter. It maps
 top-level system prompts, multimodal content, tools and grouped tool results,
 preserves signed thinking blocks for follow-up turns, assembles fragmented
 SSE events, applies stable-prefix prompt-cache breakpoints, maps Anthropic
@@ -389,14 +407,14 @@ boundaries.
 Transient request failures — 429, any 5xx (e.g. a gateway's 524), and
 transport errors — retry with exponential backoff (1s→2s→4s… capped 20s,
 +25% jitter, ctx-cancellable). Budget: `maxRetries` in config (default
-`llm.DefaultMaxAttempts` = 8, `1` disables). A streaming attempt is only
+`models.DefaultMaxAttempts` = 8, `1` disables). A streaming attempt is only
 retried before the first visible delta reaches the UI — after that a retry
 would replay rendered text, so the error surfaces instead. Mid-stream
 provider `error` chunks and 4xxs (including context-limit, which the
 compaction path must see immediately) are never retried. Each retry posts a
 `⚠ request failed (…) — retrying in Ns (attempt N/M)` line via the
 request-local backend event sink (the legacy `Client.OnRetry` hook remains for
-direct client users). Tests: `llm/retry_test.go`, `llm/backend_test.go`.
+direct client users). Tests: `models/retry_test.go`, `models/backend_test.go`.
 
 `internal/auth/auth.go`, `cmd/ghg/auth.go`,
 `internal/config/provider_key.go`, and `internal/tui/auth_cmd.go` provide

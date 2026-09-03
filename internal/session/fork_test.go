@@ -4,7 +4,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/sacca97/ghg/internal/llm"
+	"github.com/sacca97/ghg/internal/models"
 )
 
 func seeded(t *testing.T) (*Store, string) {
@@ -18,7 +18,7 @@ func seeded(t *testing.T) (*Store, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	msgs := []llm.Message{
+	msgs := []models.Message{
 		{Role: "system", Content: "sys"},
 		{Role: "user", Content: "q1", Authored: true},
 		{Role: "assistant", Content: "a1"},

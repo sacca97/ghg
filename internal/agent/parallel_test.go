@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sacca97/ghg/internal/llm"
+	"github.com/sacca97/ghg/internal/models"
 	"github.com/sacca97/ghg/internal/tools"
 )
 
@@ -23,7 +23,7 @@ import (
 // concurrently, to prove parallel execution actually overlaps.
 func slowTool(name string, conc *atomic.Int32, maxConc *atomic.Int32) tools.Tool {
 	return tools.Tool{
-		Def: llm.NewTool(name, "slow", `{"type":"object","properties":{"s":{"type":"string"}}}`),
+		Def: models.NewTool(name, "slow", `{"type":"object","properties":{"s":{"type":"string"}}}`),
 		Run: func(ctx context.Context, args json.RawMessage) (string, error) {
 			n := conc.Add(1)
 			for {
@@ -48,7 +48,7 @@ func parallelServer(t *testing.T) *httptest.Server {
 		w.Header().Set("Content-Type", "text/event-stream")
 		if call == 1 {
 			for i, id := range []string{"a", "b", "c"} {
-				args := fmt.Sprintf(`{\"s\":%q}`, id)
+				args := fmt.Sprintf(`{"s":%q}`, id)
 				fmt.Fprintf(w, `data: {"choices":[{"delta":{"tool_calls":[{"index":%d,"id":%q,"type":"function","function":{"name":"slow","arguments":%q}}]}}]}`+"\n\n", i, id, args)
 			}
 			fmt.Fprint(w, `data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`+"\n\n")
@@ -84,7 +84,7 @@ func TestSamePathEditsSerialize(t *testing.T) {
 
 	var conc, maxConc atomic.Int32
 	write := tools.Tool{
-		Def: llm.NewTool("write", "w", `{"type":"object","properties":{"path":{"type":"string"}}}`),
+		Def: models.NewTool("write", "w", `{"type":"object","properties":{"path":{"type":"string"}}}`),
 		Run: func(ctx context.Context, args json.RawMessage) (string, error) {
 			n := conc.Add(1)
 			for {
@@ -100,7 +100,7 @@ func TestSamePathEditsSerialize(t *testing.T) {
 	}
 	ag.Tools = []tools.Tool{write}
 
-	calls := []llm.ToolCall{
+	calls := []models.ToolCall{
 		{ID: "1", Function: struct {
 			Name      string `json:"name"`
 			Arguments string `json:"arguments"`
@@ -120,7 +120,7 @@ func TestMultiFileMutationsWithReversePathOrderDoNotDeadlock(t *testing.T) {
 	ag := New(testBackend("http://unused", "k"), "m", 100, "sys")
 	var conc, maxConc atomic.Int32
 	edit := tools.Tool{
-		Def: llm.NewTool("edit", "e", `{"type":"object","properties":{"edits":{"type":"array"}}}`),
+		Def: models.NewTool("edit", "e", `{"type":"object","properties":{"edits":{"type":"array"}}}`),
 		Run: func(ctx context.Context, _ json.RawMessage) (string, error) {
 			n := conc.Add(1)
 			for {
@@ -138,18 +138,18 @@ func TestMultiFileMutationsWithReversePathOrderDoNotDeadlock(t *testing.T) {
 		},
 	}
 	ag.Tools = []tools.Tool{edit}
-	first := llm.ToolCall{ID: "first", Function: struct {
+	first := models.ToolCall{ID: "first", Function: struct {
 		Name      string `json:"name"`
 		Arguments string `json:"arguments"`
 	}{Name: "edit", Arguments: `{"edits":[{"path":"/tmp/ghg-a"},{"path":"/tmp/ghg-b"}]}`}}
-	second := llm.ToolCall{ID: "second", Function: struct {
+	second := models.ToolCall{ID: "second", Function: struct {
 		Name      string `json:"name"`
 		Arguments string `json:"arguments"`
 	}{Name: "edit", Arguments: `{"edits":[{"path":"/tmp/ghg-b"},{"path":"/tmp/ghg-a"}]}`}}
 
 	done := make(chan struct{})
 	go func() {
-		ag.runToolResultsWithTools(context.Background(), []llm.ToolCall{first, second}, Events{}, ag.AllTools())
+		ag.runToolResultsWithTools(context.Background(), []models.ToolCall{first, second}, Events{}, ag.AllTools())
 		close(done)
 	}()
 	select {
@@ -170,7 +170,7 @@ func TestParallelToolBatchSharesSearchHints(t *testing.T) {
 		hints2 tools.SearchHints
 	)
 	tool1 := tools.Tool{
-		Def: llm.NewTool("write", "w", `{"type":"object"}`),
+		Def: models.NewTool("write", "w", `{"type":"object"}`),
 		Run: func(ctx context.Context, _ json.RawMessage) (string, error) {
 			mu.Lock()
 			hints1 = tools.SearchHintsFor(ctx)
@@ -179,7 +179,7 @@ func TestParallelToolBatchSharesSearchHints(t *testing.T) {
 		},
 	}
 	tool2 := tools.Tool{
-		Def: llm.NewTool("read", "r", `{"type":"object"}`),
+		Def: models.NewTool("read", "r", `{"type":"object"}`),
 		Run: func(ctx context.Context, _ json.RawMessage) (string, error) {
 			mu.Lock()
 			hints2 = tools.SearchHintsFor(ctx)
@@ -189,19 +189,19 @@ func TestParallelToolBatchSharesSearchHints(t *testing.T) {
 	}
 	ag.Tools = []tools.Tool{tool1, tool2}
 
-	call1 := llm.ToolCall{ID: "c1", Function: struct {
+	call1 := models.ToolCall{ID: "c1", Function: struct {
 		Name      string `json:"name"`
 		Arguments string `json:"arguments"`
 	}{Name: "write", Arguments: `{"path":"/tmp/a.go"}`}}
-	call2 := llm.ToolCall{ID: "c2", Function: struct {
+	call2 := models.ToolCall{ID: "c2", Function: struct {
 		Name      string `json:"name"`
 		Arguments string `json:"arguments"`
 	}{Name: "read", Arguments: `{"path":"/tmp/b.go"}`}}
 
-	ag.runToolResultsWithTools(context.Background(), []llm.ToolCall{call1, call2}, Events{}, ag.AllTools())
+	ag.runToolResultsWithTools(context.Background(), []models.ToolCall{call1, call2}, Events{}, ag.AllTools())
 
-	canonicalA := canonicalPathHint("/tmp/a.go")
-	canonicalB := canonicalPathHint("/tmp/b.go")
+	canonicalA := canonicalPath("/tmp/a.go")
+	canonicalB := canonicalPath("/tmp/b.go")
 	wantHints := []string{canonicalA, canonicalB}
 	slices.Sort(wantHints)
 
@@ -272,7 +272,7 @@ func mustStartBackground(t *testing.T, ag *Agent, desc, prompt string) *Backgrou
 // via the Done channel + a steered message. Large reports are bounded before Steer.
 func TestBackgroundTaskDeliversReport(t *testing.T) {
 	bigReport := strings.Repeat("report-body-line-data\n", 1500) // ~33 KiB > 16 KiB
-	srv := textServer(t, func(n int, req llm.Request) string { return bigReport })
+	srv := textServer(t, func(n int, req models.Request) string { return bigReport })
 	defer srv.Close()
 
 	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
@@ -363,7 +363,7 @@ func TestBackgroundSubagentConcurrencyLimit(t *testing.T) {
 // Multiple waiters all get woken by the single channel close — the property
 // that makes this cheap in Go (opencode needs a per-waiter Deferred).
 func TestBackgroundTaskBroadcastsToManyWaiters(t *testing.T) {
-	srv := textServer(t, func(n int, req llm.Request) string {
+	srv := textServer(t, func(n int, req models.Request) string {
 		time.Sleep(50 * time.Millisecond) // give waiters time to attach
 		return "ok"
 	})
@@ -479,8 +479,8 @@ func TestClearSettledKeepsRunning(t *testing.T) {
 }
 
 func TestCanonicalPathKey(t *testing.T) {
-	a := canonicalPathKey("foo/../bar/baz.go")
-	b := canonicalPathKey("bar/baz.go")
+	a := canonicalPath("foo/../bar/baz.go")
+	b := canonicalPath("bar/baz.go")
 	if a != b {
 		t.Fatalf("canonical keys differ: %q vs %q", a, b)
 	}
@@ -493,7 +493,7 @@ func TestCanonicalPathKey(t *testing.T) {
 	if err := os.Symlink(target, link); err != nil {
 		t.Skipf("symlinks unavailable: %v", err)
 	}
-	if got, want := canonicalPathKey(link), canonicalPathKey(target); got != want {
+	if got, want := canonicalPath(link), canonicalPath(target); got != want {
 		t.Fatalf("symlink keys differ: %q vs %q", got, want)
 	}
 }
@@ -521,7 +521,7 @@ func TestToolMutationPaths(t *testing.T) {
 // Subscribers registered via Subscribe receive the task's live event stream
 // (fanned in with usage accounting); a settled task rejects new subscribers.
 func TestBackgroundTaskSubscribersSeeLiveStream(t *testing.T) {
-	srv := textServer(t, func(n int, req llm.Request) string {
+	srv := textServer(t, func(n int, req models.Request) string {
 		time.Sleep(50 * time.Millisecond) // let the subscriber attach
 		return "stream-body"
 	})
@@ -548,16 +548,19 @@ func TestBackgroundTaskSubscribersSeeLiveStream(t *testing.T) {
 	}
 }
 
-// FanIn forwards each fired callback to every source that implements it.
+// FanIn forwards each fired callback to every source that implements it,
+// leaving callbacks absent from all inputs nil.
 func TestFanIn(t *testing.T) {
 	var a, b, usage atomic.Int32
 	ev := FanIn(
-		Events{OnText: func(string) { a.Add(1) }, OnUsage: func(llm.Usage) { usage.Add(1) }},
+		Events{OnText: func(string) { a.Add(1) }, OnUsage: func(models.Usage) { usage.Add(1) }},
 		Events{OnText: func(string) { b.Add(1) }},
 	)
+	if ev.OnThink != nil {
+		t.Fatal("expected nil OnThink when no input provides it")
+	}
 	ev.OnText("x")
-	ev.OnThink("y") // nobody implements it: no panic
-	ev.OnUsage(llm.Usage{})
+	ev.OnUsage(models.Usage{})
 	if a.Load() != 1 || b.Load() != 1 || usage.Load() != 1 {
 		t.Fatalf("fan-in miscounted: a=%d b=%d usage=%d", a.Load(), b.Load(), usage.Load())
 	}
@@ -571,7 +574,7 @@ func toolLoopServer(t *testing.T) *httptest.Server {
 	t.Helper()
 	call := 0
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var req llm.Request
+		var req models.Request
 		json.NewDecoder(r.Body).Decode(&req)
 		w.Header().Set("Content-Type", "text/event-stream")
 		call++
@@ -623,7 +626,7 @@ func TestBackgroundTaskSubscriberSeesToolEvents(t *testing.T) {
 // Multiple subscribers on one task each receive every event (the fan-out is
 // per-subscriber, not first-come).
 func TestBackgroundTaskManySubscribers(t *testing.T) {
-	srv := textServer(t, func(n int, req llm.Request) string {
+	srv := textServer(t, func(n int, req models.Request) string {
 		time.Sleep(30 * time.Millisecond) // let subscribers attach
 		return "broadcast-body"
 	})

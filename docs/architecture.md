@@ -88,7 +88,7 @@ Key invariants:
   queued and injected between iterations — never spliced into a half-streamed
   completion.
 - **The provider is an adapter selected at the boundary.** `agent` consumes
-  `llm.Backend`; the current compiled adapter speaks OpenAI-compatible chat
+  `models.Backend`; the current compiled adapter speaks OpenAI-compatible chat
   completions with streaming. Routing, profile metadata, discovery, pricing,
   and fallback context windows live in `config` + `provider` + the two catalog
   caches (`~/.ghg/models.json` and `~/.ghg/models-dev.json`). See
@@ -117,8 +117,7 @@ process.
 | Package | One-liner |
 |---|---|
 | `internal/agent` | the tool-use loop: `Agent.Turn`, compaction, background subagents, todos |
-| `internal/llm` | provider-neutral backend contract, compiled adapters, usage/cost parsing |
-| `internal/provider` | strict YAML profile loading, precedence, URL/auth validation, instance resolution |
+| `internal/models` | provider profiles, protocol adapters, usage/cost parsing, and model discovery |
 | `internal/tools` | bash, read, write, edit, suggest + tool schema definitions |
 | `internal/tui` | bubbletea session: transcript, input, settings, status line |
 | `internal/config` | config file, model catalog cache, provider resolution |

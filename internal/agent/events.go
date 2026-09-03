@@ -1,6 +1,6 @@
 package agent
 
-import "github.com/sacca97/ghg/internal/llm"
+import "github.com/sacca97/ghg/internal/models"
 
 // Events receives streaming callbacks during a turn. All fields are optional.
 type Events struct {
@@ -12,8 +12,8 @@ type Events struct {
 	OnSteer          func(text string)                // a steered message was injected
 	OnCompact        func(took, kept int)             // context was auto-compacted (messages removed/kept)
 	OnCompacted      func(summary string, cutoff int) // a durable compaction completed
-	OnUsage          func(u llm.Usage)                // a request reported its token usage
-	OnRetry          func(ev llm.RetryEvent)          // a transient request failure is being retried
+	OnUsage          func(u models.Usage)             // a request reported its token usage
+	OnRetry          func(ev models.RetryEvent)       // a transient request failure is being retried
 	OnGoalUpdate     func(GoalUpdate)                 // structured active-goal checkpoint
 	OnToolTelemetry  func(ToolTelemetry)              // bounded-output accounting for one tool call
 	OnModelCallStart func(ModelCallStart)
@@ -26,12 +26,12 @@ type Events struct {
 	// OnCompactionReady receives the exact pre-cutover view after checkpoint
 	// generation succeeds, but before Agent.Messages is replaced. Persistence
 	// adapters must save the raw messages and compaction event or return an error.
-	OnCompactionReady func(messages []llm.Message, summary string, cutoff int) error
+	OnCompactionReady func(messages []models.Message, summary string, cutoff int) error
 }
 
 // ToolTelemetry records the distinction between what a tool produced, what
 // was retained for recovery, and what the model actually saw. It is emitted
-// after artifact attachment so the artifact path is included in the same
+// after output attachment so the output reference is included in the same
 // lifecycle boundary as the tool result.
 type ToolTelemetry struct {
 	ID            string            `json:"id,omitempty"`
@@ -63,10 +63,10 @@ type ModelCallStart struct {
 // not happen from a zero value.
 type ModelCallEnd struct {
 	ModelCallStart
-	LatencyMS    int64     `json:"latency_ms"`
-	FinishReason string    `json:"finish_reason,omitempty"`
-	Usage        llm.Usage `json:"usage"`
-	Error        string    `json:"error,omitempty"`
+	LatencyMS    int64        `json:"latency_ms"`
+	FinishReason string       `json:"finish_reason,omitempty"`
+	Usage        models.Usage `json:"usage"`
+	Error        string       `json:"error,omitempty"`
 }
 
 // PromptView records bounded request-shape telemetry without retaining the
@@ -85,72 +85,152 @@ type PromptView struct {
 // Turn with FanIn(registry.emitter(id), Events{OnUsage: …}) so the TUI's
 // per-task subscribers and the parent's usage accounting both see the live
 // stream.
+// FanIn multiplexes several Events values into one: every fired callback is
+// invoked on each source that implements it. Callbacks absent from all inputs
+// remain nil so background agents do not calculate unneeded telemetry.
 func FanIn(evs ...Events) Events {
-	return Events{
-		OnText: func(s string) {
+	var out Events
+	var hasText, hasThink, hasToolStart, hasToolOutput, hasToolEnd, hasTelemetry, hasSteer bool
+	var hasCompact, hasCompacted, hasCompactionReady, hasUsage, hasGoalUpdate bool
+	var hasModelCallStart, hasPromptView, hasModelCallEnd, hasPlanDelta, hasRetry bool
+
+	for _, e := range evs {
+		if e.OnText != nil {
+			hasText = true
+		}
+		if e.OnThink != nil {
+			hasThink = true
+		}
+		if e.OnToolStart != nil {
+			hasToolStart = true
+		}
+		if e.OnToolOutput != nil {
+			hasToolOutput = true
+		}
+		if e.OnToolEnd != nil {
+			hasToolEnd = true
+		}
+		if e.OnToolTelemetry != nil {
+			hasTelemetry = true
+		}
+		if e.OnSteer != nil {
+			hasSteer = true
+		}
+		if e.OnCompact != nil {
+			hasCompact = true
+		}
+		if e.OnCompacted != nil {
+			hasCompacted = true
+		}
+		if e.OnCompactionReady != nil {
+			hasCompactionReady = true
+		}
+		if e.OnUsage != nil {
+			hasUsage = true
+		}
+		if e.OnRetry != nil {
+			hasRetry = true
+		}
+		if e.OnGoalUpdate != nil {
+			hasGoalUpdate = true
+		}
+		if e.OnModelCallStart != nil {
+			hasModelCallStart = true
+		}
+		if e.OnPromptView != nil {
+			hasPromptView = true
+		}
+		if e.OnModelCallEnd != nil {
+			hasModelCallEnd = true
+		}
+		if e.OnPlanDelta != nil {
+			hasPlanDelta = true
+		}
+	}
+
+	if hasText {
+		out.OnText = func(s string) {
 			for _, e := range evs {
 				if e.OnText != nil {
 					e.OnText(s)
 				}
 			}
-		},
-		OnThink: func(s string) {
+		}
+	}
+	if hasThink {
+		out.OnThink = func(s string) {
 			for _, e := range evs {
 				if e.OnThink != nil {
 					e.OnThink(s)
 				}
 			}
-		},
-		OnToolStart: func(id, name, args string) {
+		}
+	}
+	if hasToolStart {
+		out.OnToolStart = func(id, name, args string) {
 			for _, e := range evs {
 				if e.OnToolStart != nil {
 					e.OnToolStart(id, name, args)
 				}
 			}
-		},
-		OnToolOutput: func(id, output string) {
+		}
+	}
+	if hasToolOutput {
+		out.OnToolOutput = func(id, output string) {
 			for _, e := range evs {
 				if e.OnToolOutput != nil {
 					e.OnToolOutput(id, output)
 				}
 			}
-		},
-		OnToolEnd: func(id, name, result string) {
+		}
+	}
+	if hasToolEnd {
+		out.OnToolEnd = func(id, name, result string) {
 			for _, e := range evs {
 				if e.OnToolEnd != nil {
 					e.OnToolEnd(id, name, result)
 				}
 			}
-		},
-		OnToolTelemetry: func(telemetry ToolTelemetry) {
+		}
+	}
+	if hasTelemetry {
+		out.OnToolTelemetry = func(telemetry ToolTelemetry) {
 			for _, e := range evs {
 				if e.OnToolTelemetry != nil {
 					e.OnToolTelemetry(telemetry)
 				}
 			}
-		},
-		OnSteer: func(text string) {
+		}
+	}
+	if hasSteer {
+		out.OnSteer = func(text string) {
 			for _, e := range evs {
 				if e.OnSteer != nil {
 					e.OnSteer(text)
 				}
 			}
-		},
-		OnCompact: func(took, kept int) {
+		}
+	}
+	if hasCompact {
+		out.OnCompact = func(took, kept int) {
 			for _, e := range evs {
 				if e.OnCompact != nil {
 					e.OnCompact(took, kept)
 				}
 			}
-		},
-		OnCompacted: func(summary string, cutoff int) {
+		}
+	}
+	if hasCompacted {
+		out.OnCompacted = func(summary string, cutoff int) {
 			for _, e := range evs {
 				if e.OnCompacted != nil {
 					e.OnCompacted(summary, cutoff)
 				}
 			}
-		},
-		OnCompactionReady: func(messages []llm.Message, summary string, cutoff int) error {
+		}
+	}
+	if hasCompactionReady {
+		out.OnCompactionReady = func(messages []models.Message, summary string, cutoff int) error {
 			for _, e := range evs {
 				if e.OnCompactionReady != nil {
 					if err := e.OnCompactionReady(messages, summary, cutoff); err != nil {
@@ -159,48 +239,70 @@ func FanIn(evs ...Events) Events {
 				}
 			}
 			return nil
-		},
-		OnUsage: func(u llm.Usage) {
+		}
+	}
+	if hasUsage {
+		out.OnUsage = func(u models.Usage) {
 			for _, e := range evs {
 				if e.OnUsage != nil {
 					e.OnUsage(u)
 				}
 			}
-		},
-		OnGoalUpdate: func(update GoalUpdate) {
+		}
+	}
+	if hasRetry {
+		out.OnRetry = func(ev models.RetryEvent) {
+			for _, e := range evs {
+				if e.OnRetry != nil {
+					e.OnRetry(ev)
+				}
+			}
+		}
+	}
+	if hasGoalUpdate {
+		out.OnGoalUpdate = func(update GoalUpdate) {
 			for _, e := range evs {
 				if e.OnGoalUpdate != nil {
 					e.OnGoalUpdate(update)
 				}
 			}
-		},
-		OnModelCallStart: func(call ModelCallStart) {
+		}
+	}
+	if hasModelCallStart {
+		out.OnModelCallStart = func(call ModelCallStart) {
 			for _, e := range evs {
 				if e.OnModelCallStart != nil {
 					e.OnModelCallStart(call)
 				}
 			}
-		},
-		OnPromptView: func(view PromptView) {
+		}
+	}
+	if hasPromptView {
+		out.OnPromptView = func(view PromptView) {
 			for _, e := range evs {
 				if e.OnPromptView != nil {
 					e.OnPromptView(view)
 				}
 			}
-		},
-		OnModelCallEnd: func(call ModelCallEnd) {
+		}
+	}
+	if hasModelCallEnd {
+		out.OnModelCallEnd = func(call ModelCallEnd) {
 			for _, e := range evs {
 				if e.OnModelCallEnd != nil {
 					e.OnModelCallEnd(call)
 				}
 			}
-		},
-		OnPlanDelta: func(delta string) {
+		}
+	}
+	if hasPlanDelta {
+		out.OnPlanDelta = func(delta string) {
 			for _, e := range evs {
 				if e.OnPlanDelta != nil {
 					e.OnPlanDelta(delta)
 				}
 			}
-		},
+		}
 	}
+	return out
 }

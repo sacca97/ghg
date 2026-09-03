@@ -41,10 +41,7 @@ type taskEventMsg struct {
 // pane resyncs from the task's Report on the next paint, so a reordered or
 // lost interim frame is cosmetic; the worker must never stall on the UI.
 func sendTaskMsg(p *tea.Program, msg taskEventMsg) {
-	if p == nil {
-		return // headless tests
-	}
-	go p.Send(msg)
+	sendProg(p, msg)
 }
 
 // taskView is the open per-task pane: the live transcript of one background
@@ -70,6 +67,25 @@ const dockSettledGrace = time.Minute
 // within dockSettledGrace, never restored ones — newest first. Bare test
 // models have no agent; the dock is simply empty.
 func (m *model) dockTasks() []agent.BackgroundTask {
+	if m.workerOnly {
+		var out []agent.BackgroundTask
+		for _, task := range m.workerTasks {
+			if task.Restored {
+				continue
+			}
+			t := agent.BackgroundTask{ID: task.ID, Description: task.Description, Prompt: task.Prompt, Status: agent.TaskStatus(task.Status), Report: task.Report, StartedAt: task.StartedAt, EndedAt: task.EndedAt}
+			if t.Status == agent.TaskRunning || time.Since(t.EndedAt) < dockSettledGrace {
+				out = append(out, t)
+			}
+		}
+		slices.SortStableFunc(out, func(a, b agent.BackgroundTask) int {
+			if n := b.StartedAt.Compare(a.StartedAt); n != 0 {
+				return n
+			}
+			return strings.Compare(b.ID, a.ID)
+		})
+		return out
+	}
 	if m.agent == nil {
 		return nil
 	}
@@ -88,9 +104,10 @@ func (m *model) dockTasks() []agent.BackgroundTask {
 }
 
 // clampTaskSel keeps the dock selection inside the current task list.
-func (m *model) clampTaskSel() {
-	if n := len(m.dockTasks()); m.taskSel >= n {
-		m.taskSel = max(n-1, 0)
+func (m *model) clampTaskSel(n int) {
+	v := max(len(m.dockTasks()), n)
+	if m.taskSel >= v {
+		m.taskSel = max(v-1, 0)
 	}
 }
 
@@ -101,7 +118,7 @@ func (m *model) tasksDock() string {
 	if len(tasks) == 0 {
 		return ""
 	}
-	m.clampTaskSel()
+	m.clampTaskSel(len(tasks))
 
 	rows := make([]string, 0, len(tasks)+2)
 	if m.tasksFocus {
@@ -154,6 +171,22 @@ func (m *model) tasksDock() string {
 // the prompt, then the live event stream while the task runs, or the stored
 // report once it has settled.
 func (m *model) openTask(id string) {
+	if m.workerOnly {
+		t, ok := m.workerTasks[id]
+		if !ok {
+			return
+		}
+		tv := &taskView{id: id, live: t.Status == string(agent.TaskRunning)}
+		fmt.Fprintf(&tv.buf, "%s %s  %s\n\n%s %s\n", toolStyle.Render("⚙"), t.ID, t.Description, youStyle.Render("prompt:"), t.Prompt)
+		if t.Status == string(agent.TaskRunning) {
+			fmt.Fprintf(&tv.buf, "\n%s\n", dimStyle.Render("  running…"))
+		} else {
+			fmt.Fprintf(&tv.buf, "\n%s %s\n", toolStyle.Render(t.Status+":"), t.Report)
+		}
+		m.taskVP = tv
+		m.refreshTaskVP()
+		return
+	}
 	if m.agent == nil {
 		return
 	}
@@ -206,7 +239,7 @@ func (m *model) refreshTaskVP() {
 // to the pane, x cancels a running task, esc backs out to the main thread.
 func (m *model) taskViewKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	tv := m.taskVP
-	if tv == nil || m.agent == nil {
+	if tv == nil || (m.agent == nil && !m.workerOnly) {
 		m.taskVP = nil
 		return m, nil
 	}
@@ -221,7 +254,11 @@ func (m *model) taskViewKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case tea.KeyRunes:
 		if string(msg.Runes) == "x" {
-			m.agent.Tasks().Cancel(tv.id)
+			if m.workerOnly {
+				m.append(dimStyle.Render("task cancellation is not available from the worker view"))
+			} else {
+				m.agent.Tasks().Cancel(tv.id)
+			}
 			return m, nil
 		}
 	}
@@ -233,18 +270,27 @@ func (m *model) taskViewKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 // taskViewView renders the open task pane full-screen, between the header
 // row and a footer hint (View's layout mirrors View's structure).
 func (m *model) taskViewView() string {
-	if m.agent == nil || m.taskVP == nil {
+	if (m.agent == nil && !m.workerOnly) || m.taskVP == nil {
 		return dimStyle.Render("no provider configured — run /auth first")
 	}
-	t, ok := m.agent.Tasks().Get(m.taskVP.id)
 	status := "running"
-	if ok {
-		status = string(t.Status)
+	description := ""
+	var restored bool
+	if m.workerOnly {
+		t, ok := m.workerTasks[m.taskVP.id]
+		if ok {
+			status, description, restored = t.Status, t.Description, t.Restored
+		}
+	} else {
+		t, ok := m.agent.Tasks().Get(m.taskVP.id)
+		if ok {
+			status, description, restored = string(t.Status), t.Description, t.Restored
+		}
 	}
-	if ok && t.Restored {
+	if restored {
 		status += ", restored"
 	}
-	head := toolStyle.Render(fmt.Sprintf(" ⚙ %s — %s", m.taskVP.id, truncLine(t.Description, max(m.width-30, 8)))) +
+	head := toolStyle.Render(fmt.Sprintf(" ⚙ %s — %s", m.taskVP.id, truncLine(description, max(m.width-30, 8)))) +
 		dimStyle.Render("  ("+status+")")
 	foot := dimStyle.Render(" esc back · PgUp/PgDn scroll · x cancel")
 	return head + "\n" + sanitizeView(m.taskVP.vp.View()) + "\n" + foot

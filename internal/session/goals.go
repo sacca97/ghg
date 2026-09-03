@@ -2,13 +2,101 @@ package session
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
-
-	goalstate "github.com/sacca97/ghg/internal/goal"
 )
+
+// GoalStatus is the durable lifecycle state of a goal.
+type GoalStatus string
+
+const (
+	GoalStatusActive        GoalStatus = "active"
+	GoalStatusPaused        GoalStatus = "paused"
+	GoalStatusBlocked       GoalStatus = "blocked"
+	GoalStatusUsageLimited  GoalStatus = "usage-limited"
+	GoalStatusBudgetLimited GoalStatus = "budget-limited"
+	GoalStatusComplete      GoalStatus = "complete"
+)
+
+const (
+	MaxObjectiveBytes = 4000
+	MaxNoteBytes      = 4000
+)
+
+// GoalRecord is one goal's current durable state.
+type GoalRecord struct {
+	ID               string     `json:"id"`
+	Objective        string     `json:"objective"`
+	Status           GoalStatus `json:"status"`
+	Rounds           int        `json:"rounds"`
+	PromptTokens     int        `json:"prompt_tokens"`
+	CachedTokens     int        `json:"cached_tokens"`
+	CompletionTokens int        `json:"completion_tokens"`
+	Progress         string     `json:"progress,omitempty"`
+	Blocker          string     `json:"blocker,omitempty"`
+	CreatedAt        time.Time  `json:"created_at"`
+	UpdatedAt        time.Time  `json:"updated_at"`
+}
+
+func NewGoal(objective string) GoalRecord {
+	now := time.Now().UTC()
+	return GoalRecord{ID: NewGoalID(), Objective: strings.TrimSpace(objective), Status: GoalStatusActive, CreatedAt: now, UpdatedAt: now}
+}
+
+func NewGoalID() string {
+	b := make([]byte, 8)
+	if _, err := rand.Read(b); err == nil {
+		return hex.EncodeToString(b)
+	}
+	return fmt.Sprintf("%x", time.Now().UnixNano())
+}
+
+func (r GoalRecord) Validate() error {
+	if strings.TrimSpace(r.ID) == "" {
+		return errors.New("goal id is required")
+	}
+	if strings.TrimSpace(r.Objective) == "" {
+		return errors.New("goal objective is required")
+	}
+	if len(r.Objective) > MaxObjectiveBytes {
+		return fmt.Errorf("goal objective exceeds %d bytes", MaxObjectiveBytes)
+	}
+	if !ValidGoalStatus(r.Status) {
+		return fmt.Errorf("invalid goal status %q", r.Status)
+	}
+	if r.Rounds < 0 || r.PromptTokens < 0 || r.CachedTokens < 0 || r.CompletionTokens < 0 {
+		return errors.New("goal accounting values cannot be negative")
+	}
+	if len(r.Progress) > MaxNoteBytes || len(r.Blocker) > MaxNoteBytes {
+		return fmt.Errorf("goal checkpoint exceeds %d bytes", MaxNoteBytes)
+	}
+	return nil
+}
+
+func ValidGoalStatus(s GoalStatus) bool {
+	switch s {
+	case GoalStatusActive, GoalStatusPaused, GoalStatusBlocked, GoalStatusUsageLimited, GoalStatusBudgetLimited, GoalStatusComplete:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s GoalStatus) Terminal() bool { return s == GoalStatusComplete }
+
+func (s GoalStatus) Resumable() bool {
+	switch s {
+	case GoalStatusPaused, GoalStatusBlocked, GoalStatusUsageLimited, GoalStatusBudgetLimited:
+		return true
+	default:
+		return false
+	}
+}
 
 // GoalCheckpoint is one append-only snapshot of a goal's lifecycle and
 // accounting. The current state is available through LoadGoal; checkpoints
@@ -16,7 +104,7 @@ import (
 type GoalCheckpoint struct {
 	Seq              int
 	GoalID           string
-	Status           goalstate.Status
+	Status           GoalStatus
 	Rounds           int
 	PromptTokens     int
 	CachedTokens     int
@@ -34,8 +122,8 @@ func migrateLegacyGoals(db *sql.DB) error {
 		(session_id, goal_id, objective, status, rounds, usage_in, usage_cached,
 		 usage_out, progress, blocker, created_at, updated_at)
 		SELECT id, 'legacy-' || id, TRIM(goal), ?, 0, 0, 0, 0, '', '',
-		 CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
-		FROM sessions WHERE TRIM(goal) <> ''`, goalstate.StatusActive)
+		CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+		FROM sessions WHERE TRIM(goal) <> ''`, GoalStatusActive)
 	if err != nil {
 		return fmt.Errorf("migrate legacy goals: %w", err)
 	}
@@ -45,8 +133,8 @@ func migrateLegacyGoals(db *sql.DB) error {
 // LoadGoal returns the most recently updated goal for a session. A missing
 // goal is not an error; callers use the boolean to distinguish a fresh
 // session from a database failure.
-func (s *Store) LoadGoal(sessionID string) (goalstate.Record, bool, error) {
-	var record goalstate.Record
+func (s *Store) LoadGoal(sessionID string) (GoalRecord, bool, error) {
+	var record GoalRecord
 	var status, created, updated string
 	err := s.db.QueryRowContext(context.Background(), `SELECT goal_id, objective,
 		status, rounds, usage_in, usage_cached, usage_out, progress, blocker,
@@ -57,21 +145,21 @@ func (s *Store) LoadGoal(sessionID string) (goalstate.Record, bool, error) {
 			&record.Progress, &record.Blocker, &created, &updated)
 	if err != nil {
 		if err == sql.ErrNoRows {
-			return goalstate.Record{}, false, nil
+			return GoalRecord{}, false, nil
 		}
-		return goalstate.Record{}, false, fmt.Errorf("load goal %s: %w", sessionID, err)
+		return GoalRecord{}, false, fmt.Errorf("load goal %s: %w", sessionID, err)
 	}
-	record.Status = goalstate.Status(status)
+	record.Status = GoalStatus(status)
 	record.CreatedAt, err = parseGoalTime(created)
 	if err != nil {
-		return goalstate.Record{}, false, fmt.Errorf("load goal %s created_at: %w", sessionID, err)
+		return GoalRecord{}, false, fmt.Errorf("load goal %s created_at: %w", sessionID, err)
 	}
 	record.UpdatedAt, err = parseGoalTime(updated)
 	if err != nil {
-		return goalstate.Record{}, false, fmt.Errorf("load goal %s updated_at: %w", sessionID, err)
+		return GoalRecord{}, false, fmt.Errorf("load goal %s updated_at: %w", sessionID, err)
 	}
 	if err := record.Validate(); err != nil {
-		return goalstate.Record{}, false, fmt.Errorf("load goal %s: %w", sessionID, err)
+		return GoalRecord{}, false, fmt.Errorf("load goal %s: %w", sessionID, err)
 	}
 	return record, true, nil
 }
@@ -79,18 +167,18 @@ func (s *Store) LoadGoal(sessionID string) (goalstate.Record, bool, error) {
 // SaveGoal writes the current goal state without adding a checkpoint. It is
 // used by ordinary session persistence, while lifecycle transitions use
 // CheckpointGoal below.
-func (s *Store) SaveGoal(sessionID string, record goalstate.Record) error {
+func (s *Store) SaveGoal(sessionID string, record GoalRecord) error {
 	return s.writeGoal(sessionID, record, false)
 }
 
 // CheckpointGoal atomically updates the current state and appends a durable
 // progress/blocker checkpoint. The session's legacy goal column is updated as
 // a compatibility mirror for old pickers and databases.
-func (s *Store) CheckpointGoal(sessionID string, record goalstate.Record) error {
+func (s *Store) CheckpointGoal(sessionID string, record GoalRecord) error {
 	return s.writeGoal(sessionID, record, true)
 }
 
-func (s *Store) writeGoal(sessionID string, record goalstate.Record, checkpoint bool) error {
+func (s *Store) writeGoal(sessionID string, record GoalRecord, checkpoint bool) error {
 	if strings.TrimSpace(sessionID) == "" {
 		return fmt.Errorf("session id is required")
 	}
@@ -125,7 +213,7 @@ func (s *Store) writeGoal(sessionID string, record goalstate.Record, checkpoint 
 		return fmt.Errorf("save goal: %w", err)
 	}
 	legacyObjective := record.Objective
-	if record.Status != goalstate.StatusActive {
+	if record.Status != GoalStatusActive {
 		legacyObjective = ""
 	}
 	if _, err := tx.Exec(`UPDATE sessions SET goal=? WHERE id=?`, legacyObjective, sessionID); err != nil {
@@ -159,7 +247,7 @@ func (s *Store) ClearGoal(sessionID string) error {
 		_, err := s.db.Exec(`UPDATE sessions SET goal='' WHERE id=?`, sessionID)
 		return err
 	}
-	record.Status = goalstate.StatusPaused
+	record.Status = GoalStatusPaused
 	record.Blocker = "cleared by user"
 	record.Progress = ""
 	record.UpdatedAt = time.Now().UTC()
@@ -189,7 +277,7 @@ func (s *Store) GoalCheckpoints(sessionID, goalID string) ([]GoalCheckpoint, err
 			&created); err != nil {
 			return nil, err
 		}
-		checkpoint.Status = goalstate.Status(status)
+		checkpoint.Status = GoalStatus(status)
 		checkpoint.CreatedAt, err = parseGoalTime(created)
 		if err != nil {
 			return nil, err

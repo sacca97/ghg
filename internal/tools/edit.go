@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/sacca97/ghg/internal/models"
 	"github.com/sacca97/ghg/internal/observation"
 	"github.com/sacca97/ghg/internal/sandbox"
 )
@@ -35,6 +36,13 @@ type editOperation struct {
 	NewContent  string `json:"new_content"`
 }
 
+func editTool() Tool {
+	return resultTool(models.NewTool("edit",
+		"Apply one or more observed line-range edits atomically. Each primary edit references a read observation; use mode=exact only for temporary unique old_string compatibility.",
+		`{"type":"object","properties":{"mode":{"type":"string","enum":["observed","exact"],"description":"observed is the primary range-authorized mode; exact is compatibility mode"},"edits":{"type":"array","description":"Observed operations to apply atomically across one or more files","items":{"type":"object","properties":{"observation":{"type":"string"},"path":{"type":"string"},"start_line":{"type":"integer"},"end_line":{"type":"integer"},"operation":{"type":"string","enum":["replace","delete","insert_before","insert_after"]},"content":{"type":"string"}},"required":["observation","path","start_line","end_line","operation","content"]}},"path":{"type":"string","description":"Compatibility-mode file path"},"old_string":{"type":"string","description":"Compatibility-mode exact text"},"new_string":{"type":"string","description":"Compatibility-mode replacement"},"replace_all":{"type":"boolean","description":"Compatibility-mode replace every occurrence"}},"required":["mode"]}`),
+		runEdit)
+}
+
 func runEdit(ctx context.Context, args json.RawMessage) (ToolResult, error) {
 	var request editRequest
 	if err := json.Unmarshal(args, &request); err != nil {
@@ -52,6 +60,78 @@ func runEdit(ctx context.Context, args json.RawMessage) (ToolResult, error) {
 	}
 }
 
+func editDiff(oldS, newS string) string {
+	o := strings.Split(strings.TrimSuffix(oldS, "\n"), "\n")
+	n := strings.Split(strings.TrimSuffix(newS, "\n"), "\n")
+	p := 0
+	for p < len(o) && p < len(n) && o[p] == n[p] {
+		p++
+	}
+	s := 0
+	for s < len(o)-p && s < len(n)-p && o[len(o)-1-s] == n[len(n)-1-s] {
+		s++
+	}
+	if p == len(o) && p == len(n) {
+		return ""
+	}
+	var b strings.Builder
+	ctxLine := func(prefix, line string) {
+		if len(line) > 200 {
+			line = line[:200] + "…"
+		}
+		b.WriteString(prefix + line + "\n")
+	}
+	if p > 0 {
+		ctxLine(" ", o[p-1])
+	}
+	writeCappedDiffLines(&b, "-", o[p:len(o)-s])
+	writeCappedDiffLines(&b, "+", n[p:len(n)-s])
+	if s > 0 {
+		ctxLine(" ", o[len(o)-1])
+	}
+	return strings.TrimSuffix(b.String(), "\n")
+}
+
+// EditDiff exposes the compact diff formatter to the LSP adapter.
+func EditDiff(oldS, newS string) string { return editDiff(oldS, newS) }
+
+const maxEditDiffLines = 40
+
+func writeCappedDiffLines(b *strings.Builder, prefix string, lines []string) {
+	if len(lines) <= maxEditDiffLines {
+		for _, line := range lines {
+			if len(line) > 200 {
+				line = line[:200] + "…"
+			}
+			b.WriteString(prefix + line + "\n")
+		}
+		return
+	}
+	head := maxEditDiffLines / 2
+	tail := maxEditDiffLines - head
+	for _, line := range lines[:head] {
+		if len(line) > 200 {
+			line = line[:200] + "…"
+		}
+		b.WriteString(prefix + line + "\n")
+	}
+	fmt.Fprintf(b, "%s... [%d lines omitted]\n", prefix, len(lines)-maxEditDiffLines)
+	for _, line := range lines[len(lines)-tail:] {
+		if len(line) > 200 {
+			line = line[:200] + "…"
+		}
+		b.WriteString(prefix + line + "\n")
+	}
+}
+
+func lspDiagnostics(ctx context.Context, path string) string {
+	runtime := RuntimeFromContext(ctx)
+	if runtime == nil || runtime.LanguageService == nil {
+		return ""
+	}
+	return runtime.LanguageService.WaitDiagnostics(ctx, path)
+}
+
 func runExactEdit(ctx context.Context, request editRequest) (ToolResult, error) {
 	if request.Path == "" || request.OldString == "" {
 		return ToolResult{}, errors.New("exact edit requires path and a non-empty old_string")
@@ -60,7 +140,7 @@ func runExactEdit(ctx context.Context, request editRequest) (ToolResult, error) 
 	if err != nil {
 		return ToolResult{}, err
 	}
-	if deny := checkGate("edit", canonical); deny != "" {
+	if deny := checkGate(ctx, "edit", canonical); deny != "" {
 		return ToolResult{}, errors.New(deny)
 	}
 	original, err := os.ReadFile(canonical)
@@ -192,7 +272,7 @@ func runObservedEdit(ctx context.Context, request editRequest) (ToolResult, erro
 		}
 		plan := plans[canonical]
 		if plan == nil {
-			if deny := checkGate("edit", canonical); deny != "" {
+			if deny := checkGate(ctx, "edit", canonical); deny != "" {
 				return ToolResult{}, errors.New(deny)
 			}
 			original, err := os.ReadFile(canonical)
@@ -239,16 +319,22 @@ func runObservedEdit(ctx context.Context, request editRequest) (ToolResult, erro
 	hookReports := runtimePostEditReports(ctx, canonicalPaths)
 
 	var out strings.Builder
+	var retained strings.Builder
 	for _, path := range canonicalPaths {
 		plan := plans[path]
-		fmt.Fprintf(&out, "Edited %s (%d operation(s))\n", path, len(plan.operations))
+		header := fmt.Sprintf("Edited %s (%d operation(s))\n", path, len(plan.operations))
+		out.WriteString(header)
+		retained.WriteString(header)
 		out.WriteString("readback:\n")
+		retained.WriteString("readback:\n")
 		final, err := os.ReadFile(path)
 		if err != nil {
 			if os.IsNotExist(err) {
 				out.WriteString("(file was removed by postEdit)\n")
+				retained.WriteString("(file was removed by postEdit)\n")
 			} else {
 				out.WriteString("(readback failed: " + err.Error() + ")\n")
+				retained.WriteString("(readback failed: " + err.Error() + ")\n")
 			}
 		} else {
 			startByte := plan.operations[0].start
@@ -260,27 +346,37 @@ func runObservedEdit(ctx context.Context, request editRequest) (ToolResult, erro
 			startLine := 1 + bytes.Count(final[:min(startByte, len(final))], []byte{'\n'})
 			readRes, readErr := readObservedContent(ctx, path, path, bytes.NewReader(final), startLine, maxEditReadbackLines)
 			if readErr != nil {
-				out.WriteString(editReadback(final, plan.operations))
+				rb := editReadback(final, plan.operations)
+				out.WriteString(rb)
+				retained.WriteString(rb)
 			} else {
 				out.WriteString(readRes.Preview)
+				retained.WriteString(readRes.Preview)
 				if !strings.HasSuffix(readRes.Preview, "\n") {
 					out.WriteByte('\n')
+					retained.WriteByte('\n')
 				}
 			}
 			if d := editDiff(string(plan.original), string(final)); d != "" {
-				out.WriteString("```diff\n")
-				out.WriteString(d)
-				out.WriteString("\n```\n")
+				retained.WriteString("```diff\n")
+				retained.WriteString(d)
+				retained.WriteString("\n```\n")
 			}
-			out.WriteString(lspDiagnostics(ctx, path))
+			diag := lspDiagnostics(ctx, path)
+			out.WriteString(diag)
+			retained.WriteString(diag)
 		}
 	}
 	for _, report := range hookReports {
-		out.WriteString(report.note(RuntimeFromContext(ctx)))
+		note := report.note(RuntimeFromContext(ctx))
+		out.WriteString(note)
 		out.WriteByte('\n')
+		retained.WriteString(note)
+		retained.WriteByte('\n')
 	}
-	raw := strings.TrimSuffix(out.String(), "\n")
-	return textResult(raw, truncate(raw), 0), nil
+	preview := strings.TrimSuffix(out.String(), "\n")
+	retainedStr := strings.TrimSuffix(retained.String(), "\n")
+	return textResult(retainedStr, truncate(preview), 0), nil
 }
 
 func runtimePostEditReports(ctx context.Context, paths []string) []HookReport {

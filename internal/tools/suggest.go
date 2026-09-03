@@ -19,9 +19,15 @@ func SuggestTool(name string, candidates []string) []string {
 	for _, c := range candidates {
 		prefix := strings.HasPrefix(c, name) || strings.HasPrefix(name, c)
 		d := levenshtein(name, c, 4) // early-exit cap: suggestions stop mattering past a few edits
+		maxDist := 3
+		if min(len(name), len(c)) <= 4 {
+			maxDist = 1
+		} else if min(len(name), len(c)) <= 6 {
+			maxDist = 2
+		}
 		if prefix {
 			d = -len(c) // prefix matches rank first, shorter (more general) first
-		} else if d > 3 {
+		} else if d > maxDist {
 			continue
 		}
 		hits = append(hits, scored{c, d})

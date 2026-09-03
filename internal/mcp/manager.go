@@ -17,7 +17,7 @@ import (
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/sacca97/ghg/internal/config"
-	"github.com/sacca97/ghg/internal/llm"
+	"github.com/sacca97/ghg/internal/models"
 	"github.com/sacca97/ghg/internal/sandbox"
 	"github.com/sacca97/ghg/internal/tools"
 )
@@ -109,29 +109,24 @@ func autoReconnectDelay(try int) time.Duration {
 // drop, unless the manager is closing, the server is disabled, or we've
 // already retried autoReconnectMax times in a row.
 func (s *server) kickAutoReconnect(m *Manager) {
-	m.onChangeMu.Lock()
-	closing := m.closed
-	m.onChangeMu.Unlock()
 	s.mu.Lock()
 	tries := s.autoTries
+	disabled := s.cfg.Disabled()
 	s.mu.Unlock()
-	if closing || s.cfg.Disabled() || tries >= autoReconnectMax {
+	if disabled || tries >= autoReconnectMax || m.isClosed() {
 		return
 	}
 	go func() {
 		time.Sleep(autoReconnectDelay(tries))
-		m.onChangeMu.Lock()
-		closing := m.closed
-		m.onChangeMu.Unlock()
-		s.mu.Lock()
-		gave := s.status == StatusReady || s.autoTries != tries // someone else recovered/retried
-		s.mu.Unlock()
-		if closing || gave || s.cfg.Disabled() {
+		if m.isClosed() {
 			return
 		}
 		s.mu.Lock()
+		defer s.mu.Unlock()
+		if s.status == StatusReady || s.autoTries != tries || s.cfg.Disabled() {
+			return
+		}
 		s.autoTries++
-		s.mu.Unlock()
 		select {
 		case s.reconnect <- struct{}{}:
 		default:
@@ -211,8 +206,11 @@ func (m *Manager) SetOnChange(fn func()) {
 	m.onChangeMu.Unlock()
 }
 
-// FireOnChangeForTest invokes the installed callback (tests only).
-func (m *Manager) FireOnChangeForTest() { m.fireOnChange() }
+func (m *Manager) isClosed() bool {
+	m.onChangeMu.Lock()
+	defer m.onChangeMu.Unlock()
+	return m.closed
+}
 
 func (m *Manager) fireOnChange() {
 	m.onChangeMu.Lock()
@@ -283,11 +281,8 @@ func (s *server) connect(ctx context.Context, m *Manager) {
 			var listed *sdkmcp.ListToolsResult
 			listed, err = sess.ListTools(ctx, nil)
 			if err == nil {
-				m.onChangeMu.Lock()
-				closed := m.closed
-				m.onChangeMu.Unlock()
-				if closed {
-					_ = sess.Close() // manager is shutting down; don't store
+				if m.isClosed() {
+					_ = sess.Close()
 					return
 				}
 				var instr string
@@ -295,33 +290,22 @@ func (s *server) connect(ctx context.Context, m *Manager) {
 					instr = strings.TrimSpace(ir.Instructions)
 				}
 				s.mu.Lock()
-				s.defs = listed.Tools
-				s.instr = instr
-				s.sess = sess
+				s.defs, s.instr, s.sess = listed.Tools, instr, sess
 				s.gen++
 				s.autoTries = 0
 				gen := s.gen
 				s.mu.Unlock()
 				s.setState(m, StatusReady, "")
-				// Watch for a dropped session: mark failed so tool calls stop
-				// being routed (opencode's client.onclose → status failed,
-				// guarded by a client-identity check, index.ts:443). The gen
-				// counter is the same check: a watcher from an older connect
-				// must not tear down the newer session.
+				// Watch for a dropped session: mark failed so tool calls stop being routed.
 				go func() {
 					_ = sess.Wait()
-					m.onChangeMu.Lock()
-					closing := m.closed
-					m.onChangeMu.Unlock()
 					s.mu.Lock()
 					stale := s.gen != gen
 					if !stale {
-						s.sess = nil
-						s.defs = nil
-						s.instr = ""
+						s.sess, s.defs, s.instr = nil, nil, ""
 					}
 					s.mu.Unlock()
-					if !stale && !closing {
+					if !stale && !m.isClosed() {
 						s.setState(m, StatusFailed, "connection closed")
 						s.kickAutoReconnect(m)
 					}
@@ -390,7 +374,7 @@ func (s *server) bridge(d *sdkmcp.Tool) tools.Tool {
 		desc = d.Title
 	}
 	return tools.Tool{
-		Def: llm.NewTool(name, fmt.Sprintf("[MCP %s] %s", s.name, desc), schema),
+		Def: models.NewTool(name, fmt.Sprintf("[MCP %s] %s", s.name, desc), schema),
 		Run: func(ctx context.Context, args json.RawMessage) (string, error) {
 			out, err := s.call(ctx, d.Name, args)
 			return tools.Truncate(out), err
@@ -528,16 +512,6 @@ type textCaptureWriter struct {
 func (w textCaptureWriter) Write(p []byte) (int, error) {
 	w.capture.WriteString(string(p))
 	return len(p), nil
-}
-
-// flattenResult renders a CallToolResult as model-facing text (pure).
-// Text content is concatenated; binary/resource parts become placeholders
-// (ponytail: feed images to vision models); structured content is appended
-// as JSON when no text exists (opencode catalog.ts does the same). IsError
-// prefixes "Error: " so the model sees failure, per the MCP spec's own
-// guidance that tool errors belong in content.
-func flattenResult(res *sdkmcp.CallToolResult) string {
-	return mcpToolResult(res).Preview
 }
 
 // normalizeSchema passes the server's input schema through as a JSON string,
@@ -735,6 +709,9 @@ func (m *Manager) Reconnect(name string) bool {
 // children get their own process group at spawn (defaultTransport) so ghg's
 // exit path can also group-kill strays via the bashrun registry pattern.
 func (m *Manager) Close() {
+	m.onChangeMu.Lock()
+	m.closed = true
+	m.onChangeMu.Unlock()
 	for _, s := range m.servers {
 		s.mu.Lock()
 		sess := s.sess
@@ -773,35 +750,20 @@ func defaultTransport(cfg ServerConfig, stderr *ringBuffer) (sdkmcp.Transport, e
 			DisableStandaloneSSE: true,
 		}, nil
 	}
+	prog, args, dir := cfg.Command[0], cfg.Command[1:], cfg.Cwd
 	env := append(os.Environ(), envPairs(cfg.Env)...)
 	if cfg.runtime != nil {
 		env = cfg.runtime.ChildEnv(cfg.Env)
 		wrapped, err := cfg.runtime.WrapCommand(sandbox.CommandSpec{
-			Program: cfg.Command[0], Args: cfg.Command[1:], Dir: cfg.Cwd, Env: env,
+			Program: prog, Args: args, Dir: dir, Env: env,
 		})
 		if err != nil {
 			return nil, err
 		}
-		cmd := exec.Command(wrapped.Program, wrapped.Args...)
-		cmd.Dir = wrapped.Dir
-		cmd.Env = wrapped.Env
-		if stderr != nil {
-			cmd.Stderr = stderr
-		}
-		cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-		return &sdkmcp.CommandTransport{Command: cmd, TerminateDuration: 3 * time.Second}, nil
+		prog, args, dir, env = wrapped.Program, wrapped.Args, wrapped.Dir, wrapped.Env
 	}
-	cmd := exec.Command(cfg.Command[0], cfg.Command[1:]...)
-	// Legacy/direct transport callers inherit ghg's environment and layer the
-	// server's vars on top (opencode does the same — users expect $PATH etc.).
-	cmd.Env = env
-	if cfg.Cwd != "" {
-		cmd.Dir = cfg.Cwd
-	}
-	if stderr != nil {
-		cmd.Stderr = stderr
-	}
-	// Own process group: detached grandchildren of the server die with it.
+	cmd := exec.Command(prog, args...)
+	cmd.Dir, cmd.Env, cmd.Stderr = dir, env, stderr
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	return &sdkmcp.CommandTransport{Command: cmd, TerminateDuration: 3 * time.Second}, nil
 }
@@ -831,3 +793,32 @@ func (h headerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 func logf(format string, args ...any) {
 	config.LogEvent("mcp", fmt.Sprintf(format, args...))
 }
+
+// ringBuffer is a fixed-capacity byte sink keeping the most recent writes —
+// the stderr tail of an MCP stdio server, surfaced in connect errors so a
+// server that dies on startup ("command not found", panic) is debuggable
+// from /mcp without spelunking logs. Not safe for concurrent use; exec.Cmd
+// writes from one goroutine and we read after the process settles.
+type ringBuffer struct {
+	buf  []byte
+	size int
+}
+
+func newRingBuffer(size int) *ringBuffer { return &ringBuffer{size: size} }
+
+func (r *ringBuffer) Write(p []byte) (int, error) {
+	if r.size == 0 {
+		return len(p), nil
+	}
+	if len(p) >= r.size {
+		r.buf = append(r.buf[:0], p[len(p)-r.size:]...)
+		return len(p), nil
+	}
+	r.buf = append(r.buf, p...)
+	if len(r.buf) > r.size {
+		r.buf = append(r.buf[:0], r.buf[len(r.buf)-r.size:]...)
+	}
+	return len(p), nil
+}
+
+func (r *ringBuffer) String() string { return strings.TrimRight(string(r.buf), "\n") }

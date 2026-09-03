@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/sacca97/ghg/internal/llm"
+	"github.com/sacca97/ghg/internal/models"
 )
 
 func callTodowrite(t *testing.T, a *Agent, todosJSON string) string {
@@ -70,7 +70,7 @@ func TestTodowriteValidation(t *testing.T) {
 // ephemeral system message each round, and a.Messages stays clean.
 func TestTodowriteEndToEnd(t *testing.T) {
 	var sawBlock bool
-	srv := textServer(t, func(n int, req llm.Request) string {
+	srv := textServer(t, func(n int, req models.Request) string {
 		for _, m := range req.Messages {
 			if m.Role == "system" && strings.Contains(m.Content, "Your current plan") {
 				sawBlock = true

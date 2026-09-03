@@ -8,17 +8,330 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/sacca97/ghg/internal/artifact"
-	goalstate "github.com/sacca97/ghg/internal/goal"
-	"github.com/sacca97/ghg/internal/llm"
+	"github.com/sacca97/ghg/internal/models"
+	"github.com/sacca97/ghg/internal/session"
 	"github.com/sacca97/ghg/internal/tools"
 )
+
+func TestReadCoverageSuppressesRedundantRanges(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "source.go")
+	var content strings.Builder
+	for i := 1; i <= 500; i++ {
+		fmt.Fprintf(&content, "line %d\n", i)
+	}
+	if err := os.WriteFile(path, []byte(content.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ag := New(nil, "model", 100, "system")
+	guard := newReadCoverageTracker()
+	var telemetryMu sync.Mutex
+	var telemetry []ToolTelemetry
+	events := Events{OnToolTelemetry: func(value ToolTelemetry) {
+		telemetryMu.Lock()
+		telemetry = append(telemetry, value)
+		telemetryMu.Unlock()
+	}}
+	run := func(calls ...models.ToolCall) []tools.ToolResult {
+		return ag.runToolResultsWithPolicy(context.Background(), calls, events, ag.AllTools(), nil, "", guard)
+	}
+	readCall := func(id, args string) models.ToolCall {
+		return models.ToolCall{ID: id, Type: "function", Function: struct {
+			Name      string `json:"name"`
+			Arguments string `json:"arguments"`
+		}{Name: "read", Arguments: args}}
+	}
+
+	first := run(readCall("read-1", fmt.Sprintf(`{"path":%q,"offset":1,"limit":120}`, path)))[0]
+	if first.ExitCode != 0 || !strings.Contains(first.Preview, "1\tline 1") {
+		t.Fatalf("initial read failed: %+v", first)
+	}
+	repeat := run(readCall("read-2", fmt.Sprintf(`{"path":%q,"offset":1,"limit":120}`, path)))[0]
+	if repeat.ExitCode != 0 || repeat.Metadata["duplicate_suppressed"] != "true" || repeat.Metadata["observation_id"] != first.Metadata["observation_id"] {
+		t.Fatalf("repeat read was not compactly suppressed: %+v", repeat)
+	}
+	if strings.Contains(repeat.Preview, "line 1") || len(repeat.Preview) >= len(first.Preview) {
+		t.Fatalf("repeat read returned too much content: %q", repeat.Preview)
+	}
+
+	expanded := run(readCall("read-3", fmt.Sprintf(`{"path":%q,"offset":1,"limit":260}`, path)))[0]
+	if expanded.ExitCode != 0 || expanded.Metadata["duplicate_suppressed"] != "true" ||
+		!strings.Contains(expanded.Preview, "offset=121") || !strings.Contains(expanded.Preview, "limit=140") {
+		t.Fatalf("prefix expansion guidance = %+v", expanded)
+	}
+	next := run(readCall("read-4", fmt.Sprintf(`{"path":%q,"offset":121,"limit":140}`, path)))[0]
+	if next.ExitCode != 0 || next.Metadata["duplicate_suppressed"] == "true" || !strings.Contains(next.Preview, "121\tline 121") {
+		t.Fatalf("pagination read was not executed: %+v", next)
+	}
+
+	batch := run(
+		readCall("batch-90", fmt.Sprintf(`{"path":%q,"offset":301,"limit":90}`, path)),
+		readCall("batch-130", fmt.Sprintf(`{"path":%q,"offset":301,"limit":130}`, path)),
+		readCall("batch-100", fmt.Sprintf(`{"path":%q,"offset":301,"limit":100}`, path)),
+	)
+	if len(batch) != 3 || batch[0].Metadata["duplicate_suppressed"] != "true" ||
+		batch[2].Metadata["duplicate_suppressed"] != "true" || batch[1].Metadata["duplicate_suppressed"] == "true" ||
+		!strings.Contains(batch[1].Preview, "301\tline 301") {
+		t.Fatalf("same-offset batch results = %+v", batch)
+	}
+
+	missing := fmt.Sprintf(`{"path":%q,"offset":1,"limit":1}`, filepath.Join(filepath.Dir(path), "missing.go"))
+	failed := run(readCall("read-failed-1", missing))[0]
+	retried := run(readCall("read-failed-2", missing))[0]
+	if failed.ExitCode == 0 || retried.ExitCode == 0 || retried.Metadata["duplicate_suppressed"] == "true" {
+		t.Fatalf("failed reads must remain retryable: first=%+v retry=%+v", failed, retried)
+	}
+
+	bashArgs := `{"command":"printf bash"}`
+	bashResults := run(models.ToolCall{ID: "bash-1", Type: "function", Function: struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	}{Name: "bash", Arguments: bashArgs}}, models.ToolCall{ID: "bash-2", Type: "function", Function: struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	}{Name: "bash", Arguments: bashArgs}})
+	for _, result := range bashResults {
+		if result.Metadata["duplicate_suppressed"] == "true" {
+			t.Fatalf("bash call was suppressed: %+v", result)
+		}
+	}
+	failedBashArgs, err := json.Marshal(map[string]string{
+		"command": fmt.Sprintf("printf 'changed\\n' > %q; exit 1", path),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	failedBash := run(models.ToolCall{ID: "bash-failed", Type: "function", Function: struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	}{Name: "bash", Arguments: string(failedBashArgs)}})[0]
+	if failedBash.ExitCode == 0 {
+		t.Fatalf("expected modifying bash call to fail: %+v", failedBash)
+	}
+	afterFailedBash := run(readCall("read-after-failed-bash", fmt.Sprintf(`{"path":%q,"offset":1,"limit":120}`, path)))[0]
+	if afterFailedBash.ExitCode != 0 || afterFailedBash.Metadata["duplicate_suppressed"] == "true" || !strings.Contains(afterFailedBash.Preview, "changed") {
+		t.Fatalf("read after failed bash was not refreshed: %+v", afterFailedBash)
+	}
+	telemetryMu.Lock()
+	defer telemetryMu.Unlock()
+	foundDuplicateTelemetry := false
+	for _, value := range telemetry {
+		if value.ID == "read-2" {
+			foundDuplicateTelemetry = true
+			if !value.Duplicate {
+				t.Fatalf("suppressed read telemetry = %+v", value)
+			}
+		}
+	}
+	if !foundDuplicateTelemetry {
+		t.Fatal("suppressed read did not emit telemetry")
+	}
+}
+
+type fakeBackend struct {
+	streamRequests   []models.Request
+	completeRequests []models.Request
+}
+
+func (b *fakeBackend) Stream(_ context.Context, req models.Request, sink models.EventSink) (models.Message, models.Usage, error) {
+	b.streamRequests = append(b.streamRequests, req)
+	if sink.OnText != nil {
+		sink.OnText("reply")
+	}
+	return models.Message{Role: "assistant", Content: "reply"}, models.Usage{}, nil
+}
+
+func (b *fakeBackend) Complete(_ context.Context, req models.Request) (models.Message, models.Usage, error) {
+	b.completeRequests = append(b.completeRequests, req)
+	return models.Message{Role: "assistant", Content: "summary"}, models.Usage{}, nil
+}
+
+var _ models.Backend = (*fakeBackend)(nil)
+
+func TestAgentUsesBackendContract(t *testing.T) {
+	backend := &fakeBackend{}
+	ag := New(backend, "model", 100, "system")
+
+	got, err := ag.Turn(context.Background(), "hello", Events{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "reply" {
+		t.Fatalf("turn result = %q, want reply", got)
+	}
+	if len(backend.streamRequests) != 1 {
+		t.Fatalf("stream calls = %d, want 1", len(backend.streamRequests))
+	}
+	if len(backend.streamRequests[0].Messages) != 2 {
+		t.Fatalf("stream message count = %d, want system + user", len(backend.streamRequests[0].Messages))
+	}
+
+	for i := 0; i < 8; i++ {
+		ag.Messages = append(ag.Messages,
+			models.Message{Role: "user", Content: "question"},
+			models.Message{Role: "assistant", Content: "answer"},
+		)
+	}
+	if err := ag.ManualCompact(context.Background(), Events{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(backend.completeRequests) != 1 {
+		t.Fatalf("complete calls = %d, want 1", len(backend.completeRequests))
+	}
+}
+
+// TestLSPDiagnosticsReachModel pins the end-to-end flow: the model calls
+// write, the LSP hook appends a <diagnostics> block to the tool result, and
+// that block is what the provider receives on the next call.
+func TestLSPDiagnosticsReachModel(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "main.go")
+	argsJSON, _ := json.Marshal(map[string]string{"path": target, "content": "package main\n"})
+
+	call := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req models.Request
+		json.NewDecoder(r.Body).Decode(&req)
+		w.Header().Set("Content-Type", "text/event-stream")
+		call++
+		if call == 1 {
+			fmt.Fprintf(w, `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"t1","type":"function","function":{"name":"write","arguments":%s}}]}}]}`+"\n\n",
+				jsonString(string(argsJSON)))
+		} else {
+			last := req.Messages[len(req.Messages)-1]
+			if last.Role != "tool" {
+				t.Errorf("expected tool result, got %s", last.Role)
+			}
+			if !strings.Contains(last.Content, "<diagnostics file=") || !strings.Contains(last.Content, "ERROR [2:3] undefined: foo") {
+				t.Errorf("tool result missing diagnostics block: %q", last.Content)
+			}
+			fmt.Fprint(w, `data: {"choices":[{"delta":{"content":"fixed"},"finish_reason":"stop"}]}`+"\n\n")
+		}
+		fmt.Fprint(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+
+	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
+	ag.Runtime = &tools.ToolRuntime{LanguageService: stubWaiter{block: "\n\n<diagnostics file=\"" + target + "\">\nERROR [2:3] undefined: foo\n</diagnostics>"}}
+	if _, err := ag.Turn(context.Background(), "write the file", Events{}); err != nil {
+		t.Fatal(err)
+	}
+	if call < 2 {
+		t.Fatalf("loop ended after %d calls", call)
+	}
+}
+
+type stubWaiter struct{ block string }
+
+func (s stubWaiter) WaitDiagnostics(ctx context.Context, path string) string { return s.block }
+func (stubWaiter) Warm(context.Context, string)                              {}
+func (stubWaiter) Navigate(context.Context, tools.NavigationRequest) (tools.NavigationResult, error) {
+	return tools.NavigationResult{}, errors.New("not implemented")
+}
+func (stubWaiter) PreviewRename(context.Context, tools.RenameRequest) (tools.RenamePreview, error) {
+	return tools.RenamePreview{}, errors.New("not implemented")
+}
+func (stubWaiter) LookupRename(context.Context, string, string) (tools.RenamePlan, error) {
+	return tools.RenamePlan{}, errors.New("not implemented")
+}
+func (stubWaiter) ValidateRename(context.Context, tools.RenamePlan) error {
+	return errors.New("not implemented")
+}
+func (stubWaiter) ConsumeRename(context.Context, string, string) error { return nil }
+
+func jsonString(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
+}
+
+func TestToolTelemetryReportsPreviewRetentionAndRedirect(t *testing.T) {
+	a := New(nil, "model", 100, "system")
+	a.Tools = []tools.Tool{
+		{
+			Def: models.NewTool("probe", "probe", `{"type":"object"}`),
+			RunResult: func(context.Context, json.RawMessage) (tools.ToolResult, error) {
+				return tools.MarkUntrusted(tools.TextResultWithSize(strings.Repeat("x", 100), "preview", 100, true, 0), "probe"), nil
+			},
+		},
+	}
+	var got ToolTelemetry
+	a.runToolResultsWithTools(context.Background(), []models.ToolCall{{ID: "call-1", Function: struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	}{Name: "probe", Arguments: `{}`}}}, Events{OnToolTelemetry: func(value ToolTelemetry) { got = value }}, a.AllTools())
+	if got.Name != "probe" || got.ID != "call-1" || got.PreviewBytes != len("preview") || got.RetainedBytes != 100 || got.OriginalBytes != 100 || !got.Truncated {
+		t.Fatalf("telemetry = %+v", got)
+	}
+
+	redirect := tools.ExecuteResult(context.Background(), tools.All(), "bash", json.RawMessage(`{"command":"find ."}`))
+	if redirect.Metadata["bash_redirect"] != "true" {
+		t.Fatalf("redirect metadata = %+v", redirect.Metadata)
+	}
+}
+
+func TestReadCoverageInvalidatesAfterEdit(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "source.go")
+	if err := os.WriteFile(path, []byte("before\nsecond\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ag := New(nil, "model", 100, "system")
+	guard := newReadCoverageTracker()
+	run := func(call models.ToolCall) tools.ToolResult {
+		return ag.runToolResultsWithPolicy(context.Background(), []models.ToolCall{call}, Events{}, ag.AllTools(), nil, "", guard)[0]
+	}
+	readCall := func(id string) models.ToolCall {
+		return models.ToolCall{ID: id, Type: "function", Function: struct {
+			Name      string `json:"name"`
+			Arguments string `json:"arguments"`
+		}{Name: "read", Arguments: fmt.Sprintf(`{"path":%q,"offset":1,"limit":1}`, path)}}
+	}
+	first := run(readCall("read-before"))
+	if first.ExitCode != 0 || first.Metadata["observation_id"] == "" {
+		t.Fatalf("initial read failed: %+v", first)
+	}
+	if err := os.WriteFile(path, []byte("external\nsecond\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	refreshed := run(readCall("read-external"))
+	if refreshed.ExitCode != 0 || refreshed.Metadata["duplicate_suppressed"] == "true" || !strings.Contains(refreshed.Preview, "external") {
+		t.Fatalf("read after external change was not refreshed: %+v", refreshed)
+	}
+	first = refreshed
+	editArgs, err := json.Marshal(map[string]any{
+		"mode": "observed",
+		"edits": []map[string]any{{
+			"observation": first.Metadata["observation_id"],
+			"path":        path,
+			"start_line":  1,
+			"end_line":    1,
+			"operation":   "replace",
+			"content":     "updated\n",
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	edited := run(models.ToolCall{ID: "edit-1", Type: "function", Function: struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	}{Name: "edit", Arguments: string(editArgs)}})
+	if edited.ExitCode != 0 {
+		t.Fatalf("edit failed: %+v", edited)
+	}
+	second := run(readCall("read-after"))
+	if second.ExitCode != 0 || second.Metadata["duplicate_suppressed"] == "true" || !strings.Contains(second.Preview, "updated") {
+		t.Fatalf("read after edit was not refreshed: %+v", second)
+	}
+}
 
 func TestReasoningRequestUsesToggleMetadata(t *testing.T) {
 	for _, tc := range []struct {
@@ -52,10 +365,10 @@ func TestReasoningRequestUsesToggleMetadata(t *testing.T) {
 }
 
 func TestTurnWithGoalUsesEphemeralContextAndStructuredUpdate(t *testing.T) {
-	var requests []llm.Request
+	var requests []models.Request
 	var mu sync.Mutex
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var req llm.Request
+		var req models.Request
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			t.Errorf("decode request: %v", err)
 			return
@@ -76,7 +389,7 @@ func TestTurnWithGoalUsesEphemeralContextAndStructuredUpdate(t *testing.T) {
 
 	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
 	ag.Tools = nil
-	record := goalstate.New("ship the feature")
+	record := NewGoal("ship the feature")
 	record.ID = "goal-1"
 	var updates []GoalUpdate
 	final, err := ag.TurnWithGoal(context.Background(), "start", record, Events{
@@ -88,11 +401,11 @@ func TestTurnWithGoalUsesEphemeralContextAndStructuredUpdate(t *testing.T) {
 	if final != "ready" {
 		t.Fatalf("final = %q", final)
 	}
-	if len(updates) != 1 || updates[0].Status != goalstate.StatusActive || updates[0].GoalID != record.ID {
+	if len(updates) != 1 || updates[0].Status != GoalStatusActive || updates[0].GoalID != record.ID {
 		t.Fatalf("updates: %+v", updates)
 	}
 	mu.Lock()
-	gotRequests := append([]llm.Request(nil), requests...)
+	gotRequests := append([]models.Request(nil), requests...)
 	mu.Unlock()
 	if len(gotRequests) != 2 {
 		t.Fatalf("requests = %d, want 2", len(gotRequests))
@@ -100,7 +413,7 @@ func TestTurnWithGoalUsesEphemeralContextAndStructuredUpdate(t *testing.T) {
 	for i, req := range gotRequests {
 		foundGoalTool := false
 		for _, tool := range req.Tools {
-			if tool.Function.Name == goalUpdateToolName {
+			if tool.Function.Name == GoalToolName {
 				foundGoalTool = true
 			}
 		}
@@ -133,21 +446,26 @@ func TestTurnWithGoalCompletionStopsWithoutAnotherRequest(t *testing.T) {
 
 	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
 	ag.Tools = nil
-	record := goalstate.New("finish")
+	record := NewGoal("finish")
 	record.ID = "goal-2"
 	var update GoalUpdate
 	if _, err := ag.TurnWithGoal(context.Background(), "go", record, Events{OnGoalUpdate: func(g GoalUpdate) { update = g }}); err != nil {
 		t.Fatal(err)
 	}
-	if requests != 1 || update.Status != goalstate.StatusComplete {
+	if requests != 1 || update.Status != GoalStatusComplete {
 		t.Fatalf("requests=%d update=%+v", requests, update)
 	}
 }
 
-func testBackend(baseURL, apiKey string) llm.Backend {
-	client := llm.New(baseURL, apiKey)
-	client.MaxRetries = 1
-	return llm.NewOpenAIBackend(client)
+func testBackend(baseURL, apiKey string) models.Backend {
+	backend, err := models.NewBackend(models.Resolved{
+		BaseURL:  baseURL,
+		Protocol: models.ProtocolOpenAIChatCompletions,
+	}, models.BackendOptions{APIKey: apiKey, MaxRetries: 1})
+	if err != nil {
+		panic(err)
+	}
+	return backend
 }
 
 // server that answers with a tool call on the first request, text on the second
@@ -155,7 +473,7 @@ func loopServer(t *testing.T) *httptest.Server {
 	t.Helper()
 	call := 0
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var req llm.Request
+		var req models.Request
 		json.NewDecoder(r.Body).Decode(&req)
 		w.Header().Set("Content-Type", "text/event-stream")
 		call++
@@ -175,7 +493,7 @@ func loopServer(t *testing.T) *httptest.Server {
 
 func echoTool() tools.Tool {
 	return tools.Tool{
-		Def: llm.NewTool("echo", "echo", `{"type":"object","properties":{"s":{"type":"string"}}}`),
+		Def: models.NewTool("echo", "echo", `{"type":"object","properties":{"s":{"type":"string"}}}`),
 		Run: func(ctx context.Context, args json.RawMessage) (string, error) {
 			var a struct{ S string }
 			json.Unmarshal(args, &a)
@@ -222,7 +540,7 @@ func TestToolOutputCarriesCallID(t *testing.T) {
 	ag := New(testBackend("http://unused", "k"), "m", 100, "sys")
 	var ids []string
 	var snapshots []string
-	results := ag.runToolResultsWithTools(context.Background(), []llm.ToolCall{{
+	results := ag.runToolResultsWithTools(context.Background(), []models.ToolCall{{
 		ID: "bash-1",
 		Function: struct {
 			Name      string `json:"name"`
@@ -252,8 +570,8 @@ func TestToolOutputCarriesCallID(t *testing.T) {
 
 func TestParallelToolOutputStaysWithCall(t *testing.T) {
 	ag := New(testBackend("http://unused", "k"), "m", 100, "sys")
-	call := func(label string) llm.ToolCall {
-		return llm.ToolCall{
+	call := func(label string) models.ToolCall {
+		return models.ToolCall{
 			ID: label,
 			Function: struct {
 				Name      string `json:"name"`
@@ -263,7 +581,7 @@ func TestParallelToolOutputStaysWithCall(t *testing.T) {
 	}
 	var mu sync.Mutex
 	seen := map[string][]string{}
-	ag.runToolResultsWithTools(context.Background(), []llm.ToolCall{call("a"), call("b")}, Events{
+	ag.runToolResultsWithTools(context.Background(), []models.ToolCall{call("a"), call("b")}, Events{
 		OnToolOutput: func(id, output string) {
 			mu.Lock()
 			seen[id] = append(seen[id], output)
@@ -297,7 +615,7 @@ func TestParallelToolOutputStaysWithCall(t *testing.T) {
 // cost and perf views after the in-memory session totals are gone.
 func TestTurnStampsUsageModelAndToolTiming(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var req llm.Request
+		var req models.Request
 		json.NewDecoder(r.Body).Decode(&req)
 		w.Header().Set("Content-Type", "text/event-stream")
 		if len(req.Messages) > 0 && req.Messages[len(req.Messages)-1].Role == "tool" {
@@ -325,7 +643,7 @@ func TestTurnStampsUsageModelAndToolTiming(t *testing.T) {
 	if user.SentAt == nil {
 		t.Error("authored user message should carry SentAt")
 	}
-	var assistants []llm.Message
+	var assistants []models.Message
 	for _, m := range ag.Messages {
 		if m.Role == "assistant" {
 			assistants = append(assistants, m)
@@ -367,12 +685,12 @@ func TestInternalStampsStrippedFromRequest(t *testing.T) {
 	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
 	// pre-seed a message loaded from storage with all internal fields set
 	sent := time.Now()
-	u := llm.Usage{PromptTokens: 9}
-	ag.Messages = append(ag.Messages, llm.Message{
+	u := models.Usage{PromptTokens: 9}
+	ag.Messages = append(ag.Messages, models.Message{
 		Role: "assistant", Content: "prior", Usage: &u, Model: "m @ p",
-		ToolCalls: []llm.ToolCall{{ID: "x", DurationMs: 5, ExitCode: 1}},
+		ToolCalls: []models.ToolCall{{ID: "x", DurationMs: 5, ExitCode: 1}},
 	})
-	ag.Messages = append(ag.Messages, llm.Message{Role: "user", Content: "old", Authored: true, SentAt: &sent, RewoundFrom: "earlier"})
+	ag.Messages = append(ag.Messages, models.Message{Role: "user", Content: "old", Authored: true, SentAt: &sent, RewoundFrom: "earlier"})
 	if _, err := ag.Turn(context.Background(), "go", Events{}); err != nil {
 		t.Fatal(err)
 	}
@@ -412,11 +730,11 @@ func TestTurnAPIError(t *testing.T) {
 }
 
 // server that echoes text responses and records how many calls it got
-func textServer(t *testing.T, onCall func(n int, req llm.Request) string) *httptest.Server {
+func textServer(t *testing.T, onCall func(n int, req models.Request) string) *httptest.Server {
 	t.Helper()
 	n := 0
 	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var req llm.Request
+		var req models.Request
 		json.NewDecoder(r.Body).Decode(&req)
 		n++
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -429,7 +747,7 @@ func textServer(t *testing.T, onCall func(n int, req llm.Request) string) *httpt
 // TurnAuthored marks the user message as genuinely typed (for input-history
 // recall); plain Turn (steered/goal/background paths) leaves it unmarked.
 func TestTurnAuthoredMarksMessage(t *testing.T) {
-	srv := textServer(t, func(n int, req llm.Request) string { return "done" })
+	srv := textServer(t, func(n int, req models.Request) string { return "done" })
 	defer srv.Close()
 
 	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
@@ -475,7 +793,7 @@ func TestUsageAccumulates(t *testing.T) {
 	var fired int
 	for i := 0; i < 3; i++ {
 		if _, err := ag.Turn(context.Background(), "go", Events{
-			OnUsage: func(u llm.Usage) {
+			OnUsage: func(u models.Usage) {
 				fired++
 				if u.PromptTokens != 100 || u.CompletionTokens != 10 || u.Cached() != 40 {
 					t.Errorf("per-call usage: %+v", u)
@@ -497,7 +815,7 @@ func TestUsageAccumulates(t *testing.T) {
 // TestUsageMissingLeavesTotalsAlone: providers that omit usage (no terminal
 // chunk) must not corrupt totals or fire misleading events.
 func TestUsageMissingLeavesTotalsAlone(t *testing.T) {
-	srv := textServer(t, func(n int, req llm.Request) string { return "done" })
+	srv := textServer(t, func(n int, req models.Request) string { return "done" })
 	defer srv.Close()
 	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
 	if _, err := ag.Turn(context.Background(), "go", Events{}); err != nil {
@@ -509,7 +827,7 @@ func TestUsageMissingLeavesTotalsAlone(t *testing.T) {
 }
 
 func TestSteerContinuesTurn(t *testing.T) {
-	srv := textServer(t, func(n int, req llm.Request) string {
+	srv := textServer(t, func(n int, req models.Request) string {
 		if n == 2 {
 			last := req.Messages[len(req.Messages)-1]
 			if last.Role != "user" || last.Content != "also do this" {
@@ -539,7 +857,7 @@ func TestSteerContinuesTurn(t *testing.T) {
 }
 
 func TestNoSteerEndsTurn(t *testing.T) {
-	srv := textServer(t, func(n int, req llm.Request) string { return "done" })
+	srv := textServer(t, func(n int, req models.Request) string { return "done" })
 	defer srv.Close()
 	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
 	final, err := ag.Turn(context.Background(), "go", Events{})
@@ -551,7 +869,7 @@ func TestNoSteerEndsTurn(t *testing.T) {
 func TestTaskToolSpawnsSubagent(t *testing.T) {
 	call := 0
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var req llm.Request
+		var req models.Request
 		json.NewDecoder(r.Body).Decode(&req)
 		call++
 		w.Header().Set("Content-Type", "text/event-stream")
@@ -675,8 +993,8 @@ func compactionServer(t *testing.T) (*httptest.Server, *int) {
 			http.Error(w, `{"error":{"code":"context_length_exceeded"}}`, http.StatusBadRequest)
 		case 2:
 			var req struct {
-				Stream   bool          `json:"stream"`
-				Messages []llm.Message `json:"messages"`
+				Stream   bool             `json:"stream"`
+				Messages []models.Message `json:"messages"`
 			}
 			json.NewDecoder(r.Body).Decode(&req)
 			if req.Stream {
@@ -700,8 +1018,8 @@ func TestTurnAutoCompactsOnContextLimit(t *testing.T) {
 	// build a history that's compactable: system + enough turns
 	for i := 0; i < 8; i++ {
 		ag.Messages = append(ag.Messages,
-			llm.Message{Role: "user", Content: fmt.Sprintf("q%d", i)},
-			llm.Message{Role: "assistant", Content: fmt.Sprintf("a%d", i)},
+			models.Message{Role: "user", Content: fmt.Sprintf("q%d", i)},
+			models.Message{Role: "assistant", Content: fmt.Sprintf("a%d", i)},
 		)
 	}
 	var compacted int
@@ -736,8 +1054,8 @@ func TestCompactDoesNotLoopOnRepeatedContextLimit(t *testing.T) {
 		// every stream fails with context_length_exceeded
 		if r.URL.Path == "/chat/completions" {
 			var req struct {
-				Stream   bool          `json:"stream"`
-				Messages []llm.Message `json:"messages"`
+				Stream   bool             `json:"stream"`
+				Messages []models.Message `json:"messages"`
 			}
 			json.NewDecoder(r.Body).Decode(&req)
 			if !req.Stream { // the summary call
@@ -752,8 +1070,8 @@ func TestCompactDoesNotLoopOnRepeatedContextLimit(t *testing.T) {
 	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
 	for i := 0; i < 8; i++ {
 		ag.Messages = append(ag.Messages,
-			llm.Message{Role: "user", Content: fmt.Sprintf("q%d", i)},
-			llm.Message{Role: "assistant", Content: fmt.Sprintf("a%d", i)},
+			models.Message{Role: "user", Content: fmt.Sprintf("q%d", i)},
+			models.Message{Role: "assistant", Content: fmt.Sprintf("a%d", i)},
 		)
 	}
 	_, err := ag.Turn(context.Background(), "go", Events{})
@@ -769,11 +1087,11 @@ func TestEstimateTokens(t *testing.T) {
 	if got := EstimateTokens(nil); got != 0 {
 		t.Fatalf("empty: %d", got)
 	}
-	msgs := []llm.Message{
+	msgs := []models.Message{
 		{Role: "system", Content: strings.Repeat("x", 400)}, // 400/4 + 4 = 104
-		{Role: "assistant", ToolCalls: []llm.ToolCall{ // 4 + 8 + (4+96+3)/4 = 37
-			func() llm.ToolCall {
-				var tc llm.ToolCall
+		{Role: "assistant", ToolCalls: []models.ToolCall{ // 4 + 8 + (4+96+3)/4 = 37
+			func() models.ToolCall {
+				var tc models.ToolCall
 				tc.Function.Name = "tool"
 				tc.Function.Arguments = strings.Repeat("y", 96)
 				return tc
@@ -792,15 +1110,15 @@ func TestContextTokensUsesLatestReportedRequest(t *testing.T) {
 	}
 
 	ag.Messages = append(ag.Messages,
-		llm.Message{Role: "assistant", Content: "first", Usage: &llm.Usage{PromptTokens: 100, CompletionTokens: 20}},
-		llm.Message{Role: "user", Content: "next"},
-		llm.Message{Role: "assistant", Content: "latest", Usage: &llm.Usage{PromptTokens: 300, CompletionTokens: 40}},
+		models.Message{Role: "assistant", Content: "first", Usage: &models.Usage{PromptTokens: 100, CompletionTokens: 20}},
+		models.Message{Role: "user", Content: "next"},
+		models.Message{Role: "assistant", Content: "latest", Usage: &models.Usage{PromptTokens: 300, CompletionTokens: 40}},
 	)
 	if got, want := ag.ContextTokens(), 340; got != want {
 		t.Fatalf("latest context tokens = %d, want %d", got, want)
 	}
 
-	ag.Messages = append(ag.Messages, llm.Message{Role: "user", Content: strings.Repeat("x", 400)})
+	ag.Messages = append(ag.Messages, models.Message{Role: "user", Content: strings.Repeat("x", 400)})
 	if got, want := ag.ContextTokens(), 340+104; got != want {
 		t.Fatalf("context tokens with unreported message = %d, want %d", got, want)
 	}
@@ -811,8 +1129,8 @@ func TestProactiveCompactAtFiftyPercent(t *testing.T) {
 	// no context_length_exceeded round-trip needed
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
-			Stream   bool          `json:"stream"`
-			Messages []llm.Message `json:"messages"`
+			Stream   bool             `json:"stream"`
+			Messages []models.Message `json:"messages"`
 		}
 		json.NewDecoder(r.Body).Decode(&req)
 		if !req.Stream {
@@ -833,14 +1151,14 @@ func TestProactiveCompactAtFiftyPercent(t *testing.T) {
 	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
 	ag.ContextLimit = 1000 // default 50% = 500 reported context tokens
 	for i := 0; i < 8; i++ {
-		ag.Messages = append(ag.Messages, llm.Message{Role: "user", Content: strings.Repeat("x", 120)})
+		ag.Messages = append(ag.Messages, models.Message{Role: "user", Content: strings.Repeat("x", 120)})
 	}
-	ag.Messages = append(ag.Messages, llm.Message{
+	ag.Messages = append(ag.Messages, models.Message{
 		Role: "assistant", Content: "previous response",
-		Usage: &llm.Usage{PromptTokens: 250, CompletionTokens: 100},
+		Usage: &models.Usage{PromptTokens: 250, CompletionTokens: 100},
 	})
 	// Unreported pressure from a large tool result after the last usage-bearing assistant message
-	ag.Messages = append(ag.Messages, llm.Message{
+	ag.Messages = append(ag.Messages, models.Message{
 		Role: "tool", Content: strings.Repeat("a", 1000),
 	})
 	var compacted bool
@@ -859,46 +1177,44 @@ func TestProactiveCompactAtFiftyPercent(t *testing.T) {
 }
 
 func TestCompactThresholdExplicitOverride(t *testing.T) {
-	srv := textServer(t, func(n int, req llm.Request) string { return "done" })
+	srv := textServer(t, func(n int, req models.Request) string { return "done" })
 	defer srv.Close()
 
-	// 55% of the limit: over the 50% default, under an explicit 80% — no
-	// compaction for the explicit override.
+	// 55% of the limit: under the 80% default — no compaction
 	ag := New(testBackend(srv.URL, "m"), "m", 100, "sys")
 	ag.ContextLimit = 1000
-	ag.CompactThreshold = 0.8
 	for i := 0; i < 8; i++ {
-		ag.Messages = append(ag.Messages, llm.Message{Role: "user", Content: strings.Repeat("x", 360)})
+		ag.Messages = append(ag.Messages, models.Message{Role: "user", Content: strings.Repeat("x", 360)})
 	}
-	ag.Messages = append(ag.Messages, llm.Message{
+	ag.Messages = append(ag.Messages, models.Message{
 		Role: "assistant", Content: "previous response",
-		Usage: &llm.Usage{PromptTokens: 400, CompletionTokens: 150},
+		Usage: &models.Usage{PromptTokens: 400, CompletionTokens: 150},
 	})
 	if _, err := ag.Turn(context.Background(), "hi", Events{}); err != nil {
 		t.Fatal(err)
 	}
 	if len(ag.Messages) != 12 { // system + 8 users + reported assistant + user + assistant
-		t.Fatalf("history should not compact below the explicit threshold, got %d msgs", len(ag.Messages))
+		t.Fatalf("history should not compact below the default 80%% threshold, got %d msgs", len(ag.Messages))
 	}
 
-	// CompactThreshold wins over the default: same history at the default 50%
-	// would have compacted
+	// CompactThreshold wins over the default: explicit 50% threshold compacts
 	ag2 := New(testBackend(srv.URL, "m"), "m", 100, "sys")
 	ag2.ContextLimit = 1000
+	ag2.CompactThreshold = 0.5
 	for i := 0; i < 8; i++ {
-		ag2.Messages = append(ag2.Messages, llm.Message{Role: "user", Content: strings.Repeat("x", 360)})
+		ag2.Messages = append(ag2.Messages, models.Message{Role: "user", Content: strings.Repeat("x", 360)})
 	}
-	ag2.Messages = append(ag2.Messages, llm.Message{
+	ag2.Messages = append(ag2.Messages, models.Message{
 		Role: "assistant", Content: "previous response",
-		Usage: &llm.Usage{PromptTokens: 400, CompletionTokens: 150},
+		Usage: &models.Usage{PromptTokens: 400, CompletionTokens: 150},
 	})
 	if err := ag2.maybeCompact(context.Background(), Events{}); err == nil {
-		t.Fatal("the same history should compact at the default 50% threshold")
+		t.Fatal("the same history should compact at the explicit 50% threshold")
 	}
 }
 
 func TestNoProactiveCompactBelowThresholdOrWithoutLimit(t *testing.T) {
-	srv := textServer(t, func(n int, req llm.Request) string { return "done" })
+	srv := textServer(t, func(n int, req models.Request) string { return "done" })
 	defer srv.Close()
 
 	// below threshold: estimate well under 50% of the limit
@@ -910,7 +1226,7 @@ func TestNoProactiveCompactBelowThresholdOrWithoutLimit(t *testing.T) {
 
 	// no advertised limit: proactive compaction disabled regardless of size
 	ag2 := New(testBackend(srv.URL, "k"), "m", 100, "sys")
-	ag2.Messages = append(ag2.Messages, llm.Message{Role: "user", Content: strings.Repeat("x", 4000)})
+	ag2.Messages = append(ag2.Messages, models.Message{Role: "user", Content: strings.Repeat("x", 4000)})
 	if _, err := ag2.Turn(context.Background(), "hi", Events{}); err != nil {
 		t.Fatal(err)
 	}
@@ -920,15 +1236,15 @@ func TestNoProactiveCompactBelowThresholdOrWithoutLimit(t *testing.T) {
 }
 
 func TestCompactUsesCompactModel(t *testing.T) {
-	var models []string
+	var modelIDs []string
 	main := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Error("summary call must not hit the conversation's provider")
 	}))
 	defer main.Close()
 	sum := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var req llm.Request
+		var req models.Request
 		json.NewDecoder(r.Body).Decode(&req)
-		models = append(models, req.Model)
+		modelIDs = append(modelIDs, req.Model)
 		w.Write([]byte(`{"choices":[{"message":{"content":"sim"}}]}`))
 	}))
 	defer sum.Close()
@@ -938,21 +1254,21 @@ func TestCompactUsesCompactModel(t *testing.T) {
 	ag.CompactModel = "summary-model"
 	for i := 0; i < 8; i++ {
 		ag.Messages = append(ag.Messages,
-			llm.Message{Role: "user", Content: fmt.Sprintf("q%d", i)},
-			llm.Message{Role: "assistant", Content: fmt.Sprintf("a%d", i)},
+			models.Message{Role: "user", Content: fmt.Sprintf("q%d", i)},
+			models.Message{Role: "assistant", Content: fmt.Sprintf("a%d", i)},
 		)
 	}
 	if err := ag.ManualCompact(context.Background(), Events{}); err != nil {
 		t.Fatal(err)
 	}
-	if len(models) != 1 || models[0] != "summary-model" {
-		t.Fatalf("summary should run on summary-model, got %v", models)
+	if len(modelIDs) != 1 || modelIDs[0] != "summary-model" {
+		t.Fatalf("summary should run on summary-model, got %v", modelIDs)
 	}
 }
 
 func TestCompactionTelemetryUsesSummaryRoute(t *testing.T) {
-	conversation := &routeBackend{protocol: llm.ProtocolOpenAIChatCompletions}
-	summary := &routeBackend{protocol: llm.ProtocolAnthropicMessages}
+	conversation := &routeBackend{protocol: models.ProtocolOpenAIChatCompletions}
+	summary := &routeBackend{protocol: models.ProtocolAnthropicMessages}
 	ag := New(conversation, "conversation-model", 100, "sys")
 	ag.Role, ag.Provider, ag.Protocol = "fast", "main-provider", string(conversation.protocol)
 	ag.CompactBackend = summary
@@ -961,8 +1277,8 @@ func TestCompactionTelemetryUsesSummaryRoute(t *testing.T) {
 	ag.CompactProtocol = string(summary.protocol)
 	for i := 0; i < 8; i++ {
 		ag.Messages = append(ag.Messages,
-			llm.Message{Role: "user", Content: fmt.Sprintf("question %d", i)},
-			llm.Message{Role: "assistant", Content: fmt.Sprintf("answer %d", i)},
+			models.Message{Role: "user", Content: fmt.Sprintf("question %d", i)},
+			models.Message{Role: "assistant", Content: fmt.Sprintf("answer %d", i)},
 		)
 	}
 	var starts []ModelCallStart
@@ -986,22 +1302,22 @@ func TestCompactionTelemetryUsesSummaryRoute(t *testing.T) {
 }
 
 type routeBackend struct {
-	protocol llm.Protocol
+	protocol models.Protocol
 }
 
-func (b *routeBackend) AdapterProtocol() llm.Protocol { return b.protocol }
+func (b *routeBackend) AdapterProtocol() models.Protocol { return b.protocol }
 
-func (b *routeBackend) Stream(context.Context, llm.Request, llm.EventSink) (llm.Message, llm.Usage, error) {
-	return llm.Message{}, llm.Usage{}, nil
+func (b *routeBackend) Stream(context.Context, models.Request, models.EventSink) (models.Message, models.Usage, error) {
+	return models.Message{}, models.Usage{}, nil
 }
 
-func (b *routeBackend) Complete(context.Context, llm.Request) (llm.Message, llm.Usage, error) {
-	return llm.Message{Role: "assistant", Content: "summary"}, llm.Usage{}, nil
+func (b *routeBackend) Complete(context.Context, models.Request) (models.Message, models.Usage, error) {
+	return models.Message{Role: "assistant", Content: "summary"}, models.Usage{}, nil
 }
 
 func TestCompactTooLittleHistory(t *testing.T) {
 	ag := New(testBackend("http://unused", "k"), "m", 100, "sys")
-	ag.Messages = append(ag.Messages, llm.Message{Role: "user", Content: "hi"})
+	ag.Messages = append(ag.Messages, models.Message{Role: "user", Content: "hi"})
 	if _, _, err := ag.compactWithEvents(context.Background(), Events{}); err == nil {
 		t.Fatal("expected error compacting a tiny history")
 	}
@@ -1017,14 +1333,14 @@ func TestCompactKeepsToolCallPair(t *testing.T) {
 	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
 	// system, user, asst(with tool call "t1"), tool("t1" result), user, asst, user
 	for i := 0; i < 4; i++ {
-		ag.Messages = append(ag.Messages, llm.Message{Role: "user", Content: fmt.Sprintf("u%d", i)})
+		ag.Messages = append(ag.Messages, models.Message{Role: "user", Content: fmt.Sprintf("u%d", i)})
 		if i == 0 {
 			ag.Messages = append(ag.Messages,
-				llm.Message{Role: "assistant", ToolCalls: []llm.ToolCall{{ID: "t1", Type: "function"}}},
+				models.Message{Role: "assistant", ToolCalls: []models.ToolCall{{ID: "t1", Type: "function"}}},
 			)
-			ag.Messages = append(ag.Messages, llm.Message{Role: "tool", Content: "tool-out", ToolCallID: "t1"})
+			ag.Messages = append(ag.Messages, models.Message{Role: "tool", Content: "tool-out", ToolCallID: "t1"})
 		} else {
-			ag.Messages = append(ag.Messages, llm.Message{Role: "assistant", Content: fmt.Sprintf("a%d", i)})
+			ag.Messages = append(ag.Messages, models.Message{Role: "assistant", Content: fmt.Sprintf("a%d", i)})
 		}
 	}
 	before := len(ag.Messages)
@@ -1035,7 +1351,7 @@ func TestCompactKeepsToolCallPair(t *testing.T) {
 		t.Fatalf("compaction didn't shrink: before %d after %d", before, len(ag.Messages))
 	}
 	// find the kept tool result and its owning assistant
-	var asstTool, toolMsg *llm.Message
+	var asstTool, toolMsg *models.Message
 	for i := range ag.Messages {
 		if ag.Messages[i].Role == "tool" {
 			toolMsg = &ag.Messages[i]
@@ -1055,23 +1371,23 @@ func TestCompactKeepsToolCallPair(t *testing.T) {
 	}
 }
 
-func TestCompactShrinksOversizedRecentToolResultAndKeepsArtifactRef(t *testing.T) {
-	ref := artifact.Ref{
+func TestCompactShrinksOversizedRecentToolResultAndKeepsOutputRef(t *testing.T) {
+	ref := models.OutputRef{
 		ID: "sha256:" + strings.Repeat("a", 64), Hash: strings.Repeat("a", 64),
 		OriginalBytes: 20000, StoredBytes: 20000, Complete: true,
 	}
-	content := strings.Repeat("x", 20000) + tools.ArtifactReference(ref)
-	call := llm.ToolCall{ID: "call-1", Type: "function", Function: struct {
+	content := strings.Repeat("x", 20000) + tools.OutputReference(ref)
+	call := models.ToolCall{ID: "call-1", Type: "function", Function: struct {
 		Name      string `json:"name"`
 		Arguments string `json:"arguments"`
 	}{Name: "read", Arguments: `{}`}}
-	msgs := []llm.Message{
+	msgs := []models.Message{
 		{Role: "system", Content: "sys"},
 		{Role: "user", Content: "old"},
 		{Role: "assistant", Content: "old answer"},
 		{Role: "user", Content: "recent"},
-		{Role: "assistant", ToolCalls: []llm.ToolCall{call}},
-		{Role: "tool", Content: content, ToolCallID: "call-1", Name: "read", Artifact: &ref},
+		{Role: "assistant", ToolCalls: []models.ToolCall{call}},
+		{Role: "tool", Content: content, ToolCallID: "call-1", Name: "read", Output: &ref},
 	}
 
 	start, tail := compactTail(msgs, 128)
@@ -1090,16 +1406,16 @@ func TestCompactShrinksOversizedRecentToolResultAndKeepsArtifactRef(t *testing.T
 	}
 }
 
-func TestArtifactManifestIncludesOnlyCitedAndRecentRefs(t *testing.T) {
-	cited := artifact.Ref{ID: "sha256:" + strings.Repeat("b", 64), Hash: strings.Repeat("b", 64), OriginalBytes: 20, StoredBytes: 10, Complete: false}
-	omitted := artifact.Ref{ID: "sha256:" + strings.Repeat("c", 64), Hash: strings.Repeat("c", 64), OriginalBytes: 30, StoredBytes: 15, Complete: false}
-	recent := artifact.Ref{ID: "sha256:" + strings.Repeat("d", 64), Hash: strings.Repeat("d", 64), OriginalBytes: 40, StoredBytes: 40, Complete: true}
-	all := []llm.Message{
-		{Role: "tool", Artifact: &cited},
-		{Role: "tool", Artifact: &omitted},
+func TestOutputManifestIncludesOnlyCitedAndRecentRefs(t *testing.T) {
+	cited := models.OutputRef{ID: "sha256:" + strings.Repeat("b", 64), Hash: strings.Repeat("b", 64), OriginalBytes: 20, StoredBytes: 10, Complete: false}
+	omitted := models.OutputRef{ID: "sha256:" + strings.Repeat("c", 64), Hash: strings.Repeat("c", 64), OriginalBytes: 30, StoredBytes: 15, Complete: false}
+	recent := models.OutputRef{ID: "sha256:" + strings.Repeat("d", 64), Hash: strings.Repeat("d", 64), OriginalBytes: 40, StoredBytes: 40, Complete: true}
+	all := []models.Message{
+		{Role: "tool", Output: &cited},
+		{Role: "tool", Output: &omitted},
 	}
-	tail := []llm.Message{{Role: "tool", Artifact: &recent}}
-	manifest := buildArtifactManifest("prior work used "+cited.ID, tail, all)
+	tail := []models.Message{{Role: "tool", Output: &recent}}
+	manifest := buildOutputManifest("prior work used "+cited.ID, tail, all)
 	if !strings.Contains(manifest, cited.ID) || !strings.Contains(manifest, recent.ID) {
 		t.Fatalf("manifest missing cited/recent refs: %s", manifest)
 	}
@@ -1119,8 +1435,8 @@ func TestManualCompactFiresEvent(t *testing.T) {
 	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
 	for i := 0; i < 8; i++ {
 		ag.Messages = append(ag.Messages,
-			llm.Message{Role: "user", Content: fmt.Sprintf("q%d", i)},
-			llm.Message{Role: "assistant", Content: fmt.Sprintf("a%d", i)},
+			models.Message{Role: "user", Content: fmt.Sprintf("q%d", i)},
+			models.Message{Role: "assistant", Content: fmt.Sprintf("a%d", i)},
 		)
 	}
 	var fired bool
@@ -1136,12 +1452,12 @@ func TestCompactionPersistenceFailureKeepsRawMessages(t *testing.T) {
 	ag := New(&routeBackend{}, "m", 100, "sys")
 	for i := 0; i < 8; i++ {
 		ag.Messages = append(ag.Messages,
-			llm.Message{Role: "user", Content: fmt.Sprintf("q%d", i)},
-			llm.Message{Role: "assistant", Content: fmt.Sprintf("a%d", i)},
+			models.Message{Role: "user", Content: fmt.Sprintf("q%d", i)},
+			models.Message{Role: "assistant", Content: fmt.Sprintf("a%d", i)},
 		)
 	}
 	before := ag.MessagesSnapshot()
-	err := ag.ManualCompact(context.Background(), Events{OnCompactionReady: func([]llm.Message, string, int) error {
+	err := ag.ManualCompact(context.Background(), Events{OnCompactionReady: func([]models.Message, string, int) error {
 		return errors.New("disk full")
 	}})
 	if err == nil || !reflect.DeepEqual(ag.MessagesSnapshot(), before) {
@@ -1162,8 +1478,8 @@ func TestPreflightCompactionTriggersOnAbsoluteReserve(t *testing.T) {
 
 	for i := 0; i < 8; i++ {
 		ag.Messages = append(ag.Messages,
-			llm.Message{Role: "user", Content: strings.Repeat("hello world ", 10)},
-			llm.Message{Role: "assistant", Content: strings.Repeat("answer here ", 10)},
+			models.Message{Role: "user", Content: strings.Repeat("hello world ", 10)},
+			models.Message{Role: "assistant", Content: strings.Repeat("answer here ", 10)},
 		)
 	}
 
@@ -1191,12 +1507,563 @@ func TestOneShotOverflowFailsTerminalOnSecondError(t *testing.T) {
 	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
 	for i := 0; i < 8; i++ {
 		ag.Messages = append(ag.Messages,
-			llm.Message{Role: "user", Content: fmt.Sprintf("q%d", i)},
-			llm.Message{Role: "assistant", Content: fmt.Sprintf("a%d", i)},
+			models.Message{Role: "user", Content: fmt.Sprintf("q%d", i)},
+			models.Message{Role: "assistant", Content: fmt.Sprintf("a%d", i)},
 		)
 	}
 	_, err := ag.Turn(context.Background(), "hello", Events{})
-	if err == nil || !llm.IsContextLimit(err) {
+	if err == nil || !models.IsContextLimit(err) {
 		t.Fatalf("expected context limit exceeded terminal error, got %v", err)
+	}
+}
+
+func TestCumulativeCompactionIncludesPriorCheckpoint(t *testing.T) {
+	var summaryUserPrompt string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req models.Request
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		for _, m := range req.Messages {
+			if m.Role == "user" {
+				summaryUserPrompt = m.Content
+			}
+		}
+		w.Write([]byte(`{"choices":[{"message":{"content":"cumulative checkpoint"}}]}`))
+	}))
+	defer srv.Close()
+
+	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
+	ag.Messages = []models.Message{
+		{Role: "system", Content: "sys"},
+		{Role: "system", Content: "Summary of the conversation so far:\n\nInitial milestone reached."},
+		{Role: "user", Content: "now please do part 2"},
+		{Role: "assistant", Content: "working on part 2"},
+		{Role: "user", Content: "now please do part 3"},
+		{Role: "assistant", Content: "working on part 3"},
+		{Role: "user", Content: "now please do part 4"},
+		{Role: "assistant", Content: "working on part 4"},
+	}
+
+	if err := ag.ManualCompact(context.Background(), Events{}); err != nil {
+		t.Fatal(err)
+	}
+
+	if !strings.Contains(summaryUserPrompt, "<previous_checkpoint>") ||
+		!strings.Contains(summaryUserPrompt, "Initial milestone reached.") {
+		t.Fatalf("summary request omitted prior checkpoint: %s", summaryUserPrompt)
+	}
+	if !strings.Contains(summaryUserPrompt, "<new_history>") {
+		t.Fatalf("summary request omitted <new_history>: %s", summaryUserPrompt)
+	}
+}
+
+func TestCompactionRejectsTruncatedSummary(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"choices":[{"message":{"content":"truncated summary..."},"finish_reason":"length"}]}`))
+	}))
+	defer srv.Close()
+
+	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
+	for i := 0; i < 8; i++ {
+		ag.Messages = append(ag.Messages,
+			models.Message{Role: "user", Content: fmt.Sprintf("q%d", i)},
+			models.Message{Role: "assistant", Content: fmt.Sprintf("a%d", i)},
+		)
+	}
+	err := ag.ManualCompact(context.Background(), Events{})
+	if err == nil || !strings.Contains(err.Error(), "truncated by token limit") {
+		t.Fatalf("expected truncated by token limit error, got %v", err)
+	}
+}
+
+type mockAgentBackend struct {
+	responses []models.Message
+	callCount int
+}
+
+func (m *mockAgentBackend) Stream(ctx context.Context, req models.Request, sink models.EventSink) (models.Message, models.Usage, error) {
+	if m.callCount >= len(m.responses) {
+		return models.Message{Role: "assistant", Content: "done"}, models.Usage{}, nil
+	}
+	resp := m.responses[m.callCount]
+	m.callCount++
+	return resp, models.Usage{}, nil
+}
+
+func (m *mockAgentBackend) Complete(ctx context.Context, req models.Request) (models.Message, models.Usage, error) {
+	return m.Stream(ctx, req, models.EventSink{})
+}
+
+func TestToolBatchValidationAndConcurrency(t *testing.T) {
+	t.Run("PathologicalDuplicateBatch", func(t *testing.T) {
+		var toolExecutions int
+		var toolStarts int
+		var toolEnds int
+
+		dummyTool := tools.Tool{
+			Def: models.NewTool("read", "read tool", "{}"),
+			Run: func(ctx context.Context, args json.RawMessage) (string, error) {
+				toolExecutions++
+				return "ok", nil
+			},
+		}
+
+		calls := make([]models.ToolCall, 194)
+		for i := range calls {
+			calls[i] = models.ToolCall{
+				ID:   fmt.Sprintf("call-%d", i),
+				Type: "function",
+			}
+			calls[i].Function.Name = "read"
+			calls[i].Function.Arguments = `{"path":"same.txt"}`
+		}
+
+		backend := &mockAgentBackend{
+			responses: []models.Message{
+				{
+					Role:      "assistant",
+					ToolCalls: calls,
+				},
+			},
+		}
+
+		ag := New(backend, "test-model", 1000, "sys")
+		ag.Tools = []tools.Tool{dummyTool}
+
+		ev := Events{
+			OnToolStart: func(id, name, args string) { toolStarts++ },
+			OnToolEnd:   func(id, name, result string) { toolEnds++ },
+		}
+
+		_, err := ag.Turn(context.Background(), "do work", ev)
+		if err == nil {
+			t.Fatal("expected batch validation error, got nil")
+		}
+		if toolExecutions != 0 {
+			t.Fatalf("expected 0 tool executions, got %d", toolExecutions)
+		}
+		if toolStarts != 0 || toolEnds != 0 {
+			t.Fatalf("expected 0 tool events, got starts=%d ends=%d", toolStarts, toolEnds)
+		}
+		for _, msg := range ag.Messages {
+			if msg.Role == "assistant" {
+				t.Fatalf("malformed assistant response must not be retained in history: %+v", msg)
+			}
+		}
+	})
+
+	t.Run("EmergencyCeiling64", func(t *testing.T) {
+		var toolExecutions int
+		dummyTool := tools.Tool{
+			Def: models.NewTool("read", "read tool", "{}"),
+			Run: func(ctx context.Context, args json.RawMessage) (string, error) {
+				toolExecutions++
+				return "ok", nil
+			},
+		}
+
+		calls := make([]models.ToolCall, 65)
+		for i := range calls {
+			calls[i] = models.ToolCall{
+				ID:   fmt.Sprintf("call-%d", i),
+				Type: "function",
+			}
+			calls[i].Function.Name = "read"
+			calls[i].Function.Arguments = fmt.Sprintf(`{"path":"file-%d.txt"}`, i)
+		}
+
+		backend := &mockAgentBackend{
+			responses: []models.Message{
+				{Role: "assistant", ToolCalls: calls},
+			},
+		}
+
+		ag := New(backend, "test-model", 1000, "sys")
+		ag.Tools = []tools.Tool{dummyTool}
+
+		_, err := ag.Turn(context.Background(), "do work", Events{})
+		if err == nil || !strings.Contains(err.Error(), "exceeds limit 64") {
+			t.Fatalf("expected ceiling limit error, got: %v", err)
+		}
+		if toolExecutions != 0 {
+			t.Fatalf("expected 0 tool executions, got %d", toolExecutions)
+		}
+	})
+
+	t.Run("ThreeRepeatedFailures", func(t *testing.T) {
+		var toolExecutions int
+		failingTool := tools.Tool{
+			Def: models.NewTool("fail_tool", "failing tool", "{}"),
+			Run: func(ctx context.Context, args json.RawMessage) (string, error) {
+				toolExecutions++
+				return "", errors.New("persistent connection error")
+			},
+		}
+
+		makeCall := func(id string) []models.ToolCall {
+			call := models.ToolCall{
+				ID:   id,
+				Type: "function",
+			}
+			call.Function.Name = "fail_tool"
+			call.Function.Arguments = `{"retry":true}`
+			return []models.ToolCall{call}
+		}
+
+		backend := &mockAgentBackend{
+			responses: []models.Message{
+				{Role: "assistant", ToolCalls: makeCall("call-1")},
+				{Role: "assistant", ToolCalls: makeCall("call-2")},
+				{Role: "assistant", ToolCalls: makeCall("call-3")},
+				{Role: "assistant", ToolCalls: makeCall("call-4")},
+			},
+		}
+
+		ag := New(backend, "test-model", 1000, "sys")
+		ag.Tools = []tools.Tool{failingTool}
+
+		_, err := ag.Turn(context.Background(), "test failures", Events{})
+		if err == nil || !strings.Contains(err.Error(), "failed repeatedly") {
+			t.Fatalf("expected repeated failure error, got: %v", err)
+		}
+		if toolExecutions != 3 {
+			t.Fatalf("expected exactly 3 tool executions, got %d", toolExecutions)
+		}
+		if backend.callCount != 3 {
+			t.Fatalf("expected 3 model calls, but 4th request was made: callCount=%d", backend.callCount)
+		}
+	})
+
+	t.Run("BoundedConcurrency", func(t *testing.T) {
+		var active atomic.Int32
+		var maxActive atomic.Int32
+
+		concurrentTool := tools.Tool{
+			Def: models.NewTool("sleep_tool", "sleep tool", "{}"),
+			Run: func(ctx context.Context, args json.RawMessage) (string, error) {
+				cur := active.Add(1)
+				for {
+					old := maxActive.Load()
+					if cur <= old || maxActive.CompareAndSwap(old, cur) {
+						break
+					}
+				}
+				time.Sleep(30 * time.Millisecond)
+				active.Add(-1)
+				return "ok", nil
+			},
+		}
+
+		const totalCalls = 8
+		calls := make([]models.ToolCall, totalCalls)
+		for i := range calls {
+			calls[i] = models.ToolCall{
+				ID:   fmt.Sprintf("sleep-%d", i),
+				Type: "function",
+			}
+			calls[i].Function.Name = "sleep_tool"
+			calls[i].Function.Arguments = fmt.Sprintf(`{"id":%d}`, i)
+		}
+
+		backend := &mockAgentBackend{
+			responses: []models.Message{
+				{
+					Role:      "assistant",
+					ToolCalls: calls,
+				},
+				{
+					Role:    "assistant",
+					Content: "finished all tasks",
+				},
+			},
+		}
+
+		ag := New(backend, "test-model", 1000, "sys")
+		ag.Tools = []tools.Tool{concurrentTool}
+
+		resp, err := ag.Turn(context.Background(), "run concurrently", Events{})
+		if err != nil {
+			t.Fatalf("unexpected turn error: %v", err)
+		}
+		if resp != "finished all tasks" {
+			t.Fatalf("unexpected final response: %q", resp)
+		}
+		if got := maxActive.Load(); got > maxConcurrentTools {
+			t.Fatalf("max concurrent executions %d exceeded limit %d", got, maxConcurrentTools)
+		}
+		if got := maxActive.Load(); got < 2 {
+			t.Fatalf("expected concurrent execution, but max active was %d", got)
+		}
+	})
+}
+
+func TestMalformedToolCallQuarantinedAndRecovered(t *testing.T) {
+	var toolExecuted bool
+	dummyTool := tools.Tool{
+		Def: models.NewTool("test_tool", "test tool", "{}"),
+		Run: func(ctx context.Context, args json.RawMessage) (string, error) {
+			toolExecuted = true
+			return "ok", nil
+		},
+	}
+
+	backend := &mockAgentBackend{
+		responses: []models.Message{
+			{
+				Role: "assistant",
+				ToolCalls: []models.ToolCall{
+					{
+						ID:   "call-malformed",
+						Type: "function",
+						Function: struct {
+							Name      string `json:"name"`
+							Arguments string `json:"arguments"`
+						}{
+							Name:      "test_tool",
+							Arguments: `{unquoted_invalid_json: true`,
+						},
+					},
+				},
+			},
+			{
+				Role: "assistant",
+				ToolCalls: []models.ToolCall{
+					{
+						ID:   "call-valid",
+						Type: "function",
+						Function: struct {
+							Name      string `json:"name"`
+							Arguments string `json:"arguments"`
+						}{
+							Name:      "test_tool",
+							Arguments: `{"valid": true}`,
+						},
+					},
+				},
+			},
+			{
+				Role:    "assistant",
+				Content: "all done",
+			},
+		},
+	}
+
+	ag := New(backend, "test-model", 1000, "sys")
+	ag.Tools = []tools.Tool{dummyTool}
+
+	resp, err := ag.Turn(context.Background(), "do something", Events{})
+	if err != nil {
+		t.Fatalf("unexpected turn error: %v", err)
+	}
+	if resp != "all done" {
+		t.Fatalf("unexpected response: %q", resp)
+	}
+	if !toolExecuted {
+		t.Fatal("expected tool to execute on second round")
+	}
+
+	// Verify that the first assistant tool call in messages was sanitized
+	var sanitizedCallFound bool
+	for _, m := range ag.Messages {
+		if m.Role == "assistant" && len(m.ToolCalls) > 0 && m.ToolCalls[0].ID == "call-malformed" {
+			if m.ToolCalls[0].Function.Arguments != "{}" {
+				t.Fatalf("malformed arguments were not sanitized to {}: %q", m.ToolCalls[0].Function.Arguments)
+			}
+			sanitizedCallFound = true
+		}
+		if m.Role == "tool" && m.ToolCallID == "call-malformed" {
+			if !strings.Contains(m.Content, "malformed") {
+				t.Fatalf("expected synthetic error for malformed call, got: %q", m.Content)
+			}
+		}
+	}
+	if !sanitizedCallFound {
+		t.Fatal("sanitized call not found in agent messages")
+	}
+}
+
+func TestSecondMalformedToolCallTerminatesTurn(t *testing.T) {
+	var toolExecuted bool
+	dummyTool := tools.Tool{
+		Def: models.NewTool("test_tool", "test tool", "{}"),
+		Run: func(ctx context.Context, args json.RawMessage) (string, error) {
+			toolExecuted = true
+			return "ok", nil
+		},
+	}
+
+	backend := &mockAgentBackend{
+		responses: []models.Message{
+			{
+				Role: "assistant",
+				ToolCalls: []models.ToolCall{
+					{
+						ID:   "call-1",
+						Type: "function",
+						Function: struct {
+							Name      string `json:"name"`
+							Arguments string `json:"arguments"`
+						}{
+							Name:      "test_tool",
+							Arguments: `invalid json 1`,
+						},
+					},
+				},
+			},
+			{
+				Role: "assistant",
+				ToolCalls: []models.ToolCall{
+					{
+						ID:   "call-2",
+						Type: "function",
+						Function: struct {
+							Name      string `json:"name"`
+							Arguments string `json:"arguments"`
+						}{
+							Name:      "test_tool",
+							Arguments: `invalid json 2`,
+						},
+					},
+				},
+			},
+		},
+	}
+
+	ag := New(backend, "test-model", 1000, "sys")
+	ag.Tools = []tools.Tool{dummyTool}
+
+	_, err := ag.Turn(context.Background(), "do something", Events{})
+	if err == nil {
+		t.Fatal("expected error on second malformed call, got nil")
+	}
+	if !strings.Contains(err.Error(), "model tool channel remained malformed") {
+		t.Fatalf("unexpected error message: %v", err)
+	}
+	if toolExecuted {
+		t.Fatal("tool should never execute for malformed calls")
+	}
+}
+
+func TestSandboxCapabilityFailureTerminatesTurn(t *testing.T) {
+	sandboxTool := tools.Tool{
+		Def: models.NewTool("bash", "bash", "{}"),
+		RunResult: func(ctx context.Context, args json.RawMessage) (tools.ToolResult, error) {
+			return tools.ToolResult{
+				Preview:  "httptest: failed to listen on 127.0.0.1: operation not permitted",
+				ExitCode: 1,
+				Metadata: map[string]string{
+					"failure_kind": "sandbox_network_denied",
+				},
+			}, nil
+		},
+	}
+
+	backend := &mockAgentBackend{
+		responses: []models.Message{
+			{
+				Role: "assistant",
+				ToolCalls: []models.ToolCall{
+					{
+						ID:   "bash-call-1",
+						Type: "function",
+						Function: struct {
+							Name      string `json:"name"`
+							Arguments string `json:"arguments"`
+						}{
+							Name:      "bash",
+							Arguments: `{"command": "go test ./..."}`,
+						},
+					},
+				},
+			},
+			{
+				Role:    "assistant",
+				Content: "retrying with different test",
+			},
+		},
+	}
+
+	ag := New(backend, "test-model", 1000, "sys")
+	ag.Tools = []tools.Tool{sandboxTool}
+
+	_, err := ag.Turn(context.Background(), "run tests", Events{})
+	if err == nil {
+		t.Fatal("expected turn error for sandbox capability failure, got nil")
+	}
+	if !strings.Contains(err.Error(), "sandbox capability failure") {
+		t.Fatalf("expected sandbox capability failure error, got: %v", err)
+	}
+	if backend.callCount != 1 {
+		t.Fatalf("expected exactly 1 model call without retry, got %d", backend.callCount)
+	}
+}
+
+func TestLargeToolResultGetsAnOutputReference(t *testing.T) {
+	store, err := session.NewOutputStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	ag := New(nil, "m", 100, "sys")
+	ag.Outputs = store
+	ag.Tools = []tools.Tool{{
+		Def: models.NewTool("large", "large result", `{"type":"object","properties":{}}`),
+		RunResult: func(context.Context, json.RawMessage) (tools.ToolResult, error) {
+			raw := strings.Repeat("x", 60_000)
+			return tools.MarkUntrusted(tools.TextResult(raw, tools.Truncate(raw)), "test"), nil
+		},
+	}}
+	calls := []models.ToolCall{{ID: "large-1", Function: struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	}{Name: "large", Arguments: `{}`}}}
+	results := ag.runToolResultsWithTools(context.Background(), calls, Events{}, ag.AllTools())
+	if len(results) != 1 || results[0].Output == nil {
+		t.Fatalf("result did not get an output: %+v", results)
+	}
+	if !strings.Contains(results[0].Preview, "use output_read") {
+		t.Fatalf("preview missing recovery hint: %q", results[0].Preview[len(results[0].Preview)-100:])
+	}
+	if len(results[0].Preview) > 16<<10 {
+		t.Fatalf("output hint exceeded preview budget: %d", len(results[0].Preview))
+	}
+	if !strings.Contains(tools.ModelText(results[0]), "<untrusted_tool_output") {
+		t.Fatal("an explicitly untrusted result should be delimited for the model")
+	}
+	got, err := store.Read(context.Background(), *results[0].Output, 0, 100)
+	if err != nil || string(got) != strings.Repeat("x", 100) {
+		t.Fatalf("stored result = %q, %v", got, err)
+	}
+}
+
+func TestDisabledOutputsExplainUnrecoverableOutput(t *testing.T) {
+	ag := New(nil, "m", 100, "sys")
+	ag.Tools = []tools.Tool{{
+		Def: models.NewTool("large", "large result", `{"type":"object","properties":{}}`),
+		RunResult: func(context.Context, json.RawMessage) (tools.ToolResult, error) {
+			raw := strings.Repeat("x", 60_000)
+			return tools.TextResult(raw, tools.Truncate(raw)), nil
+		},
+	}}
+	calls := []models.ToolCall{{ID: "large-1", Function: struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	}{Name: "large", Arguments: `{}`}}}
+	results := ag.runToolResultsWithTools(context.Background(), calls, Events{}, ag.AllTools())
+	if len(results) != 1 || results[0].Output != nil {
+		t.Fatalf("disabled result should not have an output: %+v", results)
+	}
+}
+func TestSubagentGuidanceMatchesBoundedExplorationTools(t *testing.T) {
+	prompt := subagentPrompt()
+	for _, fragment := range []string{"grep", "glob", "find_files", "lsp", "lsp_rename", "bounded read", "observed edit ranges"} {
+		if !strings.Contains(prompt, fragment) {
+			t.Errorf("subagent prompt lacks %q: %s", fragment, prompt)
+		}
+	}
+	parent := New(nil, "model", 100, "system")
+	description := taskTool(parent).Def.Function.Description
+	for _, fragment := range []string{"grep", "glob", "find_files", "lsp", "lsp_rename", "observed edit ranges"} {
+		if !strings.Contains(description, fragment) {
+			t.Errorf("task description lacks %q: %s", fragment, description)
+		}
 	}
 }

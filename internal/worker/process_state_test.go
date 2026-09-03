@@ -3,6 +3,7 @@ package worker
 import (
 	"errors"
 	"os"
+	"path/filepath"
 	"runtime"
 	"testing"
 	"time"
@@ -55,5 +56,36 @@ func TestRuntimeStateRejectsForeignRecord(t *testing.T) {
 	}
 	if err := rt.WriteState(StateRecord{SessionID: "other", State: StateIdle}); !errors.Is(err, ErrInvalidSession) {
 		t.Fatalf("foreign state error = %v, want ErrInvalidSession", err)
+	}
+}
+
+func TestListStatesSkipsCorruptRecords(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Phase 3.7 first cut uses Unix workers")
+	}
+	baseDir := t.TempDir()
+	rt, err := NewRuntime(baseDir, "valid-1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	when := time.Now().UTC().Truncate(time.Second)
+	if err := rt.WriteState(StateRecord{State: StateIdle, Role: "fast", PID: 42, UpdatedAt: when}); err != nil {
+		t.Fatal(err)
+	}
+
+	corruptDir := filepath.Join(baseDir, "run", "corrupt-2")
+	if err := os.MkdirAll(corruptDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(corruptDir, "state.json"), []byte("{malformed json"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	states, err := ListStates(baseDir)
+	if err != nil {
+		t.Fatalf("ListStates returned error on corrupt record: %v", err)
+	}
+	if len(states) != 1 || states[0].SessionID != "valid-1" {
+		t.Fatalf("ListStates = %+v, want 1 valid record", states)
 	}
 }

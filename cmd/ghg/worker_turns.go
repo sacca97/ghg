@@ -3,16 +3,20 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/sacca97/ghg/internal/agent"
 	"github.com/sacca97/ghg/internal/config"
-	goalstate "github.com/sacca97/ghg/internal/goal"
-	"github.com/sacca97/ghg/internal/llm"
+	"github.com/sacca97/ghg/internal/export"
+	"github.com/sacca97/ghg/internal/memory"
+	"github.com/sacca97/ghg/internal/models"
 	"github.com/sacca97/ghg/internal/session"
+	"github.com/sacca97/ghg/internal/skills"
 	workerwire "github.com/sacca97/ghg/internal/worker"
 )
 
@@ -22,6 +26,10 @@ func (w *workerProcessState) startCompact() bool {
 
 func (w *workerProcessState) startTurn(input workerInput) bool {
 	return w.startOperation("turn", func(ctx context.Context) { w.runTurn(ctx, input) })
+}
+
+func (w *workerProcessState) startGoalFromContext(window int) bool {
+	return w.startOperation("goal formulation", func(ctx context.Context) { w.runGoalFromContext(ctx, window) })
 }
 
 func (w *workerProcessState) startOperation(detail string, run func(context.Context)) bool {
@@ -70,20 +78,94 @@ func (w *workerProcessState) finishOperation(detail string) {
 	}
 }
 
+func (w *workerProcessState) updateGoal(request workerwire.GoalRequest) (agent.GoalRecord, error) {
+	if err := w.requireIdleHistory(); err != nil {
+		return agent.GoalRecord{}, err
+	}
+	if w.store == nil || w.sessionID == "" {
+		return agent.GoalRecord{}, errors.New("session store unavailable")
+	}
+	if request.Action == "clear" {
+		if record, ok, err := w.store.LoadGoal(w.sessionID); err != nil {
+			return agent.GoalRecord{}, err
+		} else if ok {
+			record.Status = agent.GoalStatusPaused
+			record.Progress = ""
+			record.Blocker = "cleared by user"
+			record.UpdatedAt = time.Now().UTC()
+			if err := w.store.CheckpointGoal(w.sessionID, record); err != nil {
+				return agent.GoalRecord{}, err
+			}
+			w.publish("goal", record, true)
+			return record, nil
+		}
+		return agent.GoalRecord{}, nil
+	}
+	if request.Record == nil {
+		return agent.GoalRecord{}, errors.New("goal record is required")
+	}
+	record := *request.Record
+	if request.Action == "resume" {
+		record.Status = agent.GoalStatusActive
+		record.Blocker = ""
+		record.UpdatedAt = time.Now().UTC()
+	}
+	if err := record.Validate(); err != nil {
+		return agent.GoalRecord{}, err
+	}
+	if err := w.store.CheckpointGoal(w.sessionID, record); err != nil {
+		return agent.GoalRecord{}, err
+	}
+	w.publish("goal", record, true)
+	return record, nil
+}
+
+func (w *workerProcessState) runGoalFromContext(ctx context.Context, window int) {
+	tail, err := agent.GoalFromContextMessages(w.ag.MessagesSnapshot(), window)
+	if err == nil {
+		reasoningEffort, reasoningEnabled := w.ag.ReasoningRequest()
+		message, usage, callErr := w.ag.CompleteWithRoutePurpose(ctx, w.ag.Backend, w.ag.Role, w.ag.Provider, w.ag.Protocol, "goal-formulation", models.Request{
+			Model: w.ag.Model, MaxTokens: 8192,
+			Messages:        []models.Message{{Role: "user", Content: agent.BuildGoalFromContextPrompt(tail)}},
+			ReasoningEffort: reasoningEffort, ReasoningEnabled: reasoningEnabled,
+		}, agent.Events{})
+		w.ag.AddUsage(usage)
+		w.publish("usage", usage, true)
+		err = callErr
+		if err == nil {
+			objective := strings.TrimSpace(message.TextContent())
+			if objective == "" {
+				err = errors.New("model returned an empty goal")
+			} else {
+				record := agent.NewGoal(objective)
+				if saveErr := w.store.CheckpointGoal(w.sessionID, record); saveErr != nil {
+					err = saveErr
+				} else {
+					w.publish("goal", record, true)
+					w.publish("goal_from_context", workerwire.GoalFromContextResult{Goal: &record, Usage: usage}, true)
+					w.persist()
+					return
+				}
+			}
+		}
+	}
+	w.publish("goal_from_context", workerwire.GoalFromContextResult{Usage: models.Usage{}, Error: err.Error()}, true)
+}
+
 func (w *workerProcessState) runCompact(ctx context.Context) {
 	before := len(w.ag.MessagesSnapshot())
 	var summary string
 	var cutoff int
 	err := w.ag.ManualCompact(ctx, agent.Events{
-		OnCompactionReady: func(messages []llm.Message, summary string, cutoff int) error {
+		OnCompactionReady: func(messages []models.Message, summary string, cutoff int) error {
 			w.mu.Lock()
 			saved, modelName, providerName := w.saved, w.modelName, w.provider
 			w.mu.Unlock()
 			return w.store.PersistCompaction(w.sessionID, saved, messages, modelName, providerName, summary, cutoff)
 		},
 		OnCompacted: func(value string, at int) { summary, cutoff = value, at },
-		OnUsage:     func(usage llm.Usage) { w.publish("usage", usage, true) },
-		OnRetry:     func(retry llm.RetryEvent) { w.publish("retry", retry, true) },
+		OnUsage:     func(usage models.Usage) { w.publish("usage", usage, true) },
+		OnRetry:     func(retry models.RetryEvent) { w.publish("retry", retry, true) },
 	})
 	if err == nil {
 		kept := len(w.ag.MessagesSnapshot())
@@ -103,17 +185,165 @@ func (w *workerProcessState) runCompact(ctx context.Context) {
 	w.publish("compact_done", result, true)
 }
 
-func (w *workerProcessState) runTurn(ctx context.Context, input workerInput) {
-	if input.SystemPrompt != "" {
-		w.ag.SetSystemPrompt(input.SystemPrompt)
+func (w *workerProcessState) compactRetry() (workerwire.HistoryResult, error) {
+	if err := w.requireIdleHistory(); err != nil {
+		return workerwire.HistoryResult{}, err
 	}
-	if input.PlanMode || w.mode == "plan" {
+	if w.store == nil || w.sessionID == "" {
+		return workerwire.HistoryResult{}, errors.New("no session to retry a compaction in")
+	}
+	events := w.store.Compactions(w.sessionID)
+	if len(events) == 0 {
+		return workerwire.HistoryResult{}, errors.New("no compaction to retry")
+	}
+	last := events[len(events)-1]
+	if err := w.store.DeleteCompaction(w.sessionID, last.Seq); err != nil {
+		return workerwire.HistoryResult{}, err
+	}
+	_, messages, err := w.store.Load(w.sessionID)
+	if err != nil {
+		return workerwire.HistoryResult{}, err
+	}
+	messages = w.withSystemPrompt(messages)
+	w.ag.Messages = messages
+	w.ag.RebuildTouched(w.ag.MessagesSnapshot())
+	w.mu.Lock()
+	w.saved = len(messages)
+	w.mu.Unlock()
+	return w.historyResult(), nil
+}
+
+func (w *workerProcessState) rewind(request workerwire.RewindRequest) (workerwire.HistoryResult, error) {
+	if err := w.requireIdleHistory(); err != nil {
+		return workerwire.HistoryResult{}, err
+	}
+	if w.store == nil || w.sessionID == "" {
+		return workerwire.HistoryResult{}, errors.New("session store unavailable")
+	}
+	if len(request.Messages) == 0 || request.Messages[0].Role != "system" {
+		return workerwire.HistoryResult{}, errors.New("rewind history must include the system prompt")
+	}
+	current := w.ag.MessagesSnapshot()
+	restored := 0
+	cut := max(request.Cut, 1)
+	if cut > len(current) && cut > len(request.Messages) {
+		return workerwire.HistoryResult{}, errors.New("rewind boundary is invalid")
+	}
+
+	if cut < len(current) {
+		best, bestIdx := "", -1
+		for idx, ref := range w.store.Snapshots(w.sessionID) {
+			if idx >= cut && (bestIdx < 0 || idx < bestIdx) {
+				best, bestIdx = ref, idx
+			}
+		}
+		if best != "" {
+			wd, err := os.Getwd()
+			if err != nil {
+				return workerwire.HistoryResult{}, err
+			}
+			restored, err = session.RestoreWorkspace(wd, best)
+			if err != nil {
+				return workerwire.HistoryResult{}, err
+			}
+		}
+	}
+	if err := w.store.DeleteFrom(w.sessionID, cut); err != nil {
+		return workerwire.HistoryResult{}, err
+	}
+	messages := slices.Clone(request.Messages)
+	w.ag.Messages = messages
+	w.ag.RebuildTouched(w.ag.MessagesSnapshot())
+	w.mu.Lock()
+	saved := min(w.saved, cut)
+	modelName, providerName := w.modelName, w.provider
+	w.mu.Unlock()
+	if len(messages) > saved {
+		if err := w.store.Save(w.sessionID, saved, messages, modelName, providerName); err != nil {
+			return workerwire.HistoryResult{}, err
+		}
+	}
+	w.mu.Lock()
+	w.saved = len(messages)
+	w.mu.Unlock()
+	result := w.historyResult()
+	result.Restored = restored
+	return result, nil
+}
+
+func (w *workerProcessState) requireIdleHistory() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.activeCancel != nil || w.stopRequested || w.state == workerwire.StateStopping {
+		return errors.New("worker is busy or stopping")
+	}
+	return nil
+}
+
+func (w *workerProcessState) withSystemPrompt(messages []models.Message) []models.Message {
+	if len(messages) > 0 && messages[0].Role == "system" {
+		return messages
+	}
+	system := ""
+	if current := w.ag.MessagesSnapshot(); len(current) > 0 && current[0].Role == "system" {
+		system = current[0].Content
+	}
+	return append([]models.Message{{Role: "system", Content: system}}, messages...)
+}
+
+func (w *workerProcessState) historyResult() workerwire.HistoryResult {
+	return workerwire.HistoryResult{
+		SessionID: w.sessionID, Messages: boundedWorkerMessages(w.ag.MessagesSnapshot()),
+		Usage: w.ag.Usage(), ContextTokens: w.ag.ContextTokens(),
+	}
+}
+
+func (w *workerProcessState) runTurn(ctx context.Context, input workerInput) {
+	turnAt := len(w.ag.MessagesSnapshot())
+	snap := input.Snap
+	if snap == "" {
+		if wd, err := os.Getwd(); err == nil {
+			snap = session.SnapshotWorkspace(wd)
+		}
+	}
+	if snap != "" && w.store != nil {
+		_ = w.store.SetSnapshot(w.sessionID, turnAt, snap)
+	}
+	systemPrompt := input.SystemPrompt
+	if systemPrompt == "" {
+		if current := w.ag.MessagesSnapshot(); len(current) > 0 {
+			systemPrompt = current[0].Content
+		}
+	}
+	var additions []string
+	if wd, wdErr := os.Getwd(); wdErr == nil {
+		project := config.ProjectInstructions(wd, config.Trusted(wd))
+		if strings.Contains(systemPrompt, "<project_instructions>") {
+			systemPrompt = replaceProjectInstructions(systemPrompt, project)
+		} else if project != "" {
+			additions = append(additions, project)
+		}
+	}
+	additions = append(additions,
+		skills.PromptBlock(skills.Scan(skills.DefaultDirs()...)),
+		memory.PromptBlock(memory.Installation(), memory.Session(w.sessionID)),
+	)
+	if w.mcp != nil {
+		additions = append(additions, w.mcp.InstructionsBlock())
+	}
+	w.ag.SetSystemPrompt(agent.CompileSystemPrompt(systemPrompt, additions...))
+	if input.ReviewMode {
+		w.ag.ReviewMode = true
+		w.ag.PlanMode = false
+	} else if input.PlanMode || w.mode == "plan" {
 		w.ag.PlanMode = true
+		w.ag.ReviewMode = false
 	} else {
 		w.ag.PlanMode = false
+		w.ag.ReviewMode = false
 	}
-	var turnUsage llm.Usage
-	addUsage := func(u llm.Usage) {
+	var turnUsage models.Usage
+	addUsage := func(u models.Usage) {
 		turnUsage.PromptTokens += u.PromptTokens
 		turnUsage.CompletionTokens += u.CompletionTokens
 		turnUsage.CacheCreationTokens += u.CacheCreationTokens
@@ -127,42 +357,18 @@ func (w *workerProcessState) runTurn(ctx context.Context, input workerInput) {
 		}
 	}
 	ev := agent.Events{
-		OnText: func(s string) {
-			w.appendLive("text", s)
-			w.publish("text", s, false)
-		},
 		OnThink: func(s string) {
 			w.appendLive("think", s)
 			w.publish("think", s, false)
 		},
-		OnPlanDelta: func(s string) {
-			w.appendLive("plan", s)
-			w.publish(workerwire.EventPlanDelta, s, false)
-		},
-		OnToolStart: func(id, name, args string) {
-			w.mu.Lock()
-			w.activeTool = name
-			w.mu.Unlock()
-			w.publish("tool_start", map[string]string{"id": id, "name": name, "args": args}, true)
-		},
-		OnToolOutput: func(id, output string) {
-			w.appendLive("tool_output", output)
-			w.publish("tool_output", map[string]string{"id": id, "output": output}, false)
-		},
-		OnToolEnd: func(id, name, result string) {
-			w.mu.Lock()
-			w.activeTool = ""
-			w.mu.Unlock()
-			w.publish("tool_end", map[string]string{"id": id, "name": name, "result": result}, true)
-		},
 		OnSteer: func(s string) { w.publish("steer", s, true) },
-		OnUsage: func(u llm.Usage) { addUsage(u); w.publish("usage", u, true) },
-		OnRetry: func(ev llm.RetryEvent) { w.publish("retry", ev, true) },
+		OnUsage: func(u models.Usage) { addUsage(u); w.publish("usage", u, true) },
+		OnRetry: func(ev models.RetryEvent) { w.publish("retry", ev, true) },
 		OnGoalUpdate: func(update agent.GoalUpdate) {
 			w.persistGoalUpdate(update)
 			w.publish("goal_update", update, true)
 		},
-		OnCompactionReady: func(messages []llm.Message, summary string, cutoff int) error {
+		OnCompactionReady: func(messages []models.Message, summary string, cutoff int) error {
 			w.mu.Lock()
 			saved, modelName, providerName := w.saved, w.modelName, w.provider
 			w.mu.Unlock()
@@ -175,6 +381,7 @@ func (w *workerProcessState) runTurn(ctx context.Context, input workerInput) {
 			w.publish("compact", map[string]any{"summary": summary, "cutoff": cutoff}, true)
 		},
 	}
+	setupWireEvents(&ev, w.emitWireEvent)
 	var final string
 	var err error
 	switch {
@@ -199,27 +406,139 @@ func (w *workerProcessState) runTurn(ctx context.Context, input workerInput) {
 				planJSON, _ := json.Marshal(map[string]string{"markdown": planMD})
 				msgSeq := len(w.ag.MessagesSnapshot())
 				_ = w.store.SaveWorkflowResult(context.Background(), session.WorkflowResultRecord{
-					ResultID:   fmt.Sprintf("plan-%x", time.Now().UnixNano()&0xffffffff),
+					ResultID:   fmt.Sprintf("plan-%x", time.Now().UnixNano()),
 					SessionID:  w.sessionID,
 					Kind:       "plan",
 					Version:    2,
 					Payload:    string(planJSON),
-					Role:       config.RoleSmart,
+					Role:       w.ag.Role,
 					MessageSeq: msgSeq,
 					CreatedAt:  time.Now().UTC(),
 				})
 			}
 		}
 	}
+	var reviewPayload string
+	var reviewMarkdown string
+	if w.ag.ReviewMode && final != "" && err == nil {
+		if review, parseErr := agent.ParseReview(final); parseErr == nil {
+			reviewPayload = final
+			reviewMarkdown = export.RenderReviewMarkdown(review)
+			if w.store != nil && w.sessionID != "" {
+				msgSeq := len(w.ag.MessagesSnapshot())
+				_ = w.store.SaveWorkflowResult(context.Background(), session.WorkflowResultRecord{
+					ResultID:   fmt.Sprintf("review-%x", time.Now().UnixNano()),
+					SessionID:  w.sessionID,
+					Kind:       "review",
+					Version:    1,
+					Payload:    reviewPayload,
+					Role:       w.ag.Role,
+					MessageSeq: msgSeq,
+					CreatedAt:  time.Now().UTC(),
+				})
+			}
+		}
+	}
+	var goalRecord *agent.GoalRecord
+	goalContinue := false
+	if input.Goal != nil && w.store != nil {
+		if record, ok, loadErr := w.store.LoadGoal(w.sessionID); loadErr == nil && ok {
+			goalRecord = &record
+			goalContinue = record.Status == agent.GoalStatusActive && err == nil
+		}
+	}
+	w.ag.ReviewMode = false
+	w.ag.PlanMode = (w.mode == "plan")
+
+	w.mu.Lock()
+	modelID, modelName, provider, role, protocol, effort := w.ag.Model, w.modelName, w.provider, w.ag.Role, w.ag.Protocol, w.ag.Effort
+	contextLimit := w.ag.ContextLimit
+	w.mu.Unlock()
+	clean := true
+	if wd, err := os.Getwd(); err == nil {
+		clean = session.WorkspaceClean(wd)
+		if clean && snap != "" {
+			session.DropSnapshot(wd, snap)
+			if w.store != nil {
+				_ = w.store.SetSnapshot(w.sessionID, turnAt, "")
+			}
+		}
+	}
 	result := workerTurnResult{
-		Final: final, Usage: turnUsage, At: input.At, Snap: input.Snap,
+		SessionID: w.sessionID, Final: final, Usage: w.ag.Usage(),
+		ContextTokens: w.ag.ContextTokens(), ContextLimit: contextLimit,
+		Model: modelID, ModelName: modelName, Provider: provider,
+		Role: role, Protocol: protocol, Effort: effort,
+		At: turnAt, Snap: snap, Clean: clean,
 		Messages: boundedWorkerMessages(w.ag.MessagesSnapshot()),
-		Plan:     planMD,
+		Plan:     planMD, Review: reviewPayload, ReviewMarkdown: reviewMarkdown, Goal: goalRecord, GoalContinue: goalContinue,
 	}
 	if err != nil {
 		result.Error = err.Error()
 	}
 	w.publish("turn_done", result, true)
+}
+
+func replaceProjectInstructions(prompt, project string) string {
+	start := strings.Index(prompt, "<project_instructions>")
+	if start < 0 {
+		return prompt
+	}
+	rest := prompt[start:]
+	end := strings.Index(rest, "</project_instructions>")
+	if end < 0 {
+		return prompt
+	}
+	end += start + len("</project_instructions>")
+	return strings.Trim(strings.TrimSpace(prompt[:start])+"\n\n"+strings.TrimSpace(project)+"\n\n"+strings.TrimSpace(prompt[end:]), "\n")
+}
+
+func (w *workerProcessState) emitWireEvent(value any) {
+	event, ok := value.(map[string]any)
+	if !ok {
+		return
+	}
+	kind, _ := event["type"].(string)
+	if kind == "" {
+		return
+	}
+	data := make(map[string]any, len(event)-1)
+	for key, value := range event {
+		if key != "type" {
+			data[key] = value
+		}
+	}
+	switch kind {
+	case "text":
+		if value, ok := data["delta"].(string); ok {
+			w.appendLive("text", value)
+			w.publish(kind, value, false)
+		}
+	case "plan_delta":
+		if value, ok := data["delta"].(string); ok {
+			w.appendLive("plan", value)
+			w.publish(workerwire.EventPlanDelta, value, false)
+		}
+	case "tool_start":
+		if name, ok := data["name"].(string); ok {
+			w.mu.Lock()
+			w.activeTool = name
+			w.mu.Unlock()
+		}
+		w.publish(kind, data, false)
+	case "tool_output":
+		if output, ok := data["output"].(string); ok {
+			w.appendLive("tool_output", output)
+		}
+		w.publish(kind, data, false)
+	case "tool_end":
+		w.mu.Lock()
+		w.activeTool = ""
+		w.mu.Unlock()
+		w.publish(kind, data, false)
+	default:
+		w.publish(kind, data, false)
+	}
 }
 
 func (w *workerProcessState) persist() {
@@ -249,7 +568,7 @@ func (w *workerProcessState) persistGoalUpdate(update agent.GoalUpdate) {
 		return
 	}
 	record, ok, err := w.store.LoadGoal(w.sessionID)
-	if err != nil || !ok || record.Status != goalstate.StatusActive {
+	if err != nil || !ok || record.Status != agent.GoalStatusActive {
 		return
 	}
 	if err := update.Validate(record.ID); err != nil {
@@ -262,7 +581,7 @@ func (w *workerProcessState) persistGoalUpdate(update agent.GoalUpdate) {
 	_ = w.store.CheckpointGoal(w.sessionID, record)
 }
 
-func (w *workerProcessState) persistGoalTurn(input *goalstate.Record, usage llm.Usage, turnErr error) {
+func (w *workerProcessState) persistGoalTurn(input *agent.GoalRecord, usage models.Usage, turnErr error) {
 	if w.store == nil || w.sessionID == "" || input == nil {
 		return
 	}
@@ -272,23 +591,23 @@ func (w *workerProcessState) persistGoalTurn(input *goalstate.Record, usage llm.
 	}
 	// An explicit clear/pause made while the turn was running wins over the
 	// stale request-scoped goal supplied at turn start.
-	if record.Status != goalstate.StatusActive && record.Status != goalstate.StatusBlocked && record.Status != goalstate.StatusComplete {
+	if record.Status != agent.GoalStatusActive && record.Status != agent.GoalStatusBlocked && record.Status != agent.GoalStatusComplete {
 		return
 	}
 	record.PromptTokens += usage.PromptTokens
 	record.CachedTokens += usage.Cached()
 	record.CompletionTokens += usage.CompletionTokens
 	record.Rounds++
-	if turnErr != nil && record.Status == goalstate.StatusActive {
-		record.Status = goalstate.StatusPaused
+	if turnErr != nil && record.Status == agent.GoalStatusActive {
+		record.Status = agent.GoalStatusPaused
 		record.Blocker = truncateWorkerGoalNote(turnErr.Error())
 	}
-	if record.Status == goalstate.StatusActive && record.Rounds >= w.goalMaxRounds() {
-		record.Status = goalstate.StatusBudgetLimited
+	if record.Status == agent.GoalStatusActive && record.Rounds >= w.goalMaxRounds() {
+		record.Status = agent.GoalStatusBudgetLimited
 		record.Blocker = fmt.Sprintf("goal round circuit breaker reached (%d rounds)", record.Rounds)
 	}
 	record.UpdatedAt = time.Now().UTC()
-	if record.Status == goalstate.StatusActive {
+	if record.Status == agent.GoalStatusActive {
 		_ = w.store.SaveGoal(w.sessionID, record)
 	} else {
 		_ = w.store.CheckpointGoal(w.sessionID, record)
@@ -325,8 +644,8 @@ func (w *workerProcessState) appendContent(content string) {
 
 func truncateWorkerGoalNote(value string) string {
 	value = strings.TrimSpace(value)
-	if len(value) <= goalstate.MaxNoteBytes {
+	if len(value) <= agent.MaxNoteBytes {
 		return value
 	}
-	return value[:goalstate.MaxNoteBytes]
+	return value[:agent.MaxNoteBytes]
 }

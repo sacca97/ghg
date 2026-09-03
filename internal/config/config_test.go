@@ -145,6 +145,30 @@ func TestInfKeyBadJSON(t *testing.T) {
 	}
 }
 
+func TestMeSeedsTemplateAndStripsComments(t *testing.T) {
+	t.Setenv("GHG_HOME", t.TempDir())
+
+	if got := MeInstructions(); got != "" {
+		t.Fatalf("a fresh seed is all comments — nothing to inject, got %q", got)
+	}
+	data, err := os.ReadFile(filepath.Join(os.Getenv("GHG_HOME"), "me.md"))
+	if err != nil || !strings.Contains(string(data), "# Your standing instructions") {
+		t.Fatalf("seed file should exist with the template: %v\n%s", err, data)
+	}
+
+	if err := os.WriteFile(filepath.Join(os.Getenv("GHG_HOME"), "me.md"),
+		[]byte("# hi\n\n- Always pnpm.\n- Ask before force-push.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got := MeInstructions()
+	if !strings.Contains(got, "- Always pnpm.") || strings.Contains(got, "# hi") {
+		t.Fatalf("instructions should carry user lines only:\n%s", got)
+	}
+	if !strings.Contains(MeSeed, "/me opens this file") {
+		t.Fatal("seed should tell the user how to edit")
+	}
+}
+
 func TestLoadJSONCCommentsAndTrailingCommas(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -482,7 +506,7 @@ func TestLoadMixedTokenFields(t *testing.T) {
 	}
 }
 
-func TestArtifactConfigRoundTripAndExplicitDisable(t *testing.T) {
+func TestOutputConfigRoundTripAndLegacyKey(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	dir := filepath.Join(home, ".ghg")
@@ -501,18 +525,25 @@ func TestArtifactConfigRoundTripAndExplicitDisable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Artifacts == nil || cfg.Artifacts.Enabled == nil || *cfg.Artifacts.Enabled || cfg.Artifacts.MaxBytes != 4096 {
-		t.Fatalf("artifact config did not parse: %+v", cfg.Artifacts)
+	if cfg.Outputs == nil || cfg.Outputs.Enabled == nil || *cfg.Outputs.Enabled || cfg.Outputs.MaxBytes != 4096 {
+		t.Fatalf("output config did not parse: %+v", cfg.Outputs)
 	}
 	if err := cfg.Save(); err != nil {
 		t.Fatal(err)
+	}
+	saved, err := os.ReadFile(filepath.Join(dir, "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(saved), `"outputs"`) || strings.Contains(string(saved), `"artifacts"`) {
+		t.Fatalf("legacy config was not saved under outputs: %s", saved)
 	}
 	reloaded, err := Load()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if reloaded.Artifacts == nil || reloaded.Artifacts.Enabled == nil || *reloaded.Artifacts.Enabled || reloaded.Artifacts.MaxBytes != 4096 {
-		t.Fatalf("artifact config did not round-trip: %+v", reloaded.Artifacts)
+	if reloaded.Outputs == nil || reloaded.Outputs.Enabled == nil || *reloaded.Outputs.Enabled || reloaded.Outputs.MaxBytes != 4096 {
+		t.Fatalf("output config did not round-trip: %+v", reloaded.Outputs)
 	}
 }
 

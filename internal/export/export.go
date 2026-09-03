@@ -11,7 +11,7 @@ import (
 	"time"
 
 	"github.com/sacca97/ghg/internal/agent"
-	"github.com/sacca97/ghg/internal/llm"
+	"github.com/sacca97/ghg/internal/models"
 	"github.com/sacca97/ghg/internal/session"
 )
 
@@ -129,7 +129,7 @@ func RenderReviewMarkdown(r agent.Review) string {
 }
 
 // RenderChat formats a session conversation into clean Markdown / text.
-func RenderChat(sessionID string, msgs []llm.Message) string {
+func RenderChat(sessionID string, msgs []models.Message) string {
 	var b strings.Builder
 	if sessionID != "" {
 		b.WriteString("# Conversation: " + sessionID + "\n\n")
@@ -222,7 +222,7 @@ func RenderResult(record session.WorkflowResultRecord, format string) ([]byte, e
 			}
 			return []byte(strings.TrimRight(record.Payload, "\n") + "\n"), nil
 		case "chat", "log", "transcript":
-			var msgs []llm.Message
+			var msgs []models.Message
 			if err := json.Unmarshal([]byte(record.Payload), &msgs); err != nil {
 				return nil, fmt.Errorf("parse chat payload: %w", err)
 			}

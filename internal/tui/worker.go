@@ -14,8 +14,7 @@ import (
 
 	"github.com/sacca97/ghg/internal/agent"
 	"github.com/sacca97/ghg/internal/config"
-	"github.com/sacca97/ghg/internal/goal"
-	"github.com/sacca97/ghg/internal/llm"
+	"github.com/sacca97/ghg/internal/models"
 	"github.com/sacca97/ghg/internal/tools"
 	workerwire "github.com/sacca97/ghg/internal/worker"
 )
@@ -35,28 +34,17 @@ const (
 	workerApprovalEnv = "GHG_WORKER_APPROVAL"
 )
 
-// Wire payload shapes live in internal/worker (workerwire); these aliases
-// keep the historical local names readable.
-type (
-	workerInput             = workerwire.Input
-	workerTurnResult        = workerwire.TurnResult
-	workerCompactResult     = workerwire.CompactResult
-	workerTaskState         = workerwire.TaskState
-	workerApproval          = workerwire.Approval
-	workerApprovalAnswer    = workerwire.ApprovalAnswer
-	workerConfigureRequest  = workerwire.ConfigureRequest
-	workerSnapshot          = workerwire.Snapshot
-	workerPermissionRequest = workerwire.PermissionRequest
-)
-
 type workerEvent struct {
 	Kind string          `json:"kind"`
 	Data json.RawMessage `json:"data"`
 }
 
 func (m *model) startWorkerProcess(cautious bool) error {
-	if m.agent == nil || m.store == nil {
-		return errors.New("worker requires a configured agent and session store")
+	if m.store == nil {
+		return errors.New("worker requires a session store")
+	}
+	if m.modelName == "" || m.provName == "" {
+		return errors.New(m.degradedProviderNote())
 	}
 	if m.sessionID == "" && !m.ensureSession() {
 		return errors.New("worker could not reserve a session")
@@ -81,7 +69,8 @@ func (m *model) startWorkerProcess(cautious bool) error {
 		}
 		m.workerRuntime = runtimeFile
 		m.workerClient = client
-		m.pumpWorker(client)
+		m.workerGeneration++
+		m.pumpWorker(client, m.workerGeneration)
 		return nil
 	}
 	if err := runtimeFile.WritePrompt(m.sysPrompt); err != nil {
@@ -96,8 +85,8 @@ func (m *model) startWorkerProcess(cautious bool) error {
 		workerCWDEnv:      mustWorkingDirectory(),
 		workerModelEnv:    m.modelName,
 		workerProviderEnv: m.provName,
-		workerRoleEnv:     m.agent.Role,
-		workerEffortEnv:   m.agent.Effort,
+		workerRoleEnv:     m.currentRole(),
+		workerEffortEnv:   m.currentEffort(),
 		workerModeEnv:     m.uiMode(),
 		workerCautiousEnv: strconv.FormatBool(cautious),
 	}
@@ -121,8 +110,9 @@ func (m *model) startWorkerProcess(cautious bool) error {
 	m.workerProcess = proc
 	m.workerRuntime = runtimeFile
 	m.workerClient = client
-	m.pumpWorker(client)
-	m.monitorWorker(proc, runtimeFile)
+	m.workerGeneration++
+	m.pumpWorker(client, m.workerGeneration)
+	m.monitorWorker(proc, runtimeFile, m.workerGeneration)
 	return nil
 }
 
@@ -134,7 +124,7 @@ func (m *model) connectWorker(runtimeFile workerwire.Runtime) (*workerwire.Clien
 	var err error
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
-		client, err = workerwire.Dial(context.Background(), runtimeFile, m.workerLastSeq)
+		client, err = workerwire.Dial(context.Background(), runtimeFile)
 		if err == nil {
 			return client, nil
 		}
@@ -161,11 +151,12 @@ func (m *model) attachWorkerProcess(sessionID string) error {
 	}
 	m.workerClient = client
 	m.workerRuntime = runtimeFile
-	m.pumpWorker(client)
+	m.workerGeneration++
+	m.pumpWorker(client, m.workerGeneration)
 	return nil
 }
 
-func (m *model) monitorWorker(proc *workerwire.Process, runtimeFile workerwire.Runtime) {
+func (m *model) monitorWorker(proc *workerwire.Process, runtimeFile workerwire.Runtime, generation uint64) {
 	p := m.prog
 	go func() {
 		err := proc.Wait()
@@ -179,30 +170,49 @@ func (m *model) monitorWorker(proc *workerwire.Process, runtimeFile workerwire.R
 			}
 		}
 		if p != nil && err != nil {
-			p.Send(workerErrorMsg{err: fmt.Errorf("worker exited: %w", err), process: proc})
+			p.Send(workerErrorMsg{err: fmt.Errorf("worker exited: %w", err), process: proc, generation: generation})
 		}
 	}()
 }
 
 func (m *model) ensureWorker() bool {
-	if m.workerClient != nil || m.workerStartFailed || m.prog == nil || m.agent == nil || m.store == nil {
+	if m.workerClient != nil || m.workerStartFailed || m.prog == nil || m.store == nil {
+		return m.workerClient != nil
+	}
+	if !m.workerOnly && m.agent == nil {
 		return m.workerClient != nil
 	}
 	if err := m.startWorkerProcess(m.cautious); err != nil {
 		m.workerStartFailed = true
+		m.workerStartError = err.Error()
 		config.LogEvent("worker.start", err.Error())
 		return false
 	}
+	m.workerStartError = ""
 	return true
 }
 
+func (m *model) beginWorkerTransition() error {
+	if m.busy || m.workerLiveWork {
+		return errors.New("cannot change session while worker work is running")
+	}
+	m.stopWorker()
+	m.workerStartFailed = false
+	m.workerStartError = ""
+	return nil
+}
+
 func (m *model) syncWorkerConfiguration(updateEffort bool) {
-	if m.workerClient == nil || m.agent == nil {
+	if m.workerClient == nil {
 		return
 	}
-	if err := m.workerClient.Send(workerwire.CommandConfigure, workerRequestID("configure"), workerConfigureRequest{
-		Model: m.modelName, Provider: m.provName, Role: m.agent.Role,
-		Effort: m.agent.Effort, UpdateEffort: updateEffort,
+	role, effort := m.role, m.effort
+	if !m.workerOnly && m.agent != nil {
+		role, effort = m.agent.Role, m.agent.Effort
+	}
+	if err := m.workerClient.Send(workerwire.CommandConfigure, workerRequestID("configure"), workerwire.ConfigureRequest{
+		Model: m.modelName, Provider: m.provName, Role: role,
+		Effort: effort, UpdateEffort: updateEffort,
 		Mode: m.uiMode(),
 	}); err != nil {
 		m.append(errStyle.Render("worker configuration failed: " + err.Error()))
@@ -214,7 +224,7 @@ func mustWorkingDirectory() string {
 	return wd
 }
 
-func (m *model) pumpWorker(client *workerwire.Client) {
+func (m *model) pumpWorker(client *workerwire.Client, generation uint64) {
 	p := m.prog
 	go func() {
 		frames, errs := client.Frames(), client.Errors()
@@ -226,7 +236,7 @@ func (m *model) pumpWorker(client *workerwire.Client) {
 					continue
 				}
 				if p != nil {
-					p.Send(workerFrameMsg{frame: frame})
+					p.Send(workerFrameMsg{frame: frame, client: client, generation: generation})
 				}
 			case err, ok := <-errs:
 				if !ok {
@@ -234,12 +244,12 @@ func (m *model) pumpWorker(client *workerwire.Client) {
 					continue
 				}
 				if err != nil && p != nil {
-					p.Send(workerErrorMsg{err: err})
+					p.Send(workerErrorMsg{err: err, client: client, generation: generation})
 				}
 			}
 		}
 		if p != nil {
-			p.Send(workerErrorMsg{err: errors.New("worker connection closed")})
+			p.Send(workerErrorMsg{err: errors.New("worker connection closed"), client: client, generation: generation})
 		}
 	}()
 }
@@ -247,8 +257,10 @@ func (m *model) pumpWorker(client *workerwire.Client) {
 func (m *model) stopWorker() {
 	client, proc := m.workerClient, m.workerProcess
 	detached := m.workerDetached
+	m.workerGeneration++
 	m.workerClient, m.workerProcess = nil, nil
 	m.workerRuntime = workerwire.Runtime{}
+	m.workerDetached = false
 	if client == nil && proc == nil {
 		return
 	}
@@ -287,12 +299,12 @@ func workerRequestID(prefix string) string {
 	return fmt.Sprintf("%s-%d", prefix, time.Now().UnixNano())
 }
 
-func (m *model) submitWorkerTurn(text string, authored bool, prepared string, parts []llm.ContentPart, at int, snap string, goalCtx *goal.Record) (tea.Model, tea.Cmd) {
+func (m *model) submitWorkerTurn(text string, authored bool, prepared string, parts []models.ContentPart, at int, snap string, goalCtx *agent.GoalRecord) (tea.Model, tea.Cmd) {
 	if m.workerClient == nil {
 		return m, nil
 	}
-	if m.agent != nil {
-		message := llm.Message{Role: "user", Content: prepared, Parts: parts, Authored: authored}
+	if !m.workerOnly && m.agent != nil {
+		message := models.Message{Role: "user", Content: prepared, Parts: parts, Authored: authored}
 		if authored {
 			now := m.nowFn()
 			message.SentAt = &now
@@ -301,7 +313,7 @@ func (m *model) submitWorkerTurn(text string, authored bool, prepared string, pa
 	}
 	requestID := workerRequestID("turn")
 	systemPrompt := m.sysPrompt
-	if m.agent != nil && len(m.agent.Messages) > 0 {
+	if !m.workerOnly && m.agent != nil && len(m.agent.Messages) > 0 {
 		systemPrompt = m.agent.Messages[0].Content
 	}
 	m.cancel = func() {
@@ -309,10 +321,11 @@ func (m *model) submitWorkerTurn(text string, authored bool, prepared string, pa
 			_ = m.workerClient.Send(workerwire.CommandCancel, requestID+"-cancel", nil)
 		}
 	}
-	if err := m.workerClient.Send(workerwire.CommandInput, requestID, workerInput{
+	if err := m.workerClient.Send(workerwire.CommandInput, requestID, workerwire.Input{
 		Input: prepared, Authored: authored, Parts: parts, Goal: goalCtx,
 		SystemPrompt: systemPrompt, At: at, Snap: snap,
-		PlanMode: m.uiMode() == uiModePlan,
+		PlanMode:   !m.reviewing && m.uiMode() == uiModePlan,
+		ReviewMode: m.reviewing,
 	}); err != nil {
 		m.cancel = nil
 		m.busy = false
@@ -330,16 +343,13 @@ func (m *model) submitWorkerTurn(text string, authored bool, prepared string, pa
 }
 
 func (m *model) handleWorkerFrame(frame workerwire.Frame) (tea.Model, tea.Cmd) {
-	if frame.Seq > m.workerLastSeq {
-		m.workerLastSeq = frame.Seq
-	}
 	switch frame.Type {
 	case workerwire.TypeSnapshot:
 		var envelope workerwire.SnapshotEnvelope
 		if err := json.Unmarshal(frame.Payload, &envelope); err != nil {
 			return m, nil
 		}
-		var snapshot workerSnapshot
+		var snapshot workerwire.Snapshot
 		if err := json.Unmarshal(envelope.State, &snapshot); err != nil {
 			return m, nil
 		}
@@ -352,6 +362,50 @@ func (m *model) handleWorkerFrame(frame workerwire.Frame) (tea.Model, tea.Cmd) {
 			if err := json.Unmarshal(frame.Payload, &statuses); err == nil {
 				m.renderLSPStatuses(workerLSPStatuses(statuses))
 			}
+		}
+		if strings.HasPrefix(frame.RequestID, "mcp-") {
+			var statuses []workerwire.MCPStatus
+			if err := json.Unmarshal(frame.Payload, &statuses); err == nil {
+				m.append(renderWorkerMCPStatuses(statuses))
+			}
+		}
+		if strings.HasPrefix(frame.RequestID, "doctor-") {
+			var result workerwire.ContextDoctorResult
+			if err := json.Unmarshal(frame.Payload, &result); err == nil && result.Report != "" {
+				m.append(result.Report)
+			}
+		}
+		if frame.RequestID == m.workerHistoryRequest {
+			var result workerwire.HistoryResult
+			if err := json.Unmarshal(frame.Payload, &result); err == nil {
+				m.setMessages(result.Messages)
+				m.saved = len(result.Messages)
+				m.usage = result.Usage
+				m.workerContextTokens = result.ContextTokens
+				m.rebuildTranscript()
+				if strings.HasPrefix(frame.RequestID, "compact-retry-") {
+					m.future = nil
+					m.append(dimStyle.Render("⟲ compaction undone — raw history restored; run /compact to re-compact"))
+				} else if m.workerRewindRestore != "" {
+					m.input.SetValue(m.workerRewindRestore)
+					m.input.CursorEnd()
+					m.growInput()
+					m.workerRewindRestore = ""
+				}
+			}
+			m.workerHistoryRequest = ""
+		}
+		if frame.RequestID == m.workerChdirRequest {
+			var result workerwire.ChdirResult
+			if err := json.Unmarshal(frame.Payload, &result); err == nil && result.CWD != "" {
+				if err := os.Chdir(result.CWD); err != nil {
+					m.append(errStyle.Render("/cd: controller: " + err.Error()))
+				} else {
+					m.shortCWD = shortCWD()
+					m.append(dimStyle.Render("→ " + result.CWD))
+				}
+			}
+			m.workerChdirRequest = ""
 		}
 	case workerwire.TypeDetachAck:
 		if frame.RequestID == m.detachRequestID {
@@ -368,6 +422,13 @@ func (m *model) handleWorkerFrame(frame workerwire.Frame) (tea.Model, tea.Cmd) {
 		if frame.RequestID == m.detachRequestID {
 			m.detachRequestID = ""
 		}
+		if frame.RequestID == m.workerHistoryRequest {
+			m.workerHistoryRequest = ""
+			m.workerRewindRestore = ""
+		}
+		if frame.RequestID == m.workerChdirRequest {
+			m.workerChdirRequest = ""
+		}
 		if payload.Message != "" {
 			m.append(errStyle.Render(payload.Message))
 		}
@@ -381,41 +442,30 @@ func (m *model) handleWorkerFrame(frame workerwire.Frame) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m *model) applyWorkerSnapshot(snapshot workerSnapshot) {
-	if snapshot.ModelName != "" {
-		m.modelName = snapshot.ModelName
-	}
-	if snapshot.Provider != "" {
-		m.provName = snapshot.Provider
-	}
-	if m.agent != nil {
-		m.agent.SetUsage(snapshot.Usage)
-		m.agent.ContextLimit = snapshot.ContextLimit
-		m.agent.Model = snapshot.Model
-		m.agent.ModelName = snapshot.ModelName
-		m.agent.Provider = snapshot.Provider
-		m.agent.Role = snapshot.Role
-		m.agent.Protocol = snapshot.Protocol
-		m.agent.Effort = snapshot.Effort
-		if len(snapshot.Messages) > 0 {
-			m.agent.Messages = append([]llm.Message(nil), snapshot.Messages...)
-			// The snapshot is authoritative: re-render from it so a turn that
-			// finished between the initial DB load and this attach still shows
-			// its completed blocks (and stale tool rows do not linger).
-			m.rebuildTranscript()
-			m.saved = len(m.agent.Messages)
-		}
+func (m *model) applyWorkerSnapshot(snapshot workerwire.Snapshot) {
+	m.usage = snapshot.Usage
+	m.contextLimit = snapshot.ContextLimit
+	m.modelID = snapshot.Model
+	m.modelName = snapshot.ModelName
+	m.provName = snapshot.Provider
+	m.role = snapshot.Role
+	m.protocol = snapshot.Protocol
+	m.effort = snapshot.Effort
+	if len(snapshot.Messages) > 0 {
+		m.setMessages(snapshot.Messages)
+		// The snapshot is authoritative: re-render from it so a turn that
+		// finished between the initial DB load and this attach still shows
+		// its completed blocks (and stale tool rows do not linger).
+		m.rebuildTranscript()
+		m.saved = len(m.messages)
 	}
 	if snapshot.Mode != "" {
 		m.mode = snapshot.Mode
-		if m.agent != nil {
-			m.agent.PlanMode = (snapshot.Mode == uiModePlan)
-		}
 	}
 	m.workerContextTokens = snapshot.ContextTokens
 	m.workerState = snapshot.State
 	m.workerDetached = snapshot.Detached
-	m.workerTasks = make(map[string]workerTaskState, len(snapshot.Tasks))
+	m.workerTasks = make(map[string]workerwire.TaskState, len(snapshot.Tasks))
 	m.workerLiveWork = snapshot.State == workerwire.StateRunning || snapshot.State == workerwire.StateWaitingApproval
 	for _, task := range snapshot.Tasks {
 		m.workerTasks[task.ID] = task
@@ -453,26 +503,20 @@ func (m *model) applyWorkerSnapshot(snapshot workerSnapshot) {
 func (m *model) workerEvent(event workerEvent) tea.Cmd {
 	switch event.Kind {
 	case "route":
-		var value workerConfigureRequest
+		var value workerwire.ConfigureRequest
 		if json.Unmarshal(event.Data, &value) == nil {
-			if m.agent != nil {
-				m.agent.Model = value.Model
-				m.agent.ModelName = value.ModelName
-				if m.agent.ModelName == "" {
-					m.agent.ModelName = value.Model
-				}
-				m.agent.Provider = value.Provider
-				m.agent.Role = value.Role
-				m.agent.Protocol = value.Protocol
-				if value.UpdateEffort {
-					m.agent.Effort = value.Effort
-				}
-				if value.Mode != "" {
-					m.mode = value.Mode
-					m.agent.PlanMode = (value.Mode == uiModePlan)
-				}
-			}
+			m.modelID = value.Model
 			m.modelName, m.provName = value.ModelName, value.Provider
+			if m.modelName == "" {
+				m.modelName = value.Model
+			}
+			m.role, m.protocol = value.Role, value.Protocol
+			if value.UpdateEffort {
+				m.effort = value.Effort
+			}
+			if value.Mode != "" {
+				m.mode = value.Mode
+			}
 		}
 		return nil
 	case "state":
@@ -486,23 +530,26 @@ func (m *model) workerEvent(event workerEvent) tea.Cmd {
 			m.workerDetached = value.Detached
 			if value.Mode != "" {
 				m.mode = value.Mode
-				if m.agent != nil {
-					m.agent.PlanMode = (value.Mode == uiModePlan)
-				}
 			}
 			m.busy = value.State == workerwire.StateRunning || value.State == workerwire.StateWaitingApproval
 			m.workerLiveWork = m.busy || m.workerHasLiveTask()
 		}
 		return nil
 	case "task":
-		var value workerTaskState
+		var value workerwire.TaskState
 		if json.Unmarshal(event.Data, &value) == nil {
 			if m.workerTasks == nil {
-				m.workerTasks = make(map[string]workerTaskState)
+				m.workerTasks = make(map[string]workerwire.TaskState)
 			}
 			m.workerTasks[value.ID] = value
 			m.workerLiveWork = m.busy || m.workerHasLiveTask()
 			return func() tea.Msg { return taskUpdateMsg{} }
+		}
+		return nil
+	case "mcp":
+		var value []workerwire.MCPStatus
+		if json.Unmarshal(event.Data, &value) == nil {
+			return func() tea.Msg { return mcpStatusMsg{statuses: value} }
 		}
 		return nil
 	case "text":
@@ -536,11 +583,9 @@ func (m *model) workerEvent(event workerEvent) tea.Cmd {
 			return func() tea.Msg { return toolEndMsg{value.ID, value.Name, value.Result} }
 		}
 	case "usage":
-		var value llm.Usage
+		var value models.Usage
 		if json.Unmarshal(event.Data, &value) == nil {
-			if m.agent != nil {
-				m.agent.AddUsage(value)
-			}
+			m.usage.Add(value)
 			if total := value.PromptTokens + value.CompletionTokens; total > 0 {
 				m.workerContextTokens = total
 			}
@@ -552,16 +597,46 @@ func (m *model) workerEvent(event workerEvent) tea.Cmd {
 			return func() tea.Msg { return goalUpdateMsg{update: value} }
 		}
 	case "retry":
-		var value llm.RetryEvent
+		var value models.RetryEvent
 		if json.Unmarshal(event.Data, &value) == nil {
 			return func() tea.Msg {
 				return noticeMsg(fmt.Sprintf("⚠ request failed (%s) — retrying in %s (attempt %d/%d)", value.Err, value.Delay.Round(time.Millisecond), value.Attempt+1, value.Max))
 			}
 		}
+	case "goal":
+		var value agent.GoalRecord
+		if json.Unmarshal(event.Data, &value) == nil {
+			return func() tea.Msg { return goalUpdateRecordMsg{record: value} }
+		}
+	case "goal_from_context":
+		var value workerwire.GoalFromContextResult
+		if json.Unmarshal(event.Data, &value) == nil {
+			var err error
+			if value.Error != "" {
+				err = errors.New(value.Error)
+			}
+			var record *agent.GoalRecord
+			if value.Goal != nil {
+				copy := *value.Goal
+				record = &copy
+			}
+			goalText := ""
+			if record != nil {
+				goalText = record.Objective
+			}
+			return func() tea.Msg {
+				return goalFromContextMsg{goal: goalText, record: record, usage: value.Usage, err: err}
+			}
+		}
+	case "schedule":
+		var value string
+		if json.Unmarshal(event.Data, &value) == nil {
+			return func() tea.Msg { return noticeMsg(value) }
+		}
 	case "compact":
 		return func() tea.Msg { return noticeMsg("◎ compacted — raw history preserved") }
 	case "compact_done":
-		var value workerCompactResult
+		var value workerwire.CompactResult
 		if json.Unmarshal(event.Data, &value) == nil {
 			var err error
 			if value.Error != "" {
@@ -571,23 +646,24 @@ func (m *model) workerEvent(event workerEvent) tea.Cmd {
 					err = errors.New(value.Error)
 				}
 			}
-			if m.agent != nil && len(value.Messages) > 0 {
-				m.agent.Messages = append([]llm.Message(nil), value.Messages...)
-				m.workerContextTokens = m.agent.ContextTokens()
+			if len(value.Messages) > 0 {
+				m.setMessages(value.Messages)
+				m.workerContextTokens = agent.EstimateTokens(value.Messages)
 			}
+			contextTokens := m.workerContextTokens
 			return func() tea.Msg {
-				return workerCompactDoneMsg{err: err, usage: value.Usage}
+				return workerCompactDoneMsg{err: err, usage: value.Usage, contextTokens: contextTokens}
 			}
 		}
 	case "permission_request":
-		var value workerPermissionRequest
+		var value workerwire.PermissionRequest
 		if json.Unmarshal(event.Data, &value) == nil {
 			return func() tea.Msg {
 				return workerPermissionMsg{approval: value.Approval}
 			}
 		}
 	case "turn_done":
-		var value workerTurnResult
+		var value workerwire.TurnResult
 		if json.Unmarshal(event.Data, &value) == nil {
 			var err error
 			if value.Error != "" {
@@ -597,12 +673,43 @@ func (m *model) workerEvent(event workerEvent) tea.Cmd {
 					err = errors.New(value.Error)
 				}
 			}
-			if m.agent != nil && len(value.Messages) > 0 {
-				m.agent.Messages = append([]llm.Message(nil), value.Messages...)
-				m.workerContextTokens = m.agent.ContextTokens()
+			if len(value.Messages) > 0 {
+				m.setMessages(value.Messages)
+			}
+			m.usage = value.Usage
+			m.workerContextTokens = value.ContextTokens
+			if value.ContextLimit > 0 {
+				m.contextLimit = value.ContextLimit
+			}
+			if value.Model != "" {
+				m.modelID = value.Model
+			}
+			if value.ModelName != "" {
+				m.modelName = value.ModelName
+			}
+			if value.Provider != "" {
+				m.provName = value.Provider
+			}
+			if value.Role != "" {
+				m.role = value.Role
+			}
+			if value.Protocol != "" {
+				m.protocol = value.Protocol
+			}
+			if value.Effort != "" || m.effort != "" {
+				m.effort = value.Effort
+			}
+			var goal *agent.GoalRecord
+			if value.Goal != nil {
+				copy := *value.Goal
+				goal = &copy
 			}
 			return func() tea.Msg {
-				return turnDoneMsg{final: value.Final, err: err, at: value.At, snap: value.Snap, clean: workspaceClean(), goalUsage: value.Usage}
+				return turnDoneMsg{
+					final: value.Final, err: err, at: value.At, snap: value.Snap,
+					clean: value.Clean, plan: value.Plan, review: value.Review, reviewMarkdown: value.ReviewMarkdown,
+					goal: goal, goalContinue: value.GoalContinue, goalUsage: value.Usage,
+				}
 			}
 		}
 	}

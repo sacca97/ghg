@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sacca97/ghg/internal/llm"
+	"github.com/sacca97/ghg/internal/models"
 )
 
 func TestWorkflowResultsRoundTripForkAndRewind(t *testing.T) {
@@ -26,7 +26,7 @@ func TestWorkflowResultsRoundTripForkAndRewind(t *testing.T) {
 	}
 
 	// Create session with 4 messages
-	msgs := []llm.Message{
+	msgs := []models.Message{
 		{Role: "user", Content: "initial prompt"},
 		{Role: "assistant", Content: "first answer"},
 		{Role: "user", Content: "second prompt"},

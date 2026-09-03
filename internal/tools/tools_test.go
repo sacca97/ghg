@@ -59,7 +59,7 @@ func TestToolRoundTrip(t *testing.T) {
 func TestReadConsumesAndBoundsAnOversizedSingleLine(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "long.txt")
-	content := strings.Repeat("x", int(maxArtifactBytes)+4096)
+	content := strings.Repeat("x", int(maxOutputBytes)+4096)
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -213,16 +213,14 @@ func (m *mockInteractiveRunner) Run(_ context.Context, command string, timeout t
 }
 
 // TestBashToolInteractiveHook verifies that bash with interactive:true hands
-// off to the installed InteractiveBash runner, passing command+timeout+keys,
+// off to the runtime's interactive runner, passing command+timeout+keys,
 // and returns whatever the runner returns. It also confirms the hook is
 // consulted only when interactive is true.
 func TestBashToolInteractiveHook(t *testing.T) {
 	mock := &mockInteractiveRunner{returnThis: "PASSWORD_ACCEPTED\n(exit: 0)"}
-	prev := InteractiveBash
-	InteractiveBash = mock
-	defer func() { InteractiveBash = prev }()
+	ctx := WithRuntime(context.Background(), &ToolRuntime{InteractiveRunner: mock})
 
-	out := run(t, "bash", `{"command":"sudo apt install -y sl","interactive":true,"timeout":20}`)
+	out := Execute(ctx, All(), "bash", json.RawMessage(`{"command":"sudo apt install -y sl","interactive":true,"timeout":20}`))
 	if out != "PASSWORD_ACCEPTED\n(exit: 0)" {
 		t.Fatalf("interactive bash should return runner output verbatim: %q", out)
 	}
@@ -238,7 +236,7 @@ func TestBashToolInteractiveHook(t *testing.T) {
 
 	// interactive:false must NOT call the runner even when it's installed
 	mock.gotCommand = ""
-	out = run(t, "bash", `{"command":"echo nohook"}`)
+	out = Execute(ctx, All(), "bash", json.RawMessage(`{"command":"echo nohook"}`))
 	if mock.gotCommand != "" {
 		t.Fatalf("non-interactive call should not reach the runner: %q", mock.gotCommand)
 	}
@@ -267,5 +265,43 @@ func TestReadObservedContentFromReader(t *testing.T) {
 	_, err = readObservedContent(context.Background(), "/canonical/path.go", "path.go", strings.NewReader(data), 10, 1)
 	if err == nil || !strings.Contains(err.Error(), "offset 10 past end of file") {
 		t.Fatalf("expected past EOF error, got: %v", err)
+	}
+}
+
+func TestSandboxNetworkDeniedClassifier(t *testing.T) {
+	tests := []struct {
+		name   string
+		output string
+		want   bool
+	}{
+		{
+			name:   "httptest failure",
+			output: "2026/09/02 12:00:00 httptest: failed to listen on 127.0.0.1:45678: operation not permitted\nFAIL\texample.com/pkg",
+			want:   true,
+		},
+		{
+			name:   "listen tcp failure",
+			output: "panic: listen tcp 127.0.0.1:8080: bind: operation not permitted",
+			want:   true,
+		},
+		{
+			name:   "generic test failure",
+			output: "--- FAIL: TestFoo (0.01s)\n    foo_test.go:42: expected 1, got 2\nFAIL",
+			want:   false,
+		},
+		{
+			name:   "generic permission denied on file",
+			output: "cat: /etc/shadow: Permission denied",
+			want:   false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := isSandboxNetworkDenied(tc.output)
+			if got != tc.want {
+				t.Fatalf("isSandboxNetworkDenied(%q) = %v, want %v", tc.output, got, tc.want)
+			}
+		})
 	}
 }

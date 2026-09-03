@@ -14,7 +14,7 @@ References that motivated them:
 - opencode `packages/core/src/background-job.ts` — a registry of `Deferred` /
   `Scope` / token for background subagents.
 
-Provider stream callbacks follow the same ownership rule: `llm.EventSink` is
+Provider stream callbacks follow the same ownership rule: `models.EventSink` is
 passed per backend call. A foreground turn and its background subagent can
 share one adapter without temporarily assigning a retry callback on the
 underlying client, so callback delivery has no shared-hook race.
@@ -166,10 +166,10 @@ Each tool-call worker owns its bounded capture and finishes writing the
 retained bytes before it invokes `OnToolEnd` or publishes the result back to
 the turn. `TextCapture` and the bash runner keep a fixed head/tail buffer while
 counting every byte, so a noisy process cannot grow memory with its output.
-The injected artifact writer is content-addressed and has no mutable package
+The injected output store is content-addressed and has no mutable package
 global; concurrent calls may deduplicate the same immutable payload safely.
 
-The session store writes a tool message and its artifact metadata in one
+The session store writes a tool message and its output metadata in one
 SQLite transaction. Fork and rewind copy/delete references by message
 boundary, while garbage collection reads the complete reference set before
 deleting only unreferenced payloads. Artifact reads are bounded and session

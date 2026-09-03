@@ -20,7 +20,18 @@ type Client struct {
 	done      chan struct{}
 }
 
-func Dial(ctx context.Context, runtime Runtime, lastSeq uint64) (*Client, error) {
+// NewClient wraps an established connection for worker communication.
+func NewClient(conn net.Conn, sessionID string) *Client {
+	return &Client{
+		conn:      conn,
+		sessionID: sessionID,
+		frames:    make(chan Frame, outboundCapacity),
+		errs:      make(chan error, 1),
+		done:      make(chan struct{}),
+	}
+}
+
+func Dial(ctx context.Context, runtime Runtime) (*Client, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -28,19 +39,12 @@ func Dial(ctx context.Context, runtime Runtime, lastSeq uint64) (*Client, error)
 	if err != nil {
 		return nil, fmt.Errorf("dial worker: %w", err)
 	}
-	c := &Client{
-		conn:      conn,
-		sessionID: runtime.SessionID,
-		frames:    make(chan Frame, outboundCapacity),
-		errs:      make(chan error, 1),
-		done:      make(chan struct{}),
-	}
+	c := NewClient(conn, runtime.SessionID)
 	go c.readLoop()
 	if err := c.write(Frame{
 		Version:   ProtocolVersion,
 		SessionID: runtime.SessionID,
 		Type:      TypeAttach,
-		Payload:   mustPayload(AttachRequest{LastSeq: lastSeq}),
 	}); err != nil {
 		c.Close()
 		return nil, err

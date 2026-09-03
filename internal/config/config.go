@@ -4,117 +4,13 @@ package config
 import (
 	"encoding/json"
 	"fmt"
-	"maps"
 	"os"
 	pathpkg "path"
 	"path/filepath"
-	"slices"
 	"strings"
 
 	"github.com/sacca97/ghg/internal/sandbox"
 )
-
-// Provider is an API endpoint that can serve models.
-type Provider struct {
-	Name      string `json:"name,omitempty"`
-	Profile   string `json:"profile,omitempty"` // reusable YAML profile; empty keeps legacy anonymous behavior
-	BaseURL   string `json:"baseUrl"`
-	API       string `json:"api"`              // legacy protocol selector; profiles use canonical protocol names
-	APIKey    string `json:"apiKey,omitempty"` // literal key or a secret reference ("$VAR"/"${VAR}"/"!cmd"); apiKeyEnv is another option
-	APIKeyEnv string `json:"apiKeyEnv,omitempty"`
-}
-
-// Key returns the resolved API key for the provider, "" when none is
-// configured. Unresolvable secret references degrade to "" like a missing
-// key; ResolveKey reports the error for callers that can surface it.
-func (p Provider) Key() string {
-	k, _ := p.ResolveKey()
-	return k
-}
-
-// ResolveKey is Key with error detail: apiKey/apiKeyEnv may hold a secret
-// reference (see ResolveSecret), resolved here at the point of use so the
-// config file and session store hold only references and a missing var only
-// errors when the provider is actually used. The resolved value never enters
-// the event log.
-func (p Provider) ResolveKey() (string, error) {
-	if p.APIKeyEnv != "" {
-		if v := os.Getenv(p.APIKeyEnv); v != "" {
-			return v, nil
-		}
-	}
-	if p.APIKey != "" {
-		k, err := ResolveSecret(p.APIKey)
-		if err != nil {
-			return "", fmt.Errorf("provider %q apiKey: %w", p.Name, err)
-		}
-		return k, nil
-	}
-	// ponytail: special-case fallback to the inf CLI's stored key; generalize to apiKeyFile if more providers need it
-	// when the profile or legacy URL identifies the built-in default service.
-	if p.Profile == "inference" || strings.Contains(p.BaseURL, "api.inference.net") {
-		return infKey(), nil
-	}
-	return "", nil
-}
-
-// infKey reads apiKey/codingAgentApiKey from ~/.inf/config.json (written by `inf auth set-key`).
-func infKey() string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return ""
-	}
-	data, err := os.ReadFile(filepath.Join(home, ".inf", "config.json"))
-	if err != nil {
-		return ""
-	}
-	var c struct {
-		APIKey            string `json:"apiKey"`
-		CodingAgentAPIKey string `json:"codingAgentApiKey"`
-	}
-	if json.Unmarshal(data, &c) != nil {
-		return ""
-	}
-	if c.APIKey != "" {
-		return c.APIKey
-	}
-	return c.CodingAgentAPIKey
-}
-
-// Model routes a model to one or more providers that serve it.
-type Model struct {
-	Name      string   `json:"name,omitempty"`
-	Providers []string `json:"providers"`    // provider keys, first is the default
-	ID        string   `json:"id,omitempty"` // model id sent to the API; defaults to the map key
-	// API overrides a profile route for this model. It is useful as an escape
-	// hatch when a provider announces a model before its profile route table is
-	// updated.
-	API string `json:"api,omitempty"`
-	// Context is the model's context window (max INPUT tokens). The provider's
-	// /models context_length overrides it when advertised; this is the fallback
-	// and the value shown for providers that don't report one.
-	Context int `json:"context,omitempty"`
-	// MaxOut caps OUTPUT tokens (the max_tokens request param). 0 uses the
-	// provider's max_completion_tokens when advertised, else a sane default.
-	MaxOut int `json:"maxOut,omitempty"`
-	// MaxTokens is the legacy field name for Context (it was misnamed: it held
-	// the context window, not an output cap). Read on load for back-compat.
-	MaxTokens int `json:"maxTokens,omitempty"`
-	// Vision reports whether the model accepts image inputs. When false (the
-	// default), @image tags are NOT inlined as base64 vision parts — the model
-	// gets a pointer note instead, so a text-only model isn't sent a request it
-	// would reject. A provider-advertised input_modalities entry overrides this.
-	Vision bool `json:"vision,omitempty"`
-}
-
-// ContextWindow returns the model's context (input) size, honoring the legacy
-// maxTokens field for configs written before the rename.
-func (m Model) ContextWindow() int {
-	if m.Context > 0 {
-		return m.Context
-	}
-	return m.MaxTokens
-}
 
 // DefaultCompactModel is the built-in compaction-model default: the
 // deepseek-v4-flash route wired into the built-in default config. An
@@ -157,8 +53,9 @@ type Config struct {
 	Thinking        *bool                 `json:"thinking,omitempty"`        // nil defaults to on; false hides reasoning tokens (ctrl+o)
 	CollapsePaste   *bool                 `json:"collapsePaste,omitempty"`   // nil/false: pastes land verbatim; true collapses ≥3-line pastes into a [Pasted ~N lines] placeholder
 	GoalMaxRounds   int                   `json:"goalMaxRounds,omitempty"`   // global goal-loop round cap; 0 = DefaultGoalMaxRounds; projects.json may override per folder
-	MaxRetries      int                   `json:"maxRetries,omitempty"`      // attempts per provider request on transient failures (429/5xx/network); 0 = llm.DefaultMaxAttempts, 1 = no retries
-	Artifacts       *ArtifactConfig       `json:"artifacts,omitempty"`       // bounded tool-result persistence; nil/enabled nil uses defaults
+	MaxRetries      int                   `json:"maxRetries,omitempty"`      // attempts per provider request on transient failures (429/5xx/network); 0 = models.DefaultMaxAttempts, 1 = no retries
+	Outputs         *OutputConfig         `json:"outputs,omitempty"`         // bounded tool-result persistence; nil/enabled nil uses defaults
+	Artifacts       *OutputConfig         `json:"-"`                         // legacy in-memory alias for Outputs
 	Execution       *ExecutionConfig      `json:"execution,omitempty"`       // filesystem/network/approval policy for tool subprocesses
 	Providers       map[string]Provider   `json:"providers"`
 	Models          map[string]Model      `json:"models"`
@@ -253,13 +150,52 @@ func (c *Config) ValidateExecution() error {
 	return nil
 }
 
-// ArtifactConfig controls durable tool-result evidence. Persistence is on by
+// OutputConfig controls durable tool-result evidence. Persistence is on by
 // default; Enabled is a pointer so an explicit false is distinguishable from
-// an older config that has no artifacts block. MaxBytes is the per-result
-// stored-payload ceiling and falls back to the artifact package default.
-type ArtifactConfig struct {
+// a config without an outputs block. MaxBytes is the per-result stored-payload
+// ceiling and falls back to the session package default.
+type OutputConfig struct {
 	Enabled  *bool `json:"enabled,omitempty"`
 	MaxBytes int64 `json:"maxBytes,omitempty"`
+}
+
+// ArtifactConfig is retained as a source-compatibility alias for callers
+// that still construct the old configuration type.
+type ArtifactConfig = OutputConfig
+
+// UnmarshalJSON accepts both the current outputs key and the legacy artifacts
+// key. The current key wins when both are present.
+func (c *Config) UnmarshalJSON(data []byte) error {
+	type plainConfig Config
+	var decoded plainConfig
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	var keys struct {
+		Outputs   *OutputConfig `json:"outputs"`
+		Artifacts *OutputConfig `json:"artifacts"`
+	}
+	if err := json.Unmarshal(data, &keys); err != nil {
+		return err
+	}
+	*c = Config(decoded)
+	c.Outputs = keys.Outputs
+	if c.Outputs == nil {
+		c.Outputs = keys.Artifacts
+	}
+	c.Artifacts = c.Outputs
+	return nil
+}
+
+// MarshalJSON writes the current outputs key, including when an older caller
+// populated only the legacy in-memory alias.
+func (c Config) MarshalJSON() ([]byte, error) {
+	type plainConfig Config
+	if c.Outputs == nil {
+		c.Outputs = c.Artifacts
+	}
+	c.Artifacts = nil
+	return json.Marshal(plainConfig(c))
 }
 
 // LSPServer is the config-file form of an LSP server entry. It mirrors
@@ -539,104 +475,6 @@ func marshalConfig(c *Config) ([]byte, error) {
 		"//   \"mcpImport\": { \"codex\": { \"enabled\": true, \"exclude\": [\"node_repl\"] } }\n"
 	out := append([]byte(header), body...)
 	return append(out, '\n'), nil
-}
-
-// ResolvedRoute contains the canonical provider and model resolution result.
-type ResolvedRoute struct {
-	Provider     Provider
-	Model        Model
-	ProviderName string
-	ModelName    string
-	APIID        string
-}
-
-// Resolve picks the provider and API model id for a model name.
-// provider may be "" to use the config default routing.
-func (c *Config) Resolve(model, provider string) (ResolvedRoute, error) {
-	if model == "" {
-		model = c.DefaultModel
-	}
-	m, ok := c.Models[model]
-	if !ok {
-		// Catalog fallback: a provider-advertised model needs no config entry;
-		// config entries stay authoritative overrides when present.
-		var err error
-		m, provider, err = c.resolveFromCatalog(model, provider)
-		if err != nil {
-			return ResolvedRoute{}, err
-		}
-	}
-	if provider == "" {
-		provider = c.DefaultProvider
-	}
-	if provider == "" && len(m.Providers) > 0 {
-		provider = m.Providers[0]
-	}
-	p, ok := c.Providers[provider]
-	if !ok {
-		return ResolvedRoute{}, fmt.Errorf("unknown provider %q (providers: %s)", provider, keys(c.Providers))
-	}
-	id := m.ID
-	if id == "" {
-		id = model
-	}
-	return ResolvedRoute{
-		Provider:     p,
-		Model:        m,
-		ProviderName: provider,
-		ModelName:    model,
-		APIID:        id,
-	}, nil
-}
-
-// resolveFromCatalog synthesizes a Model for an id advertised in a provider's
-// cached /models catalog but absent from cfg.Models. Capabilities (context,
-// max output, vision) come from the catalog entry; the provider routing is the
-// catalog's owner. provider may pin the choice ("" scans all providers); when
-// several providers advertise the id and none is pinned, it errors naming the
-// candidates so the user can disambiguate with -p / a provider argument.
-func (c *Config) resolveFromCatalog(model, provider string) (Model, string, error) {
-	type hit struct {
-		prov string
-		mi   *ModelInfoLite
-	}
-	var hits []hit
-	for name, cat := range LoadCatalogs() {
-		if provider != "" && name != provider {
-			continue
-		}
-		if _, ok := c.Providers[name]; !ok {
-			continue // catalog for a provider no longer configured
-		}
-		if mi := cat.Find(model); mi != nil {
-			hits = append(hits, hit{name, mi})
-		}
-	}
-	if len(hits) == 0 {
-		return Model{}, "", fmt.Errorf("unknown model %q (models: %s)", model, keys(c.Models))
-	}
-	if len(hits) > 1 {
-		names := make([]string, len(hits))
-		for i, h := range hits {
-			names[i] = h.prov
-		}
-		return Model{}, "", fmt.Errorf("model %q is advertised by multiple providers (%s); pass a provider to disambiguate (-p / /model %s <provider>)",
-			model, strings.Join(names, ", "), model)
-	}
-	h := hits[0]
-	m := Model{
-		Providers: []string{h.prov},
-		ID:        model,
-		Context:   h.mi.ContextLength,
-		MaxOut:    h.mi.MaxCompletionTokens,
-		Vision:    slices.Contains(h.mi.InputModalities, "image"),
-	}
-	return m, h.prov, nil
-}
-
-func keys[V any](m map[string]V) string {
-	keys := slices.Sorted(maps.Keys(m))
-	return strings.Join(keys, ", ")
 }
 
 // Default returns the first-run config, wired for the built-in default service.

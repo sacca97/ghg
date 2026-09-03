@@ -12,7 +12,7 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/sacca97/ghg/internal/provider"
+	"github.com/sacca97/ghg/internal/models"
 )
 
 func authServer(t *testing.T, expectedKey string, status int) (*httptest.Server, *int32) {
@@ -84,12 +84,12 @@ func publicCatalogServer(t *testing.T, expectedKey string) *httptest.Server {
 	}))
 }
 
-func loadAuthProfile(t *testing.T, dir, id, baseURL, catalog string) provider.Profiles {
+func loadAuthProfile(t *testing.T, dir, id, baseURL, catalog string) models.Profiles {
 	t.Helper()
 	catalogKind := catalog
 	public := ""
 	if catalog == "public-openai-models" {
-		catalogKind = provider.CatalogOpenAIModels
+		catalogKind = models.CatalogOpenAIModels
 		public = "  public: true\n"
 	}
 	data := fmt.Sprintf(`schema: 1
@@ -116,7 +116,7 @@ catalog:
 	if err := os.WriteFile(filepath.Join(dir, id+".yaml"), []byte(data), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	profiles, err := provider.Load(provider.LoadOptions{UserDir: dir})
+	profiles, err := models.Load(models.LoadOptions{UserDir: dir})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,7 +126,7 @@ catalog:
 func TestAuthenticateCatalogUsesOneValidatedResponse(t *testing.T) {
 	server, requests := authServer(t, "sk-go", http.StatusOK)
 	defer server.Close()
-	profiles := loadAuthProfile(t, t.TempDir(), "opencode", server.URL, provider.CatalogOpenAIModels)
+	profiles := loadAuthProfile(t, t.TempDir(), "opencode", server.URL, models.CatalogOpenAIModels)
 
 	result, err := Authenticate(context.Background(), profiles, "opencode", " Bearer sk-go ", 1)
 	if err != nil {
@@ -146,7 +146,7 @@ func TestAuthenticateCatalogUsesOneValidatedResponse(t *testing.T) {
 func TestAuthenticateCatalogNoneUsesProbeWithoutModels(t *testing.T) {
 	server, requests := authServer(t, "sk-probe", http.StatusOK)
 	defer server.Close()
-	profiles := loadAuthProfile(t, t.TempDir(), "probe-only", server.URL, provider.CatalogNone)
+	profiles := loadAuthProfile(t, t.TempDir(), "probe-only", server.URL, models.CatalogNone)
 
 	result, err := Authenticate(context.Background(), profiles, "probe-only", "sk-probe", 1)
 	if err != nil {
@@ -237,7 +237,7 @@ catalog:
 	if err := os.WriteFile(filepath.Join(dir, "routed-public.yaml"), []byte(data), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	profiles, err := provider.Load(provider.LoadOptions{UserDir: dir})
+	profiles, err := models.Load(models.LoadOptions{UserDir: dir})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -255,7 +255,7 @@ func TestAuthenticateRedactsCredentialFromValidationError(t *testing.T) {
 	secret := "sk-echo-secret"
 	server, _ := authServer(t, secret, http.StatusUnauthorized)
 	defer server.Close()
-	profiles := loadAuthProfile(t, t.TempDir(), "opencode", server.URL, provider.CatalogOpenAIModels)
+	profiles := loadAuthProfile(t, t.TempDir(), "opencode", server.URL, models.CatalogOpenAIModels)
 
 	_, err := Authenticate(context.Background(), profiles, "opencode", secret, 1)
 	if err == nil || !strings.Contains(err.Error(), "validation failed") {
@@ -267,7 +267,7 @@ func TestAuthenticateRedactsCredentialFromValidationError(t *testing.T) {
 }
 
 func TestResolveProfileReportsAvailableIDsAndAuthNoneRefusal(t *testing.T) {
-	profiles := provider.Profiles{}
+	profiles := models.Profiles{}
 	if _, err := ResolveProfile(profiles, "missing"); err == nil || !strings.Contains(err.Error(), "available: none") {
 		t.Fatalf("unknown profile should list IDs: %v", err)
 	}
@@ -287,7 +287,7 @@ catalog:
 	if err := os.WriteFile(filepath.Join(dir, "local.yaml"), []byte(data), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	loaded, err := provider.Load(provider.LoadOptions{UserDir: dir})
+	loaded, err := models.Load(models.LoadOptions{UserDir: dir})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -10,29 +10,61 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"golang.org/x/term"
 
 	"github.com/sacca97/ghg/internal/auth"
 	"github.com/sacca97/ghg/internal/config"
+	"github.com/sacca97/ghg/internal/models"
 )
 
 // authCLI validates and stores a credential for any loaded provider profile.
 // Profile metadata is the source of truth for the endpoint, wire protocol,
 // auth header, environment variable, and setup hint.
 func authCLI(args []string) error {
+	if len(args) == 0 {
+		profiles, err := loadProviderProfiles()
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf("usage: ghg auth <provider> [--env] [<key>] | ghg auth status [provider] | ghg auth logout [provider] (providers: %s)", strings.Join(profiles.IDs(), ", "))
+	}
+
+	subcmd := strings.TrimSpace(args[0])
+	if subcmd == "status" {
+		target := "codex-subscription"
+		if len(args) > 1 {
+			target = strings.TrimSpace(args[1])
+		}
+		return authStatusCLI(target)
+	}
+	if subcmd == "logout" {
+		target := "codex-subscription"
+		if len(args) > 1 {
+			target = strings.TrimSpace(args[1])
+		}
+		return authLogoutCLI(target)
+	}
+
+	name := subcmd
+	if len(args) > 1 && args[1] == "status" {
+		return authStatusCLI(name)
+	}
+	if len(args) > 1 && args[1] == "logout" {
+		return authLogoutCLI(name)
+	}
+
 	profiles, err := loadProviderProfiles()
 	if err != nil {
 		return err
 	}
-	if len(args) == 0 {
-		return fmt.Errorf("usage: ghg auth <provider> [--env] [<key>] (providers: %s)", strings.Join(profiles.IDs(), ", "))
-	}
-
-	name := strings.TrimSpace(args[0])
 	resolved, err := auth.ResolveProfile(profiles, name)
 	if err != nil {
 		return err
+	}
+	if resolved.RequiresOAuth() {
+		return authOAuthCLI(name, resolved)
 	}
 	if !resolved.RequiresAPIKey() {
 		return fmt.Errorf("provider %q takes no API key", name)
@@ -192,4 +224,91 @@ func shellRC() string {
 	default:
 		return ""
 	}
+}
+
+func authOAuthCLI(name string, resolved models.Resolved) error {
+	fmt.Printf("Starting OAuth login for %s…\n", resolved.Profile.DisplayName)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	opts := auth.LoginOptions{
+		OpenBrowser: true,
+		Printer: func(url string) {
+			fmt.Printf("Open the following authorization URL in your browser:\n\n  %s\n\nWaiting for callback on http://localhost:1455…\n", url)
+		},
+	}
+	creds, err := auth.Login(ctx, opts)
+	if err != nil {
+		return fmt.Errorf("OAuth login failed: %w", err)
+	}
+	fmt.Println("OAuth login successful!")
+	if creds.AccountID != "" {
+		fmt.Printf("Account ID: %s\n", creds.AccountID)
+	}
+	return configureOAuthPostLogin(name, resolved)
+}
+
+func configureOAuthPostLogin(name string, resolved models.Resolved) error {
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	if err := cfg.UpsertOAuthProvider(name, resolved); err != nil {
+		return err
+	}
+	if err := cfg.Save(); err != nil {
+		return err
+	}
+
+	backend, berr := auth.NewBackend(resolved, "", "", 0)
+	var modelErr error
+	if berr != nil {
+		modelErr = berr
+	} else if cat, ok := backend.(models.CatalogBackend); ok {
+		modelsCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		models, err := cat.Models(modelsCtx)
+		if err != nil {
+			modelErr = err
+		} else if len(models) > 0 {
+			_ = config.SaveCatalog(name, resolved.BaseURL, models)
+			fmt.Printf("%s configured — %d models added to the catalog.\n", resolved.Profile.DisplayName, len(models))
+			return nil
+		}
+	}
+	fmt.Printf("%s configured.\n", resolved.Profile.DisplayName)
+	if modelErr != nil {
+		fmt.Printf("Warning: model discovery failed: %s (run /model refresh to retry).\n", modelErr.Error())
+	}
+	return nil
+}
+
+func authStatusCLI(name string) error {
+	mgr := auth.DefaultCodexCredentialManager()
+	st, err := mgr.Status(context.Background())
+	if err != nil {
+		return err
+	}
+	if !st.Configured {
+		fmt.Printf("Provider %q is not authenticated.\n", name)
+		return nil
+	}
+	fmt.Printf("Provider %q authentication status:\n", name)
+	if st.AccountID != "" {
+		fmt.Printf("  Account ID: %s\n", st.AccountID)
+	}
+	if st.Expired {
+		fmt.Printf("  Status:     expired at %s\n", st.ExpiresAt.Format(time.RFC3339))
+	} else {
+		fmt.Printf("  Status:     valid until %s\n", st.ExpiresAt.Format(time.RFC3339))
+	}
+	return nil
+}
+
+func authLogoutCLI(name string) error {
+	mgr := auth.DefaultCodexCredentialManager()
+	if err := mgr.Logout(context.Background()); err != nil {
+		return err
+	}
+	fmt.Printf("Logged out from %q.\n", name)
+	return nil
 }

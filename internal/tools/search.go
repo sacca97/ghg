@@ -21,21 +21,23 @@ import (
 	"sync"
 	"time"
 
-	"github.com/sacca97/ghg/internal/llm"
+	"github.com/sacca97/ghg/internal/models"
 	"github.com/sacca97/ghg/internal/sandbox"
 	"github.com/sacca97/ghg/internal/search"
 )
 
 const (
-	defaultSearchMaxResults = 25
-	maxSearchResults        = 10000
-	maxSearchEntries        = 100000
-	maxBinaryProbeBytes     = 8 << 10
-	maxSearchLineBytes      = 1 << 20
-	maxMatchLineBytes       = 4 << 10
-	maxSearchPatternBytes   = 16 << 10
-	searchPreviewBytes      = 16 << 10
-	searchPerFileCap        = 4
+	defaultSearchMaxResults  = 25
+	maxSearchPageSize        = 250
+	maxSearchSnapshotResults = 2000
+	maxSearchResults         = maxSearchSnapshotResults
+	maxSearchEntries         = 100000
+	maxBinaryProbeBytes      = 8 << 10
+	maxSearchLineBytes       = 1 << 20
+	maxMatchLineBytes        = 4 << 10
+	maxSearchPatternBytes    = 16 << 10
+	searchPreviewBytes       = 16 << 10
+	searchPerFileCap         = 4
 )
 
 var errSearchLimit = errors.New("search limit reached")
@@ -66,21 +68,21 @@ type findFilesArgs struct {
 }
 
 func grepTool() Tool {
-	return resultTool(llm.NewTool("grep",
+	return resultTool(models.NewTool("grep",
 		"Search text files for a regular expression. Prefer this for text; use patterns for one OR search. Results respect nested .gitignore files, skip binaries and symlinks, are grouped by file, and paginate with cursor.",
-		`{"type":"object","properties":{"pattern":{"type":"string","description":"Regular expression to search for; use patterns for multiple alternatives"},"patterns":{"type":"array","items":{"type":"string"},"description":"Regular expressions ORed together and searched in one traversal"},"path":{"type":"string","description":"File or directory to search (default: current working directory)"},"include":{"type":"string","description":"Optional glob filter such as *.go"},"max_results":{"type":"integer","description":"Matches per page (default 25, maximum 10000)"},"cursor":{"type":"string","description":"Cursor returned by an earlier page; reuse it with max_results to continue"},"case_sensitive":{"type":"boolean","description":"Whether the expression is case-sensitive (default true)"},"literal":{"type":"boolean","description":"Treat patterns as literal text instead of regular expressions"}},"required":[]}`),
+		`{"type":"object","properties":{"pattern":{"type":"string","description":"Regular expression to search for; use patterns for multiple alternatives"},"patterns":{"type":"array","items":{"type":"string"},"description":"Regular expressions ORed together and searched in one traversal"},"path":{"type":"string","description":"File or directory to search (default: current working directory)"},"include":{"type":"string","description":"Optional glob filter such as *.go"},"max_results":{"type":"integer","description":"Matches per page (default 25, maximum 10000)"},"cursor":{"type":"string","description":"Cursor returned by an earlier page; reuse it with max_results to continue"},"case_sensitive":{"type":"boolean","description":"Whether the expression is case-sensitive (default true)"},"literal":{"type":"boolean","description":"Treat patterns as literal text instead of regular expressions"}},"required":["pattern"]}`),
 		runGrepResult)
 }
 
 func globTool() Tool {
-	return resultTool(llm.NewTool("glob",
+	return resultTool(models.NewTool("glob",
 		"Find regular files by deterministic slash-aware glob. Use ** for recursive paths. It respects nested .gitignore files, never follows symlinks, and paginates with cursor.",
 		`{"type":"object","properties":{"pattern":{"type":"string","description":"Glob pattern relative to path, for example **/*.go"},"path":{"type":"string","description":"Directory or file to search (default: current working directory)"},"max_results":{"type":"integer","description":"Paths per page (default 25, maximum 10000)"},"cursor":{"type":"string","description":"Cursor returned by an earlier page"}},"required":["pattern"]}`),
 		runGlobResult)
 }
 
 func findFilesTool() Tool {
-	return resultTool(llm.NewTool("find_files",
+	return resultTool(models.NewTool("find_files",
 		"Find files by fuzzy path or filename match. Every candidate is scored before the best results are selected; use glob for exact patterns.",
 		`{"type":"object","properties":{"query":{"type":"string","description":"Filename or path text to match fuzzily"},"path":{"type":"string","description":"Directory to search (default: current working directory)"},"max_results":{"type":"integer","description":"Paths per page (default 25, maximum 10000)"},"cursor":{"type":"string","description":"Cursor returned by an earlier page"}},"required":["query"]}`),
 		runFindFilesResult)
@@ -169,7 +171,7 @@ func runFindFilesResult(ctx context.Context, args json.RawMessage) (ToolResult, 
 	if err != nil {
 		return ToolResult{}, fmt.Errorf("resolve find_files path %q: %w", root, err)
 	}
-	hits := search.FuzzyFiles(resolved, a.Query, 0)
+	hits := search.FuzzyFiles(resolved, a.Query, maxSearchSnapshotResults)
 	items := make([]search.Item, 0, min(len(hits), maxSearchResults))
 	for _, hit := range hits {
 		if len(items) >= maxSearchResults {
@@ -213,10 +215,10 @@ func (c *searchCollector) add(ctx context.Context, item search.Item) error {
 	}
 	// This is deliberately an accounting budget, not the model-facing page
 	// budget. It bounds the immutable cursor snapshot before it can become an
-	// artifact while still retaining enough results for many small pages.
+	// output while still retaining enough results for many small pages.
 	itemBytes := int64(len(item.Path) + len(item.Text) + 32)
-	if c.bytes+itemBytes > maxArtifactBytes {
-		c.stop(fmt.Sprintf("search snapshot limited to %d bytes", maxArtifactBytes))
+	if c.bytes+itemBytes > maxOutputBytes {
+		c.stop(fmt.Sprintf("search snapshot limited to %d bytes", maxOutputBytes))
 		return errSearchLimit
 	}
 	c.items = append(c.items, item)
@@ -247,7 +249,9 @@ func collectGrepSnapshot(ctx context.Context, args grepArgs) (search.Snapshot, e
 	defer func() { _ = scope.Close() }()
 
 	collector := newSearchCollector()
-	if scope.single {
+	if _, ok := rgAvailable(); ok {
+		err = grepSnapshotRG(ctx, args, scope, collector)
+	} else if scope.single {
 		if include == nil || include.matches(scope.matchPath(scope.start)) {
 			err = grepSnapshotFile(ctx, scope.fsys, scope.start, scope.displayPath(scope.start), matcher, collector)
 		}
@@ -429,8 +433,8 @@ func pageSize(n int) int {
 	if n <= 0 {
 		return defaultSearchMaxResults
 	}
-	if n > maxSearchResults {
-		return maxSearchResults
+	if n > maxSearchPageSize {
+		return maxSearchPageSize
 	}
 	return n
 }
@@ -478,10 +482,7 @@ func renderSearchResult(ctx context.Context, snapshot search.Snapshot, cursor se
 		remaining = len(snapshot.Items) - searchPageItemsBefore(chunks, nextOffset)
 		hasMore = searchStore != nil && nextOffset < len(chunks)
 	}
-	fullText := renderSearchAll(snapshot, grouped)
-	capture := NewTextCapture(maxArtifactBytes)
-	capture.WriteString(fullText)
-	result := capturedResult(capture.String(), pageText, capture.OriginalBytes(), snapshot.Complete && capture.Complete(), 0)
+	result := capturedResult(pageText, pageText, int64(len(pageText)), snapshot.Complete, 0)
 	result.Metadata = map[string]string{
 		"search_id":               snapshot.ID,
 		"search_kind":             snapshot.Kind,
@@ -510,29 +511,38 @@ func searchPageChunks(items []search.Item, capPerFile int, grouped bool) [][]sea
 	return groupedSearchChunks(items, capPerFile)
 }
 
-// selectSearchPage accepts only complete rendered pages. The cursor advances
-// after the last item that actually fits inside the model-facing byte ceiling;
-// it never advances past a result that bounded rendering would cut away.
+// selectSearchPage accepts complete chunks that fit within the byte ceiling.
+// It uses incremental byte accounting rather than re-rendering the full page string per candidate.
 func selectSearchPage(snapshot search.Snapshot, chunks [][]search.Item, offset, size int, cursorAvailable, grouped bool) ([]search.Item, int) {
 	page := make([]search.Item, 0, min(size, len(snapshot.Items)))
 	nextOffset := offset
+	estimatedBytes := 256
+	lastPath := ""
 	for i := offset; i < len(chunks) && len(page) < size; i++ {
 		chunk := chunks[i]
 		if len(page) > 0 && len(page)+len(chunk) > size {
 			break
 		}
-		candidate := append(slices.Clone(page), chunk...)
-		candidateOffset := i + 1
-		candidateHasMore := cursorAvailable && candidateOffset < len(chunks)
-		candidateRemaining := len(snapshot.Items) - searchPageItemsBefore(chunks, candidateOffset)
-		candidateText := renderSearchPage(snapshot.Kind, candidate, len(snapshot.Items), len(candidate), candidateRemaining,
-			candidateHasMore, searchCursor{Kind: snapshot.Kind, ID: snapshot.ID, Offset: candidateOffset},
-			grouped, snapshot)
-		if len(candidateText) > searchPreviewBytes {
+		chunkBytes := 0
+		if grouped {
+			for _, item := range chunk {
+				if item.Path != lastPath {
+					chunkBytes += len(item.Path) + 3 // path:\n
+					lastPath = item.Path
+				}
+				chunkBytes += len(item.Text) + 12 // "  %d:%s\n"
+			}
+		} else {
+			for _, item := range chunk {
+				chunkBytes += len(item.Path) + 1 // path\n
+			}
+		}
+		if estimatedBytes+chunkBytes > searchPreviewBytes {
 			break
 		}
-		page = candidate
-		nextOffset = candidateOffset
+		estimatedBytes += chunkBytes
+		page = append(page, chunk...)
+		nextOffset = i + 1
 	}
 	return page, nextOffset
 }
@@ -605,31 +615,6 @@ func renderSearchPage(kind string, items []search.Item, total, displayed, remain
 		fmt.Fprintf(&b, "[incomplete search snapshot: %s; omitted results are unavailable]", snapshot.Reason)
 	}
 	return strings.TrimSuffix(b.String(), "\n")
-}
-
-func renderSearchAll(snapshot search.Snapshot, grouped bool) string {
-	if len(snapshot.Items) == 0 {
-		return snapshot.Kind + ": (no matches)\n"
-	}
-	var b strings.Builder
-	if grouped {
-		lastPath := ""
-		for _, item := range snapshot.Items {
-			if item.Path != lastPath {
-				b.WriteString(item.Path + ":\n")
-				lastPath = item.Path
-			}
-			fmt.Fprintf(&b, "  %d:%s\n", item.Line, item.Text)
-		}
-	} else {
-		for _, item := range snapshot.Items {
-			b.WriteString(item.Path + "\n")
-		}
-	}
-	if !snapshot.Complete {
-		fmt.Fprintf(&b, "[incomplete search snapshot: %s; omitted results are unavailable]\n", snapshot.Reason)
-	}
-	return b.String()
 }
 
 func grepSnapshotFile(ctx context.Context, fsys fs.FS, name, display string, matcher *regexp.Regexp, out *searchCollector) error {
@@ -998,6 +983,9 @@ func openSearchScope(ctx context.Context, requested string) (*searchScope, error
 	}
 	info, err := os.Lstat(abs)
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil, fmt.Errorf("search path %q does not exist; locate the path with glob or find_files instead of guessing", requested)
+		}
 		return nil, fmt.Errorf("search path %q: %w", requested, err)
 	}
 	if info.Mode()&os.ModeSymlink != 0 {

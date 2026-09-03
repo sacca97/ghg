@@ -3,12 +3,14 @@ package tools
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"strings"
 
+	"github.com/sacca97/ghg/internal/models"
 	"github.com/sacca97/ghg/internal/observation"
 	"github.com/sacca97/ghg/internal/sandbox"
 )
@@ -21,6 +23,25 @@ const (
 	maxObservationPath = 4 << 10
 	readHeaderBudget   = 128
 )
+
+func readTool() Tool {
+	return resultTool(models.NewTool("read",
+		"Read a bounded range of complete lines and issue an observation id for later range-authorized edits. Use offset/limit to continue.",
+		`{"type":"object","properties":{"path":{"type":"string","description":"Path to the file"},"offset":{"type":"number","description":"1-based line to start from (default 1)"},"limit":{"type":"number","description":"Max complete lines to return (default 250, maximum 1000)"}},"required":["path"]}`),
+		runReadResult)
+}
+
+func runReadResult(ctx context.Context, args json.RawMessage) (ToolResult, error) {
+	var a struct {
+		Path   string `json:"path"`
+		Offset int    `json:"offset"`
+		Limit  int    `json:"limit"`
+	}
+	if err := json.Unmarshal(args, &a); err != nil {
+		return ToolResult{}, err
+	}
+	return runObservedRead(ctx, a)
+}
 
 func runObservedRead(ctx context.Context, args struct {
 	Path   string `json:"path"`
@@ -127,6 +148,18 @@ func readObservedContent(ctx context.Context, canonical, display string, r io.Re
 	}
 
 	id := observation.NewID()
+	sessionID, store := observationContextFor(ctx)
+	isDuplicate := false
+	if store != nil {
+		if finder, ok := store.(interface {
+			FindLatest(string, string, int, int) (observation.Record, bool)
+		}); ok {
+			if prior, found := finder.FindLatest(sessionID, canonical, start, start+selected-1); found && prior.Content == content.String() {
+				id = prior.ID
+				isDuplicate = true
+			}
+		}
+	}
 	header := fmt.Sprintf("[observation %s path=%s lines=%d-%d next_offset=%d]\n", id, filepath.ToSlash(canonical), start, start+selected-1, nextOffset)
 	raw := header + numbered.String()
 	if len(raw) > maxObservationPath+maxReadBytes {
@@ -142,15 +175,7 @@ func readObservedContent(ctx context.Context, canonical, display string, r io.Re
 		Content:     content.String(),
 		Complete:    !limitedByBytes,
 	}
-	sessionID, store := observationContextFor(ctx)
-	if store != nil {
-		if finder, ok := store.(interface {
-			FindLatest(string, string, int, int) (observation.Record, bool)
-		}); ok {
-			if prior, found := finder.FindLatest(sessionID, canonical, start, start+selected-1); found && prior.Content == content.String() {
-				id = prior.ID
-			}
-		}
+	if store != nil && !isDuplicate {
 		if err := store.Save(ctx, sessionID, record); err != nil {
 			return ToolResult{}, fmt.Errorf("persist read observation: %w", err)
 		}

@@ -75,11 +75,9 @@ func workerAttachCLI(args []string) error {
 		return err
 	}
 	tui.Version = version
-	attachErr := error(nil)
-	if _, err := tui.RunAttached(cfg, meta.Model, meta.Provider, systemPrompt(), meta.ID, false); err == nil {
+	_, attachErr := tui.RunAttached(cfg, meta.Model, meta.Provider, systemPrompt(), meta.ID, false)
+	if attachErr == nil {
 		return nil
-	} else {
-		attachErr = err
 	}
 	// A detached worker may have completed its idle grace period. Reopen the
 	// durable session normally, which starts a fresh worker from its persisted
@@ -110,7 +108,7 @@ func workerStopCLI(args []string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	client, err := workerwire.Dial(ctx, runtimeFile, 0)
+	client, err := workerwire.Dial(ctx, runtimeFile)
 	if err != nil {
 		return err
 	}

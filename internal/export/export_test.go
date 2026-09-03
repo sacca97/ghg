@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/sacca97/ghg/internal/agent"
-	"github.com/sacca97/ghg/internal/llm"
+	"github.com/sacca97/ghg/internal/models"
 	"github.com/sacca97/ghg/internal/session"
 )
 
@@ -171,13 +171,13 @@ func TestWriteExportFileAtomicAndPermissions(t *testing.T) {
 }
 
 func TestRenderChatMarkdownAndJSON(t *testing.T) {
-	msgs := []llm.Message{
+	msgs := []models.Message{
 		{Role: "system", Content: "Standard prompt"},
 		{Role: "user", Content: "How do I test this?"},
 		{
 			Role:    "assistant",
 			Content: "Run the tests with `go test`.",
-			ToolCalls: []llm.ToolCall{
+			ToolCalls: []models.ToolCall{
 				{
 					Function: struct {
 						Name      string `json:"name"`

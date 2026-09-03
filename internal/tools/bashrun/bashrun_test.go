@@ -232,3 +232,43 @@ func TestUserShellResolution(t *testing.T) {
 		t.Fatalf("run via user shell: %+v", res)
 	}
 }
+
+func TestBoundedCapturePreviewRollingUTF8(t *testing.T) {
+	c := newBoundedCapture(100)
+	c.Write([]byte("hello"))
+	c.Write([]byte{0xe4})
+	c.Write([]byte{0xb8, 0x96})
+	preview := c.Preview(10)
+	if !strings.Contains(preview, "世") {
+		t.Fatalf("expected valid UTF-8 in preview, got: %q", preview)
+	}
+
+	chunk := []byte(strings.Repeat("abcdefghij", 1000)) // 10 KB
+	for i := 0; i < 100; i++ {
+		c.Write(chunk)
+	}
+	if c.total != 1000000+8 {
+		t.Fatalf("expected total bytes %d, got %d", 1000008, c.total)
+	}
+	prev := c.Preview(50)
+	if len(prev) > 50 {
+		t.Fatalf("preview exceeded limit: len=%d", len(prev))
+	}
+}
+
+func TestPipefailPreserved(t *testing.T) {
+	t.Setenv("SHELL", "bash")
+	res := Run(context.Background(), Options{
+		Command: "false | tail -n 1",
+	})
+	if res.Exit == "" {
+		t.Fatalf("expected pipeline failure to produce non-empty exit status, got: %+v", res)
+	}
+
+	resOk := Run(context.Background(), Options{
+		Command: "true | tail -n 1",
+	})
+	if resOk.Exit != "" {
+		t.Fatalf("expected successful pipeline to produce empty exit status, got: %+v", resOk)
+	}
+}

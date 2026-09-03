@@ -10,7 +10,7 @@ and completion.
 
 ## Delivered
 
-- `internal/goal` defines the persisted record, six lifecycle states, bounded
+- `internal/agent` defines the persisted record, six lifecycle states, bounded
   notes, model-update validation, and host-controlled pause/limit transitions.
 - `internal/session` stores the current goal by session and goal ID, appends
   checkpoints, migrates the legacy `sessions.goal` string, and copies/deletes
@@ -35,7 +35,7 @@ The model never completes a goal through final prose. It must call
 
 ## Verification
 
-- `go test ./internal/goal ./internal/session ./internal/agent ./internal/tui`
+- `go test ./internal/agent ./internal/session ./internal/tui`
 - `go test ./...` reaches the known pre-existing
   `internal/auth/TestAuthenticateCatalogUsesOneValidatedResponse` fixture
   mismatch (`OPENCODE_KEY` versus the obsolete `OPENCODE_GO_KEY`).

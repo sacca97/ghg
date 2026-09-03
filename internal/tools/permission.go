@@ -5,6 +5,7 @@
 package tools
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -30,10 +31,6 @@ type GateRequest struct {
 	Command string // the bash command or the file path
 	Rule    string // the rule "always" would install (arity-collapsed)
 }
-
-// Gate is the installed permission hook. It returns the decision and, on
-// reject, a free-text redirect that goes back to the model. Nil = allow.
-var Gate func(GateRequest) (GateDecision, string)
 
 // arity maps a command prefix to how many tokens define "the command" —
 // longest prefix wins, flags never count. Compact version of opencode's
@@ -998,11 +995,12 @@ func globalInstall(base string, argv []string) bool {
 
 // checkGate runs the installed gate for a tool call; "" means proceed, a
 // non-empty string is the rejection fed back to the model.
-func checkGate(tool, command string) string {
-	if Gate == nil {
+func checkGate(ctx context.Context, tool, command string) string {
+	runtime := RuntimeFromContext(ctx)
+	if runtime == nil || runtime.HumanGate == nil {
 		return ""
 	}
-	decision, redirect := Gate(GateRequest{Tool: tool, Command: command, Rule: CommandRule(command)})
+	decision, redirect := runtime.HumanGate(GateRequest{Tool: tool, Command: command, Rule: CommandRule(command)})
 	if decision == GateReject {
 		if redirect == "" {
 			redirect = "the user rejected this action"

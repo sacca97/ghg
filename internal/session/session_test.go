@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sacca97/ghg/internal/llm"
+	"github.com/sacca97/ghg/internal/models"
 )
 
 func TestTaskRoundTrip(t *testing.T) {
@@ -70,12 +70,12 @@ func TestStoreRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	sent := time.Date(2025, 6, 1, 14, 30, 0, 0, time.UTC)
-	use := llm.Usage{PromptTokens: 12, CompletionTokens: 4}
-	msgs := []llm.Message{
+	use := models.Usage{PromptTokens: 12, CompletionTokens: 4}
+	msgs := []models.Message{
 		{Role: "system", Content: "sys"},
 		{Role: "user", Content: "first question here", Authored: true, SentAt: &sent},
 		{Role: "assistant", Content: "the answer", Usage: &use, Model: "kimi-k3-fast @ inference",
-			ToolCalls: []llm.ToolCall{{ID: "c1", DurationMs: 42, ExitCode: 0}}},
+			ToolCalls: []models.ToolCall{{ID: "c1", DurationMs: 42, ExitCode: 0}}},
 		{Role: "tool", Content: "c1 result", ToolCallID: "c1", Name: "bash"},
 		{Role: "user", Content: "follow-up"},
 		{Role: "assistant", Content: "final\nanswer"},
@@ -90,6 +90,9 @@ func TestStoreRoundTrip(t *testing.T) {
 	}
 	if meta.ID != id || meta.Title != "first question here" {
 		t.Fatalf("meta: %+v", meta)
+	}
+	if got := DeterministicTitle(" \tfirst\x00\nsecond "); got != "first second" {
+		t.Fatalf("deterministic title: %q", got)
 	}
 	if len(got) != 5 || got[0].Role != "user" || got[4].Content != "final\nanswer" {
 		t.Fatalf("messages: %+v", got)
@@ -149,21 +152,21 @@ func TestMostRecentForCWD(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := st.Save(oldID, 1, []llm.Message{{Role: "system"}, {Role: "user", Content: "old"}}, "old", "p"); err != nil {
+	if err := st.Save(oldID, 1, []models.Message{{Role: "system"}, {Role: "user", Content: "old"}}, "old", "p"); err != nil {
 		t.Fatal(err)
 	}
 	newID, err := st.Create("/work", "new", "p")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := st.Save(newID, 1, []llm.Message{{Role: "system"}, {Role: "user", Content: "new"}}, "new", "p"); err != nil {
+	if err := st.Save(newID, 1, []models.Message{{Role: "system"}, {Role: "user", Content: "new"}}, "new", "p"); err != nil {
 		t.Fatal(err)
 	}
 	otherID, err := st.Create("/other", "other", "p")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := st.Save(otherID, 1, []llm.Message{{Role: "system"}, {Role: "user", Content: "other"}}, "other", "p"); err != nil {
+	if err := st.Save(otherID, 1, []models.Message{{Role: "system"}, {Role: "user", Content: "other"}}, "other", "p"); err != nil {
 		t.Fatal(err)
 	}
 	// Make recency unambiguous even on filesystems/clocks with second-level
@@ -198,7 +201,7 @@ func TestEffortRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := st.Save(id, 1, []llm.Message{{Role: "system"}, {Role: "user", Content: "q"}}, "m", "p"); err != nil {
+	if err := st.Save(id, 1, []models.Message{{Role: "system"}, {Role: "user", Content: "q"}}, "m", "p"); err != nil {
 		t.Fatal(err)
 	}
 
@@ -242,13 +245,13 @@ func TestUserHistory(t *testing.T) {
 
 	// two sessions in different folders; the newer one typed last
 	a, _ := st.Create("/proj/a", "m", "p")
-	st.Save(a, 0, []llm.Message{
+	st.Save(a, 0, []models.Message{
 		{Role: "system", Content: "sys"},
 		{Role: "user", Content: "from folder A", Authored: true},
 		{Role: "assistant", Content: "ans"},
 	}, "m", "p")
 	b, _ := st.Create("/proj/b", "m", "p")
-	st.Save(b, 0, []llm.Message{
+	st.Save(b, 0, []models.Message{
 		{Role: "system", Content: "sys"},
 		{Role: "user", Content: "from folder B", Authored: true},
 		{Role: "assistant", Content: "ans"},
@@ -284,7 +287,7 @@ func TestUserHistorySkipsInjected(t *testing.T) {
 	defer st.Close()
 
 	id, _ := st.Create("/proj/x", "m", "p")
-	st.Save(id, 0, []llm.Message{
+	st.Save(id, 0, []models.Message{
 		{Role: "system", Content: "sys"},
 		{Role: "user", Content: "real question I typed", Authored: true},
 		{Role: "assistant", Content: "ans"},
@@ -318,7 +321,7 @@ func TestStoreEdgeCases(t *testing.T) {
 	defer st.Close()
 	id1, _ := st.Create("/tmp", "m", "p")
 	id2, _ := st.Create("/tmp", "m", "p")
-	msgs := []llm.Message{{Role: "system"}, {Role: "user", Content: "q"}}
+	msgs := []models.Message{{Role: "system"}, {Role: "user", Content: "q"}}
 	st.Save(id1, 1, msgs, "m", "p")
 	st.Save(id2, 1, msgs, "m", "p")
 	if _, _, err := st.Load(""); err == nil || !strings.Contains(err.Error(), "ambiguous") {
@@ -343,7 +346,7 @@ func TestGoalPersistence(t *testing.T) {
 	}
 	defer st.Close()
 	id, _ := st.Create("/tmp", "m", "p")
-	st.Save(id, 1, []llm.Message{{Role: "system"}, {Role: "user", Content: "q"}}, "m", "p")
+	st.Save(id, 1, []models.Message{{Role: "system"}, {Role: "user", Content: "q"}}, "m", "p")
 
 	if err := st.SetGoal(id, "finish the thing"); err != nil {
 		t.Fatal(err)
@@ -368,21 +371,21 @@ func TestLoadSynthesizesDanglingToolResults(t *testing.T) {
 	}
 	defer st.Close()
 
-	call := func(id, name string) llm.ToolCall {
-		var tc llm.ToolCall
+	call := func(id, name string) models.ToolCall {
+		var tc models.ToolCall
 		tc.ID, tc.Function.Name = id, name
 		return tc
 	}
 	id, _ := st.Create("/tmp", "m", "p")
-	msgs := []llm.Message{
+	msgs := []models.Message{
 		{Role: "system", Content: "sys"},
 		{Role: "user", Content: "go"},
 		// crash between the two parallel calls' results: c1 answered, c2 dangling
-		{Role: "assistant", ToolCalls: []llm.ToolCall{call("c1", "read"), call("c2", "bash")}},
+		{Role: "assistant", ToolCalls: []models.ToolCall{call("c1", "read"), call("c2", "bash")}},
 		{Role: "tool", Content: "file body", ToolCallID: "c1", Name: "read"},
 		{Role: "user", Content: "next"},
 		// a whole tool batch lost to the crash
-		{Role: "assistant", ToolCalls: []llm.ToolCall{call("c3", "edit"), call("c4", "write")}},
+		{Role: "assistant", ToolCalls: []models.ToolCall{call("c3", "edit"), call("c4", "write")}},
 	}
 	if err := st.Save(id, 1, msgs, "m", "p"); err != nil {
 		t.Fatal(err)
@@ -426,7 +429,7 @@ func TestCompactionEvent(t *testing.T) {
 	defer st.Close()
 
 	id, _ := st.Create("/tmp", "m", "p")
-	msgs := []llm.Message{
+	msgs := []models.Message{
 		{Role: "system", Content: "sys"},
 		{Role: "user", Content: "q1"},
 		{Role: "assistant", Content: "a1"},
@@ -471,7 +474,7 @@ func TestCompactionEvent(t *testing.T) {
 
 	// a later turn appends new rows to the raw log (the TUI only ever saves
 	// the compacted in-memory history's NEW tail, which is raw rows)
-	if err := st.Save(id, 7, []llm.Message{
+	if err := st.Save(id, 7, []models.Message{
 		{}, {}, {}, {}, {}, {}, {}, // placeholder rows 0..6 (already stored)
 		{Role: "user", Content: "q4"},
 		{Role: "assistant", Content: "a4"},
@@ -520,7 +523,7 @@ func TestRawCutoffTranslatesThroughPriorCompaction(t *testing.T) {
 		t.Fatalf("pass-through cutoff: %d, want 4", got)
 	}
 
-	raw := []llm.Message{
+	raw := []models.Message{
 		{Role: "system", Content: "sys"},
 		{Role: "user", Content: "q1"},
 		{Role: "assistant", Content: "a1"},
@@ -541,7 +544,7 @@ func TestRawCutoffTranslatesThroughPriorCompaction(t *testing.T) {
 	// The agent's view after it: [sys, summary, a2, q3, a3, q4, a4] — the
 	// summary is a derived system row, not a raw row. A second compaction
 	// whose tail starts at view index 5 (q4) must record raw row 7.
-	view := []llm.Message{
+	view := []models.Message{
 		{Role: "system", Content: "sys"},
 		{Role: "system", Content: "Summary of the conversation so far:\n\nfirst"},
 		{Role: "assistant", Content: "a2"},
@@ -586,7 +589,7 @@ func TestPersistCompactionSavesUnsavedAndRecordsEvent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	msgs := []llm.Message{
+	msgs := []models.Message{
 		{Role: "system", Content: "sys"},
 		{Role: "user", Content: "q1"},
 		{Role: "assistant", Content: "a1"},

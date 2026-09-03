@@ -5,12 +5,147 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/textarea"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/sacca97/ghg/internal/tools/bashrun"
 )
+
+type interactive struct {
+	keys    chan []byte
+	output  string
+	await   bool
+	awaitcd int
+}
+
+type interactiveStartMsg struct{ keys chan []byte }
+type interactiveOutMsg struct{ chunk string }
+type interactiveAwaitMsg struct{ secsLeft int }
+type interactiveDoneMsg struct {
+	output string
+	exit   string
+}
+
+func (m *model) iactiveKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.Type {
+	case tea.KeyCtrlC:
+		if !m.interrupt1 {
+			m.interrupt1 = true
+			return m, nil
+		}
+		if m.cancel != nil {
+			m.cancel()
+		}
+		return m, nil
+	case tea.KeyEsc:
+		m.sendKeys([]byte{0x1b})
+		return m, nil
+	case tea.KeyEnter:
+		m.sendKeys([]byte("\r"))
+		return m, nil
+	case tea.KeyTab:
+		m.sendKeys([]byte("\t"))
+		return m, nil
+	case tea.KeyBackspace, tea.KeyDelete:
+		m.sendKeys([]byte{0x7f})
+		return m, nil
+	case tea.KeyUp, tea.KeyDown, tea.KeyLeft, tea.KeyRight:
+		m.sendKeys([]byte(arrowBytes(msg.Type)))
+		return m, nil
+	case tea.KeyCtrlJ:
+		m.sendKeys([]byte("\r"))
+		return m, nil
+	}
+	if msg.Type == tea.KeyRunes || msg.Type == tea.KeySpace {
+		var buf []byte
+		if msg.Alt {
+			buf = append(buf, 0x1b)
+		}
+		for _, r := range msg.Runes {
+			var rb [4]byte
+			n := utf8.EncodeRune(rb[:], r)
+			buf = append(buf, rb[:n]...)
+		}
+		if len(buf) > 0 {
+			m.sendKeys(buf)
+		}
+	}
+	return m, nil
+}
+
+func (m *model) sendKeys(b []byte) {
+	if m.iactive == nil {
+		return
+	}
+	select {
+	case m.iactive.keys <- b:
+	default:
+	}
+}
+
+func arrowBytes(t tea.KeyType) string {
+	switch t {
+	case tea.KeyUp:
+		return bashrun.KeyUp
+	case tea.KeyDown:
+		return bashrun.KeyDown
+	case tea.KeyLeft:
+		return bashrun.KeyLeft
+	case tea.KeyRight:
+		return bashrun.KeyRight
+	}
+	return ""
+}
+
+func (m *model) interactiveView() string {
+	if m.iactive == nil {
+		return ""
+	}
+	const maxLines = 12
+	lines := strings.Split(strings.TrimRight(m.iactive.output, "\n"), "\n")
+	if len(lines) > maxLines {
+		lines = lines[len(lines)-maxLines:]
+	}
+	rendered := dimStyle.Render("  " + strings.Join(lines, "\n  "))
+	header := toolStyle.Render("⚒ bash (interactive)")
+	if m.iactive.await {
+		header += errStyle.Render(fmt.Sprintf("  ⏳ waiting for input — cancels in %ds", m.iactive.awaitcd))
+	} else {
+		header += dimStyle.Render("  (type to respond; ctrl+c ctrl+c to cancel)")
+	}
+	return header + "\n" + rendered
+}
+
+type namePrompt struct {
+	label string
+	draft string
+	mask  bool
+	onOK  func(string)
+}
+
+func (m *model) openNamePrompt(label, value string, onOK func(string)) {
+	m.namePrompt = &namePrompt{label: label, draft: m.input.Value(), onOK: onOK}
+	m.input.SetValue(value)
+	m.input.CursorEnd()
+	m.growInput()
+}
+
+func (m *model) closeNamePrompt() {
+	m.input.SetValue(m.namePrompt.draft)
+	m.input.CursorEnd()
+	m.namePrompt = nil
+	m.growInput()
+}
+
+func (p *namePrompt) maskedValue(v string) string {
+	if !p.mask {
+		return v
+	}
+	return strings.Repeat("•", len([]rune(v)))
+}
 
 // newInput builds the prompt textarea with ghg's keybindings and styling.
 // Newlines come from ctrl+j / shift+enter / alt+enter; plain enter submits.
@@ -76,11 +211,21 @@ func (m *model) growInput() {
 		return
 	}
 	val := m.input.Value()
+	line := m.input.Line()
+	col := m.input.LineInfo().ColumnOffset
+	w := m.width - 2
+	if w <= 0 {
+		w = m.input.Width() + 2
+	}
 	ti := newInput()
-	ti.SetWidth(m.input.Width() + 2) // Width() is content width; SetWidth takes total
+	ti.SetWidth(w)
 	ti.SetHeight(h)
 	ti.SetValue(val)
-	ti.CursorEnd()
+	ti.CursorStart()
+	for ti.Line() < line {
+		ti.CursorDown()
+	}
+	ti.SetCursor(col)
 	m.input = ti
 }
 
@@ -103,9 +248,6 @@ func (m *model) key(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 	if m.picker != nil {
 		return m.pickerKey(msg)
-	}
-	if m.mpicker != nil {
-		return m.modelPickerKey(msg)
 	}
 	// Keyboard input cancels a pending transcript selection and any edge-scroll
 	// tick attached to it.
@@ -169,7 +311,7 @@ func (m *model) key(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.tasksFocus = !m.tasksFocus
-		m.clampTaskSel()
+		m.clampTaskSel(-1)
 		return m, nil
 	case tea.KeyCtrlD:
 		return m.command("/detach")
@@ -406,21 +548,21 @@ func (m *model) key(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		if m.menu != nil {
 			c := m.menu.cands[m.menu.idx]
-			// a bare command previewed by tab cycling runs immediately, same
+			// A bare command previewed by tab cycling runs immediately, same
 			// as picking it with arrows + enter (one-keystroke settings)
-			if m.menu.cyc && m.menu.head == "" && execNow[c.Text] {
+			if m.menu.cyc && m.menu.head == "" && registryImmediate(c.Text) {
 				m.menu = nil
 				m.input.Reset()
 				return m.command(c.Text)
 			}
-			// tab cycling already inserted the candidate: commit it; otherwise
+			// Tab cycling already inserted the candidate: commit it; otherwise
 			// insert it now (directories stay open for deeper completion)
 			if m.menu.cyc {
 				m.acceptPreview()
 				return m, nil
 			}
-			// bare commands that act without further args run immediately
-			if m.menu.head == "" && execNow[c.Text] {
+			// Bare commands that act without further args run immediately.
+			if m.menu.head == "" && registryImmediate(c.Text) {
 				m.menu = nil
 				m.input.Reset()
 				return m.command(c.Text)

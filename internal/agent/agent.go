@@ -13,22 +13,34 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/sacca97/ghg/internal/artifact"
-	goalstate "github.com/sacca97/ghg/internal/goal"
-	"github.com/sacca97/ghg/internal/llm"
+	"github.com/sacca97/ghg/internal/memory"
+	"github.com/sacca97/ghg/internal/models"
 	"github.com/sacca97/ghg/internal/observation"
 	"github.com/sacca97/ghg/internal/search"
 	"github.com/sacca97/ghg/internal/session"
 	"github.com/sacca97/ghg/internal/tools"
 )
 
-// ArtifactCatalog is the session-scoped metadata index used by the
-// artifact_list and artifact_read tools. Implementations must enforce the
-// supplied session id; the agent never accepts a path from the model.
-type ArtifactCatalog interface {
-	LookupArtifact(ctx context.Context, sessionID, id string) (artifact.Metadata, error)
-	ListArtifacts(ctx context.Context, sessionID string, filter artifact.Filter, limit int) ([]artifact.Metadata, error)
+const (
+	maxToolCallsPerResponse = 64
+	maxConcurrentTools      = 4
+
+	planFinalizationToolError   = "Error: exploration is complete for this plan. Tools are disabled; emit the final <proposed_plan> block now."
+	reviewFinalizationToolError = "Error: exploration is complete for this review. Only submit_review is available; submit the best evidence-backed result now."
+	malformedToolCallError      = "Error: tool call arguments were malformed (invalid JSON or exceeded size limit) and were omitted. Reissue the call with valid JSON arguments."
+
+	maxToolCallArgBytes  = 256 * 1024 // 256 KiB
+	maxToolBatchArgBytes = 512 * 1024 // 512 KiB
+)
+
+// HistoryCatalog is the durable session boundary for bounded history recall.
+type HistoryCatalog interface {
+	SearchHistory(context.Context, string, string, string, *int, int) ([]session.HistoryHit, error)
+	ReadHistory(context.Context, string, int, int, *int, int) ([]session.HistoryMessage, []string, error)
 }
+
+type HistoryHit = session.HistoryHit
+type HistoryMessage = session.HistoryMessage
 
 // SubagentFactory builds a fresh agent for a delegated task. role is one of
 // the config role names; the task tool currently supplies "tiny". Keeping the
@@ -38,7 +50,7 @@ type SubagentFactory func(ctx context.Context, role, systemPrompt string) (*Agen
 
 // Agent holds one conversation.
 type Agent struct {
-	Backend   llm.Backend
+	Backend   models.Backend
 	Model     string // model id sent to the API
 	ModelName string // config model name (may differ from Model via id mapping)
 	Provider  string // config provider name
@@ -58,21 +70,14 @@ type Agent struct {
 	// Delegated agents inherit a child view in newSubagent.
 	Runtime  *tools.ToolRuntime
 	Tools    []tools.Tool
-	Messages []llm.Message
-	// ArtifactWriter receives retained tool output before the model-facing
-	// preview is shortened. Nil means no artifact persistence is configured.
-	ArtifactWriter artifact.Writer
-	// ArtifactCatalog resolves references for the read-only artifact tools.
-	// It is deliberately separate from the payload writer so session scoping
-	// remains an explicit boundary.
-	ArtifactCatalog ArtifactCatalog
-	ArtifactStore   *artifact.Store
+	Messages []models.Message
+	// Outputs receives retained tool output before the model-facing preview is
+	// shortened. Nil disables output persistence.
+	Outputs       *session.OutputStore
+	OutputCatalog session.OutputCatalog
 	// HistoryCatalog is the durable session boundary for bounded history
 	// recall. It is optional so no-session runs never advertise recall tools.
-	HistoryCatalog session.HistoryStore
-	// ArtifactsDisabled distinguishes an intentional config opt-out from a
-	// session store that is simply unavailable.
-	ArtifactsDisabled bool
+	HistoryCatalog HistoryCatalog
 	// SubagentsDisabled suppresses the task tool so the model cannot launch subagents.
 	SubagentsDisabled bool
 
@@ -87,10 +92,11 @@ type Agent struct {
 	// CompactBackend and CompactModel run the compaction summary; nil/"" uses
 	// the conversation's own backend and model. The provider/protocol fields
 	// keep route telemetry correct when the summary uses the tiny role.
-	CompactBackend  llm.Backend
-	CompactModel    string
-	CompactProvider string
-	CompactProtocol string
+	CompactBackend      models.Backend
+	CompactModel        string
+	CompactProvider     string
+	CompactProtocol     string
+	CompactContextLimit int
 	// CompactThreshold is the fraction of ContextLimit at which Turn compacts
 	// proactively; 0 uses defaultCompactThreshold.
 	CompactThreshold float64
@@ -107,6 +113,11 @@ type Agent struct {
 	// separate definition: the conversation and its message history carry over
 	// between planning and execution.
 	PlanMode bool
+
+	// ReviewMode restricts the agent to a read-only tool allowlist plus
+	// submit_review and injects a review prompt. It is a one-shot collaboration
+	// mode that terminates upon successful review submission.
+	ReviewMode bool
 
 	mu        sync.Mutex
 	pending   []pendingSteer // steered user messages awaiting injection
@@ -144,7 +155,7 @@ type Agent struct {
 	// goroutine; the TUI reads it between turns via TodosJSON.
 	Todos []Todo
 
-	sessionID atomic.Pointer[string] // scopes memory and artifact tools
+	sessionID atomic.Pointer[string] // scopes memory and output tools
 
 	// toolsMu guards mcpTools: the MCP manager's OnChange can fire (server
 	// settled) while a Turn is streaming, and Turn reads the tool set per
@@ -153,7 +164,7 @@ type Agent struct {
 	mcpTools []tools.Tool
 
 	usageMu sync.Mutex
-	usage   llm.Usage // session totals across every API call (PromptTokens = input)
+	usage   models.Usage // session totals across every API call (PromptTokens = input)
 }
 
 // Steer queues a user message for injection at the next loop boundary of the
@@ -168,12 +179,12 @@ func (a *Agent) Steer(text string) {
 // pendingSteer is a queued steered message, optionally carrying images.
 type pendingSteer struct {
 	text  string
-	parts []llm.ContentPart
+	parts []models.ContentPart
 }
 
 // SteerImages is Steer with image parts — the model receives text and
 // images together as a multimodal user message at the loop boundary.
-func (a *Agent) SteerImages(text string, parts []llm.ContentPart) {
+func (a *Agent) SteerImages(text string, parts []models.ContentPart) {
 	a.mu.Lock()
 	a.pending = append(a.pending, pendingSteer{text: text, parts: parts})
 	a.mu.Unlock()
@@ -187,7 +198,7 @@ func (a *Agent) SteerImages(text string, parts []llm.ContentPart) {
 func (a *Agent) AppendUser(content string) {
 	a.mu.Lock()
 	a.msgsMu.Lock()
-	a.Messages = append(a.Messages, llm.Message{Role: "user", Content: content})
+	a.Messages = append(a.Messages, models.Message{Role: "user", Content: content})
 	a.msgsMu.Unlock()
 	a.mu.Unlock()
 }
@@ -201,24 +212,15 @@ func (a *Agent) drainPending() []pendingSteer {
 }
 
 // AddUsage folds one request's usage into the session totals.
-func (a *Agent) AddUsage(u llm.Usage) {
+func (a *Agent) AddUsage(u models.Usage) {
 	a.usageMu.Lock()
-	a.usage.PromptTokens += u.PromptTokens
-	a.usage.CompletionTokens += u.CompletionTokens
-	if u.PromptTokensDetails != nil {
-		if a.usage.PromptTokensDetails == nil {
-			a.usage.PromptTokensDetails = &struct {
-				CachedTokens int `json:"cached_tokens"`
-			}{}
-		}
-		a.usage.PromptTokensDetails.CachedTokens += u.PromptTokensDetails.CachedTokens
-	}
+	a.usage.Add(u)
 	a.usageMu.Unlock()
 }
 
 // SetUsage seeds the session totals with stored values — a resumed session
 // keeps counting from where it was saved, not from zero.
-func (a *Agent) SetUsage(u llm.Usage) {
+func (a *Agent) SetUsage(u models.Usage) {
 	a.usageMu.Lock()
 	a.usage = u
 	a.usageMu.Unlock()
@@ -228,14 +230,14 @@ func (a *Agent) SetUsage(u llm.Usage) {
 // over along with the conversation.
 func (a *Agent) ResetUsage() {
 	a.usageMu.Lock()
-	a.usage = llm.Usage{}
+	a.usage = models.Usage{}
 	a.usageMu.Unlock()
 }
 
 // Usage returns the session's cumulative token usage: input, output, and
 // cached-input tokens across every streamed call (plus compaction and
 // subagent calls on this agent).
-func (a *Agent) Usage() llm.Usage {
+func (a *Agent) Usage() models.Usage {
 	a.usageMu.Lock()
 	defer a.usageMu.Unlock()
 	u := a.usage
@@ -272,23 +274,28 @@ func (a *Agent) ActiveTokens() int {
 	return EstimateTokens(a.Messages)
 }
 
-func New(backend llm.Backend, model string, maxTokens int, systemPrompt string) *Agent {
+func New(backend models.Backend, model string, maxTokens int, systemPrompt string) *Agent {
 	a := &Agent{
 		Backend:       backend,
 		Model:         model,
 		MaxTokens:     maxTokens,
-		Messages:      []llm.Message{{Role: "system", Content: systemPrompt}},
+		Messages:      []models.Message{{Role: "system", Content: systemPrompt}},
 		Checkpointing: true,
 		HistoryRecall: true,
 	}
-	if p, ok := backend.(llm.ProtocolBackend); ok {
+	if p, ok := backend.(models.ProtocolBackend); ok {
 		a.Protocol = string(p.AdapterProtocol())
 	}
 	a.Tools = tools.All()
 	a.Tools = append(a.Tools, taskTool(a))
 	a.Tools = append(a.Tools, todoTool(a))
-	a.Tools = append(a.Tools, memoryTools(a)...)
-	a.Tools = append(a.Tools, artifactTools(a)...)
+	a.Tools = append(a.Tools, memory.Tools(a.currentSessionID)...)
+	a.Tools = append(a.Tools, tools.OutputTools(tools.OutputToolConfig{
+		SessionID: a.currentSessionID,
+		Catalog:   func() session.OutputCatalog { return a.OutputCatalog },
+		Store:     func() *session.OutputStore { return a.Outputs },
+		Messages:  a.MessagesSnapshot,
+	})...)
 	a.files = newFileLocks()
 	a.bg = newTaskRegistry()
 	a.observations = observation.NewRegistry()
@@ -296,6 +303,22 @@ func New(backend llm.Backend, model string, maxTokens int, systemPrompt string) 
 	a.touched = make(map[string]struct{})
 	a.seenOperation = make(map[string]int)
 	return a
+}
+
+// SetSessionID scopes session-backed tools.
+func (a *Agent) SetSessionID(id string) {
+	if id == "" {
+		a.sessionID.Store(nil)
+		return
+	}
+	a.sessionID.Store(&id)
+}
+
+func (a *Agent) currentSessionID() string {
+	if p := a.sessionID.Load(); p != nil {
+		return *p
+	}
+	return ""
 }
 
 // newSubagent creates the fresh, non-recursive agent used by task calls and
@@ -337,18 +360,21 @@ func (a *Agent) newSubagent(ctx context.Context, role string) (*Agent, error) {
 		sub.ContextLimit = a.ContextLimit
 	}
 	// The task tool is deliberately non-recursive: replace any factory-built
-	// default tool set with the ordinary built-ins, then restore artifact tools.
+	// default tool set with the ordinary built-ins, then restore output tools.
 	sub.Tools = tools.All()
 	sub.Runtime = a.Runtime.Child()
 	sub.files = a.files
-	sub.ArtifactWriter = a.ArtifactWriter
-	sub.ArtifactCatalog = a.ArtifactCatalog
-	sub.ArtifactStore = a.ArtifactStore
+	sub.Outputs = a.Outputs
+	sub.OutputCatalog = a.OutputCatalog
 	sub.HistoryCatalog = a.HistoryCatalog
-	sub.ArtifactsDisabled = a.ArtifactsDisabled
 	sub.SubagentsDisabled = a.SubagentsDisabled
 	sub.SetSessionID(a.currentSessionID())
-	sub.Tools = append(sub.Tools, artifactTools(sub)...)
+	sub.Tools = append(sub.Tools, tools.OutputTools(tools.OutputToolConfig{
+		SessionID: sub.currentSessionID,
+		Catalog:   func() session.OutputCatalog { return sub.OutputCatalog },
+		Store:     func() *session.OutputStore { return sub.Outputs },
+		Messages:  sub.MessagesSnapshot,
+	})...)
 	return sub, nil
 }
 
@@ -510,13 +536,101 @@ func (a *Agent) seenOperationCount(fingerprint string) int {
 	return a.seenOperation[fingerprint]
 }
 
+func (a *Agent) resetSeenOperations() {
+	if a == nil {
+		return
+	}
+	a.operationMu.Lock()
+	a.seenOperation = make(map[string]int)
+	a.operationMu.Unlock()
+}
+
+// validateToolBatch rejects pathological tool batches before anything executes.
+// It enforces fixed bounds on batch size, duplicate calls within a single
+// response, and tool ID/name integrity.
+func (a *Agent) validateToolBatch(calls []models.ToolCall) error {
+	if len(calls) > maxToolCallsPerResponse {
+		return fmt.Errorf("model returned an unsafe tool batch: %d calls exceeds limit %d", len(calls), maxToolCallsPerResponse)
+	}
+	seenIDs := make(map[string]bool, len(calls))
+	seenFingerprints := make(map[string]string, len(calls))
+	duplicateCounts := make(map[string]int)
+
+	for _, tc := range calls {
+		if tc.ID == "" {
+			return errors.New("model returned a tool call with empty id")
+		}
+		if seenIDs[tc.ID] {
+			return fmt.Errorf("model returned duplicate tool call id %q", tc.ID)
+		}
+		seenIDs[tc.ID] = true
+
+		if tc.Function.Name == "" {
+			return errors.New("model returned a tool call with empty name")
+		}
+
+		fp := a.operationFingerprint(tc.Function.Name, tc.Function.Arguments)
+		if _, exists := seenFingerprints[fp]; exists {
+			duplicateCounts[tc.Function.Name]++
+		} else {
+			seenFingerprints[fp] = tc.ID
+		}
+	}
+
+	if len(duplicateCounts) > 0 {
+		var firstTool string
+		var count int
+		for name, c := range duplicateCounts {
+			firstTool = name
+			count = c + 1 // including the initial occurrence
+			break
+		}
+		return fmt.Errorf("model returned duplicate tool calls: %s repeated %d times", firstTool, count)
+	}
+	return nil
+}
+
+// findMalformedToolCalls returns indices of tool calls whose arguments are invalid
+// JSON, exceed the per-call or batch size limits, or lack required identifiers.
+func findMalformedToolCalls(calls []models.ToolCall) []int {
+	var malformed []int
+	totalBytes := 0
+	for i, tc := range calls {
+		totalBytes += len(tc.Function.Arguments)
+		if tc.ID == "" || tc.Function.Name == "" || len(tc.Function.Arguments) > maxToolCallArgBytes || !json.Valid([]byte(tc.Function.Arguments)) {
+			malformed = append(malformed, i)
+		}
+	}
+	if totalBytes > maxToolBatchArgBytes && len(malformed) == 0 {
+		for i := range calls {
+			malformed = append(malformed, i)
+		}
+	}
+	return malformed
+}
+
+func toolResultError(res tools.ToolResult) (string, bool) {
+	if res.ExitCode == 0 && !strings.HasPrefix(res.Preview, "Error:") {
+		return "", false
+	}
+	text := res.Preview
+	if strings.HasPrefix(text, "Error:") {
+		text = strings.TrimPrefix(text, "Error:")
+	}
+	text = strings.TrimSpace(text)
+	if text == "" {
+		text = "tool execution failed"
+	}
+	return text, true
+}
+
 // MessagesSnapshot returns a copy of the conversation safe to read while a
 // turn runs on another goroutine. Direct field access (a.Messages) is only
 // safe for the goroutine driving the turn.
-func (a *Agent) MessagesSnapshot() []llm.Message {
+func (a *Agent) MessagesSnapshot() []models.Message {
 	a.msgsMu.Lock()
 	defer a.msgsMu.Unlock()
-	return append([]llm.Message(nil), a.Messages...)
+	return append([]models.Message(nil), a.Messages...)
 }
 
 // SetSystemPrompt replaces the session's system prompt between turns. The
@@ -528,7 +642,7 @@ func (a *Agent) SetSystemPrompt(prompt string) {
 	}
 	a.msgsMu.Lock()
 	if len(a.Messages) == 0 {
-		a.Messages = []llm.Message{{Role: "system", Content: prompt}}
+		a.Messages = []models.Message{{Role: "system", Content: prompt}}
 	} else {
 		a.Messages[0].Role = "system"
 		a.Messages[0].Content = prompt
@@ -551,7 +665,7 @@ func (a *Agent) AllTools() []tools.Tool {
 	defer a.toolsMu.Unlock()
 	all := append(append([]tools.Tool(nil), a.Tools...), a.mcpTools...)
 	if a.HistoryRecall && a.HistoryCatalog != nil && a.currentSessionID() != "" {
-		all = append(all, historyTools(a)...)
+		all = append(all, HistoryTools(a.HistoryCatalog, a.currentSessionID, a.searchState)...)
 	}
 	if a.SubagentsDisabled {
 		filtered := make([]tools.Tool, 0, len(all))
@@ -569,13 +683,13 @@ func (a *Agent) AllTools() []tools.Tool {
 // around the complete backend operation, including any adapter retry delay.
 // Usage accounting remains with the caller because different call paths fold
 // it into different agent/session owners.
-func (a *Agent) Stream(ctx context.Context, req llm.Request, sink llm.EventSink, ev Events) (llm.Message, llm.Usage, error) {
+func (a *Agent) Stream(ctx context.Context, req models.Request, sink models.EventSink, ev Events) (models.Message, models.Usage, error) {
 	return a.callStream(ctx, a.Backend, a.Role, a.Provider, a.Protocol, req, sink, ev)
 }
 
 // Complete performs one non-streaming model call with the same telemetry
 // boundary as Stream. It does not mutate the agent's usage totals.
-func (a *Agent) Complete(ctx context.Context, req llm.Request, ev Events) (llm.Message, llm.Usage, error) {
+func (a *Agent) Complete(ctx context.Context, req models.Request, ev Events) (models.Message, models.Usage, error) {
 	return a.CompleteWithRoute(ctx, a.Backend, a.Role, a.Provider, a.Protocol, req, ev)
 }
 
@@ -583,19 +697,19 @@ func (a *Agent) Complete(ctx context.Context, req llm.Request, ev Events) (llm.M
 // wrapper using the route that actually owns backend. It is used by direct
 // one-shot callers such as title generation and goal formulation, which do
 // not run through Turn but must still report their provider and adapter.
-func (a *Agent) CompleteWithRoute(ctx context.Context, backend llm.Backend, role, provider, protocol string, req llm.Request, ev Events) (llm.Message, llm.Usage, error) {
+func (a *Agent) CompleteWithRoute(ctx context.Context, backend models.Backend, role, provider, protocol string, req models.Request, ev Events) (models.Message, models.Usage, error) {
 	return a.callCompletePurpose(ctx, backend, role, provider, protocol, "", req, ev)
 }
 
 // CompleteWithRoutePurpose is the telemetry-aware variant used by bounded
 // internal model calls such as the optional approval reviewer. Purpose keeps
 // that spend distinguishable from an ordinary tiny subagent turn.
-func (a *Agent) CompleteWithRoutePurpose(ctx context.Context, backend llm.Backend, role, provider, protocol, purpose string, req llm.Request, ev Events) (llm.Message, llm.Usage, error) {
+func (a *Agent) CompleteWithRoutePurpose(ctx context.Context, backend models.Backend, role, provider, protocol, purpose string, req models.Request, ev Events) (models.Message, models.Usage, error) {
 	return a.callCompletePurpose(ctx, backend, role, provider, protocol, purpose, req, ev)
 }
 
-func (a *Agent) callInfo(backend llm.Backend, role, provider, protocol, model string) ModelCallStart {
-	if p, ok := backend.(llm.ProtocolBackend); ok {
+func (a *Agent) callInfo(backend models.Backend, role, provider, protocol, model string) ModelCallStart {
+	if p, ok := backend.(models.ProtocolBackend); ok {
 		protocol = string(p.AdapterProtocol())
 	}
 	if protocol == "" {
@@ -604,7 +718,10 @@ func (a *Agent) callInfo(backend llm.Backend, role, provider, protocol, model st
 	return ModelCallStart{Role: role, Provider: provider, Model: model, Protocol: protocol}
 }
 
-func (a *Agent) callStream(ctx context.Context, backend llm.Backend, role, provider, protocol string, req llm.Request, sink llm.EventSink, ev Events) (llm.Message, llm.Usage, error) {
+func (a *Agent) callStream(ctx context.Context, backend models.Backend, role, provider, protocol string, req models.Request, sink models.EventSink, ev Events) (models.Message, models.Usage, error) {
+	if req.SessionID == "" {
+		req.SessionID = a.currentSessionID()
+	}
 	start := time.Now()
 	call := a.callInfo(backend, role, provider, protocol, req.Model)
 	a.emitPromptView(ev, call, req)
@@ -613,15 +730,18 @@ func (a *Agent) callStream(ctx context.Context, backend llm.Backend, role, provi
 	}
 	if backend == nil {
 		err := errors.New("agent: nil backend")
-		a.emitCallEnd(ev, call, start, llm.Message{}, llm.Usage{}, err)
-		return llm.Message{}, llm.Usage{}, err
+		a.emitCallEnd(ev, call, start, models.Message{}, models.Usage{}, err)
+		return models.Message{}, models.Usage{}, err
 	}
 	msg, usage, err := backend.Stream(ctx, req, sink)
 	a.emitCallEnd(ev, call, start, msg, usage, err)
 	return msg, usage, err
 }
 
-func (a *Agent) callCompletePurpose(ctx context.Context, backend llm.Backend, role, provider, protocol, purpose string, req llm.Request, ev Events) (llm.Message, llm.Usage, error) {
+func (a *Agent) callCompletePurpose(ctx context.Context, backend models.Backend, role, provider, protocol, purpose string, req models.Request, ev Events) (models.Message, models.Usage, error) {
+	if req.SessionID == "" {
+		req.SessionID = a.currentSessionID()
+	}
 	start := time.Now()
 	call := a.callInfo(backend, role, provider, protocol, req.Model)
 	call.Purpose = purpose
@@ -631,15 +751,15 @@ func (a *Agent) callCompletePurpose(ctx context.Context, backend llm.Backend, ro
 	}
 	if backend == nil {
 		err := errors.New("agent: nil backend")
-		a.emitCallEnd(ev, call, start, llm.Message{}, llm.Usage{}, err)
-		return llm.Message{}, llm.Usage{}, err
+		a.emitCallEnd(ev, call, start, models.Message{}, models.Usage{}, err)
+		return models.Message{}, models.Usage{}, err
 	}
 	msg, usage, err := backend.Complete(ctx, req)
 	a.emitCallEnd(ev, call, start, msg, usage, err)
 	return msg, usage, err
 }
 
-func (a *Agent) emitPromptView(ev Events, call ModelCallStart, req llm.Request) {
+func (a *Agent) emitPromptView(ev Events, call ModelCallStart, req models.Request) {
 	if ev.OnPromptView == nil {
 		return
 	}
@@ -653,7 +773,7 @@ func (a *Agent) emitPromptView(ev Events, call ModelCallStart, req llm.Request) 
 	})
 }
 
-func (a *Agent) emitCallEnd(ev Events, call ModelCallStart, start time.Time, msg llm.Message, usage llm.Usage, err error) {
+func (a *Agent) emitCallEnd(ev Events, call ModelCallStart, start time.Time, msg models.Message, usage models.Usage, err error) {
 	if ev.OnModelCallEnd == nil {
 		return
 	}
@@ -689,43 +809,60 @@ func (a *Agent) TurnAuthored(ctx context.Context, input string, ev Events) (stri
 }
 
 // TurnWithImages is TurnAuthored for a submission that attaches images. Each
-// part is a vision ContentPart (see llm.ImagePart); the model receives the
+// part is a vision ContentPart (see models.ImagePart); the model receives the
 // text and the images together as a multimodal content array.
-func (a *Agent) TurnWithImages(ctx context.Context, input string, parts []llm.ContentPart, ev Events) (string, error) {
+func (a *Agent) TurnWithImages(ctx context.Context, input string, parts []models.ContentPart, ev Events) (string, error) {
 	return a.turn(ctx, input, parts, true, nil, ev)
 }
 
 // TurnWithGoal runs a normal turn with a request-scoped active goal context.
 // The goal record is copied so model updates cannot mutate caller state; the
 // caller receives each validated update through Events.OnGoalUpdate.
-func (a *Agent) TurnWithGoal(ctx context.Context, input string, goal goalstate.Record, ev Events) (string, error) {
+func (a *Agent) TurnWithGoal(ctx context.Context, input string, goal GoalRecord, ev Events) (string, error) {
 	return a.turn(ctx, input, nil, false, &goal, ev)
 }
 
 // TurnAuthoredWithGoal is TurnWithGoal for a human-authored submission.
-func (a *Agent) TurnAuthoredWithGoal(ctx context.Context, input string, goal goalstate.Record, ev Events) (string, error) {
+func (a *Agent) TurnAuthoredWithGoal(ctx context.Context, input string, goal GoalRecord, ev Events) (string, error) {
 	return a.turn(ctx, input, nil, true, &goal, ev)
 }
 
 // TurnWithImagesAndGoal combines an authored multimodal turn with a
 // request-scoped active goal context.
-func (a *Agent) TurnWithImagesAndGoal(ctx context.Context, input string, parts []llm.ContentPart, goal goalstate.Record, ev Events) (string, error) {
+func (a *Agent) TurnWithImagesAndGoal(ctx context.Context, input string, parts []models.ContentPart, goal GoalRecord, ev Events) (string, error) {
 	return a.turn(ctx, input, parts, true, &goal, ev)
+}
+
+func (a *Agent) readOnlyCollaborationMode() bool {
+	return a.PlanMode || a.ReviewMode
+}
+
+func (a *Agent) collaborationPrompt() string {
+	if a.ReviewMode {
+		return reviewModePrompt
+	}
+	if a.PlanMode {
+		return planModePrompt
+	}
+	return ""
 }
 
 // assembleRequestMessages constructs the model request messages while keeping
 // a byte-stable prefix across turns and tool rounds:
-//   1. Base system prompt (history[0])
-//   2. Stable collaboration-mode prompt (planModePrompt, if PlanMode)
-//   3. Budget reminder (if non-empty)
-//   4. Conversation history (history[1:])
-//   5. Trailing transient blocks (todoContent, goalContent)
-func (a *Agent) assembleRequestMessages(history []llm.Message, todoContent, goalContent, budgetReminder string) []llm.Message {
+//  1. Base system prompt (history[0])
+//  2. Stable collaboration-mode prompt (planModePrompt / reviewModePrompt)
+//  3. Budget reminder (if non-empty)
+//  4. Conversation history (history[1:])
+//  5. Trailing transient blocks (todoContent, goalContent)
+func (a *Agent) assembleRequestMessages(history []models.Message, todoContent, goalContent, budgetReminder string) []models.Message {
 	if len(history) == 0 {
 		return history
 	}
+	if !a.readOnlyCollaborationMode() && todoContent == "" && goalContent == "" && budgetReminder == "" {
+		return history
+	}
 	prefixCount := 1
-	if a.PlanMode {
+	if a.readOnlyCollaborationMode() {
 		prefixCount++
 		if budgetReminder != "" {
 			prefixCount++
@@ -738,38 +875,38 @@ func (a *Agent) assembleRequestMessages(history []llm.Message, todoContent, goal
 	if goalContent != "" {
 		suffixCount++
 	}
-	reqMsgs := make([]llm.Message, 0, prefixCount+len(history)-1+suffixCount)
+	reqMsgs := make([]models.Message, 0, prefixCount+len(history)-1+suffixCount)
 	reqMsgs = append(reqMsgs, history[0])
-	if a.PlanMode {
-		reqMsgs = append(reqMsgs, llm.Message{Role: "system", Content: planModePrompt})
+	if a.readOnlyCollaborationMode() {
+		reqMsgs = append(reqMsgs, models.Message{Role: "system", Content: a.collaborationPrompt()})
 		if budgetReminder != "" {
-			reqMsgs = append(reqMsgs, llm.Message{Role: "system", Content: budgetReminder})
+			reqMsgs = append(reqMsgs, models.Message{Role: "system", Content: budgetReminder})
 		}
 	}
 	if len(history) > 1 {
 		reqMsgs = append(reqMsgs, history[1:]...)
 	}
 	if todoContent != "" {
-		reqMsgs = append(reqMsgs, llm.Message{Role: "system", Content: todoContent})
+		reqMsgs = append(reqMsgs, models.Message{Role: "system", Content: todoContent})
 	}
 	if goalContent != "" {
-		reqMsgs = append(reqMsgs, llm.Message{Role: "system", Content: goalContent})
+		reqMsgs = append(reqMsgs, models.Message{Role: "system", Content: goalContent})
 	}
 	return reqMsgs
 }
 
-func (a *Agent) turn(ctx context.Context, input string, parts []llm.ContentPart, authored bool, goalCtx *goalstate.Record, ev Events) (string, error) {
-	var activeGoal *goalstate.Record
+func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPart, authored bool, goalCtx *GoalRecord, ev Events) (string, error) {
+	var activeGoal *GoalRecord
 	if goalCtx != nil {
 		goal := *goalCtx
 		if err := goal.Validate(); err != nil {
 			return "", fmt.Errorf("invalid goal context: %w", err)
 		}
-		if goal.Status == goalstate.StatusActive {
+		if goal.Status == GoalStatusActive {
 			activeGoal = &goal
 		}
 	}
-	msg := llm.Message{Role: "user", Content: input, Parts: parts, Authored: authored}
+	msg := models.Message{Role: "user", Content: input, Parts: parts, Authored: authored}
 	if authored {
 		now := time.Now()
 		msg.SentAt = &now
@@ -784,58 +921,83 @@ func (a *Agent) turn(ctx context.Context, input string, parts []llm.ContentPart,
 		a.Messages = append(a.Messages, msg)
 	}
 	a.msgsMu.Unlock()
+	reviewTarget := msg.Content
 
 	var planBudget *rolloutBudget
-	if a.PlanMode && authored {
+	if a.readOnlyCollaborationMode() && authored {
 		planBudget = newPlanRolloutBudget()
 	}
+	readGuard := newReadCoverageTracker()
+	compactionEvents := ev
+	compactionEvents.OnCompacted = func(summary string, cutoff int) {
+		readGuard.clear()
+		if ev.OnCompacted != nil {
+			ev.OnCompacted(summary, cutoff)
+		}
+	}
 
+	// Freeze tools and precompute definitions once for the entire turn.
+	turnTools := a.AllTools()
+	if a.readOnlyCollaborationMode() {
+		turnTools = filterPlanTools(turnTools)
+		if a.ReviewMode {
+			turnTools = append(turnTools, submitReviewTool())
+		}
+	}
+	if activeGoal != nil {
+		turnTools = append(turnTools, GoalTool(*activeGoal))
+	}
+	turnDefs := tools.Defs(turnTools)
+	var synthesisDefs []models.Tool
+
+	turnErrors := make(map[string]int)
+	malformedRoundsInTurn := 0
 	rounds := 0
 	for {
 		if a.MaxTurns > 0 && rounds >= a.MaxTurns {
 			return "", fmt.Errorf("max turns (%d) reached — the model kept calling tools; re-run with a higher -max-turns or a more specific prompt", a.MaxTurns)
 		}
 		rounds++
-		if err := a.maybeCompact(ctx, ev); err != nil {
+		if err := a.maybeCompact(ctx, compactionEvents); err != nil {
 			return "", err
 		}
 
+		finalizing := planBudget != nil && planBudget.IsReserveCrossed()
 		var budgetReminder string
 		if planBudget != nil {
-			budgetReminder = planBudget.ReminderBlock()
+			budgetReminder = planBudget.reminderBlock(finalizing, a.ReviewMode)
 		}
 		todoContent := a.todoBlock()
 		var goalContent string
 		if activeGoal != nil {
-			goalContent = goalContextBlock(*activeGoal)
+			goalContent = GoalContextBlock(*activeGoal)
 		}
 		msgs := a.assembleRequestMessages(a.Messages, todoContent, goalContent, budgetReminder)
 
-		available := a.AllTools()
-		if a.PlanMode {
-			if planBudget != nil && planBudget.IsReserveCrossed() {
-				available = nil // Reserve crossed: disable tools for final synthesis request
+		reqDefs := turnDefs
+		available := turnTools
+		if a.readOnlyCollaborationMode() && finalizing {
+			if a.ReviewMode {
+				available = []tools.Tool{submitReviewTool()}
+				reqDefs = tools.Defs(available)
 			} else {
-				available = a.planTools()
+				reqDefs = synthesisDefs
+				available = nil // Reserve crossed: disable tools for final synthesis request
 			}
 		}
-		if activeGoal != nil {
-			// The goal tool is request-local. Ordinary conversations, Plan mode,
-			// declarative definitions, and subagents never receive this control surface.
-			available = append(available, goalUpdateTool(*activeGoal))
-		}
+
 		// Surface transient-request retries through the event hook so the UI
 		// shows "retrying" instead of looking hung. The sink is request-local;
 		// the backend remains safe to share with foreground and background turns.
 		reasoningEffort, reasoningEnabled := a.ReasoningRequest()
 		var parser *planStreamParser
-		sink := llm.EventSink{
+		sink := models.EventSink{
 			OnThink: ev.OnThink,
 			OnRetry: ev.OnRetry,
 		}
 		if a.PlanMode {
 			// Plan mode routes streamed text through a block parser so the
-			// proposed-plan artifact is surfaced via OnPlanDelta while the
+			// proposed-plan output is surfaced via OnPlanDelta while the
 			// surrounding conversational text still streams via OnText.
 			parser = &planStreamParser{}
 			parser.visible = ev.OnText
@@ -844,10 +1006,10 @@ func (a *Agent) turn(ctx context.Context, input string, parts []llm.ContentPart,
 		} else {
 			sink.OnText = ev.OnText
 		}
-		msg, usage, err := a.Stream(ctx, llm.Request{
+		msg, usage, err := a.Stream(ctx, models.Request{
 			Model:            a.Model,
 			Messages:         msgs,
-			Tools:            tools.Defs(available),
+			Tools:            reqDefs,
 			ReasoningEffort:  reasoningEffort,
 			ReasoningEnabled: reasoningEnabled,
 			SessionID:        a.currentSessionID(),
@@ -860,7 +1022,11 @@ func (a *Agent) turn(ctx context.Context, input string, parts []llm.ContentPart,
 			ev.OnUsage(usage)
 		}
 		if planBudget != nil {
-			planBudget.RecordUsage(usage, EstimateTokens(msgs))
+			var fallbackTokens int
+			if usage.PromptTokens == 0 && usage.InputTokens == 0 && usage.CompletionTokens == 0 && usage.OutputTokens == 0 {
+				fallbackTokens = EstimateTokens(msgs)
+			}
+			planBudget.RecordUsage(usage, fallbackTokens)
 		}
 		if err != nil {
 			if errors.Is(err, context.Canceled) || ctx.Err() != nil {
@@ -871,7 +1037,7 @@ func (a *Agent) turn(ctx context.Context, input string, parts []llm.ContentPart,
 					a.msgsMu.Lock()
 					a.Messages = append(a.Messages, msg)
 					for _, tc := range msg.ToolCalls {
-						a.Messages = append(a.Messages, llm.Message{
+						a.Messages = append(a.Messages, models.Message{
 							Role:       "tool",
 							Content:    "Error: tool call interrupted — the turn was canceled by user before execution completed",
 							ToolCallID: tc.ID,
@@ -881,7 +1047,7 @@ func (a *Agent) turn(ctx context.Context, input string, parts []llm.ContentPart,
 					a.msgsMu.Unlock()
 				}
 			}
-			if a.Checkpointing && !a.compacted && llm.IsContextLimit(err) && ctx.Err() == nil {
+			if a.Checkpointing && !a.compacted && models.IsContextLimit(err) && ctx.Err() == nil {
 				a.compacted = true
 				took := len(a.Messages)
 				sum, cutoff, cerr := a.compactWithEvents(ctx, ev)
@@ -893,6 +1059,7 @@ func (a *Agent) turn(ctx context.Context, input string, parts []llm.ContentPart,
 						if ev.OnCompacted != nil {
 							ev.OnCompacted(emergency, emergencyCutoff)
 						}
+						readGuard.clear()
 						continue
 					}
 					// restore the guard on hard errors so a manual /compact
@@ -906,6 +1073,7 @@ func (a *Agent) turn(ctx context.Context, input string, parts []llm.ContentPart,
 				if ev.OnCompacted != nil {
 					ev.OnCompacted(sum, cutoff)
 				}
+				readGuard.clear()
 				continue // retry the (now-smaller) request
 			}
 			if planBudget != nil && planBudget.Remaining() <= 0 {
@@ -919,53 +1087,98 @@ func (a *Agent) turn(ctx context.Context, input string, parts []llm.ContentPart,
 			}
 			return "", err
 		}
+		if len(msg.ToolCalls) > 0 {
+			if malformedIndices := findMalformedToolCalls(msg.ToolCalls); len(malformedIndices) > 0 {
+				if malformedRoundsInTurn > 0 {
+					return "", errors.New("model tool channel remained malformed")
+				}
+				malformedRoundsInTurn++
+				malformedSet := make(map[int]bool, len(malformedIndices))
+				for _, idx := range malformedIndices {
+					malformedSet[idx] = true
+				}
+				for i := range msg.ToolCalls {
+					if malformedSet[i] {
+						msg.ToolCalls[i].Function.Arguments = "{}"
+						if msg.ToolCalls[i].ID == "" {
+							msg.ToolCalls[i].ID = fmt.Sprintf("malformed_call_%d", i)
+						}
+					}
+				}
+				msg.Usage = &usage
+				msg.Model = a.Model + " @ " + a.Provider
+				a.msgsMu.Lock()
+				a.Messages = append(a.Messages, msg)
+				for _, tc := range msg.ToolCalls {
+					a.Messages = append(a.Messages, models.Message{
+						Role:       "tool",
+						Content:    malformedToolCallError,
+						ToolCallID: tc.ID,
+						Name:       tc.Function.Name,
+					})
+				}
+				a.msgsMu.Unlock()
+				continue
+			}
+
+			if err := a.validateToolBatch(msg.ToolCalls); err != nil {
+				return "", err
+			}
+		}
 		msg.Usage = &usage
 		msg.Model = a.Model + " @ " + a.Provider
 		a.msgsMu.Lock()
 		a.Messages = append(a.Messages, msg)
 		a.msgsMu.Unlock()
 		if len(msg.ToolCalls) > 0 {
-			results := a.runToolResultsWithTools(ctx, msg.ToolCalls, ev, available)
+			finalizationError := ""
+			if finalizing {
+				finalizationError = planFinalizationToolError
+				if a.ReviewMode {
+					finalizationError = reviewFinalizationToolError
+				}
+			}
+			results := a.runToolResultsWithPolicy(ctx, msg.ToolCalls, ev, available, turnTools, finalizationError, readGuard)
 			a.msgsMu.Lock()
 			for i, tc := range msg.ToolCalls {
-				a.Messages = append(a.Messages, llm.Message{
+				a.Messages = append(a.Messages, models.Message{
 					Role:       "tool",
 					Content:    tools.ModelText(results[i]),
 					ToolCallID: tc.ID,
 					Name:       tc.Function.Name,
-					Artifact:   results[i].Artifact,
+					Output:     results[i].Output,
 					ExitCode:   results[i].ExitCode,
 					Source:     results[i].Source,
 				})
 			}
 			a.msgsMu.Unlock()
-			if activeGoal != nil {
-				terminal := false
-				for i := range results {
-					update, ok := goalUpdateFromResult(results[i])
-					if !ok {
-						continue
-					}
-					if err := update.Validate(activeGoal.ID); err != nil {
-						// The tool validates before producing metadata. Keep this
-						// guard at the agent boundary in case a future result
-						// producer supplies goal metadata directly.
-						continue
-					}
-					activeGoal.Status = update.Status
-					activeGoal.Progress = update.Progress
-					activeGoal.Blocker = update.Blocker
-					if ev.OnGoalUpdate != nil {
-						ev.OnGoalUpdate(update)
-					}
-					if update.Status == goalstate.StatusBlocked || update.Status == goalstate.StatusComplete {
-						terminal = true
+			for i, res := range results {
+				if res.Metadata != nil && res.Metadata["failure_kind"] == "sandbox_network_denied" {
+					cmdName := msg.ToolCalls[i].Function.Name
+					return "", fmt.Errorf("sandbox capability failure (%s): local network listener denied by sandbox policy", cmdName)
+				}
+			}
+			for i, tc := range msg.ToolCalls {
+				if errText, ok := toolResultError(results[i]); ok {
+					fp := a.operationFingerprint(tc.Function.Name+":error", errText)
+					turnErrors[fp]++
+					if turnErrors[fp] >= 3 {
+						snippet := strings.ReplaceAll(errText, "\n", " ")
+						if len(snippet) > 200 {
+							snippet = snippet[:200] + "..."
+						}
+						return "", fmt.Errorf("tool %s failed repeatedly with the same error: %s", tc.Function.Name, snippet)
 					}
 				}
-				if terminal {
-					a.compacted = false
-					return msg.Content, nil
+			}
+			if a.ReviewMode {
+				if reviewArgs, ok := a.reviewTerminal(reviewTarget, msg, results, ev); ok {
+					return reviewArgs, nil
 				}
+			}
+			if activeGoal != nil && a.goalTerminal(activeGoal, results, ev) {
+				a.compacted = false
+				return msg.Content, nil
 			}
 			if ctx.Err() != nil {
 				return "", ctx.Err()
@@ -979,7 +1192,7 @@ func (a *Agent) turn(ctx context.Context, input string, parts []llm.ContentPart,
 			if ev.OnSteer != nil {
 				ev.OnSteer(s.text)
 			}
-			a.Messages = append(a.Messages, llm.Message{Role: "user", Content: s.text, Parts: s.parts})
+			a.Messages = append(a.Messages, models.Message{Role: "user", Content: s.text, Parts: s.parts})
 		}
 		if len(steered) > 0 {
 			a.msgsMu.Unlock()
@@ -989,6 +1202,63 @@ func (a *Agent) turn(ctx context.Context, input string, parts []llm.ContentPart,
 			return msg.Content, nil
 		}
 	}
+}
+
+func (a *Agent) reviewTerminal(target string, msg models.Message, results []tools.ToolResult, ev Events) (string, bool) {
+	for i, call := range msg.ToolCalls {
+		if _, isErr := toolResultError(results[i]); isErr || call.Function.Name != "submit_review" {
+			continue
+		}
+		reviewArgs := string(call.Function.Arguments)
+		if rev, err := ParseReview(reviewArgs); err == nil && a.HistoryCatalog != nil && a.currentSessionID() != "" && ev.OnCompactionReady != nil {
+			checkpoint := buildReviewCheckpoint(target, rev)
+			took := len(a.Messages)
+			cutoff := took
+			if err := ev.OnCompactionReady(append([]models.Message(nil), a.Messages...), checkpoint, cutoff); err == nil {
+				a.msgsMu.Lock()
+				a.Messages = []models.Message{
+					a.Messages[0],
+					{Role: "system", Content: "Summary of the conversation so far:\n\n" + checkpoint},
+				}
+				a.msgsMu.Unlock()
+				if ev.OnCompact != nil {
+					ev.OnCompact(took-len(a.Messages), len(a.Messages))
+				}
+				if ev.OnCompacted != nil {
+					ev.OnCompacted(checkpoint, cutoff)
+				}
+				a.resetSeenOperations()
+				a.compacted = true
+				return reviewArgs, true
+			}
+		}
+		a.compacted = false
+		return reviewArgs, true
+	}
+	return "", false
+}
+
+func (a *Agent) goalTerminal(goal *GoalRecord, results []tools.ToolResult, ev Events) bool {
+	terminal := false
+	for _, result := range results {
+		update, ok := GoalUpdateFromResult(result)
+		if !ok {
+			continue
+		}
+		if err := update.Validate(goal.ID); err != nil {
+			continue
+		}
+		goal.Status = update.Status
+		goal.Progress = update.Progress
+		goal.Blocker = update.Blocker
+		if ev.OnGoalUpdate != nil {
+			ev.OnGoalUpdate(update)
+		}
+		if update.Status == GoalStatusBlocked || update.Status == GoalStatusComplete {
+			terminal = true
+		}
+	}
+	return terminal
 }
 
 // ReasoningRequest returns the provider-neutral reasoning fields for the
@@ -1012,12 +1282,35 @@ func (a *Agent) ReasoningRequest() (string, *bool) {
 
 // runToolResultsWithTools executes a batch of tool calls concurrently, returning
 // one structured result per call in the original order.
+func (a *Agent) runToolResultsWithTools(ctx context.Context, calls []models.ToolCall, ev Events, available []tools.Tool) []tools.ToolResult {
+	return a.runToolResultsWithPolicy(ctx, calls, ev, available, nil, "", nil)
+}
 
-func (a *Agent) runToolResultsWithTools(ctx context.Context, calls []llm.ToolCall, ev Events, available []tools.Tool) []tools.ToolResult {
+// runToolResultsWithPolicy is the same executor with an optional policy result
+// for known tools that are temporarily withdrawn from the available set.
+func (a *Agent) runToolResultsWithPolicy(ctx context.Context, calls []models.ToolCall, ev Events, available, known []tools.Tool, unavailableMessage string, readGuard *readCoverageTracker) []tools.ToolResult {
 	for _, tc := range calls {
 		a.recordTouched(tc.Function.Name, tc.Function.Arguments)
 	}
 	hints := a.searchHints()
+	var unavailable map[string]struct{}
+	if unavailableMessage != "" {
+		availableNames := make(map[string]struct{}, len(available))
+		for _, tool := range available {
+			availableNames[tool.Def.Function.Name] = struct{}{}
+		}
+		unavailable = make(map[string]struct{}, len(known))
+		for _, tool := range known {
+			name := tool.Def.Function.Name
+			if _, ok := availableNames[name]; !ok {
+				unavailable[name] = struct{}{}
+			}
+		}
+	}
+	decisions := []readDecision(nil)
+	if readGuard != nil {
+		decisions = readGuard.prepare(calls, unavailable)
+	}
 
 	results := make([]tools.ToolResult, len(calls))
 	type outcome struct {
@@ -1027,20 +1320,38 @@ func (a *Agent) runToolResultsWithTools(ctx context.Context, calls []llm.ToolCal
 	}
 	outCh := make(chan outcome, len(calls)) // buffered: never blocks the workers
 
+	sem := make(chan struct{}, maxConcurrentTools)
 	var wg sync.WaitGroup
+	// The operation fingerprint and duplicate count feed only the tool
+	// telemetry event, and each costs a sha256 hash plus a redaction walk over
+	// the arguments (and a map counter). Skip both when no consumer is
+	// subscribed; the duplicate tool-call guard is applied earlier by
+	// validateToolBatch with its own fingerprint pass.
+	observeTelemetry := ev.OnToolTelemetry != nil
 	for i, tc := range calls {
+		if i < len(decisions) && decisions[i].suppressed {
+			continue
+		}
 		wg.Add(1)
-		go func(i int, tc llm.ToolCall) {
+		go func(i int, tc models.ToolCall) {
 			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
 			name, args := tc.Function.Name, tc.Function.Arguments
-			fingerprint := a.operationFingerprint(name, args)
-			duplicate := a.seenOperationCount(fingerprint) > 1
+			var fingerprint string
+			duplicate := false
+			if observeTelemetry {
+				fingerprint = a.operationFingerprint(name, args)
+				duplicate = a.seenOperationCount(fingerprint) > 1
+			}
 
 			// Serialize against other mutations before starting. Acquiring here
 			// (before OnToolStart) keeps "running" rows honest: a tool only
 			// shows as running once it actually holds its lock.
 			var release func()
-			if a.files != nil {
+			_, policyUnavailable := unavailable[name]
+			if a.files != nil && !policyUnavailable {
 				if paths := toolMutationPaths(name, args); len(paths) > 0 {
 					release = a.files.acquirePaths(paths)
 				} else if toolRequiresGlobalMutation(name, args) {
@@ -1067,15 +1378,13 @@ func (a *Agent) runToolResultsWithTools(ctx context.Context, calls []llm.ToolCal
 			toolCtx = tools.WithSearchHints(toolCtx, hints)
 			toolCtx = tools.WithSessionID(toolCtx, a.currentSessionID())
 			toolCtx = tools.WithRuntime(toolCtx, a.Runtime)
-			result := tools.ExecuteResult(toolCtx, available, name, json.RawMessage(args))
-			if duplicate && (name == "read" || name == "grep" || name == "glob" || name == "find_files") {
-				if result.ExitCode == 0 && len(result.Preview) > 0 {
-					note := "\n[Notice: Exact duplicate query already executed earlier in this session. Use the evidence already gathered; proceed to synthesize or take action.]"
-					result.Preview += note
-					result.Retained += note
-				}
+			var result tools.ToolResult
+			if policyUnavailable {
+				result = tools.ToolResult{Preview: unavailableMessage, ExitCode: 1, Source: name}
+			} else {
+				result = tools.ExecuteResult(toolCtx, available, name, json.RawMessage(args))
 			}
-			result = a.attachArtifact(ctx, result)
+			result = a.attachOutput(ctx, result)
 			ms := time.Since(start).Milliseconds()
 			if ev.OnToolTelemetry != nil {
 				metadata := make(map[string]string, len(result.Metadata))
@@ -1112,121 +1421,34 @@ func (a *Agent) runToolResultsWithTools(ctx context.Context, calls []llm.ToolCal
 		calls[oc.i].DurationMs = oc.ms
 		calls[oc.i].ExitCode = oc.result.ExitCode
 	}
+	if readGuard != nil {
+		readGuard.apply(a, ev, calls, results, decisions)
+	}
 	return results
 }
 
-// attachArtifact persists retained evidence before the completion event is
-// delivered. Artifact failures never fail a tool call: the bounded preview is
+// attachOutput persists retained evidence before the completion event is
+// delivered. Output failures never fail a tool call: the bounded preview is
 // still useful and remains the model-facing result.
-func (a *Agent) attachArtifact(ctx context.Context, result tools.ToolResult) tools.ToolResult {
-	if result.Artifact != nil || result.Retained == "" ||
+func (a *Agent) attachOutput(ctx context.Context, result tools.ToolResult) tools.ToolResult {
+	if result.Output != nil || result.Retained == "" ||
 		(result.Complete && result.OriginalBytes <= int64(len(result.Preview))) {
 		return result
 	}
-	if a.ArtifactWriter == nil {
-		if a.ArtifactsDisabled {
-			result.Preview = tools.TruncateWithSuffix(result.Preview, "\n[artifact persistence disabled; omitted output is unrecoverable]")
-		}
+	if a.Outputs == nil {
 		return result
 	}
-	ref, err := a.ArtifactWriter.Put(ctx, artifact.PutRequest{
-		Data:          []byte(result.Retained),
-		OriginalBytes: result.OriginalBytes,
-		Complete:      result.Complete,
-		MediaType:     "text/plain",
-		Metadata:      result.Metadata,
-	})
+	ref, err := a.Outputs.Put(ctx, []byte(result.Retained), result.OriginalBytes, result.Complete, "text/plain")
 	if err != nil {
-		result.Preview = tools.TruncateWithSuffix(result.Preview, "\n[artifact unavailable; the omitted output cannot be recovered]")
+		result.Preview = tools.TruncateWithSuffix(result.Preview, "\n[output unavailable; the omitted output cannot be recovered]")
 		return result
 	}
-	result.Artifact = &ref
-	result.Preview = tools.TruncateWithSuffix(result.Preview, tools.ArtifactReference(ref))
+	ref.Metadata = result.Metadata
+	result.Output = &ref
+	result.Preview = tools.TruncateWithSuffix(result.Preview, tools.OutputReference(ref))
 	return result
 }
 
 // writeTranscript renders messages as a role-tagged transcript for a
 // meta-prompt (compaction summary, goal formulation). Tool results are
 // truncated so a giant file read doesn't blow up the request.
-func writeTranscript(b *strings.Builder, msgs []llm.Message) {
-	for _, m := range msgs {
-		switch m.Role {
-		case "user":
-			fmt.Fprintf(b, "user: %s\n", truncateField(m.TextContent(), 2000))
-		case "assistant":
-			if c := strings.TrimSpace(m.TextContent()); c != "" {
-				fmt.Fprintf(b, "assistant: %s\n", truncateField(c, 2000))
-			}
-			for _, tc := range m.ToolCalls {
-				// Keep the established `tool(args)` prefix: goal formulation and
-				// existing transcript consumers use it as a compact call shape.
-				// The id and execution fields remain part of the ledger after it.
-				fmt.Fprintf(b, "assistant called %s(%s) id=%s", tc.Function.Name, truncateField(tc.Function.Arguments, 500), tc.ID)
-				if tc.DurationMs > 0 || tc.ExitCode != 0 {
-					fmt.Fprintf(b, " [duration_ms=%d exit_code=%d]", tc.DurationMs, tc.ExitCode)
-				}
-				b.WriteByte('\n')
-			}
-		case "tool":
-			source := m.Source
-			if source == "" {
-				source = m.Name
-			}
-			fmt.Fprintf(b, "tool result source=%s exit_code=%d: %s", source, m.ExitCode, truncateField(m.Content, 500))
-			if m.Artifact != nil {
-				ref := m.Artifact
-				fmt.Fprintf(b, " [artifact id=%s hash=%s original_bytes=%d stored_bytes=%d complete=%t]",
-					ref.ID, ref.Hash, ref.OriginalBytes, ref.StoredBytes, ref.Complete)
-			}
-			b.WriteByte('\n')
-		}
-	}
-}
-
-// GoalFromContextDefaultWindow is how many tail messages /goal-from-context
-// distills when the user doesn't pass a count.
-const GoalFromContextDefaultWindow = 8
-
-// GoalFromContextMessages returns the last n conversation messages (the
-// window /goal-from-context distills), skipping the system prompt. n <= 0
-// means GoalFromContextDefaultWindow. Fewer than two messages in the window
-// means there isn't enough context to formulate a goal.
-func GoalFromContextMessages(msgs []llm.Message, n int) ([]llm.Message, error) {
-	if n <= 0 {
-		n = GoalFromContextDefaultWindow
-	}
-	if len(msgs) == 0 {
-		return nil, errors.New("not enough context to formulate a goal — chat a bit first")
-	}
-	conv := msgs[1:]
-	if len(conv) < 2 {
-		return nil, errors.New("not enough context to formulate a goal — chat a bit first")
-	}
-	if n > len(conv) {
-		n = len(conv)
-	}
-	return conv[len(conv)-n:], nil
-}
-
-// BuildGoalFromContextPrompt asks the model to distill the given tail
-// messages into a concrete, verifiable goal statement suitable for /goal.
-// The reply must be the bare goal text — the TUI sets it verbatim.
-func BuildGoalFromContextPrompt(tail []llm.Message) string {
-	var b strings.Builder
-	b.WriteString("Distill the end of this conversation into a detailed goal the assistant should keep working on until it is verifiably done.\n\n")
-	b.WriteString("Reply with ONLY the goal: a first line stating the concrete outcome, then a short bullet list of the specific, checkable completion criteria ")
-	b.WriteString("(files to change, commands that must pass, behavior to confirm). Include the key constraints, decisions, and identifiers (file paths, function names, ")
-	b.WriteString("error messages) from the conversation so the goal stands alone. No preamble, no quotes, no explanation.\n\n---\n\n")
-	writeTranscript(&b, tail)
-	b.WriteString("\n---\n\nWrite the goal now.")
-	return b.String()
-}
-
-func truncateField(s string, n int) string {
-	s = strings.ReplaceAll(s, "\n", " ")
-	s = strings.TrimSpace(s)
-	if len(s) > n {
-		return s[:n-1] + "…"
-	}
-	return s
-}

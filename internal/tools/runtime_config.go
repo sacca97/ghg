@@ -21,6 +21,19 @@ type cacheLeaf struct {
 	Source      string
 }
 
+type cacheTarget struct {
+	envVar        string
+	defaultSuffix string
+	leaves        []string
+	source        string
+}
+
+var standardCacheTargets = []cacheTarget{
+	{envVar: "CARGO_HOME", defaultSuffix: ".cargo", leaves: []string{"registry", "git"}, source: "Cargo cache"},
+	{envVar: "RUSTUP_HOME", defaultSuffix: ".rustup", leaves: []string{"downloads"}, source: "Rustup download cache"},
+	{envVar: "BUN_INSTALL", defaultSuffix: ".bun", leaves: []string{"install/cache"}, source: "Bun install cache"},
+}
+
 // NewConfiguredRuntime builds the process-wide execution boundary for one
 // workspace. Cache discovery happens once here, during trusted startup; tool
 // calls never broaden roots by inspecting the user's home directory.
@@ -260,18 +273,14 @@ func discoveredCacheRoots(env map[string]string) []cacheLeaf {
 	}
 
 	home := effectiveHome(env)
-	cargoHome := effectiveHomePath(env, "CARGO_HOME", home, ".cargo")
-	rustupHome := effectiveHomePath(env, "RUSTUP_HOME", home, ".rustup")
-	bunInstall := effectiveHomePath(env, "BUN_INSTALL", home, ".bun")
-	if cargoHome != "" {
-		add(filepath.Join(cargoHome, "registry"), cargoHome, "Cargo registry cache")
-		add(filepath.Join(cargoHome, "git"), cargoHome, "Cargo git cache")
-	}
-	if rustupHome != "" {
-		add(filepath.Join(rustupHome, "downloads"), rustupHome, "Rustup download cache")
-	}
-	if bunInstall != "" {
-		add(filepath.Join(bunInstall, "install", "cache"), bunInstall, "Bun install cache")
+	for _, target := range standardCacheTargets {
+		root := effectiveHomePath(env, target.envVar, home, target.defaultSuffix)
+		if root == "" {
+			continue
+		}
+		for _, leaf := range target.leaves {
+			add(filepath.Join(root, leaf), root, target.source)
+		}
 	}
 	if value := envValue(env, "NPM_CONFIG_CACHE"); value == "off" {
 		// An explicit disabled cache must remain disabled.

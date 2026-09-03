@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"os"
 	"runtime"
 	"strings"
@@ -61,13 +62,13 @@ func TestServerAttachControllerAndDetach(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	h.onAttached = func() { _ = server.Sequence() }
+	h.onAttached = func() { _ = server.Detached() }
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go func() { _ = server.Serve(ctx) }()
 	defer server.Close()
 
-	client, err := Dial(context.Background(), rt, 0)
+	client, err := Dial(context.Background(), rt)
 	if err != nil {
 		if strings.Contains(err.Error(), "operation not permitted") {
 			t.Skip("unix socket connection not permitted by sandbox environment")
@@ -82,7 +83,7 @@ func TestServerAttachControllerAndDetach(t *testing.T) {
 		t.Fatalf("second frame = %+v, want attached", frame)
 	}
 
-	second, err := Dial(context.Background(), rt, 0)
+	second, err := Dial(context.Background(), rt)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,4 +168,20 @@ func nextFrame(t *testing.T, client *Client) Frame {
 		t.Fatal("timed out waiting for worker frame")
 	}
 	return Frame{}
+}
+
+func TestWriteErrorWithDeadlineTimesOutOnUnreadConn(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	defer serverConn.Close()
+	defer clientConn.Close()
+
+	start := time.Now()
+	err := writeErrorWithDeadline(serverConn, "s1", "handshake error")
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("expected write error on unread pipe, got nil")
+	}
+	if elapsed < 800*time.Millisecond || elapsed > 3*time.Second {
+		t.Fatalf("expected write error to time out around 1s, took %v", elapsed)
+	}
 }

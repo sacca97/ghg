@@ -2,18 +2,20 @@ package config
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"time"
 
-	"github.com/sacca97/ghg/internal/llm"
+	"github.com/sacca97/ghg/internal/models"
 )
 
 // catalogTTL is how long a provider's fetched model list stays fresh.
 const catalogTTL = 24 * time.Hour
 
-// Catalog is the cached model list of one provider.
+// Catalog is the cached model list of one models.
 type Catalog struct {
 	FetchedAt time.Time       `json:"fetchedAt"`
 	BaseURL   string          `json:"baseUrl"`
@@ -126,7 +128,7 @@ func SaveCatalogs(cats map[string]Catalog) error {
 // ModelInfoLites converts provider model records into the catalog-cache shape.
 // Keeping this conversion beside the cache prevents each onboarding surface
 // from drifting when a capability field is added.
-func ModelInfoLites(infos []llm.ModelInfo) []ModelInfoLite {
+func ModelInfoLites(infos []models.ModelInfo) []ModelInfoLite {
 	lites := make([]ModelInfoLite, len(infos))
 	for i, mi := range infos {
 		lites[i] = ModelInfoLite{
@@ -147,7 +149,7 @@ func ModelInfoLites(infos []llm.ModelInfo) []ModelInfoLite {
 // SaveCatalog merges one provider's freshly validated model list into the
 // catalog cache. A successful auth flow uses the same response for validation
 // and seeding, so it never needs a second discovery request.
-func SaveCatalog(name, baseURL string, infos []llm.ModelInfo) error {
+func SaveCatalog(name, baseURL string, infos []models.ModelInfo) error {
 	cats := LoadCatalogs()
 	cats[name] = Catalog{FetchedAt: time.Now(), BaseURL: baseURL, Models: ModelInfoLites(infos)}
 	return SaveCatalogs(cats)
@@ -155,3 +157,126 @@ func SaveCatalog(name, baseURL string, infos []llm.ModelInfo) error {
 
 // Stale reports whether the cached catalog should be refetched.
 func (c Catalog) Stale() bool { return time.Since(c.FetchedAt) > catalogTTL }
+
+// resolveFromCatalog synthesizes a Model for an id advertised in a provider's
+// cached /models catalog but absent from cfg.Models.
+func (c *Config) resolveFromCatalog(model, provider string) (Model, string, error) {
+	type hit struct {
+		prov string
+		mi   *ModelInfoLite
+	}
+	var hits []hit
+	for name, cat := range LoadCatalogs() {
+		if provider != "" && name != provider {
+			continue
+		}
+		if _, ok := c.Providers[name]; !ok {
+			continue
+		}
+		if mi := cat.Find(model); mi != nil {
+			hits = append(hits, hit{name, mi})
+		}
+	}
+	if len(hits) == 0 {
+		return Model{}, "", fmt.Errorf("unknown model %q (models: %s)", model, keys(c.Models))
+	}
+	if len(hits) > 1 {
+		names := make([]string, len(hits))
+		for i, h := range hits {
+			names[i] = h.prov
+		}
+		return Model{}, "", fmt.Errorf("model %q is advertised by multiple providers (%s); pass a provider to disambiguate (-p / /model %s <provider>)",
+			model, strings.Join(names, ", "), model)
+	}
+	h := hits[0]
+	m := Model{
+		Providers: []string{h.prov},
+		ID:        model,
+		Context:   h.mi.ContextLength,
+		MaxOut:    h.mi.MaxCompletionTokens,
+		Vision:    slices.Contains(h.mi.InputModalities, "image"),
+	}
+	return m, h.prov, nil
+}
+
+// CatalogWantedModels returns IDs present in provider catalogs.
+func CatalogWantedModels(cats map[string]Catalog) map[string]struct{} {
+	wanted := make(map[string]struct{})
+	for _, cat := range cats {
+		for _, model := range cat.Models {
+			if id := strings.TrimSpace(model.ID); id != "" {
+				wanted[id] = struct{}{}
+			}
+		}
+	}
+	return wanted
+}
+
+// CatalogWantedModels adds configured and role-selected model IDs to the
+// catalog IDs used for metadata refreshes.
+func (c *Config) CatalogWantedModels(cats map[string]Catalog) map[string]struct{} {
+	wanted := CatalogWantedModels(cats)
+	if c == nil {
+		return wanted
+	}
+	for name, model := range c.Models {
+		id := strings.TrimSpace(model.ID)
+		if id == "" {
+			id = strings.TrimSpace(name)
+		}
+		if id != "" {
+			wanted[id] = struct{}{}
+		}
+	}
+	for _, role := range c.Roles {
+		id := strings.TrimSpace(role.Model)
+		if id == "" {
+			continue
+		}
+		if model, ok := c.Models[id]; ok && strings.TrimSpace(model.ID) != "" {
+			wanted[strings.TrimSpace(model.ID)] = struct{}{}
+		} else {
+			wanted[id] = struct{}{}
+		}
+	}
+	for _, name := range []string{c.DefaultModel, c.CompactModel} {
+		id := strings.TrimSpace(name)
+		if id == "" {
+			continue
+		}
+		if model, ok := c.Models[id]; ok && strings.TrimSpace(model.ID) != "" {
+			wanted[strings.TrimSpace(model.ID)] = struct{}{}
+		} else {
+			wanted[id] = struct{}{}
+		}
+	}
+	return wanted
+}
+
+// EnrichCatalogMetadata fills missing catalog context and reasoning metadata.
+func EnrichCatalogMetadata(cat Catalog, metadata ModelsDevCache, providerIDs []string) (Catalog, bool) {
+	changed := false
+	for i := range cat.Models {
+		if cat.Models[i].ContextLength <= 0 {
+			if n := metadata.ContextLength(cat.Models[i].ID, providerIDs...); n > 0 {
+				cat.Models[i].ContextLength = n
+				changed = true
+			}
+		}
+
+		info, ok := metadata.ReasoningFor(cat.Models[i].ID, providerIDs...)
+		if !ok {
+			continue
+		}
+		if !cat.Models[i].ReasoningKnown && len(cat.Models[i].ReasoningEfforts) == 0 {
+			cat.Models[i].ReasoningEfforts = slices.Clone(info.Efforts)
+			cat.Models[i].ReasoningKnown = true
+			changed = true
+		}
+		if info.Toggle && !cat.Models[i].ReasoningToggle {
+			cat.Models[i].ReasoningToggle = true
+			changed = true
+		}
+	}
+	return cat, changed
+}

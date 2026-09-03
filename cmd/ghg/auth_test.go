@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/sacca97/ghg/internal/config"
+	"github.com/sacca97/ghg/internal/models"
 )
 
 func fakeProfileServer(t *testing.T, goodKey string) *httptest.Server {
@@ -257,5 +258,30 @@ func TestShellRC(t *testing.T) {
 		if got := shellRC(); got != c.want {
 			t.Errorf("SHELL=%q: got %q, want %q", c.shell, got, c.want)
 		}
+	}
+}
+
+func TestAuthOAuthCLIDiscoveryFailure(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("GHG_HOME", home)
+	profiles, err := models.Load(models.LoadOptions{UserDir: filepath.Join(home, "providers")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolved, err := profiles.Resolve(models.Instance{
+		Name:    "codex-subscription",
+		Profile: "codex-subscription",
+		BaseURL: "http://127.0.0.1:9999/unreachable",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := configureOAuthPostLogin("codex-subscription", resolved); err != nil {
+		t.Fatalf("configureOAuthPostLogin should succeed even when discovery fails: %v", err)
+	}
+	cfg, _ := config.Load()
+	if _, ok := cfg.Providers["codex-subscription"]; !ok {
+		t.Fatal("OAuth provider was not saved to config")
 	}
 }

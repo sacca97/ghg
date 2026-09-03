@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -11,9 +12,8 @@ import (
 )
 
 const (
-	eventRingCapacity = 256
-	outboundCapacity  = 128
-	requestCacheSize  = 256
+	outboundCapacity = 128
+	requestCacheSize = 256
 )
 
 type Handler interface {
@@ -52,7 +52,6 @@ type Server struct {
 	controller   *peer
 	attaching    bool
 	seq          uint64
-	ring         []Frame
 	requests     map[string]Frame
 	requestOrder []string
 	detached     bool
@@ -79,7 +78,7 @@ func NewServer(runtime Runtime, handler Handler) (*Server, error) {
 		lock:     lock,
 		listener: listener,
 		handler:  handler,
-		ring:     make([]Frame, 0, eventRingCapacity), requests: make(map[string]Frame),
+		requests: make(map[string]Frame),
 	}, nil
 }
 
@@ -173,22 +172,10 @@ func (s *Server) Publish(kind string, data any, important bool) (uint64, error) 
 	if _, err := encodeFrame(frame); err != nil {
 		return 0, err
 	}
-	if len(s.ring) == eventRingCapacity {
-		copy(s.ring, s.ring[1:])
-		s.ring[len(s.ring)-1] = frame
-	} else {
-		s.ring = append(s.ring, frame)
-	}
 	if s.controller != nil {
 		s.controller.enqueue(frame, important)
 	}
 	return s.seq, nil
-}
-
-func (s *Server) Sequence() uint64 {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.seq
 }
 
 func (s *Server) Detached() bool {
@@ -212,13 +199,15 @@ func (s *Server) serveConnection(conn net.Conn) {
 		return
 	}
 	if first.Type != TypeAttach || first.SessionID != s.runtime.SessionID {
-		_ = writeError(conn, s.runtime.SessionID, "attach required")
+		_ = writeErrorWithDeadline(conn, s.runtime.SessionID, "attach required")
 		return
 	}
-	var attach AttachRequest
 	if len(first.Payload) != 0 && string(first.Payload) != "null" {
-		if err := json.Unmarshal(first.Payload, &attach); err != nil {
-			_ = writeError(conn, s.runtime.SessionID, "invalid attach payload")
+		var attach AttachRequest
+		dec := json.NewDecoder(bytes.NewReader(first.Payload))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&attach); err != nil {
+			_ = writeErrorWithDeadline(conn, s.runtime.SessionID, "invalid attach payload")
 			return
 		}
 	}
@@ -257,10 +246,10 @@ func (s *Server) serveConnection(conn net.Conn) {
 		return
 	}
 	s.attaching = false
-	state, snapshotSeq, resync, snapshotErr := s.snapshotLocked(context.Background(), attach.LastSeq)
+	state, snapshotSeq, snapshotErr := s.snapshotLocked(context.Background())
 	if snapshotErr != nil {
 		s.mu.Unlock()
-		_ = writeError(conn, s.runtime.SessionID, snapshotErr.Error())
+		_ = writeErrorWithDeadline(conn, s.runtime.SessionID, snapshotErr.Error())
 		p.close()
 		s.handler.Disconnected(context.Background(), false)
 		return
@@ -276,7 +265,7 @@ func (s *Server) serveConnection(conn net.Conn) {
 		SessionID: s.runtime.SessionID,
 		Seq:       snapshotSeq,
 		Type:      TypeSnapshot,
-		Payload:   mustPayload(SnapshotEnvelope{State: state, Resync: resync}),
+		Payload:   mustPayload(SnapshotEnvelope{State: state}),
 	}, true)
 	_ = p.enqueue(Frame{
 		Version:   ProtocolVersion,
@@ -302,21 +291,16 @@ func (s *Server) serveConnection(conn net.Conn) {
 	}
 }
 
-func (s *Server) snapshotLocked(ctx context.Context, lastSeq uint64) (json.RawMessage, uint64, bool, error) {
+func (s *Server) snapshotLocked(ctx context.Context) (json.RawMessage, uint64, error) {
 	state, err := s.handler.Snapshot(ctx)
 	if err != nil {
-		return nil, 0, false, err
+		return nil, 0, err
 	}
 	raw, err := marshalPayload(state)
 	if err != nil {
-		return nil, 0, false, err
+		return nil, 0, err
 	}
-	resync := false
-	if lastSeq != 0 && len(s.ring) > 0 {
-		oldest := s.ring[0].Seq
-		resync = lastSeq+1 < oldest
-	}
-	return raw, s.seq, resync, nil
+	return raw, s.seq, nil
 }
 
 func (s *Server) handleCommand(p *peer, frame Frame) {
@@ -400,6 +384,11 @@ func errorFrame(sessionID, message string) Frame {
 
 func writeError(w io.Writer, sessionID, message string) error {
 	return WriteFrame(w, errorFrame(sessionID, message))
+}
+
+func writeErrorWithDeadline(conn net.Conn, sessionID, message string) error {
+	_ = conn.SetWriteDeadline(time.Now().Add(time.Second))
+	return writeError(conn, sessionID, message)
 }
 
 type peer struct {

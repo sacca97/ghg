@@ -103,6 +103,8 @@ func (r *Registry) BindSession(ctx context.Context, sessionID string) error {
 	return nil
 }
 
+const maxLiveSnapshotsPerSession = 16
+
 // Save stores a snapshot in memory and mirrors it when sessionID is set.
 func (r *Registry) Save(ctx context.Context, sessionID string, snapshot Snapshot) error {
 	if r == nil {
@@ -117,12 +119,34 @@ func (r *Registry) Save(ctx context.Context, sessionID string, snapshot Snapshot
 	snapshot = cloneSnapshot(snapshot)
 	r.mu.Lock()
 	r.snapshots[sessionKey(sessionID, snapshot.ID)] = snapshot
+	r.evictOldest(sessionID)
 	store := r.persistent
 	r.mu.Unlock()
 	if store != nil && strings.TrimSpace(sessionID) != "" {
 		return store.SaveSearchSnapshot(ctx, sessionID, snapshot)
 	}
 	return nil
+}
+
+// ponytail: O(n) eviction is intentional while the per-session limit is 16;
+// replace with an LRU only if this bound grows materially.
+func (r *Registry) evictOldest(sessionID string) {
+	prefix := sessionID + "\x00"
+	count := 0
+	var oldestKey string
+	var oldestTime time.Time
+	for key, snap := range r.snapshots {
+		if strings.HasPrefix(key, prefix) {
+			count++
+			if oldestKey == "" || snap.CreatedAt.Before(oldestTime) {
+				oldestKey = key
+				oldestTime = snap.CreatedAt
+			}
+		}
+	}
+	if count > maxLiveSnapshotsPerSession && oldestKey != "" {
+		delete(r.snapshots, oldestKey)
+	}
 }
 
 // Load returns a live snapshot first, then asks the durable store for it.
@@ -170,7 +194,7 @@ func NewID(prefix string) string {
 
 // fileIndexTTL keeps completion responsive without turning every keystroke
 // into a full recursive walk.
-const fileIndexTTL = 2 * time.Second
+const fileIndexTTL = 30 * time.Second
 
 type fileIndexEntry struct {
 	builtAt time.Time

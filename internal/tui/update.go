@@ -14,12 +14,20 @@ import (
 
 	"github.com/sacca97/ghg/internal/agent"
 	"github.com/sacca97/ghg/internal/config"
-	goalstate "github.com/sacca97/ghg/internal/goal"
+	"github.com/sacca97/ghg/internal/export"
+	"github.com/sacca97/ghg/internal/goal"
 	"github.com/sacca97/ghg/internal/mcp"
 	"github.com/sacca97/ghg/internal/session"
 	"github.com/sacca97/ghg/internal/tools"
 	workerwire "github.com/sacca97/ghg/internal/worker"
 )
+
+func sendProg(p *tea.Program, msg tea.Msg) {
+	if p == nil {
+		return
+	}
+	go p.Send(msg)
+}
 
 // scrollMouseWheel advances one terminal row per vertical wheel event. The
 // viewport widget defaults to three rows, which makes the transcript feel
@@ -126,10 +134,6 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 	defer m.layout()
 
-	if vp, ok := msg.(viewProbe); ok { // tests read model state race-safely
-		vp.fn(m)
-		return m, nil
-	}
 	switch msg := msg.(type) {
 	case selectionCopyMsg:
 		if msg.err != nil {
@@ -146,13 +150,6 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.applyWheelFrame()
 		return m, nil
 
-	case cfgSyncTick:
-		return m.cfgSync()
-
-	case cfgSyncMsg:
-		m.applyCfgSync(msg)
-		return m, nil
-
 	case tea.WindowSizeMsg:
 		resized := msg.Width != m.width // width change → re-wrap the whole transcript
 		m.width, m.height = msg.Width, msg.Height
@@ -162,51 +159,58 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
-	case titleMsg:
-		// only fill a title still at its auto placeholder (a /rename wins)
-		if m.agent != nil && m.store != nil && m.sessionID != "" {
-			if meta, _, err := m.store.Load(m.sessionID); err == nil {
-				first := ""
-				for _, msg := range m.agent.Messages {
-					if msg.Role == "user" && msg.Authored {
-						first = truncLine(strings.Join(strings.Fields(msg.TextContent()), " "), 64)
-						break
-					}
-				}
-				if meta.Title == first {
-					_ = m.store.SetTitle(m.sessionID, msg.title)
-					m.append(dimStyle.Render("◎ session titled: " + msg.title))
-				}
-			}
-		}
-		return m, nil
-
 	case permRequest:
 		m.permDialog = &permDialog{req: msg.req, reply: msg.reply}
 		return m, nil
 
 	case workerFrameMsg:
+		if msg.generation != 0 && msg.generation != m.workerGeneration {
+			return m, nil
+		}
+		if msg.client != nil && msg.client != m.workerClient {
+			return m, nil
+		}
+		if msg.frame.SessionID != "" && m.sessionID != "" && msg.frame.SessionID != m.sessionID {
+			return m, nil
+		}
 		return m.handleWorkerFrame(msg.frame)
 
 	case workerErrorMsg:
-		if msg.process != nil && msg.process == m.workerProcess {
+		if msg.generation != 0 && msg.generation != m.workerGeneration {
+			return m, nil
+		}
+		if msg.client != nil && msg.client != m.workerClient {
+			// Ignore errors from stale, replaced clients.
+			return m, nil
+		}
+		wasDetached := m.workerDetached
+		isCurrentClient := msg.client != nil && msg.client == m.workerClient
+		isCurrentProc := msg.process != nil && msg.process == m.workerProcess
+		if isCurrentClient || isCurrentProc {
+			m.workerGeneration++
 			if m.workerClient != nil {
 				_ = m.workerClient.Close()
 			}
 			m.workerClient = nil
-			m.workerProcess = nil
-			m.workerRuntime = workerwire.Runtime{}
+			if isCurrentProc {
+				m.workerProcess = nil
+				m.workerRuntime = workerwire.Runtime{}
+				m.workerStartFailed = false
+			}
 			m.workerState = workerwire.StateInterrupted
 			m.workerLiveWork = false
+			m.workerDetached = false
 			m.busy = false
 			m.cancel = nil
 			m.interrupt1 = false
+			m.flushThink()
+			m.thinkStart = time.Time{}
 			m.turnStart = time.Time{}
-			m.workerStartFailed = false
 		}
-		if msg.err != nil && !m.workerDetached {
+		if msg.err != nil && !wasDetached {
 			m.append(errStyle.Render("worker: " + msg.err.Error()))
 		}
+		m.refreshVP()
 		return m, nil
 
 	case workerPermissionMsg:
@@ -222,7 +226,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.MouseMsg:
 		// The middle row of the bottom status box owns the model, effort, and mode
 		// controls, so clicks there must not fall through to transcript scrolling.
-		if m.settings == nil && m.picker == nil && m.mpicker == nil && m.taskVP == nil &&
+		if m.settings == nil && m.picker == nil && m.taskVP == nil &&
 			m.height > 0 && msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft && msg.Y == statusInfoRow(m.height) {
 			if m.statusModelW > 0 && msg.X >= m.statusModelX && msg.X < m.statusModelX+m.statusModelW {
 				m.cycleStatusModel()
@@ -249,7 +253,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.settings != nil {
 			return m.paletteMouse(msg)
 		}
-		if m.picker == nil && m.mpicker == nil && m.settings == nil {
+		if m.picker == nil && m.settings == nil {
 			// dock rows sit just above the input box: click selects/opens,
 			// wheel scrolls the selection through the strip
 			if top, n := m.dockTop(), len(m.dockTasks()); n > 0 && msg.Y >= top && msg.Y < top+n {
@@ -342,7 +346,15 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				b.toolRunning = false
 				b.toolFailed = strings.HasPrefix(msg.result, "Error:")
 				if b.toolFailed {
-					b.text += errStyle.Render(" — failed")
+					errMsg := strings.TrimSpace(strings.TrimPrefix(msg.result, "Error:"))
+					firstLine := strings.SplitN(errMsg, "\n", 2)[0]
+					showBashReason := msg.name == "bash" &&
+						(strings.HasPrefix(firstLine, "unknown tool") || strings.HasPrefix(firstLine, "tool unavailable"))
+					if (msg.name != "bash" || showBashReason) && firstLine != "" && !strings.HasPrefix(firstLine, "exit status") {
+						b.text += errStyle.Render(" — failed: " + firstLine)
+					} else {
+						b.text += errStyle.Render(" — failed")
+					}
 				}
 				b.stale = true
 				break
@@ -425,7 +437,14 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case goalUpdateMsg:
+		if m.workerOnly {
+			return m, nil
+		}
 		m.applyGoalUpdate(msg.update)
+		return m, nil
+
+	case goalUpdateRecordMsg:
+		m.applyGoalRecord(msg.record)
 		return m, nil
 
 	case goalFromContextMsg:
@@ -448,8 +467,15 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.append(errStyle.Render("goal-from-context: model returned an empty goal"))
 		default:
 			goal := strings.TrimSpace(msg.goal)
-			m.setGoal(goal)
+			if msg.record != nil {
+				m.applyGoalRecord(*msg.record)
+			} else {
+				m.setGoal(goal)
+			}
 			m.append(dimStyle.Render("◎ goal set: " + goal))
+			if m.workerOnly {
+				return m.submitGoal(goal)
+			}
 			return m.submit(goal)
 		}
 		return m, nil
@@ -494,7 +520,12 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.turnStart = time.Time{}
 		m.future = nil
 		m.msgBlock = nil
-		if m.agent != nil {
+		if m.workerOnly {
+			m.usage = msg.usage
+			if msg.contextTokens > 0 {
+				m.workerContextTokens = msg.contextTokens
+			}
+		} else if m.agent != nil {
 			m.agent.SetUsage(msg.usage)
 		}
 		if msg.err != nil {
@@ -513,7 +544,6 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.cancel = nil
 		m.interrupt1 = false
 		m.turnStart = time.Time{}
-		m.maybeTitle()
 		// Cancellation arrives wrapped from the in-flight http request
 		// ("Post ...: context canceled"), so identity comparison misses it —
 		// which would strand the queue instead of draining it.
@@ -523,41 +553,100 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		} else if canceled {
 			m.append(dimStyle.Render("(interrupted — any running tool calls will be recorded as interrupted; ghg can retry them next turn)"))
 		}
-		continueGoal := m.goalTurnFinished(msg, canceled)
-		if m.uiMode() == uiModePlan && msg.final != "" {
-			if planMD, ok := agent.ExtractProposedPlan(msg.final); ok {
+		continueGoal := false
+		if m.workerOnly {
+			if msg.goal != nil {
+				m.applyGoalRecord(*msg.goal)
+			}
+			continueGoal = msg.goalContinue && msg.err == nil && !canceled
+		} else {
+			continueGoal = m.goalTurnFinished(msg, canceled)
+		}
+		if m.reviewing {
+			m.reviewing = false
+			if !m.workerOnly && m.agent != nil {
+				m.agent.ReviewMode = false
+				m.agent.PlanMode = (m.uiMode() == uiModePlan)
+			}
+			if msg.err == nil && !canceled && msg.final != "" {
+				if m.workerOnly {
+					if msg.reviewMarkdown != "" {
+						m.appendAssistant(msg.reviewMarkdown)
+					} else {
+						m.appendAssistant(msg.final)
+					}
+				} else if !m.workerOnly {
+					if rev, err := agent.ParseReview(msg.final); err == nil {
+						rendered := export.RenderReviewMarkdown(rev)
+						m.appendAssistant(rendered)
+						if m.store != nil && m.sessionID != "" {
+							msgSeq := 0
+							role := ""
+							if m.agent != nil {
+								msgSeq = len(m.agent.MessagesSnapshot())
+								role = m.agent.Role
+							}
+							_ = m.store.SaveWorkflowResult(context.Background(), session.WorkflowResultRecord{
+								ResultID:   fmt.Sprintf("review-%x", time.Now().UnixNano()),
+								SessionID:  m.sessionID,
+								Kind:       "review",
+								Version:    1,
+								Payload:    msg.final,
+								Role:       role,
+								MessageSeq: msgSeq,
+								CreatedAt:  time.Now().UTC(),
+							})
+						}
+					}
+				}
+			}
+		} else if m.uiMode() == uiModePlan && msg.final != "" {
+			if m.workerOnly {
+				if msg.plan != "" {
+					m.proposedPlanMD = msg.plan
+				}
+			} else if planMD, ok := agent.ExtractProposedPlan(msg.final); ok {
 				m.proposedPlanMD = planMD
 				if m.store != nil && m.sessionID != "" {
 					planJSON, _ := json.Marshal(map[string]string{"markdown": planMD})
 					msgSeq := 0
+					role := ""
 					if m.agent != nil {
 						msgSeq = len(m.agent.MessagesSnapshot())
+						role = m.agent.Role
 					}
 					_ = m.store.SaveWorkflowResult(context.Background(), session.WorkflowResultRecord{
-						ResultID:   fmt.Sprintf("plan-%x", time.Now().UnixNano()&0xffffffff),
+						ResultID:   fmt.Sprintf("plan-%x", time.Now().UnixNano()),
 						SessionID:  m.sessionID,
 						Kind:       "plan",
 						Version:    2,
 						Payload:    string(planJSON),
-						Role:       config.RoleSmart,
+						Role:       role,
 						MessageSeq: msgSeq,
 						CreatedAt:  time.Now().UTC(),
 					})
 				}
 			}
 		}
-		m.persist()
-		switch {
-		case msg.snap != "" && msg.clean:
-			dropSnapshot(msg.snap) // the turn changed no files; nothing to roll back
-		case msg.snap != "":
+		if !m.workerOnly {
+			m.persist()
+			switch {
+			case msg.snap != "" && msg.clean:
+				session.DropSnapshot(cwd(), msg.snap) // the turn changed no files; nothing to roll back
+			case msg.snap != "":
+				if m.snapshots == nil {
+					m.snapshots = map[int]string{}
+				}
+				m.snapshots[msg.at] = msg.snap
+				if m.store != nil && m.sessionID != "" {
+					_ = m.store.SetSnapshot(m.sessionID, msg.at, msg.snap)
+				}
+			}
+		} else if msg.snap != "" && !msg.clean {
 			if m.snapshots == nil {
 				m.snapshots = map[int]string{}
 			}
 			m.snapshots[msg.at] = msg.snap
-			if m.store != nil && m.sessionID != "" {
-				_ = m.store.SetSnapshot(m.sessionID, msg.at, msg.snap)
-			}
 		}
 		// codex-style follow-up: send queued messages one turn at a time;
 		// `!` shell escapes execute locally instead of starting a turn.
@@ -577,8 +666,8 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// response never completes or pauses an active goal.
 		if continueGoal {
 			record, ok := m.goalRecordForSession()
-			if ok && record.Status == goalstate.StatusActive {
-				return m.submitGoal(goalContinuePrompt(record.Objective))
+			if ok && record.Status == agent.GoalStatusActive {
+				return m.submitGoal(goal.ContinuePrompt(record.Objective))
 			}
 		}
 		return m, nil
@@ -589,6 +678,14 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case authResultMsg:
 		m.applyAuthResult(msg)
+		return m, nil
+
+	case authOAuthWaitingMsg:
+		m.append(dimStyle.Render("open the following authorization URL in your browser:\n\n  " + msg.url + "\n\nwaiting for callback on http://localhost:1455…"))
+		return m, nil
+
+	case authOAuthResultMsg:
+		m.applyOAuthResult(msg)
 		return m, nil
 
 	case noticeMsg:
@@ -610,7 +707,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case taskUpdateMsg:
 		// a background subagent started or settled; the dock shows it. An
 		// open view of a settled task reloads from the stored report.
-		if m.agent != nil && m.taskVP != nil {
+		if !m.workerOnly && m.agent != nil && m.taskVP != nil {
 			if t, ok := m.agent.Tasks().Get(m.taskVP.id); ok && t.Status != agent.TaskRunning && m.taskVP.live {
 				m.openTask(m.taskVP.id) // reseed with the final report
 			} else {
@@ -620,11 +717,20 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case mcpStatusMsg:
+		if len(msg.statuses) > 0 || m.workerOnly {
+			if len(msg.statuses) > 0 {
+				m.append(renderWorkerMCPStatuses(msg.statuses))
+			}
+			return m, nil
+		}
 		// An MCP server changed state. Announce each server's FIRST settle in
 		// the transcript (one line, once per session per server) so arrivals
 		// and failures are visible without typing /mcp — later transitions
 		// (auto-reconnect, toggles) stay quiet to avoid flapping noise.
 		if m.mcpMgr != nil {
+			if m.agent != nil {
+				m.agent.SetMCPTools(m.mcpMgr.Tools())
+			}
 			if m.mcpSeen == nil {
 				m.mcpSeen = map[string]bool{}
 			}
@@ -683,11 +789,6 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
-	case scheduleTickMsg:
-		if m.agent == nil {
-			return m, scheduleTick()
-		}
-		return m, tea.Batch(scheduleTick(), m.fireDueSchedules())
 	}
 
 	var cmd tea.Cmd

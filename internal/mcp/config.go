@@ -10,6 +10,7 @@
 package mcp
 
 import (
+	"encoding/json"
 	"fmt"
 	"hash/fnv"
 	"os"
@@ -240,7 +241,7 @@ func setSource(src map[string]ServerConfig, path string) {
 }
 
 // LoadMergedFiltered discovers server configs like LoadMerged, then applies
-// the import policy: filtered-out claude/codex entries land in Blocked as
+// the import policy: filtered-out claude entries land in Blocked as
 // disabled+noted copies. ghgCfg entries always pass through.
 func LoadMergedFiltered(cwd string, ghgCfg map[string]ServerConfig, policy ImportPolicy) Filtered {
 	errs := map[string]error{}
@@ -249,13 +250,7 @@ func LoadMergedFiltered(cwd string, ghgCfg map[string]ServerConfig, policy Impor
 	if err != nil && !os.IsNotExist(err) {
 		errs[".mcp.json"] = err
 	}
-	codexPath := CodexPath()
-	codex, err := LoadCodex(codexPath)
-	if err != nil && !os.IsNotExist(err) {
-		errs[codexPath] = err
-	}
 	setSource(claude, claudePath)
-	setSource(codex, codexPath)
 	setSource(ghgCfg, ghgConfigPath())
 	blocked := map[string]ServerConfig{}
 	split := func(src map[string]ServerConfig, p ImportSourcePolicy) map[string]ServerConfig {
@@ -279,19 +274,15 @@ func LoadMergedFiltered(cwd string, ghgCfg map[string]ServerConfig, policy Impor
 		return kept
 	}
 	claudeKept := split(claude, policy.Claude)
-	codexKept := split(codex, policy.Codex)
-	sources := make(map[string]string, len(ghgCfg)+len(codex)+len(claude))
+	sources := make(map[string]string, len(ghgCfg)+len(claude))
 	for name := range ghgCfg {
 		sources[name] = "ghg"
 	}
 	for name := range claude {
 		sources[name] = ".mcp.json"
 	}
-	for name := range codex { // codex wins over claude in Merge
-		sources[name] = "codex"
-	}
 	return Filtered{
-		Merged:  Merge(ghgCfg, codexKept, claudeKept),
+		Merged:  Merge(ghgCfg, nil, claudeKept),
 		Blocked: blocked,
 		Sources: sources,
 		Errs:    errs,
@@ -299,19 +290,15 @@ func LoadMergedFiltered(cwd string, ghgCfg map[string]ServerConfig, policy Impor
 }
 
 // LoadMerged discovers MCP server configs from all supported sources and
-// merges them: the project .mcp.json in cwd (claude-style), the codex config,
-// then ghg's own config on top. cwd is the project directory; ghgCfg may
+// merges them: the project .mcp.json in cwd (claude-style), then ghg's
+// own config on top. cwd is the project directory; ghgCfg may
 // be nil. Discovery failures (unreadable/unparseable files) are reported in
 // errs, keyed by source path, and never abort the merge. No import policy is
-// applied — both sources are imported wholesale.
+// applied — sources are imported wholesale.
 func LoadMerged(cwd string, ghgCfg map[string]ServerConfig) (map[string]ServerConfig, map[string]error) {
 	f := LoadMergedFiltered(cwd, ghgCfg, ImportPolicyFrom(nil))
 	return f.Merged, f.Errs
 }
-
-// CodexPath is the codex CLI's config file location (~/.codex/config.toml).
-// A variable so tests can point it at fixtures.
-var CodexPath = defaultCodexPath
 
 // ghgConfigPath is ghg's own config file location (~/.ghg/config.json) —
 // the source of any server from the config's "mcp" block. Best-effort: ""
@@ -348,14 +335,6 @@ func FromConfigMap(in map[string]config.MCPServer) map[string]ServerConfig {
 	return out
 }
 
-func defaultCodexPath() string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return ""
-	}
-	return filepath.Join(home, ".codex", "config.toml")
-}
-
 // expandEnv resolves "$VAR" and "${VAR}" references in config values (claude
 // does this in .mcp.json env blocks; codex expands env vars in its TOML too).
 // Missing variables expand to "".
@@ -375,4 +354,81 @@ func expandEnvMap(m map[string]string) map[string]string {
 		out[k] = expandEnv(v)
 	}
 	return out
+}
+
+// claudeFile is the shape of a claude-style .mcp.json project file:
+//
+//	{"mcpServers": {"name": {"type": "stdio", "command": ..., "args": [...],
+//	                         "env": {...}, "url": ..., "headers": {...}}}}
+//
+// "type" is optional: entries with a command default to stdio, entries with a
+// url default to http. "sse" (legacy server-sent events transport) is
+// imported as disabled with a note — the ecosystem moved to streamable HTTP
+// and ghg doesn't ship the legacy transport.
+type claudeFile struct {
+	MCPServers map[string]claudeServer `json:"mcpServers"`
+}
+
+type claudeServer struct {
+	Type    string            `json:"type"`
+	Command string            `json:"command"`
+	Args    []string          `json:"args"`
+	Env     map[string]string `json:"env"`
+	Cwd     string            `json:"cwd"`
+	URL     string            `json:"url"`
+	Headers map[string]string `json:"headers"`
+	Enabled *bool             `json:"enabled"`
+	Timeout int               `json:"timeout"` // seconds (claude-code uses ms for MCP_TIMEOUT; the file form is seconds)
+}
+
+// ParseClaude normalizes a claude-style .mcp.json document into server
+// configs. "$VAR"/"${VAR}" references in env and header values are expanded
+// from the process environment.
+func ParseClaude(data []byte) (map[string]ServerConfig, error) {
+	var f claudeFile
+	if err := json.Unmarshal(data, &f); err != nil {
+		return nil, fmt.Errorf("parse .mcp.json: %w", err)
+	}
+	out := make(map[string]ServerConfig, len(f.MCPServers))
+	for name, s := range f.MCPServers {
+		c := ServerConfig{
+			Env:     expandEnvMap(s.Env),
+			Cwd:     s.Cwd,
+			URL:     s.URL,
+			Headers: expandEnvMap(s.Headers),
+			Enabled: s.Enabled,
+		}
+		if s.Command != "" {
+			c.Command = append([]string{s.Command}, s.Args...)
+		}
+		switch s.Type {
+		case "sse":
+			disabled := false
+			c.Enabled = &disabled
+			c.Note = "claude sse transport is legacy and unsupported — switch the server to streamable http (type: \"http\")"
+		case "http", "streamable-http", "":
+			// "" infers from command/url above; both are our native shapes.
+		case "stdio":
+			// default; nothing to adjust
+		default:
+			c.Note = fmt.Sprintf("unknown claude transport type %q — assumed from command/url fields", s.Type)
+		}
+		if s.Timeout > 0 {
+			c.StartupTimeout = s.Timeout
+			c.ToolTimeout = s.Timeout
+		}
+		out[name] = c
+	}
+	return out, nil
+}
+
+// LoadClaude reads and parses a claude-style .mcp.json file. A missing file
+// is not an error (returns nil map + os.IsNotExist-satisfying error) so
+// callers can treat discovery as best-effort.
+func LoadClaude(path string) (map[string]ServerConfig, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return ParseClaude(data)
 }

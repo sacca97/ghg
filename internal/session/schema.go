@@ -20,10 +20,11 @@ CREATE TABLE IF NOT EXISTS messages (
 	session_id TEXT NOT NULL REFERENCES sessions(id),
 	seq        INTEGER NOT NULL,
 	role       TEXT NOT NULL,
-	content    TEXT NOT NULL, -- llm.Message JSON
+	content    TEXT NOT NULL, -- models.Message JSON
 	PRIMARY KEY (session_id, seq)
 );
--- Artifact metadata is session-scoped. Payloads are immutable and shared by
+-- Output metadata is session-scoped. The table name is retained for database
+-- compatibility. Payloads are immutable and shared by
 -- content hash; the message sequence is only the ownership/fork/rewind index.
 CREATE TABLE IF NOT EXISTS artifacts (
 	session_id    TEXT NOT NULL REFERENCES sessions(id),
@@ -201,8 +202,8 @@ func applySchema(db *sql.DB) error {
 	for _, c := range extraColumns {
 		_, _ = db.Exec(`ALTER TABLE sessions ADD COLUMN ` + c.def)
 	}
-	// The artifact table was introduced after the initial Phase 1 slice; keep
-	// databases created by that slice readable when metadata is added.
+	// Keep databases created by the initial Phase 1 slice readable when output
+	// metadata is added.
 	_, _ = db.Exec(`ALTER TABLE artifacts ADD COLUMN metadata TEXT NOT NULL DEFAULT ''`)
 	if err := migrateLegacyGoals(db); err != nil {
 		return err

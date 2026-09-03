@@ -34,15 +34,24 @@ const (
 )
 
 const (
-	CommandDetach    = "detach"
-	CommandCancel    = "cancel"
-	CommandInput     = "input"
-	CommandApprove   = "approve"
-	CommandConfigure = "configure"
-	CommandCompact   = "compact"
-	CommandStop      = "stop"
-	CommandPing      = "ping"
-	CommandLSPStatus = "lsp_status"
+	CommandDetach          = "detach"
+	CommandCancel          = "cancel"
+	CommandInput           = "input"
+	CommandApprove         = "approve"
+	CommandConfigure       = "configure"
+	CommandCompact         = "compact"
+	CommandStop            = "stop"
+	CommandPing            = "ping"
+	CommandLSPStatus       = "lsp_status"
+	CommandMCPStatus       = "mcp_status"
+	CommandMCPReconnect    = "mcp_reconnect"
+	CommandMCPEnable       = "mcp_enable"
+	CommandMCPDisable      = "mcp_disable"
+	CommandContextDoctor   = "context_doctor"
+	CommandRewind          = "rewind"
+	CommandCompactRetry    = "compact_retry"
+	CommandGoal            = "goal"
+	CommandGoalFromContext = "goal_from_context"
 	// CommandChdir retargets the worker process at the TUI's new working
 	// directory: the worker owns the tools and sandbox, so a TUI-side chdir
 	// alone would leave it reading and editing the original workspace.
@@ -72,9 +81,7 @@ type Frame struct {
 	Payload   json.RawMessage `json:"payload,omitempty"`
 }
 
-type AttachRequest struct {
-	LastSeq uint64 `json:"last_seq,omitempty"`
-}
+type AttachRequest struct{}
 
 type CommandRequest struct {
 	Name    string          `json:"name"`
@@ -82,8 +89,7 @@ type CommandRequest struct {
 }
 
 type SnapshotEnvelope struct {
-	State  json.RawMessage `json:"state"`
-	Resync bool            `json:"resync,omitempty"`
+	State json.RawMessage `json:"state"`
 }
 
 type EventEnvelope struct {
@@ -152,7 +158,7 @@ func (d *Decoder) readLine() ([]byte, error) {
 			return nil, ErrFrameTooLarge
 		}
 		if err == nil {
-			if len(line) == 1 || line[len(line)-1] != '\n' {
+			if len(line) == 1 {
 				return nil, ErrProtocol
 			}
 			return bytes.TrimSuffix(line, []byte{'\n'}), nil
@@ -247,7 +253,10 @@ func knownCommand(name string) bool {
 	switch name {
 	case CommandDetach, CommandCancel, CommandInput, CommandApprove,
 		CommandConfigure, CommandCompact,
-		CommandStop, CommandPing, CommandLSPStatus, CommandChdir, CommandAppend:
+		CommandStop, CommandPing, CommandLSPStatus, CommandMCPStatus,
+		CommandMCPReconnect, CommandMCPEnable, CommandMCPDisable, CommandContextDoctor, CommandRewind,
+		CommandCompactRetry, CommandGoal, CommandGoalFromContext,
+		CommandChdir, CommandAppend:
 		return true
 	default:
 		return false

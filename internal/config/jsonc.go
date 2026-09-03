@@ -129,7 +129,7 @@ func parseJSONC(data []byte, v any) error {
 	return json.Unmarshal(bytes.TrimSpace(stripped), v)
 }
 
-// ReadJSON reads a small JSON file from the loopy dir into v. Missing file
+// ReadJSON reads a small JSON file from the ghg home directory into v. Missing file
 // is an error the caller treats as "empty" — these are optional state files.
 func ReadJSON(name string, v any) error {
 	dir, err := Dir()
@@ -143,7 +143,7 @@ func ReadJSON(name string, v any) error {
 	return json.Unmarshal(data, v)
 }
 
-// WriteJSON writes v as JSON to a small file in the loopy dir atomically.
+// WriteJSON writes v as JSON to a small file in the ghg home directory atomically.
 func WriteJSON(name string, v any) error {
 	dir, err := Dir()
 	if err != nil {

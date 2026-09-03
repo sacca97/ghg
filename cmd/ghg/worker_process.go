@@ -16,12 +16,11 @@ import (
 	"time"
 
 	"github.com/sacca97/ghg/internal/agent"
-	"github.com/sacca97/ghg/internal/artifact"
 	"github.com/sacca97/ghg/internal/config"
-	"github.com/sacca97/ghg/internal/llm"
 	"github.com/sacca97/ghg/internal/lsp"
 	"github.com/sacca97/ghg/internal/mcp"
-	"github.com/sacca97/ghg/internal/provider"
+	"github.com/sacca97/ghg/internal/models"
+	"github.com/sacca97/ghg/internal/schedule"
 	"github.com/sacca97/ghg/internal/session"
 	"github.com/sacca97/ghg/internal/tools"
 	workerwire "github.com/sacca97/ghg/internal/worker"
@@ -59,12 +58,10 @@ type (
 type workerProcessState struct {
 	mu              sync.Mutex
 	cfg             *config.Config
-	profiles        provider.Profiles
-	definitions     map[string]agent.Definition
+	profiles        models.Profiles
 	server          *workerwire.Server
 	ag              *agent.Agent
 	store           *session.Store
-	artifacts       *artifact.Store
 	runtime         *tools.ToolRuntime
 	runtimeClean    func()
 	lsp             *lsp.Manager
@@ -135,6 +132,7 @@ func runWorkerProcess() error {
 
 	ctx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopSignals()
+	go w.scheduleLoop(ctx)
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- server.Serve(ctx) }()
 	select {
@@ -166,10 +164,6 @@ func newWorkerProcess(runtimeFile workerwire.Runtime) (*workerProcessState, erro
 		return nil, err
 	}
 	profiles, err := loadProviderProfiles()
-	if err != nil {
-		return nil, err
-	}
-	definitions, err := agent.LoadAgentDefinitions(agent.DefinitionLoadOptions{ProjectTrusted: true})
 	if err != nil {
 		return nil, err
 	}
@@ -213,7 +207,10 @@ func newWorkerProcess(runtimeFile workerwire.Runtime) (*workerProcessState, erro
 	if err != nil {
 		sysPrompt = systemPromptForProject(true)
 	}
-	ag, modelName, providerName, err := newWorkerAgent(cfg, profiles, modelName, providerName, role, sysPrompt)
+	ag, modelName, providerName, err := agent.NewConfigured(agent.BuildOptions{
+		Config: cfg, Profiles: profiles, Model: modelName, Provider: providerName,
+		Role: role, SystemPrompt: sysPrompt,
+	})
 	if err != nil {
 		store.Close()
 		return nil, err
@@ -232,14 +229,18 @@ func newWorkerProcess(runtimeFile workerwire.Runtime) (*workerProcessState, erro
 		store.Close()
 		return nil, err
 	}
-	artifactsDisabled := cfg.Artifacts != nil && cfg.Artifacts.Enabled != nil && !*cfg.Artifacts.Enabled
-	var artifactStore *artifact.Store
-	if !artifactsDisabled {
-		maxBytes := artifact.DefaultMaxBytes
-		if cfg.Artifacts != nil && cfg.Artifacts.MaxBytes > 0 {
-			maxBytes = cfg.Artifacts.MaxBytes
+	outputConfig := cfg.Outputs
+	if outputConfig == nil {
+		outputConfig = cfg.Artifacts
+	}
+	outputsDisabled := outputConfig != nil && outputConfig.Enabled != nil && !*outputConfig.Enabled
+	var outputStore *session.OutputStore
+	if !outputsDisabled {
+		maxBytes := session.DefaultMaxBytes
+		if outputConfig != nil && outputConfig.MaxBytes > 0 {
+			maxBytes = outputConfig.MaxBytes
 		}
-		artifactStore, err = artifact.NewWithLimit(filepath.Join(dir, "artifacts"), maxBytes)
+		outputStore, err = session.NewOutputStoreWithLimit(filepath.Join(dir, "outputs"), maxBytes)
 		if err != nil {
 			runtimeCleanup()
 			store.Close()
@@ -247,18 +248,17 @@ func newWorkerProcess(runtimeFile workerwire.Runtime) (*workerProcessState, erro
 		}
 	}
 	w := &workerProcessState{
-		cfg: cfg, profiles: profiles, definitions: definitions, ag: ag, store: store, artifacts: artifactStore, runtime: configuredRuntime,
+		cfg: cfg, profiles: profiles, ag: ag, store: store, runtime: configuredRuntime,
 		runtimeClean: runtimeCleanup,
 		runtimeFile:  runtimeFile, sessionID: sessionID, modelName: modelName,
 		provider: providerName, role: role, mode: mode, saved: len(ag.Messages), state: workerwire.StateIdle,
 		pending: make(map[string]*workerApprovalFlight), done: make(chan struct{}),
 	}
+	store.Outputs = outputStore
 	ag.Runtime = configuredRuntime
-	ag.ArtifactStore = artifactStore
-	ag.ArtifactWriter = artifactStore
-	ag.ArtifactCatalog = store
+	ag.Outputs = outputStore
+	ag.OutputCatalog = store
 	ag.HistoryCatalog = store
-	ag.ArtifactsDisabled = artifactsDisabled
 	ag.SubagentsDisabled = !config.SubagentsEnabled(cfg)
 	ag.SetObservationStore(store.ObservationRegistryStore())
 	ag.SetSearchStore(store.SearchRegistryStore())
@@ -274,11 +274,22 @@ func newWorkerProcess(runtimeFile workerwire.Runtime) (*workerProcessState, erro
 	} else if effort := os.Getenv(workerEffortEnv); effort != "" {
 		ag.Effort = effort
 	} else {
-		ag.Effort = cfg.DefaultEffort
-		if ag.Effort == "" {
-			ag.Effort = "medium"
+		ag.Effort = defaultEffort(cfg)
+	}
+	var usage models.Usage
+	usage.PromptTokens, usage.CompletionTokens = meta.UsageIn, meta.UsageOut
+	usage.AddCached(meta.UsageCached)
+	if usage.PromptTokens == 0 && usage.CompletionTokens == 0 && usage.Cached() == 0 {
+		for _, message := range msgs {
+			if message.Usage == nil {
+				continue
+			}
+			usage.PromptTokens += message.Usage.PromptTokens
+			usage.CompletionTokens += message.Usage.CompletionTokens
+			usage.AddCached(message.Usage.Cached())
 		}
 	}
+	ag.SetUsage(usage)
 	if tasks, taskErr := store.LoadTasks(sessionID); taskErr == nil {
 		for _, task := range tasks {
 			status := agent.TaskStatus(task.Status)
@@ -290,11 +301,11 @@ func newWorkerProcess(runtimeFile workerwire.Runtime) (*workerProcessState, erro
 		}
 	}
 	ag.Tasks().OnRecord = func(id string, task *agent.BackgroundTask) {
-		if id != sessionID {
+		if id != sessionID || task == nil {
 			return
 		}
-		_ = store.SaveTask(sessionID, sessionTask(task))
-		w.publish("task", workerTask(task), true)
+		_ = store.SaveTask(sessionID, sessionTask(*task))
+		w.publish("task", workerTask(*task), true)
 		if task.Status != agent.TaskRunning {
 			w.mu.Lock()
 			detached := w.detached
@@ -309,7 +320,7 @@ func newWorkerProcess(runtimeFile workerwire.Runtime) (*workerProcessState, erro
 		configuredRuntime.Reviewer = ag.ApproveForMe
 	}
 	if cautious, _ := strconv.ParseBool(os.Getenv(workerCautiousEnv)); cautious {
-		tools.Gate = w.legacyGate
+		configuredRuntime.Cautious = true
 	}
 	w.lsp = lsp.NewManager(lsp.FromConfigMap(cfg.LSPServers))
 	w.lsp.SetRuntime(configuredRuntime)
@@ -321,7 +332,7 @@ func newWorkerProcess(runtimeFile workerwire.Runtime) (*workerProcessState, erro
 			w.mcp.SetBlocked(disc.Blocked)
 			w.mcp.SetOnChange(func() {
 				ag.SetMCPTools(w.mcp.Tools())
-				w.publish("mcp", w.mcp.Statuses(), true)
+				w.publish("mcp", w.mcpStatuses(), true)
 			})
 			w.mcp.Start(context.Background())
 			ag.SetMCPTools(w.mcp.Tools())
@@ -330,22 +341,10 @@ func newWorkerProcess(runtimeFile workerwire.Runtime) (*workerProcessState, erro
 	return w, nil
 }
 
-func newWorkerAgent(cfg *config.Config, profiles provider.Profiles, modelName, providerName, role, sysPrompt string) (*agent.Agent, string, string, error) {
-	route, err := cfg.Resolve(modelName, providerName)
-	if err != nil {
-		return nil, "", "", err
-	}
-	ag, err := newAgentFromRoute(cfg, profiles, route, role, sysPrompt)
-	if err != nil {
-		return nil, "", "", err
-	}
-	return ag, route.ModelName, route.ProviderName, nil
-}
-
 // configureWorkerCompaction keeps the worker's compaction route aligned with
 // the interactive role policy. A configured tiny role wins; legacy configs use
 // the built-in compact model and otherwise fall back to the active backend.
-func configureWorkerCompaction(ag *agent.Agent, cfg *config.Config, profiles provider.Profiles, systemPrompt string) {
+func configureWorkerCompaction(ag *agent.Agent, cfg *config.Config, profiles models.Profiles, systemPrompt string) {
 	if ag == nil || cfg == nil {
 		return
 	}
@@ -360,7 +359,10 @@ func configureWorkerCompaction(ag *agent.Agent, cfg *config.Config, profiles pro
 	if modelName == "" {
 		modelName = config.DefaultCompactModel
 	}
-	compact, _, _, err := newWorkerAgent(cfg, profiles, modelName, providerName, config.RoleTiny, systemPrompt)
+	compact, _, _, err := agent.NewConfigured(agent.BuildOptions{
+		Config: cfg, Profiles: profiles, Model: modelName, Provider: providerName,
+		Role: config.RoleTiny, SystemPrompt: systemPrompt,
+	})
 	if err != nil || compact == nil || compact.Backend == nil {
 		return
 	}
@@ -475,12 +477,62 @@ func (w *workerProcessState) scheduleIdleExit() {
 		if !detached || stopping {
 			return
 		}
-		if w.server != nil && w.server.ControllerPresent() || w.hasLiveWork() {
+		if w.server != nil && w.server.ControllerPresent() || w.hasLiveWork() || w.hasActiveSchedules() {
 			return
 		}
 		w.requestStop(false, "detached worker idle grace elapsed")
 	})
 	w.mu.Unlock()
+}
+
+func (w *workerProcessState) scheduleLoop(ctx context.Context) {
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-w.done:
+			return
+		case now := <-ticker.C:
+			w.fireDueSchedule(now)
+		}
+	}
+}
+
+func (w *workerProcessState) fireDueSchedule(now time.Time) {
+	if w.store == nil || w.sessionID == "" || w.hasLiveWork() {
+		return
+	}
+	task, ok := schedule.NextDue(w.store.Schedules(w.sessionID), now)
+	if !ok {
+		return
+	}
+	prompt := fmt.Sprintf("⏰ Scheduled task #%d fired (%s). Work on it now:\n\n%s", task.ID, task.Schedule, task.Prompt)
+	if !w.startTurn(workerInput{Input: prompt}) {
+		return
+	}
+	if err := w.store.MarkFired(w.sessionID, task.ID, task.Slot); err != nil {
+		w.publish("schedule", fmt.Sprintf("scheduled task #%d started, but could not record its fire: %v", task.ID, err), true)
+		return
+	}
+	w.publish("schedule", fmt.Sprintf("⏰ scheduled task #%d fired — %s", task.ID, task.Prompt), true)
+}
+
+func (w *workerProcessState) hasActiveSchedules() bool {
+	if w.store == nil || w.sessionID == "" {
+		return false
+	}
+	for _, task := range w.store.Schedules(w.sessionID) {
+		parsed, err := schedule.Parse(task.Schedule)
+		if err != nil {
+			continue
+		}
+		if parsed.Every > 0 || task.LastFire.IsZero() {
+			return true
+		}
+	}
+	return false
 }
 
 func (w *workerProcessState) hasLiveWork() bool {
@@ -514,21 +566,20 @@ func (w *workerProcessState) closeResources() {
 			w.runtimeClean = nil
 		}
 	}
-	tools.Gate = nil
 	if w.store != nil {
 		_ = w.store.Close()
 	}
 }
 
-func workerTask(task *agent.BackgroundTask) workerTaskState {
-	return workerTaskState{ID: task.ID, Description: task.Description, Prompt: task.Prompt, Status: string(task.Status), Report: task.Report, StartedAt: task.StartedAt, EndedAt: task.EndedAt}
+func workerTask(task agent.BackgroundTask) workerTaskState {
+	return workerTaskState{ID: task.ID, Description: task.Description, Prompt: task.Prompt, Status: string(task.Status), Report: task.Report, StartedAt: task.StartedAt, EndedAt: task.EndedAt, Restored: task.Restored}
 }
 
-func sessionTask(task *agent.BackgroundTask) session.Task {
+func sessionTask(task agent.BackgroundTask) session.Task {
 	return session.Task{ID: task.ID, Description: task.Description, Prompt: task.Prompt, Status: string(task.Status), Report: task.Report, StartedAt: task.StartedAt, EndedAt: task.EndedAt}
 }
 
-func boundedWorkerMessages(messages []llm.Message) []llm.Message {
+func boundedWorkerMessages(messages []models.Message) []models.Message {
 	const maxBytes = 512 << 10
 	if len(messages) == 0 {
 		return nil
@@ -547,7 +598,7 @@ func boundedWorkerMessages(messages []llm.Message) []llm.Message {
 		return nil
 	}
 	if start > 0 && messages[0].Role == "system" {
-		return append([]llm.Message{messages[0]}, messages[start:]...)
+		return append([]models.Message{messages[0]}, messages[start:]...)
 	}
 	return messages[start:]
 }

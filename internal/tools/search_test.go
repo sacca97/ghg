@@ -66,6 +66,13 @@ func TestGrepTool(t *testing.T) {
 	if !strings.Contains(out, match+":\n  1:package src") {
 		t.Fatalf("grep pattern relative to selected directory missed match: %q", out)
 	}
+
+	missing := filepath.Join(dir, "does_not_exist")
+	out = run(t, "grep", fmt.Sprintf(`{"pattern":"package","path":%q}`, missing))
+	wantErr := fmt.Sprintf(`search path %q does not exist; locate the path with glob or find_files instead of guessing`, missing)
+	if !strings.Contains(out, wantErr) {
+		t.Fatalf("expected self-correcting error on missing path, got %q", out)
+	}
 }
 
 func TestGlobToolPatternsAndOrdering(t *testing.T) {

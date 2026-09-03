@@ -6,6 +6,9 @@ import (
 	"sort"
 	"strings"
 	"sync"
+
+	"github.com/sacca97/ghg/internal/models"
+	"github.com/sacca97/ghg/internal/tools"
 )
 
 // fileLocks serializes mutations to the same canonical path across parallel
@@ -38,7 +41,7 @@ func (f *fileLocks) acquirePaths(paths []string) func() {
 	keys := make([]string, 0, len(paths))
 	seen := make(map[string]struct{}, len(paths))
 	for _, path := range paths {
-		key := canonicalPathKey(path)
+		key := canonicalPath(path)
 		if key == "" {
 			continue
 		}
@@ -81,9 +84,12 @@ func (f *fileLocks) acquireGlobal() func() {
 	}
 }
 
-// canonicalPathKey normalizes a path so two spellings of the same file share
+// canonicalPath normalizes a path so two spellings of the same file share
 // one lock (pi resolves through the FS; we settle for absolute + clean).
-func canonicalPathKey(path string) string {
+func canonicalPath(path string) string {
+	if strings.TrimSpace(path) == "" {
+		return ""
+	}
 	if abs, err := filepath.Abs(path); err == nil {
 		path = abs
 	}
@@ -134,4 +140,54 @@ func toolRequiresGlobalMutation(toolName, args string) bool {
 		return false
 	}
 	return strings.EqualFold(strings.TrimSpace(request.Operation), "apply")
+}
+
+// RebuildTouched rehydrates the ranking hints from a resumed conversation.
+// The hints never grant access or change search results; they only improve the
+// first-page order for files the session already inspected.
+func (a *Agent) RebuildTouched(msgs []models.Message) {
+	if a == nil {
+		return
+	}
+	for _, msg := range msgs {
+		if msg.Role != "assistant" {
+			continue
+		}
+		for _, call := range msg.ToolCalls {
+			a.recordTouched(call.Function.Name, call.Function.Arguments)
+		}
+	}
+}
+
+func (a *Agent) recordTouched(toolName, args string) {
+	paths := toolMutationPaths(toolName, args)
+	if toolName == "read" {
+		var in struct {
+			Path string `json:"path"`
+		}
+		if json.Unmarshal([]byte(args), &in) == nil && in.Path != "" {
+			paths = append(paths, in.Path)
+		}
+	}
+	if len(paths) == 0 {
+		return
+	}
+	a.touchedMu.Lock()
+	defer a.touchedMu.Unlock()
+	for _, name := range paths {
+		if key := canonicalPath(name); key != "" {
+			a.touched[key] = struct{}{}
+		}
+	}
+}
+
+func (a *Agent) searchHints() tools.SearchHints {
+	a.touchedMu.Lock()
+	paths := make([]string, 0, len(a.touched))
+	for path := range a.touched {
+		paths = append(paths, path)
+	}
+	a.touchedMu.Unlock()
+	sort.Strings(paths)
+	return tools.SearchHints{Touched: paths}
 }

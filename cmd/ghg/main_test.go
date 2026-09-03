@@ -12,8 +12,8 @@ import (
 
 	"github.com/sacca97/ghg/internal/agent"
 	"github.com/sacca97/ghg/internal/config"
-	"github.com/sacca97/ghg/internal/llm"
 	"github.com/sacca97/ghg/internal/lsp"
+	"github.com/sacca97/ghg/internal/models"
 	"github.com/sacca97/ghg/internal/session"
 	workerwire "github.com/sacca97/ghg/internal/worker"
 )
@@ -104,7 +104,7 @@ func TestContinueSessionIDUsesCurrentDirectory(t *testing.T) {
 		st.Close()
 		t.Fatal(err)
 	}
-	if err := st.Save(id, 1, []llm.Message{{Role: "system"}, {Role: "user", Content: "continue me"}}, "model", "provider"); err != nil {
+	if err := st.Save(id, 1, []models.Message{{Role: "system"}, {Role: "user", Content: "continue me"}}, "model", "provider"); err != nil {
 		st.Close()
 		t.Fatal(err)
 	}
@@ -246,15 +246,15 @@ type workerTestBackend struct {
 	planText string
 }
 
-func (b *workerTestBackend) Stream(_ context.Context, _ llm.Request, sink llm.EventSink) (llm.Message, llm.Usage, error) {
+func (b *workerTestBackend) Stream(_ context.Context, _ models.Request, sink models.EventSink) (models.Message, models.Usage, error) {
 	if sink.OnText != nil {
 		sink.OnText(b.planText)
 	}
-	return llm.Message{Role: "assistant", Content: b.planText}, llm.Usage{PromptTokens: 10, CompletionTokens: 20}, nil
+	return models.Message{Role: "assistant", Content: b.planText}, models.Usage{PromptTokens: 10, CompletionTokens: 20}, nil
 }
 
-func (b *workerTestBackend) Complete(_ context.Context, _ llm.Request) (llm.Message, llm.Usage, error) {
-	return llm.Message{Role: "assistant", Content: b.planText}, llm.Usage{}, nil
+func (b *workerTestBackend) Complete(_ context.Context, _ models.Request) (models.Message, models.Usage, error) {
+	return models.Message{Role: "assistant", Content: b.planText}, models.Usage{}, nil
 }
 
 func TestWorkerPlanTurnAndSnapshot(t *testing.T) {

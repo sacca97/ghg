@@ -100,7 +100,7 @@ func TestResolveRoleRejectsRemovedNames(t *testing.T) {
 }
 
 func TestRoleForMode(t *testing.T) {
-	if got := RoleForMode(ModePlanning); got != RoleSmart {
+	if got := RoleForMode("plan"); got != RoleSmart {
 		t.Fatalf("planning role = %q, want %q", got, RoleSmart)
 	}
 	if got := RoleForMode(ModeActing); got != RoleFast {

@@ -15,8 +15,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/sacca97/ghg/internal/llm"
+	"github.com/sacca97/ghg/internal/models"
+	"github.com/sacca97/ghg/internal/observation"
 	"github.com/sacca97/ghg/internal/sandbox"
+	"github.com/sacca97/ghg/internal/search"
 )
 
 // ApprovalMode selects who may approve a capability that the deterministic
@@ -93,14 +95,14 @@ type ApprovalResult struct {
 // ReviewerCall accounts the optional tiny model separately from ordinary
 // model-call telemetry.
 type ReviewerCall struct {
-	Role      string    `json:"role"`
-	Provider  string    `json:"provider"`
-	Model     string    `json:"model"`
-	Protocol  string    `json:"protocol"`
-	Purpose   string    `json:"purpose"`
-	Usage     llm.Usage `json:"usage"`
-	LatencyMS int64     `json:"latency_ms"`
-	Error     string    `json:"error,omitempty"`
+	Role      string       `json:"role"`
+	Provider  string       `json:"provider"`
+	Model     string       `json:"model"`
+	Protocol  string       `json:"protocol"`
+	Purpose   string       `json:"purpose"`
+	Usage     models.Usage `json:"usage"`
+	LatencyMS int64        `json:"latency_ms"`
+	Error     string       `json:"error,omitempty"`
 }
 
 // ApprovalReviewer is intentionally a function rather than an agent
@@ -125,19 +127,21 @@ type ExecutionAudit struct {
 // a narrowed view of the same boundary and never reconstructs a permissive
 // default.
 type ToolRuntime struct {
-	Policy          *sandbox.Policy
-	ApprovalMode    ApprovalMode
-	Reviewer        ApprovalReviewer
-	SecretNames     []string
-	TempDir         string
-	HumanGate       func(GateRequest) (GateDecision, string)
-	LanguageService LanguageService
-	PostEditHooks   []PostEditHook
-	Headless        bool
-	Goal            string
-	Justification   string
-	OnAudit         func(ExecutionAudit)
-	OnReviewerCall  func(ReviewerCall)
+	Policy            *sandbox.Policy
+	ApprovalMode      ApprovalMode
+	Reviewer          ApprovalReviewer
+	SecretNames       []string
+	TempDir           string
+	HumanGate         func(GateRequest) (GateDecision, string)
+	Cautious          bool
+	InteractiveRunner InteractiveRunner
+	LanguageService   LanguageService
+	PostEditHooks     []PostEditHook
+	Headless          bool
+	Goal              string
+	Justification     string
+	OnAudit           func(ExecutionAudit)
+	OnReviewerCall    func(ReviewerCall)
 
 	envOverrides map[string]string
 	state        *runtimeState
@@ -232,6 +236,93 @@ func RuntimeFromContext(ctx context.Context) *ToolRuntime {
 	}
 	runtime, _ := ctx.Value(runtimeContextKey{}).(*ToolRuntime)
 	return runtime
+}
+
+type onUpdateKey struct{}
+type observationStoreKey struct{}
+type searchStoreKey struct{}
+type searchHintsKey struct{}
+
+// SearchHints improve first-page search order without changing results.
+type SearchHints struct {
+	Touched  []string
+	Modified []string
+}
+
+type observationStore interface {
+	Save(context.Context, string, observation.Record) error
+	Load(context.Context, string, string) (observation.Record, error)
+}
+
+type searchStore interface {
+	Save(context.Context, string, search.Snapshot) error
+	Load(context.Context, string, string) (search.Snapshot, error)
+}
+
+// WithOnUpdate attaches a per-call output callback.
+func WithOnUpdate(ctx context.Context, fn func(snapshot string)) context.Context {
+	if fn == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, onUpdateKey{}, fn)
+}
+
+func onUpdate(ctx context.Context) func(snapshot string) {
+	fn, _ := ctx.Value(onUpdateKey{}).(func(string))
+	return fn
+}
+
+// WithObservationStore supplies the session-scoped observation registry.
+func WithObservationStore(ctx context.Context, sessionID string, store observationStore) context.Context {
+	if store == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, observationStoreKey{}, observationContext{sessionID: sessionID, store: store})
+}
+
+type observationContext struct {
+	sessionID string
+	store     observationStore
+}
+
+func observationContextFor(ctx context.Context) (string, observationStore) {
+	value, _ := ctx.Value(observationStoreKey{}).(observationContext)
+	return value.sessionID, value.store
+}
+
+// WithSearchStore supplies the stable pagination snapshot registry.
+func WithSearchStore(ctx context.Context, sessionID string, store searchStore) context.Context {
+	if store == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, searchStoreKey{}, searchContext{sessionID: sessionID, store: store})
+}
+
+type searchContext struct {
+	sessionID string
+	store     searchStore
+}
+
+func searchContextFor(ctx context.Context) (string, searchStore) {
+	value, _ := ctx.Value(searchStoreKey{}).(searchContext)
+	return value.sessionID, value.store
+}
+
+// WithSearchHints attaches non-authoritative ranking hints for one search.
+func WithSearchHints(ctx context.Context, hints SearchHints) context.Context {
+	hints.Touched = slices.Clone(hints.Touched)
+	hints.Modified = slices.Clone(hints.Modified)
+	return context.WithValue(ctx, searchHintsKey{}, hints)
+}
+
+// SearchHintsFor returns ranking hints attached to ctx.
+func SearchHintsFor(ctx context.Context) SearchHints {
+	hints, _ := ctx.Value(searchHintsKey{}).(SearchHints)
+	return hints
+}
+
+func searchHintsFor(ctx context.Context) SearchHints {
+	return SearchHintsFor(ctx)
 }
 
 // WrapCommand exposes the same OS boundary to non-Bash subprocesses such as
@@ -393,6 +484,10 @@ func (r *ToolRuntime) authorizeCommand(ctx context.Context, tool, command, cwd s
 		return r.denyApproval(ctx, ApprovalRequest{Tool: tool, Command: redactCommand(command, r.SecretNames), Classification: string(dispositionHardDeny), Fingerprint: operationFingerprint(tool, command, cwd)}, "opaque shell syntax cannot be safely segmented")
 	}
 	disposition, reason, network := classifyCommand(segments, r.Policy)
+	if r.Cautious && disposition == dispositionRoutine {
+		disposition = dispositionHuman
+		reason = "cautious mode requires approval"
+	}
 	requestedReadRoots, requestedWriteRoots, rootsErr := requestedCommandRoots(segments, r.Policy)
 	if rootsErr != nil {
 		request := r.approvalRequest(tool, command, cwd, segments, dispositionHardDeny, false, reason, nil, nil)

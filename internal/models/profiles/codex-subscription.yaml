@@ -1,0 +1,12 @@
+schema: 1
+id: codex-subscription
+display_name: OpenAI Codex (ChatGPT subscription)
+protocol: openai-responses
+base_url: https://chatgpt.com/backend-api/codex
+auth:
+  kind: codex-subscription
+docs:
+  keys_url: https://chatgpt.com
+catalog:
+  kind: openai-models
+  public: false

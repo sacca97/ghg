@@ -289,12 +289,7 @@ func TestPaletteModelRolePanelSelectsRoute(t *testing.T) {
 	if len(pp.list) != 4 {
 		t.Fatalf("expected four role choices, got %d", len(pp.list))
 	}
-	// The test agent has no role, so execute selects fast by default. Move to
-	// default before choosing its concrete model.
-	tm, _ = m.paletteKey(tea.KeyMsg{Type: tea.KeyUp})
-	m = tm.(*model)
-	tm, _ = m.paletteKey(tea.KeyMsg{Type: tea.KeyUp})
-	m = tm.(*model)
+	// The test agent has no role, so it selects default by default.
 	if m.settings.top().list[m.settings.top().midx] != "default" {
 		t.Fatalf("role selector should reach default, got %q", m.settings.top().list[m.settings.top().midx])
 	}
@@ -417,7 +412,7 @@ func TestPaletteCompactPanelDefaultRowRestores(t *testing.T) {
 // The Compaction level row steps the threshold ±10% in place and shows it.
 func TestPaletteCompactionLevelSteps(t *testing.T) {
 	m := compactCmdModel()
-	m.agent.CompactThreshold = compactThresholdFor(m.cfg) // default 40%
+	m.agent.CompactThreshold = config.CompactThreshold(m.cfg) // default 40%
 	m.openPalette()
 	var it *paletteItem
 	for i := range m.settings.items {

@@ -9,11 +9,10 @@ import (
 	"testing"
 
 	"github.com/sacca97/ghg/internal/config"
-	"github.com/sacca97/ghg/internal/mcp"
 )
 
-// importFixture writes a healthy ghg config plus a codex config with two
-// servers, and points CodexPath at the fixture.
+// importFixture writes a healthy ghg config plus an .mcp.json config with two
+// servers.
 func importFixture(t *testing.T, mcpImport string) (wd string) {
 	t.Helper()
 	ghgHome := t.TempDir()
@@ -28,14 +27,11 @@ func importFixture(t *testing.T, mcpImport string) (wd string) {
 	if err := os.WriteFile(filepath.Join(ghgHome, "config.json"), []byte(cfgSrc), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	codexFile := filepath.Join(wd, "codex.toml")
-	if err := os.WriteFile(codexFile, []byte(
-		"[mcp_servers.node_repl]\ncommand = \"/app/bin/node_repl\"\n[mcp_servers.paper]\nurl = \"http://127.0.0.1:29979/mcp\"\n"), 0o600); err != nil {
+	mcpFile := filepath.Join(wd, ".mcp.json")
+	if err := os.WriteFile(mcpFile, []byte(
+		`{"mcpServers": {"node_repl": {"command": "/app/bin/node_repl"}, "paper": {"url": "http://127.0.0.1:29979/mcp"}}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	orig := mcp.CodexPath
-	mcp.CodexPath = func() string { return codexFile }
-	t.Cleanup(func() { mcp.CodexPath = orig })
 	return wd
 }
 
@@ -106,7 +102,7 @@ func TestMCPImportDryRunWritesNothing(t *testing.T) {
 }
 
 func TestMCPImportAppliesAndIsIdempotent(t *testing.T) {
-	wd := importFixture(t, `, "mcpImport": { "codex": { "exclude": ["node_repl"] } }`)
+	wd := importFixture(t, `, "mcpImport": { "claude": { "exclude": ["node_repl"] } }`)
 	chdir(t, wd)
 
 	if err := mcpImportCLI(nil); err != nil {

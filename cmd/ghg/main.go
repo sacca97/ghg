@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/sacca97/ghg/internal/agent"
 	"github.com/sacca97/ghg/internal/config"
 	"github.com/sacca97/ghg/internal/session"
 	"github.com/sacca97/ghg/internal/tui"
@@ -82,6 +83,22 @@ func main() {
 	sandboxFlag := flag.String("sandbox", "", "execution sandbox: read-only, workspace-write, or danger-full-access")
 	networkFlag := flag.String("network", "", "execution network: deny or host")
 	approvalFlag := flag.String("approval", "", "exceptional capability approval: ask, auto-review, or never")
+	flag.Usage = func() {
+		fmt.Fprintln(flag.CommandLine.Output(), "usage: ghg [flags] [prompt]")
+		flag.PrintDefaults()
+		fmt.Fprintln(flag.CommandLine.Output(), `
+commands:
+  run       execute one headless turn
+  sessions  list saved sessions
+  ps        list background workers
+  attach    attach to a background worker
+  stop      stop a background worker
+  outputs   collect unreferenced output payloads
+  mcp       manage MCP servers
+  auth      configure provider credentials
+  export    export session results
+  update    update ghg`)
+	}
 	flag.Parse()
 	die := func(err error) {
 		fmt.Fprintln(os.Stderr, "ghg:", err)
@@ -93,81 +110,62 @@ func main() {
 		return
 	}
 
-	// `ghg mcp ...` — server management and the MCP server mode.
-	if flag.NArg() > 0 && flag.Arg(0) == "mcp" {
-		if err := mcpCLI(flag.Args()[1:], version); err != nil {
-			die(err)
+	if flag.NArg() > 0 {
+		args := flag.Args()[1:]
+		switch flag.Arg(0) {
+		case "run":
+			if err := runCLI(args); err != nil {
+				die(err)
+			}
+			return
+		case "sessions":
+			if err := sessionsCLI(); err != nil {
+				die(err)
+			}
+			return
+		case "ps":
+			if err := workerPSCLI(); err != nil {
+				die(err)
+			}
+			return
+		case "attach":
+			if err := workerAttachCLI(args); err != nil {
+				die(err)
+			}
+			return
+		case "stop":
+			if err := workerStopCLI(args); err != nil {
+				die(err)
+			}
+			return
+		case "outputs", "artifacts":
+			if err := outputsCLI(args); err != nil {
+				die(err)
+			}
+			return
+		case "mcp":
+			if err := mcpCLI(args, version); err != nil {
+				die(err)
+			}
+			return
+		case "auth":
+			if err := authCLI(args); err != nil {
+				die(err)
+			}
+			return
+		case "export":
+			if err := exportCLI(args); err != nil {
+				die(err)
+			}
+			return
+		case "update":
+			if err := updateCLI(); err != nil {
+				die(err)
+			}
+			return
+		default:
+			die(fmt.Errorf("unknown command %q (see ghg --help)", flag.Arg(0)))
 		}
-		return
-	}
-
-	// `ghg run ...` — non-interactive one-turn mode for scripting; no TTY or
-	// trust prompt required (headless use implies trusted automation).
-	if flag.NArg() > 0 && flag.Arg(0) == "run" {
-		if err := runCLI(flag.Args()[1:]); err != nil {
-			die(err)
-		}
-		return
-	}
-
-	// `ghg sessions` — list stored sessions (the scriptable companion to run).
-	if flag.NArg() > 0 && flag.Arg(0) == "sessions" {
-		if err := sessionsCLI(); err != nil {
-			die(err)
-		}
-		return
-	}
-
-	if flag.NArg() > 0 && flag.Arg(0) == "ps" {
-		if err := workerPSCLI(); err != nil {
-			die(err)
-		}
-		return
-	}
-	if flag.NArg() > 0 && flag.Arg(0) == "attach" {
-		if err := workerAttachCLI(flag.Args()[1:]); err != nil {
-			die(err)
-		}
-		return
-	}
-	if flag.NArg() > 0 && flag.Arg(0) == "stop" {
-		if err := workerStopCLI(flag.Args()[1:]); err != nil {
-			die(err)
-		}
-		return
-	}
-
-	// `ghg artifacts gc` — reclaim unreferenced content-addressed tool
-	// results without ever deleting a payload still indexed by a session.
-	if flag.NArg() > 0 && flag.Arg(0) == "artifacts" {
-		if err := artifactsCLI(flag.Args()[1:]); err != nil {
-			die(err)
-		}
-		return
-	}
-
-	// `ghg update` — re-run the install script to get the latest release.
-	if flag.NArg() > 0 && flag.Arg(0) == "update" {
-		if err := updateCLI(); err != nil {
-			die(err)
-		}
-		return
-	}
-
-	// `ghg export ...` — export structured workflow results (plans, reviews).
-	if flag.NArg() > 0 && flag.Arg(0) == "export" {
-		if err := exportCLI(flag.Args()[1:]); err != nil {
-			die(err)
-		}
-		return
-	}
-
-	// `ghg auth ...` — profile-driven provider key onboarding.
-	if flag.NArg() > 0 && flag.Arg(0) == "auth" {
-		if err := authCLI(flag.Args()[1:]); err != nil {
-			die(err)
-		}
-		return
 	}
 
 	cfg, err := config.Load()
@@ -187,18 +185,16 @@ func main() {
 			os.Exit(1)
 		}
 		if *modelFlag == "" && *providerFlag == "" {
-			if _, _, _, err := newModeAgent(cfg, profiles, config.ModeActing, systemPrompt()); err != nil {
+			if _, _, _, err := agent.NewConfiguredForRole(cfg, profiles, config.RoleForMode(config.ModeActing), systemPrompt(), false); err != nil {
 				fmt.Fprintln(os.Stderr, "ghg:", err)
 				os.Exit(1)
 			}
 			return
 		}
-		route, err := cfg.Resolve(*modelFlag, *providerFlag)
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "ghg:", err)
-			os.Exit(1)
-		}
-		if _, err := newAgentFromRoute(cfg, profiles, route, config.RoleForMode(config.ModeActing), systemPrompt()); err != nil {
+		if _, _, _, err := agent.NewConfigured(agent.BuildOptions{
+			Config: cfg, Profiles: profiles, Model: *modelFlag, Provider: *providerFlag,
+			Role: config.RoleForMode(config.ModeActing), SystemPrompt: systemPrompt(),
+		}); err != nil {
 			fmt.Fprintln(os.Stderr, "ghg:", err)
 			os.Exit(1)
 		}

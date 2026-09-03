@@ -9,8 +9,24 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/sacca97/ghg/internal/llm"
+	"github.com/sacca97/ghg/internal/models"
 )
+
+// ErrInvalidHistoryQuery hides SQLite parser details from model-facing tools.
+var ErrInvalidHistoryQuery = errors.New("invalid history query")
+
+type HistoryHit struct {
+	Seq     int
+	Role    string
+	Epoch   int
+	Snippet string
+}
+
+type HistoryMessage struct {
+	Seq     int
+	Epoch   int
+	Message models.Message
+}
 
 const (
 	historyIndexTextLimit = 16 << 10
@@ -19,40 +35,10 @@ const (
 	maxHistoryQueryBytes  = 512
 )
 
-// ErrInvalidHistoryQuery is deliberately generic: SQLite's FTS parser error
-// can contain implementation details that are not useful to a model-facing
-// tool result.
-var ErrInvalidHistoryQuery = errors.New("invalid history query")
-
-// HistoryHit is one ranked result from the derived history index.
-type HistoryHit struct {
-	Seq     int
-	Role    string
-	Epoch   int
-	Snippet string
-}
-
-// HistoryMessage is a raw message selected for bounded recall. The message is
-// returned to the agent only so it can render descriptive, untrusted text; it
-// is never inserted into a live provider request.
-type HistoryMessage struct {
-	Seq     int
-	Epoch   int
-	Message llm.Message
-}
-
-// HistoryStore is the session boundary used by the history tools. The
-// implementation owns SQL and epoch derivation; callers supply the active
-// session id on every operation.
-type HistoryStore interface {
-	SearchHistory(context.Context, string, string, string, *int, int) ([]HistoryHit, error)
-	ReadHistory(context.Context, string, int, int, *int, int) ([]HistoryMessage, []string, error)
-}
-
 // historyIndexText extracts searchable text without indexing system policy,
-// image data, provider blocks, or artifact payload files. Tool-call names and
+// image data, provider blocks, or output payload files. Tool-call names and
 // bounded arguments remain useful for finding a past operation.
-func historyIndexText(msg llm.Message) string {
+func historyIndexText(msg models.Message) string {
 	var parts []string
 	switch msg.Role {
 	case "user":
@@ -108,7 +94,7 @@ func rebuildHistoryFTS(db *sql.DB) error {
 	type rawMessage struct {
 		sessionID string
 		seq       int
-		message   llm.Message
+		message   models.Message
 	}
 	var messages []rawMessage
 	for rows.Next() {
@@ -118,7 +104,7 @@ func rebuildHistoryFTS(db *sql.DB) error {
 			_ = rows.Close()
 			return err
 		}
-		var msg llm.Message
+		var msg models.Message
 		if json.Unmarshal([]byte(data), &msg) == nil {
 			messages = append(messages, rawMessage{sessionID: sessionID, seq: seq, message: msg})
 		}
@@ -145,14 +131,14 @@ func rebuildHistoryFTS(db *sql.DB) error {
 	return tx.Commit()
 }
 
-func replaceHistoryFTS(tx *sql.Tx, sessionID string, seq int, msg llm.Message) error {
+func replaceHistoryFTS(tx *sql.Tx, sessionID string, seq int, msg models.Message) error {
 	if _, err := tx.Exec(`DELETE FROM history_fts WHERE session_id=? AND seq=?`, sessionID, seq); err != nil {
 		return err
 	}
 	return insertHistoryFTS(tx, sessionID, seq, msg)
 }
 
-func insertHistoryFTS(tx *sql.Tx, sessionID string, seq int, msg llm.Message) error {
+func insertHistoryFTS(tx *sql.Tx, sessionID string, seq int, msg models.Message) error {
 	content := historyIndexText(msg)
 	if content == "" {
 		return nil
@@ -254,7 +240,7 @@ func (s *Store) ReadHistory(ctx context.Context, sessionID string, start, end in
 		if err := rows.Scan(&seq, &data); err != nil {
 			return nil, nil, err
 		}
-		var msg llm.Message
+		var msg models.Message
 		if err := json.Unmarshal([]byte(data), &msg); err != nil {
 			if len(diagnostics) < 4 {
 				diagnostics = append(diagnostics, fmt.Sprintf("skipped malformed message at seq %d", seq))

@@ -3,8 +3,6 @@ package session
 import (
 	"path/filepath"
 	"testing"
-
-	goalstate "github.com/sacca97/ghg/internal/goal"
 )
 
 func TestGoalLifecycleRoundTrip(t *testing.T) {
@@ -18,7 +16,7 @@ func TestGoalLifecycleRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	record := goalstate.New("ship the feature")
+	record := NewGoal("ship the feature")
 	record.ID = "goal-1"
 	record.Rounds = 2
 	record.PromptTokens = 100
@@ -33,13 +31,13 @@ func TestGoalLifecycleRoundTrip(t *testing.T) {
 	if err != nil || !ok {
 		t.Fatalf("load goal: %+v %v %v", got, ok, err)
 	}
-	if got.ID != record.ID || got.Status != goalstate.StatusActive || got.Rounds != 2 ||
+	if got.ID != record.ID || got.Status != GoalStatusActive || got.Rounds != 2 ||
 		got.PromptTokens != 100 || got.CachedTokens != 25 || got.CompletionTokens != 40 ||
 		got.Progress != record.Progress {
 		t.Fatalf("goal did not round-trip: %+v", got)
 	}
 
-	record.Status = goalstate.StatusBlocked
+	record.Status = GoalStatusBlocked
 	record.Blocker = "the deployment environment is unavailable"
 	if err := st.CheckpointGoal(sessionID, record); err != nil {
 		t.Fatal(err)
@@ -48,7 +46,7 @@ func TestGoalLifecycleRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(checkpoints) != 2 || checkpoints[0].Status != goalstate.StatusActive || checkpoints[1].Status != goalstate.StatusBlocked {
+	if len(checkpoints) != 2 || checkpoints[0].Status != GoalStatusActive || checkpoints[1].Status != GoalStatusBlocked {
 		t.Fatalf("checkpoints: %+v", checkpoints)
 	}
 
@@ -56,7 +54,7 @@ func TestGoalLifecycleRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	got, ok, err = st.LoadGoal(sessionID)
-	if err != nil || !ok || got.Status != goalstate.StatusPaused || got.Blocker != "cleared by user" {
+	if err != nil || !ok || got.Status != GoalStatusPaused || got.Blocker != "cleared by user" {
 		t.Fatalf("clear should preserve a paused record: %+v %v %v", got, ok, err)
 	}
 	meta, _, err := st.Load(sessionID)
@@ -64,7 +62,7 @@ func TestGoalLifecycleRoundTrip(t *testing.T) {
 		t.Fatalf("legacy active mirror should be empty after clear: %+v %v", meta, err)
 	}
 	checkpoints, err = st.GoalCheckpoints(sessionID, record.ID)
-	if err != nil || len(checkpoints) != 3 || checkpoints[2].Status != goalstate.StatusPaused {
+	if err != nil || len(checkpoints) != 3 || checkpoints[2].Status != GoalStatusPaused {
 		t.Fatalf("clear checkpoint: %+v %v", checkpoints, err)
 	}
 }
@@ -90,7 +88,7 @@ func TestLegacyGoalMigration(t *testing.T) {
 		t.Fatal(err)
 	}
 	record, ok, err := st.LoadGoal(sessionID)
-	if err != nil || !ok || record.ID != "legacy-"+sessionID || record.Status != goalstate.StatusActive || record.Objective != "legacy objective" {
+	if err != nil || !ok || record.ID != "legacy-"+sessionID || record.Status != GoalStatusActive || record.Objective != "legacy objective" {
 		t.Fatalf("legacy record: %+v %v %v", record, ok, err)
 	}
 }
@@ -106,12 +104,12 @@ func TestForkAndDeleteCopyGoalLedger(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	record := goalstate.New("copy this goal")
+	record := NewGoal("copy this goal")
 	record.ID = "goal-copy"
 	if err := st.CheckpointGoal(source, record); err != nil {
 		t.Fatal(err)
 	}
-	record.Status = goalstate.StatusComplete
+	record.Status = GoalStatusComplete
 	record.Progress = "verified"
 	if err := st.CheckpointGoal(source, record); err != nil {
 		t.Fatal(err)
@@ -122,7 +120,7 @@ func TestForkAndDeleteCopyGoalLedger(t *testing.T) {
 		t.Fatal(err)
 	}
 	got, ok, err := st.LoadGoal(fork)
-	if err != nil || !ok || got.ID != record.ID || got.Status != goalstate.StatusComplete {
+	if err != nil || !ok || got.ID != record.ID || got.Status != GoalStatusComplete {
 		t.Fatalf("forked goal: %+v %v %v", got, ok, err)
 	}
 	checkpoints, err := st.GoalCheckpoints(fork, record.ID)

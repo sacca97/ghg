@@ -13,16 +13,16 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sacca97/ghg/internal/llm"
+	"github.com/sacca97/ghg/internal/models"
 	"github.com/sacca97/ghg/internal/session"
 )
 
 // runFixture writes a config pointing the default model at an SSE test
 // server that replies with reply (and records each request into reqs).
-func runFixture(t *testing.T, reply string, reqs *[]llm.Request) {
+func runFixture(t *testing.T, reply string, reqs *[]models.Request) {
 	t.Helper()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var req llm.Request
+		var req models.Request
 		json.NewDecoder(r.Body).Decode(&req)
 		if reqs != nil {
 			*reqs = append(*reqs, req)
@@ -46,7 +46,7 @@ func runFixture(t *testing.T, reply string, reqs *[]llm.Request) {
 	}
 }
 
-func runPlanFixture(t *testing.T, reqs *[]llm.Request) {
+func runPlanFixture(t *testing.T, reqs *[]models.Request) {
 	t.Helper()
 	var calls int
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -68,7 +68,7 @@ func runPlanFixture(t *testing.T, reqs *[]llm.Request) {
 		call := calls
 		calls++
 		if reqs != nil {
-			var req llm.Request
+			var req models.Request
 			if err := json.Unmarshal(data, &req); err != nil {
 				t.Errorf("decode provider-neutral request: %v", err)
 			} else {
@@ -183,7 +183,7 @@ func TestRunJSONStream(t *testing.T) {
 }
 
 func TestRunPlanOnlyUsesReadOnlyPlannerAndExits(t *testing.T) {
-	var reqs []llm.Request
+	var reqs []models.Request
 	runPlanFixture(t, &reqs)
 	out, err := runCapture(t, "", "--plan-only", "--format", "json", "ship it")
 	if err != nil {
@@ -198,7 +198,7 @@ func TestRunPlanOnlyUsesReadOnlyPlannerAndExits(t *testing.T) {
 	}
 	for _, name := range names {
 		switch name {
-		case "read", "grep", "glob", "find_files", "lsp", "artifact_list", "artifact_read", "history_search", "history_read":
+		case "read", "grep", "glob", "find_files", "lsp", "output_list", "output_read", "history_search", "history_read":
 		default:
 			t.Fatalf("planner exposed non-read-only tool %q (all tools: %q)", name, strings.Join(names, ","))
 		}
@@ -228,7 +228,7 @@ func TestRunPlanOnlyUsesReadOnlyPlannerAndExits(t *testing.T) {
 }
 
 func TestRunPlanThenExecuteEmitsBothRoles(t *testing.T) {
-	var reqs []llm.Request
+	var reqs []models.Request
 	runPlanFixture(t, &reqs)
 	out, err := runCapture(t, "", "--plan", "--format", "json", "ship it")
 	if err != nil {
@@ -277,7 +277,7 @@ func TestRunPlanOnlyRequiresProposedBlock(t *testing.T) {
 
 // Piped stdin is appended to the prompt argument in the user message.
 func TestRunStdinAppendsToPrompt(t *testing.T) {
-	var reqs []llm.Request
+	var reqs []models.Request
 	runFixture(t, "ok", &reqs)
 
 	if _, err := runCapture(t, "piped context\n", "summarize this"); err != nil {
@@ -300,7 +300,7 @@ func TestRunStdinAppendsToPrompt(t *testing.T) {
 // -resume continues a persisted session instead of starting fresh; the
 // resumed conversation's history precedes the new prompt.
 func TestRunResume(t *testing.T) {
-	var reqs []llm.Request
+	var reqs []models.Request
 	runFixture(t, "first reply", &reqs)
 	if _, err := runCapture(t, "", "first question"); err != nil {
 		t.Fatal(err)
@@ -344,7 +344,7 @@ func TestRunResumeUnknown(t *testing.T) {
 
 // -system overrides the prompt; -system-file wins over -system.
 func TestRunSystemOverride(t *testing.T) {
-	var reqs []llm.Request
+	var reqs []models.Request
 	runFixture(t, "ok", &reqs)
 	if _, err := runCapture(t, "", "-system", "You are a pirate.", "hi"); err != nil {
 		t.Fatal(err)

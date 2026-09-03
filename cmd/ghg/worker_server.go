@@ -6,10 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/sacca97/ghg/internal/agent"
+	"github.com/sacca97/ghg/internal/config"
 	"github.com/sacca97/ghg/internal/tools"
 	workerwire "github.com/sacca97/ghg/internal/worker"
 )
@@ -91,15 +95,73 @@ func (w *workerProcessState) Command(_ context.Context, command workerwire.Comma
 			return workerwire.CommandResult{}, errors.New("worker is busy or stopping")
 		}
 		return workerwire.CommandResult{Payload: json.RawMessage(`{"accepted":true}`)}, nil
+	case workerwire.CommandCompactRetry:
+		result, err := w.compactRetry()
+		if err != nil {
+			return workerwire.CommandResult{}, err
+		}
+		data, err := json.Marshal(result)
+		if err != nil {
+			return workerwire.CommandResult{}, fmt.Errorf("marshal compact retry: %w", err)
+		}
+		return workerwire.CommandResult{Payload: data}, nil
+	case workerwire.CommandRewind:
+		var request workerwire.RewindRequest
+		if err := json.Unmarshal(command.Payload, &request); err != nil {
+			return workerwire.CommandResult{}, errors.New("rewind payload is invalid")
+		}
+		result, err := w.rewind(request)
+		if err != nil {
+			return workerwire.CommandResult{}, err
+		}
+		data, err := json.Marshal(result)
+		if err != nil {
+			return workerwire.CommandResult{}, fmt.Errorf("marshal rewind: %w", err)
+		}
+		return workerwire.CommandResult{Payload: data}, nil
+	case workerwire.CommandGoal:
+		var request workerwire.GoalRequest
+		if err := json.Unmarshal(command.Payload, &request); err != nil {
+			return workerwire.CommandResult{}, errors.New("goal payload is invalid")
+		}
+		record, err := w.updateGoal(request)
+		if err != nil {
+			return workerwire.CommandResult{}, err
+		}
+		data, err := json.Marshal(record)
+		if err != nil {
+			return workerwire.CommandResult{}, fmt.Errorf("marshal goal: %w", err)
+		}
+		return workerwire.CommandResult{Payload: data}, nil
+	case workerwire.CommandGoalFromContext:
+		var request workerwire.GoalFromContextRequest
+		if err := json.Unmarshal(command.Payload, &request); err != nil {
+			return workerwire.CommandResult{}, errors.New("goal-from-context payload is invalid")
+		}
+		if !w.startGoalFromContext(request.Window) {
+			return workerwire.CommandResult{}, errors.New("worker is busy or stopping")
+		}
+		return workerwire.CommandResult{Payload: json.RawMessage(`{"accepted":true}`)}, nil
 	case workerwire.CommandChdir:
+		if err := w.requireIdleHistory(); err != nil {
+			return workerwire.CommandResult{}, err
+		}
 		var dir string
 		if err := json.Unmarshal(command.Payload, &dir); err != nil || dir == "" {
 			return workerwire.CommandResult{}, errors.New("worker chdir target is invalid")
 		}
-		if err := os.Chdir(dir); err != nil {
+		canonical, err := canonicalDir(dir)
+		if err != nil {
 			return workerwire.CommandResult{}, fmt.Errorf("worker chdir: %w", err)
 		}
-		return workerwire.CommandResult{Payload: json.RawMessage(`{"accepted":true}`)}, nil
+		if err := os.Chdir(canonical); err != nil {
+			return workerwire.CommandResult{}, fmt.Errorf("worker chdir: %w", err)
+		}
+		data, err := json.Marshal(workerwire.ChdirResult{CWD: canonical})
+		if err != nil {
+			return workerwire.CommandResult{}, fmt.Errorf("marshal worker chdir: %w", err)
+		}
+		return workerwire.CommandResult{Payload: data}, nil
 	case workerwire.CommandAppend:
 		var request workerwire.AppendRequest
 		if err := json.Unmarshal(command.Payload, &request); err != nil || strings.TrimSpace(request.Content) == "" {
@@ -143,9 +205,109 @@ func (w *workerProcessState) Command(_ context.Context, command workerwire.Comma
 			return workerwire.CommandResult{}, fmt.Errorf("marshal worker LSP status: %w", err)
 		}
 		return workerwire.CommandResult{Payload: data}, nil
+	case workerwire.CommandMCPStatus:
+		data, err := json.Marshal(w.mcpStatuses())
+		if err != nil {
+			return workerwire.CommandResult{}, fmt.Errorf("marshal worker MCP status: %w", err)
+		}
+		return workerwire.CommandResult{Payload: data}, nil
+	case workerwire.CommandMCPReconnect, workerwire.CommandMCPEnable, workerwire.CommandMCPDisable:
+		if err := w.requireIdleHistory(); err != nil {
+			return workerwire.CommandResult{}, err
+		}
+		if w.mcp == nil {
+			return workerwire.CommandResult{}, errors.New("worker MCP manager is unavailable")
+		}
+		var request workerwire.MCPRequest
+		if err := json.Unmarshal(command.Payload, &request); err != nil || strings.TrimSpace(request.Name) == "" {
+			return workerwire.CommandResult{}, errors.New("MCP server name is invalid")
+		}
+		var ok bool
+		switch command.Name {
+		case workerwire.CommandMCPReconnect:
+			ok = w.mcp.Reconnect(request.Name)
+		case workerwire.CommandMCPEnable:
+			ok = w.mcp.Enable(request.Name)
+		case workerwire.CommandMCPDisable:
+			ok = w.mcp.Disable(request.Name)
+		}
+		if !ok {
+			return workerwire.CommandResult{}, fmt.Errorf("no MCP server named %s", request.Name)
+		}
+		if command.Name == workerwire.CommandMCPEnable || command.Name == workerwire.CommandMCPDisable {
+			if err := w.persistMCPConfig(request.Name); err != nil {
+				return workerwire.CommandResult{}, err
+			}
+		}
+		data, err := json.Marshal(w.mcpStatuses())
+		if err != nil {
+			return workerwire.CommandResult{}, fmt.Errorf("marshal worker MCP status: %w", err)
+		}
+		return workerwire.CommandResult{Payload: data}, nil
+	case workerwire.CommandContextDoctor:
+		data, err := json.Marshal(w.contextDoctorReport())
+		if err != nil {
+			return workerwire.CommandResult{}, fmt.Errorf("marshal context doctor: %w", err)
+		}
+		return workerwire.CommandResult{Payload: data}, nil
 	default:
 		return workerwire.CommandResult{}, fmt.Errorf("worker command %q is not implemented", command.Name)
 	}
+}
+
+func (w *workerProcessState) mcpStatuses() []workerwire.MCPStatus {
+	if w.mcp == nil {
+		return []workerwire.MCPStatus{}
+	}
+	servers := append(w.mcp.Statuses(), w.mcp.Blocked()...)
+	sort.Slice(servers, func(i, j int) bool { return servers[i].Name < servers[j].Name })
+	statuses := make([]workerwire.MCPStatus, len(servers))
+	for i, server := range servers {
+		statuses[i] = workerwire.MCPStatus{
+			Name: server.Name, State: server.Status.String(), Note: server.Note,
+			Error: server.Err, Tools: server.Tools, Source: server.Source,
+		}
+	}
+	return statuses
+}
+
+func (w *workerProcessState) persistMCPConfig(name string) error {
+	live, ok := w.mcp.Config(name)
+	if !ok {
+		return fmt.Errorf("no MCP server named %s", name)
+	}
+	if w.cfg.MCPServers == nil {
+		w.cfg.MCPServers = map[string]config.MCPServer{}
+	}
+	enabled := !live.Disabled()
+	w.cfg.MCPServers[name] = config.MCPServer{
+		Command: live.Command, Env: live.Env, Cwd: live.Cwd,
+		URL: live.URL, Headers: live.Headers, Enabled: &enabled,
+		Note: live.Note, StartupTimeout: live.StartupTimeout, ToolTimeout: live.ToolTimeout,
+	}
+	if err := w.cfg.Save(); err != nil {
+		return fmt.Errorf("MCP config save failed: %w", err)
+	}
+	return nil
+}
+
+func canonicalDir(path string) (string, error) {
+	abs, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	resolved, err := filepath.EvalSymlinks(abs)
+	if err != nil {
+		return "", err
+	}
+	info, err := os.Stat(resolved)
+	if err != nil {
+		return "", err
+	}
+	if !info.IsDir() {
+		return "", errors.New("target is not a directory")
+	}
+	return resolved, nil
 }
 
 // configure changes only the idle worker's route. Keeping the existing Agent
@@ -170,7 +332,10 @@ func (w *workerProcessState) configure(request workerConfigureRequest) error {
 	if messages := w.ag.MessagesSnapshot(); len(messages) > 0 {
 		systemPrompt = messages[0].Content
 	}
-	candidate, resolvedModel, resolvedProvider, err := newWorkerAgent(w.cfg, w.profiles, modelName, providerName, role, systemPrompt)
+	candidate, resolvedModel, resolvedProvider, err := agent.NewConfigured(agent.BuildOptions{
+		Config: w.cfg, Profiles: w.profiles, Model: modelName, Provider: providerName,
+		Role: role, SystemPrompt: systemPrompt,
+	})
 	if err != nil {
 		w.mu.Unlock()
 		return err
@@ -191,6 +356,14 @@ func (w *workerProcessState) configure(request workerConfigureRequest) error {
 	if request.Mode != "" {
 		w.mode = request.Mode
 		w.ag.PlanMode = (request.Mode == "plan")
+	}
+	if request.UpdateCompact {
+		w.cfg.CompactModel = request.CompactModel
+		w.cfg.CompactProvider = request.CompactProvider
+		configureWorkerCompaction(w.ag, w.cfg, w.profiles, systemPrompt)
+	}
+	if request.UpdateCompactThreshold && request.CompactThreshold > 0 {
+		w.ag.CompactThreshold = request.CompactThreshold
 	}
 	w.modelName, w.provider, w.role = resolvedModel, resolvedProvider, role
 	configureWorkerCompaction(w.ag, w.cfg, w.profiles, systemPrompt)
@@ -276,10 +449,6 @@ func (w *workerProcessState) humanGate(req tools.GateRequest) (tools.GateDecisio
 		return workerwire.StateRunning, w.detached, "approval answered", true
 	})
 	return decision, redirect
-}
-
-func (w *workerProcessState) legacyGate(req tools.GateRequest) (tools.GateDecision, string) {
-	return w.humanGate(req)
 }
 
 func (w *workerProcessState) answerApproval(answer workerApprovalAnswer) bool {
@@ -385,7 +554,7 @@ func (w *workerProcessState) taskStates() []workerTaskState {
 	tasks := w.ag.Tasks().List()
 	out := make([]workerTaskState, 0, len(tasks))
 	for _, task := range tasks {
-		out = append(out, workerTaskState{ID: task.ID, Description: task.Description, Prompt: task.Prompt, Status: string(task.Status), Report: task.Report, StartedAt: task.StartedAt, EndedAt: task.EndedAt})
+		out = append(out, workerTask(task))
 	}
 	return out
 }

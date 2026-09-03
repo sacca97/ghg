@@ -4,6 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -11,6 +14,7 @@ import (
 
 	sdkmcp "github.com/modelcontextprotocol/go-sdk/mcp"
 
+	"github.com/sacca97/ghg/internal/models"
 	"github.com/sacca97/ghg/internal/tools"
 )
 
@@ -175,6 +179,18 @@ func TestManagerFailedServerDegradesToErrorString(t *testing.T) {
 	_, err := s.call(context.Background(), "anything", nil)
 	if err == nil || !strings.Contains(err.Error(), "unavailable") {
 		t.Errorf("call err = %v", err)
+	}
+
+	// Executing a stale tool def through the standard tools.Tool interface returns error text.
+	staleTool := tools.Tool{
+		Def: models.NewTool("mcp__ghost__anything", "stale def", `{"type":"object"}`),
+		Run: func(ctx context.Context, args json.RawMessage) (string, error) {
+			return s.call(ctx, "anything", args)
+		},
+	}
+	execOut := tools.Execute(context.Background(), []tools.Tool{staleTool}, "mcp__ghost__anything", nil)
+	if !strings.HasPrefix(execOut, "Error: ") || !strings.Contains(execOut, "unavailable") {
+		t.Errorf("execute stale tool = %q", execOut)
 	}
 }
 
@@ -429,6 +445,10 @@ func TestNormalizeSchema(t *testing.T) {
 	}
 }
 
+func flattenResult(res *sdkmcp.CallToolResult) string {
+	return mcpToolResult(res).Preview
+}
+
 func TestFlattenTruncates(t *testing.T) {
 	big := strings.Repeat("x", 60_000)
 	res := &sdkmcp.CallToolResult{Content: []sdkmcp.Content{&sdkmcp.TextContent{Text: big}}}
@@ -540,5 +560,175 @@ func TestProbe(t *testing.T) {
 	}
 	if res.Elapsed > 15*time.Second {
 		t.Errorf("probe blew far past the startup timeout: %s", res.Elapsed)
+	}
+}
+
+func TestEnableDisableCycle(t *testing.T) {
+	m := newTestManager(t, map[string]ServerConfig{"docs": testCfg("docs")})
+	m.Start(context.Background())
+	waitReady(t, m)
+
+	if !m.Disable("docs") {
+		t.Fatal("disable returned false")
+	}
+	if st := m.Statuses()[0]; st.Status != StatusDisabled {
+		t.Fatalf("after disable: %+v", st)
+	}
+	if len(m.Tools()) != 0 {
+		t.Error("disabled server contributes no tools")
+	}
+	if _, err := m.servers["docs"].call(context.Background(), "greet", nil); err == nil || !strings.Contains(err.Error(), "disabled") {
+		t.Errorf("call to disabled server: %v", err)
+	}
+
+	if !m.Enable("docs") {
+		t.Fatal("enable returned false")
+	}
+	for i := 0; i < 300; i++ {
+		if st := m.Statuses()[0]; st.Status == StatusReady {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if st := m.Statuses()[0]; st.Status != StatusReady {
+		t.Fatalf("after enable: %+v", st)
+	}
+	out := ""
+	for _, tool := range m.Tools() {
+		if tool.Def.Function.Name == "mcp__docs__greet" {
+			out, _ = tool.Run(context.Background(), nil)
+		}
+	}
+	if out == "" {
+		t.Error("re-enabled server's tools should work")
+	}
+
+	for _, bad := range []string{"nope"} {
+		if m.Disable(bad) || m.Enable(bad) {
+			t.Error("unknown name should return false")
+		}
+	}
+	if _, ok := m.Config("docs"); !ok {
+		t.Error("Config should return the live definition")
+	}
+	if _, ok := m.Config("nope"); ok {
+		t.Error("Config unknown name should be !ok")
+	}
+}
+
+func TestRingBuffer(t *testing.T) {
+	r := newRingBuffer(8)
+	r.Write([]byte("abc"))
+	r.Write([]byte("defghij")) // wraps: keep last 8
+	if got := r.String(); got != "cdefghij" {
+		t.Errorf("wrap = %q", got)
+	}
+	r.Write([]byte("0123456789")) // oversize: keep tail
+	if got := r.String(); got != "23456789" {
+		t.Errorf("oversize = %q", got)
+	}
+	zero := newRingBuffer(0)
+	zero.Write([]byte("anything"))
+	if zero.String() != "" {
+		t.Error("zero-capacity sink should discard")
+	}
+}
+
+func TestFlattenRemainingContentTypes(t *testing.T) {
+	res := flattenResult(&sdkmcp.CallToolResult{Content: []sdkmcp.Content{
+		&sdkmcp.AudioContent{MIMEType: "audio/wav", Data: []byte{1}},
+		&sdkmcp.EmbeddedResource{Resource: &sdkmcp.ResourceContents{URI: "file:///x", Text: "contents"}},
+		&sdkmcp.EmbeddedResource{Resource: &sdkmcp.ResourceContents{URI: "file:///bin", Blob: []byte{9, 9}}},
+		&sdkmcp.ResourceLink{URI: "https://link", Name: "ref"},
+	}})
+	for _, want := range []string{"audio content omitted", "[resource file:///x]", "contents", "binary resource omitted", "resource link: https://link (ref)"} {
+		if !strings.Contains(res, want) {
+			t.Errorf("missing %q in %q", want, res)
+		}
+	}
+}
+
+func TestDefaultTransportResolvesHeaderSecrets(t *testing.T) {
+	t.Setenv("GHG_MCP_SECRET_TEST", "resolved-token")
+
+	// References resolve at connect time; the config keeps the raw reference.
+	cfg := ServerConfig{URL: "https://mcp.example.com", Headers: map[string]string{
+		"Authorization": "${GHG_MCP_SECRET_TEST}",
+		"X-Cmd":         "!printf cmd-token",
+		"X-Literal":     "plain",
+		"X-Dropped":     "$GHG_MCP_SECRET_UNSET",
+	}}
+	tr, err := defaultTransport(cfg, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Headers["Authorization"] != "${GHG_MCP_SECRET_TEST}" {
+		t.Fatalf("config mutated: %q", cfg.Headers["Authorization"])
+	}
+	st, ok := tr.(*sdkmcp.StreamableClientTransport)
+	if !ok {
+		t.Fatalf("transport type %T", tr)
+	}
+	ht, ok := st.HTTPClient.Transport.(headerTransport)
+	if !ok {
+		t.Fatalf("inner transport type %T", st.HTTPClient.Transport)
+	}
+	if ht["Authorization"] != "resolved-token" || ht["X-Cmd"] != "cmd-token" || ht["X-Literal"] != "plain" {
+		t.Fatalf("resolved headers: %+v", ht)
+	}
+	if _, present := ht["X-Dropped"]; present {
+		t.Fatalf("unresolvable reference must be dropped, got %q", ht["X-Dropped"])
+	}
+}
+
+func TestStdioServerEndToEnd(t *testing.T) {
+	if os.Getenv("GHG_TEST_SELFHOST") == "" {
+		t.Skip("set GHG_TEST_SELFHOST=1 to run")
+	}
+	bin := filepath.Join(t.TempDir(), "ghg")
+	if out, err := exec.Command("go", "build", "-o", bin, "../../cmd/ghg").CombinedOutput(); err != nil {
+		t.Fatalf("build: %v\n%s", err, out)
+	}
+
+	// Happy path: real subprocess connect → tools → call → clean Close.
+	m := NewManager(map[string]ServerConfig{"self": {Command: []string{bin, "mcp", "serve"}}})
+	m.Start(context.Background())
+	s := m.servers["self"]
+	select {
+	case <-s.ready:
+	case <-time.After(30 * time.Second):
+		t.Fatal("never settled")
+	}
+	if st := m.Statuses()[0]; st.Status != StatusReady || st.Tools != 4 {
+		t.Fatalf("status = %+v", st)
+	}
+	out, err := s.call(context.Background(), "read", json.RawMessage(`{"path":"manager.go","limit":3}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "package mcp") {
+		t.Fatalf("read via MCP = %q", out)
+	}
+	m.Close() // must return promptly and reap the child
+	if st := m.Statuses()[0]; st.Status == StatusReady {
+		t.Error("post-Close status should not be ready")
+	}
+
+	// Failure path: a command that dies instantly surfaces stderr in /mcp.
+	m2 := NewManager(map[string]ServerConfig{"bad": {Command: []string{"sh", "-c", "echo dying-loudly >&2; exit 1"}, StartupTimeout: 5}})
+	m2.Start(context.Background())
+	defer m2.Close()
+	s2 := m2.servers["bad"]
+	select {
+	case <-s2.ready:
+	case <-time.After(10 * time.Second):
+		t.Fatal("never settled")
+	}
+	st2 := m2.Statuses()[0]
+	if st2.Status != StatusFailed {
+		t.Fatalf("bad server status = %+v", st2)
+	}
+	if !strings.Contains(st2.Err, "dying-loudly") {
+		t.Errorf("stderr tail should be in the failure message: %q", st2.Err)
 	}
 }

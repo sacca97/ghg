@@ -6,7 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
+	"slices"
+	"strings"
 	"time"
 )
 
@@ -25,6 +26,7 @@ type StateRecord struct {
 	State     State     `json:"state"`
 	Detached  bool      `json:"detached,omitempty"`
 	Role      string    `json:"role,omitempty"`
+	Mode      string    `json:"mode,omitempty"`
 	PID       int       `json:"pid,omitempty"`
 	UpdatedAt time.Time `json:"updated_at"`
 	Detail    string    `json:"detail,omitempty"`
@@ -146,18 +148,15 @@ func ListStates(baseDir string) ([]StateRecord, error) {
 		runtime := runtimePaths(absBase, entry.Name())
 		record, err := runtime.ReadState()
 		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				continue
-			}
-			return nil, err
+			continue
 		}
 		out = append(out, record)
 	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].UpdatedAt.Equal(out[j].UpdatedAt) {
-			return out[i].SessionID < out[j].SessionID
+	slices.SortFunc(out, func(a, b StateRecord) int {
+		if n := a.UpdatedAt.Compare(b.UpdatedAt); n != 0 {
+			return n
 		}
-		return out[i].UpdatedAt.Before(out[j].UpdatedAt)
+		return strings.Compare(a.SessionID, b.SessionID)
 	})
 	return out, nil
 }

@@ -66,42 +66,65 @@ Context is a budget, and the loop spends it deliberately:
 
 - **Proactive** — `maybeCompact` runs before each request once the latest
   successful request's provider-reported context size (`PromptTokens +
-  CompletionTokens`) crosses a percent of the advertised window (default 50%,
-  `compactPct` in config, slidable ←/→ in the ctrl+p settings). It is zero
-  until the first successful response.
-- **Reactive** — a provider context-limit error triggers one compaction +
-  retry.
+  CompletionTokens`) crosses the adaptive threshold: $\min(0.80 \times \text{window}, 400000, \text{window} - \text{reserve})$.
+  When explicit `compactPct` is set in config (slidable ←/→ in the ctrl+p settings),
+  the chosen percentage is honored while still respecting the output reserve.
+  It is zero until the first successful response.
+- **Reactive** — a provider context-limit error triggers one compaction + retry.
+  A `compacted` guard prevents retry loops.
 
-`compact()` keeps the system prompt plus a recent tail, and is
-**orphan-safe**: a tail that begins with a `tool`-role message walks back to
-its owning assistant message, so no tool result references an erased call ID.
+`compact()` uses cumulative, dedicated summarization:
+1. **Cumulative Checkpoint Reuse** — if an earlier compaction exists, its body is passed
+   inside `<previous_checkpoint>` tags so the model updates existing state with `<new_history>`
+   instead of re-summarizing from scratch.
+2. **Dedicated System Prompt** — summarization runs under a focused prompt instructing the model
+   to produce a state checkpoint without executing tasks or answering questions.
+3. **Truncated Summary Rejection** — checkpoints that hit token output limits or return empty
+   are rejected rather than corrupting session state.
+4. **Bounded Tail & Atomic Groups** — keeps the system prompt plus a recent tail capped at
+   $\min(\text{ContextLimit}/4, 24000)$ tokens. Tool-call groups are selected atomically from
+   newest to oldest, ensuring a tail never orphans a tool result from its assistant call.
 
 Tool results are structured before this boundary. The summary ledger records
-bounded arguments/output, exit status, duration, and artifact metadata; the
+bounded arguments/output, exit status, duration, and output metadata; the
 derived prompt carries a metadata-only manifest for references cited by the
 summary or kept tail. A recent result that exceeds the remaining token budget
-is shrunk deterministically without dropping its artifact id, while the raw
+is shrunk deterministically without dropping its output id, while the raw
 SQLite message log remains available for resume, retry, audit, and
-`artifact_read`.
+`output_read`.
 
 ```mermaid
 flowchart TB
     subgraph before["conversation before compaction"]
         S[system prompt]
+        P["prior checkpoint<br/>(if exists)"]
         T1[old turns 1..N]
-        T2[recent tail]
+        T2["recent tail<br/>(bounded ≤ 24k tokens)"]
     end
     S --> C["compact()"]
-    T1 --> SUM["summarize via Complete<br/>(compact model, non-streaming)"]
+    P --> SUM["summarize via Complete<br/>(dedicated prompt, non-streaming)"]
+    T1 --> SUM
     T2 --> C
     SUM --> C
-    C --> after["system + summary + tail<br/>(tail never orphans a tool call)"]
+    C --> after["system + cumulative summary + tail<br/>(tail never orphans a tool call)"]
 ```
 
 The summarizer defaults to `deepseek-v4-flash-0731`
 (`config.DefaultCompactModel`), falls back to the configured
 `compactModel`/`compactProvider`, then to the conversation's own model.
 `/compact [model] [provider]` does it by hand.
+
+## Per-turn tool freezing & plan runaway guard
+
+1. **Tool Freezing** — at the start of `Turn()`, `AllTools()` and tool definitions are
+   snapshotted once. Subsequent rounds reuse these stable definitions, avoiding per-round
+   reallocations or mid-turn tool drift.
+2. **Plan Runaway Guard** — in Plan mode, a rollout budget tracks weighted token expenditures
+   and a 128 model-call ceiling. Crossing any reserve
+   disables tools and forces a final synthesis request for `<proposed_plan>`.
+3. **Cheap Review Correction** — validation failures during code reviews trigger a bounded
+   2-round correction definition exposing only `submit_review`, preventing full multi-round
+   exploratory retries.
 
 ## Background subagents
 

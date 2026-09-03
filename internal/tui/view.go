@@ -3,6 +3,7 @@ package tui
 import (
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -10,7 +11,7 @@ import (
 
 	"github.com/sacca97/ghg/internal/agent"
 	"github.com/sacca97/ghg/internal/config"
-	"github.com/sacca97/ghg/internal/llm"
+	"github.com/sacca97/ghg/internal/models"
 
 	"github.com/charmbracelet/x/ansi"
 )
@@ -98,23 +99,29 @@ func (b block) render(width int) string {
 		if b.expanded || len(lines) <= toolPreviewLines {
 			return wrap(dimStyle.Render("  "+strings.Join(lines, "\n  ")), width)
 		}
-		preview := lines[:toolPreviewLines]
-		// An edit-style result carries a fenced diff at the tail; surface its
-		// -/+ lines in the collapsed preview so the change shows without
-		// expanding.
+		var preview []string
 		if strings.HasSuffix(lines[len(lines)-1], "```") {
-			var diffs []string
+			const maxDiffPreviewLines = 8
 			for _, l := range lines {
+				if strings.HasPrefix(l, "```") {
+					continue
+				}
 				if strings.HasPrefix(l, "-") || strings.HasPrefix(l, "+") {
-					diffs = append(diffs, l)
+					if !strings.HasPrefix(l, "---") && !strings.HasPrefix(l, "+++") {
+						if len(preview) < maxDiffPreviewLines+1 {
+							preview = append(preview, l)
+						}
+					}
+				} else if len(preview) < 2 {
+					preview = append(preview, l)
 				}
 			}
-			if len(diffs) > 0 {
-				preview = append(preview, diffs...)
-			}
+		}
+		if len(preview) == 0 {
+			preview = lines[:toolPreviewLines]
 		}
 		out := dimStyle.Render("  " + strings.Join(preview, "\n  "))
-		hint := fmt.Sprintf("\n  … +%d lines (ctrl+e or click to expand)", len(lines)-toolPreviewLines)
+		hint := fmt.Sprintf("\n  … +%d lines (ctrl+e or click to expand)", len(lines)-len(preview))
 		return wrap(out+dimStyle.Render(hint), width)
 	case blockToolRun:
 		return wrap(b.text, width)
@@ -210,11 +217,6 @@ func (m *model) contentPad() int {
 	return max(m.vp.Height-h, 0)
 }
 
-// viewportView renders the transcript viewport at its full allocated height.
-// The content is bottom-anchored — padding goes on top — so a short transcript
-// still ends directly above the input. Keeping the height fixed is important:
-// when scrolling lands on a blank separator, trimming it would move the input
-// and status box, so scrolling never moves the stable tail.
 // inputRule is the one-row divider between the transcript (plus its
 // ephemeral spinner/queue rows) and the input box, so the thing you type into
 // is visually separate from the thing you read. It replaces what used to be a
@@ -239,6 +241,11 @@ func (m *model) inputRule() string {
 // across the whole desk; the transcript is the thing to follow, not the rule.
 const maxRuleWidth = 120
 
+// viewportView renders the transcript viewport at its full allocated height.
+// The content is bottom-anchored — padding goes on top — so a short transcript
+// still ends directly above the input. Keeping the height fixed is important:
+// when scrolling lands on a blank separator, trimming it would move the input
+// and status box, so scrolling never moves the stable tail.
 func (m *model) viewportView() string {
 	view := m.vp.View()
 	if m.selection != nil && m.selection.hasRange() {
@@ -308,6 +315,12 @@ func (m *model) layout() {
 	if m.iactive != nil {
 		chrome += lipgloss.Height(m.interactiveView()) + 1
 	}
+	if m.permDialog != nil {
+		chrome += lipgloss.Height(m.permView()) + 1
+	}
+	if m.rew != nil {
+		chrome += lipgloss.Height(m.rewindView()) + 1
+	}
 	if m.menu != nil {
 		chrome += min(len(m.menu.cands), menuRows) + 1
 	}
@@ -360,7 +373,7 @@ func (m *model) busyStats() string {
 	return fmt.Sprintf(" %d:%02d", int(elapsed.Minutes()), int(elapsed.Seconds())%60)
 }
 
-// contextLimitFor returns the context window for a model id on a provider.
+// contextLimitFor returns the context window for a model id on a models.
 // Provider catalogs win, followed by explicit config, then models.dev.
 func (m *model) contextLimitFor(provName, apiID string) int {
 	if cat, ok := m.catalogs[provName]; ok {
@@ -389,13 +402,14 @@ func (m *model) contextLimitFor(provName, apiID string) int {
 // known, the current model's advertised context window. It starts at zero
 // until an assistant response reports usage.
 func (m *model) contextStatus() string {
-	if m.agent == nil {
-		return "ctx 0"
+	used := m.workerContextTokens
+	limit := m.contextLimit
+	if !m.workerOnly && m.workerClient == nil && m.workerProcess == nil && m.workerState == "" && m.agent != nil {
+		used = m.agent.ContextTokens()
+		limit = m.agent.ContextLimit
 	}
-	used := m.agent.ContextTokens()
-	limit := m.agent.ContextLimit
-	if m.workerClient != nil || m.workerProcess != nil || m.workerState != "" {
-		used = m.workerContextTokens
+	if limit <= 0 && !m.workerOnly && m.agent != nil {
+		limit = m.agent.ContextLimit
 	}
 	if limit <= 0 {
 		return "ctx " + fmtTok(used)
@@ -407,30 +421,36 @@ func (m *model) contextStatus() string {
 // model's advertised rates; ok is false when the provider's catalog has no
 // pricing for the model, in which case the status line hides the segment.
 func (m *model) sessionCost() (float64, bool) {
-	if m.agent == nil {
-		return 0, false
-	}
 	cat, ok := m.catalogs[m.provName]
 	if !ok {
 		return 0, false
 	}
-	in, out, cacheRead, ok := cat.Pricing(m.agent.Model)
+	in, out, cacheRead, ok := cat.Pricing(m.currentModelID())
 	if !ok {
 		return 0, false
 	}
-	return llm.SessionCost(m.agent.Usage(), in, out, cacheRead), true
+	return models.SessionCost(m.currentUsage(), in, out, cacheRead), true
 }
-
-// compactThresholdFor converts the config's compactPct preference into the
-// agent's threshold fraction. Out-of-range values clamp to [10, 90]; 0 (unset)
-// means the built-in default.
 
 // tasksView renders the background-subagent list for /tasks.
 func (m *model) tasksView() string {
-	if m.agent == nil {
+	if m.agent == nil && !m.workerOnly {
 		return dimStyle.Render("(no provider configured — run /auth first)")
 	}
-	tasks := m.agent.Tasks().List()
+	var tasks []agent.BackgroundTask
+	if m.workerOnly {
+		for _, task := range m.workerTasks {
+			tasks = append(tasks, agent.BackgroundTask{ID: task.ID, Description: task.Description, Prompt: task.Prompt, Status: agent.TaskStatus(task.Status), Report: task.Report, StartedAt: task.StartedAt, EndedAt: task.EndedAt, Restored: task.Restored})
+		}
+		slices.SortStableFunc(tasks, func(a, b agent.BackgroundTask) int {
+			if n := b.StartedAt.Compare(a.StartedAt); n != 0 {
+				return n
+			}
+			return strings.Compare(b.ID, a.ID)
+		})
+	} else {
+		tasks = m.agent.Tasks().List()
+	}
 	if len(tasks) == 0 {
 		return dimStyle.Render("(no background subagents)")
 	}
@@ -463,14 +483,8 @@ func (m *model) tasksView() string {
 	return b.String()
 }
 
-// switchModel rebuilds the agent on a new model/provider, carrying history.
-
 // appendAssistant writes assistant text into the transcript, rendering it as
 // markdown (glamour) and prefixing the first line of each segment with "● ".
-// A rendered segment can reflow to a different height than the raw text, so
-// the whole segment lands as one block.
-// appendAssistant finalizes an in-flight assistant segment into the
-// transcript as raw markdown (rendered at the current width in refreshVP).
 // Consecutive segments of one message merge into a single block so the whole
 // message re-renders as one markdown document on resize.
 func (m *model) appendAssistant(s string) {
@@ -527,6 +541,25 @@ func (m *model) setThinking(on bool) {
 	}
 }
 
+func formatThinkingDuration(dur time.Duration) string {
+	if dur < 0 {
+		dur = 0
+	}
+	totalSec := int(dur / time.Second)
+	if totalSec < 60 {
+		return fmt.Sprintf("%ds", totalSec)
+	}
+	if totalSec < 3600 {
+		m := totalSec / 60
+		s := totalSec % 60
+		return fmt.Sprintf("%dm %ds", m, s)
+	}
+	h := totalSec / 3600
+	m := (totalSec % 3600) / 60
+	s := totalSec % 60
+	return fmt.Sprintf("%dh %dm %ds", h, m, s)
+}
+
 func (m *model) flushThink() {
 	hadReasoning := !m.thinkStart.IsZero()
 	dur := m.nowFn().Sub(m.thinkStart)
@@ -535,11 +568,11 @@ func (m *model) flushThink() {
 	}
 	m.thinkStart = time.Time{}
 	if hadReasoning && m.showThinking {
-		m.append(thinkingStyle.Render(fmt.Sprintf("◌ Thinking %.1fs", dur.Seconds())))
+		m.append(thinkingStyle.Render("◌ Thinking " + formatThinkingDuration(dur)))
 	}
 }
 
-// thinkView renders the in-flight reasoning timer (e.g. "◌ Thinking 3.2s").
+// thinkView renders the in-flight reasoning timer (e.g. "◌ Thinking 3s").
 func (m *model) thinkView() string {
 	if m.thinkStart.IsZero() || !m.showThinking {
 		return ""
@@ -548,7 +581,7 @@ func (m *model) thinkView() string {
 	if dur < 0 {
 		dur = 0
 	}
-	s := fmt.Sprintf("◌ Thinking %.1fs", dur.Seconds())
+	s := "◌ Thinking " + formatThinkingDuration(dur)
 	return thinkingStyle.Render(wrap(s, m.width))
 }
 
@@ -588,15 +621,10 @@ func (m *model) View() string {
 		b.WriteString(m.pickerView())
 		return b.String()
 	}
-	if m.mpicker != nil {
-		b.WriteString(m.modelPickerView())
-		return b.String()
-	}
 	if m.taskVP != nil {
 		b.WriteString(m.taskViewView())
 		return b.String()
 	}
-	// and the /help command. The bottom hint covers the busy/interactive states.
 	b.WriteString(m.viewportView() + "\n")
 	if !m.thinkStart.IsZero() && m.showThinking {
 		b.WriteString("\n" + m.thinkView() + "\n")
@@ -611,7 +639,7 @@ func (m *model) View() string {
 		b.WriteString("\n" + m.permView() + "\n")
 	}
 	if m.busy {
-		hint := " thinking… (enter queues · /theme /effort run now · esc interrupts · ctrl+c ctrl+c interrupts)"
+		hint := " thinking… (enter queues · /effort run now · esc interrupts · ctrl+c ctrl+c interrupts)"
 		if m.iactive != nil {
 			hint = " bash (interactive) — type to respond · ctrl+c ctrl+c to cancel"
 		} else if m.interrupt1 {
@@ -700,10 +728,17 @@ func (m *model) statusView() string {
 	}
 	mode := m.uiMode()
 	effort := "(" + effortLabel(m.currentEffort()) + ")"
-	folder := shortCWD()
+	folder := m.shortCWD
+	if folder == "" {
+		folder = shortCWD()
+	}
+	slotW := m.modelSlotW
+	if slotW <= 0 {
+		slotW = m.statusModelSlotWidth()
+	}
 	fields := []statusField{
 		{text: folder, width: ansi.StringWidth(folder)},
-		{text: model, width: m.statusModelSlotWidth()},
+		{text: model, width: slotW},
 		{text: effort, width: ansi.StringWidth(effort)},
 		{text: mode, width: ansi.StringWidth(mode)},
 		{text: m.provName, width: ansi.StringWidth(m.provName)},
@@ -888,89 +923,6 @@ func shortCWD() string {
 	return dir
 }
 
-const previewLines = 5
-
-// pickerView renders the /resume picker: oldest at top, newest at bottom,
-// the selected session expanded with previews of its last exchange.
-func (m *model) pickerView() string {
-	p := m.picker
-	rows := []string{}
-	expanded := 3 + 2*previewLines // meta + previews
-	// how many collapsed rows fit alongside the expanded selection + footer
-	budget := max(m.height-2-expanded-1, 2)
-	lo := max(p.idx-budget/2, 0)
-	hi := min(lo+budget+1, len(p.metas))
-
-	for i := hi - 1; i >= lo; i-- { // metas is newest-first; render oldest on top
-		meta := p.metas[i]
-		title := meta.Title
-		if title == "" {
-			title = "(untitled)"
-		}
-		line := fmt.Sprintf("%s  %s · %s · %s @ %s", meta.ID, title, ago(meta.UpdatedAt), meta.Model, meta.Provider)
-		if i != p.idx {
-			rows = append(rows, wrap("    "+line, m.width))
-			continue
-		}
-		rows = append(rows, wrap(botStyle.Render("  → ")+line, m.width))
-		prev := p.previews[meta.ID]
-		rows = append(rows, previewBlock(youStyle.Render("❯ "), prev[0], m.width)...)
-		rows = append(rows, previewBlock(botStyle.Render("● "), prev[1], m.width)...)
-	}
-	footer := fmt.Sprintf("  (%d/%d) ↑/k older · ↓/j newer · enter resume · dd delete · esc cancel", p.idx+1, len(p.metas))
-	if p.pendingD {
-		footer = fmt.Sprintf("  (%d/%d) press d again to delete session %s", p.idx+1, len(p.metas), p.metas[p.idx].ID)
-	}
-	rows = append(rows, dimStyle.Render(footer))
-	// pad so the footer stays at the bottom of the screen
-	for len(rows) < m.height-1 {
-		rows = append(rows, "")
-	}
-	return strings.Join(rows, "\n")
-}
-
-// previewBlock renders up to previewLines lines of a message under a prefix.
-// previewBlock renders up to previewLines *rendered* lines of a message
-// under a prefix, wrapping each source line at the given width (no
-// truncation — long lines wrap instead of ending in "…").
-func previewBlock(prefix, text string, width int) []string {
-	text = strings.TrimSpace(text)
-	if text == "" {
-		return nil
-	}
-	w := max(width-8, 8)
-	var lines []string
-	for i, l := range strings.Split(text, "\n") {
-		wrapped := strings.Split(ansi.Hardwrap(l, w, true), "\n")
-		for j, wl := range wrapped {
-			if i == 0 && j == 0 {
-				lines = append(lines, "      "+prefix+wl)
-			} else {
-				lines = append(lines, "        "+wl)
-			}
-		}
-	}
-	if len(lines) > previewLines {
-		lines = append(lines[:previewLines],
-			dimStyle.Render(fmt.Sprintf("        … +%d lines (full text after resume)", len(lines)-previewLines)))
-	}
-	return lines
-}
-
-func ago(t time.Time) string {
-	d := time.Since(t)
-	switch {
-	case d < time.Minute:
-		return "just now"
-	case d < time.Hour:
-		return fmt.Sprintf("%dm ago", int(d.Minutes()))
-	case d < 24*time.Hour:
-		return fmt.Sprintf("%dh ago", int(d.Hours()))
-	default:
-		return fmt.Sprintf("%dd ago", int(d.Hours()/24))
-	}
-}
-
 func (m *model) menuView() string {
 	// window of menuRows candidates around the selection
 	start := 0
@@ -981,12 +933,13 @@ func (m *model) menuView() string {
 
 	nameW := 0
 	for _, c := range m.menu.cands[start:end] {
-		nameW = max(nameW, len(c.Text))
+		nameW = max(nameW, ansi.StringWidth(c.Text))
 	}
 	var b strings.Builder
 	for i := start; i < end; i++ {
 		c := m.menu.cands[i]
-		line := fmt.Sprintf("%-*s  ", nameW, c.Text)
+		pad := max(0, nameW-ansi.StringWidth(c.Text))
+		line := c.Text + strings.Repeat(" ", pad) + "  "
 		if i == m.menu.idx {
 			b.WriteString(botStyle.Render("→ "+line) + dimStyle.Render(c.Desc))
 		} else {
@@ -1006,8 +959,8 @@ func wrap(s string, width int) string {
 }
 
 func truncLine(s string, width int) string {
-	if width > 0 && len(s) > width {
-		return s[:width-1] + "…"
+	if width <= 0 {
+		return ""
 	}
-	return s
+	return ansi.Truncate(s, width, "…")
 }

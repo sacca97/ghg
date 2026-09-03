@@ -24,6 +24,7 @@ import (
 	"os"
 	"os/exec"
 	"os/user"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -31,8 +32,8 @@ import (
 
 	"github.com/creack/pty"
 
-	"github.com/sacca97/ghg/internal/artifact"
 	"github.com/sacca97/ghg/internal/sandbox"
+	"github.com/sacca97/ghg/internal/session"
 )
 
 // userShell resolves the user's login shell: $SHELL first, then the passwd
@@ -84,7 +85,7 @@ type Result struct {
 	// Interactive reports whether the interactive PTY path was used.
 	Interactive bool
 	// OriginalBytes is the total stdout/stderr byte count. Output is bounded
-	// to artifact.DefaultMaxBytes and may contain deterministic head/tail data.
+	// to session.DefaultMaxBytes and may contain deterministic head/tail data.
 	OriginalBytes int64
 	// Complete is false when Output omitted the middle of a result.
 	Complete bool
@@ -99,18 +100,20 @@ type boundedCapture struct {
 	data      []byte
 	head      []byte
 	tail      []byte
+	rolling   []byte
 	truncated bool
 }
 
 func newBoundedCapture(limit int64) *boundedCapture {
 	if limit <= 0 {
-		limit = artifact.DefaultMaxBytes
+		limit = session.DefaultMaxBytes
 	}
 	return &boundedCapture{limit: int(limit)}
 }
 
 func (c *boundedCapture) Write(p []byte) (int, error) {
 	c.total += int64(len(p))
+	c.appendRolling(p, 16<<10)
 	if c.truncated {
 		c.appendTail(p)
 		return len(p), nil
@@ -130,6 +133,17 @@ func (c *boundedCapture) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
+func (c *boundedCapture) appendRolling(p []byte, maxPreview int) {
+	if len(p) >= maxPreview {
+		c.rolling = append(c.rolling[:0], p[len(p)-maxPreview:]...)
+		return
+	}
+	c.rolling = append(c.rolling, p...)
+	if len(c.rolling) > maxPreview {
+		c.rolling = c.rolling[len(c.rolling)-maxPreview:]
+	}
+}
+
 func (c *boundedCapture) appendTail(p []byte) {
 	tailLen := c.limit - c.limit/2
 	if len(p) >= tailLen {
@@ -140,6 +154,37 @@ func (c *boundedCapture) appendTail(p []byte) {
 	if len(c.tail) > tailLen {
 		c.tail = c.tail[len(c.tail)-tailLen:]
 	}
+}
+
+func validUTF8Tail(data []byte) string {
+	for len(data) > 0 && (data[0]&0xC0) == 0x80 {
+		data = data[1:]
+	}
+	return string(data)
+}
+
+// Preview returns a bounded tail of the latest output suitable for live
+// updates, copying at most limit bytes.
+func (c *boundedCapture) Preview(limit int) string {
+	if limit <= 0 {
+		limit = 14 << 10
+	}
+	if !c.truncated {
+		if len(c.data) <= limit {
+			return string(c.data)
+		}
+		return validUTF8Tail(c.data[len(c.data)-limit:])
+	}
+	if len(c.rolling) == 0 {
+		if len(c.tail) <= limit {
+			return validUTF8Tail(c.tail)
+		}
+		return validUTF8Tail(c.tail[len(c.tail)-limit:])
+	}
+	if len(c.rolling) <= limit {
+		return validUTF8Tail(c.rolling)
+	}
+	return validUTF8Tail(c.rolling[len(c.rolling)-limit:])
 }
 
 func (c *boundedCapture) String() string {
@@ -206,6 +251,10 @@ func Run(ctx context.Context, opts Options) Result {
 
 	program := userShell()
 	args := []string{"-c", opts.Command}
+	switch filepath.Base(program) {
+	case "bash", "zsh", "ksh":
+		args = []string{"-o", "pipefail", "-c", opts.Command}
+	}
 	var dir string
 	if opts.Sandbox != nil {
 		wrapped, err := opts.Sandbox.WrapCommand(sandbox.CommandSpec{
@@ -274,7 +323,7 @@ func runPiped(ctx context.Context, cmd *exec.Cmd, opts Options) Result {
 
 	// Drain both pipes concurrently; the readers finish on pipe EOF (process
 	// exit) OR when we close them below after Wait returns.
-	out := newBoundedCapture(artifact.DefaultMaxBytes)
+	out := newBoundedCapture(session.DefaultMaxBytes)
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -311,7 +360,7 @@ func runPiped(ctx context.Context, cmd *exec.Cmd, opts Options) Result {
 			last := ""
 			publish := func() {
 				mu.Lock()
-				snapshot := out.String()
+				snapshot := out.Preview(14 * 1024)
 				mu.Unlock()
 				if snapshot == "" || snapshot == last {
 					return
@@ -391,7 +440,7 @@ func runInteractive(ctx context.Context, cmd *exec.Cmd, opts Options) Result {
 		stop()
 	}()
 
-	buf := newBoundedCapture(artifact.DefaultMaxBytes)
+	buf := newBoundedCapture(session.DefaultMaxBytes)
 	outCh := make(chan []byte, 16)
 
 	// Output pump: copy PTY -> caller + buffer; on read error the child has

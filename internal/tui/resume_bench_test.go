@@ -5,22 +5,22 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/sacca97/ghg/internal/llm"
+	"github.com/sacca97/ghg/internal/models"
 )
 
 // benchTranscript builds a realistic resumed conversation: n exchanges, each
 // with a user message, an assistant answer (markdown), and a tool call.
-func benchTranscript(n int) []llm.Message {
-	msgs := make([]llm.Message, 0, n*3)
+func benchTranscript(n int) []models.Message {
+	msgs := make([]models.Message, 0, n*3)
 	for i := 0; i < n; i++ {
 		msgs = append(msgs,
-			llm.Message{Role: "user", Content: fmt.Sprintf("question %d: how do I do the thing?", i)},
-			llm.Message{Role: "assistant", Content: strings.Repeat("Here is **some** `answer` with text. ", 20)},
-			func() llm.Message {
-				var tc llm.ToolCall
+			models.Message{Role: "user", Content: fmt.Sprintf("question %d: how do I do the thing?", i)},
+			models.Message{Role: "assistant", Content: strings.Repeat("Here is **some** `answer` with text. ", 20)},
+			func() models.Message {
+				var tc models.ToolCall
 				tc.Function.Name = "bash"
 				tc.Function.Arguments = fmt.Sprintf(`{"command":"ls %d"}`, i)
-				return llm.Message{Role: "assistant", ToolCalls: []llm.ToolCall{tc}}
+				return models.Message{Role: "assistant", ToolCalls: []models.ToolCall{tc}}
 			}(),
 		)
 	}

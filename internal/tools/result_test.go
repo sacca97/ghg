@@ -6,12 +6,11 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/sacca97/ghg/internal/artifact"
-	"github.com/sacca97/ghg/internal/llm"
+	"github.com/sacca97/ghg/internal/models"
 )
 
-func TestModelTextDelimitsUntrustedBytesAndKeepsArtifactHintOutside(t *testing.T) {
-	ref := artifact.Ref{
+func TestModelTextDelimitsUntrustedBytesAndKeepsOutputHintOutside(t *testing.T) {
+	ref := models.OutputRef{
 		ID:            "sha256:" + strings.Repeat("a", 64),
 		Hash:          strings.Repeat("a", 64),
 		OriginalBytes: 200,
@@ -19,8 +18,8 @@ func TestModelTextDelimitsUntrustedBytesAndKeepsArtifactHintOutside(t *testing.T
 		Complete:      false,
 	}
 	result := MarkUntrusted(ToolResult{
-		Preview:  "returned text" + ArtifactReference(ref),
-		Artifact: &ref,
+		Preview: "returned text" + OutputReference(ref),
+		Output:  &ref,
 	}, "mcp__docs__fetch")
 
 	if !IsUntrusted(result) || result.Source != "mcp__docs__fetch" {
@@ -32,8 +31,8 @@ func TestModelTextDelimitsUntrustedBytesAndKeepsArtifactHintOutside(t *testing.T
 		t.Fatalf("rendered result = %q", got)
 	}
 	close := strings.Index(got, "</untrusted_tool_output>")
-	if close < 0 || !strings.HasSuffix(got, ArtifactReference(ref)) || strings.Index(got, ArtifactReference(ref)) < close {
-		t.Fatalf("artifact hint must follow the untrusted block: %q", got)
+	if close < 0 || !strings.HasSuffix(got, OutputReference(ref)) || strings.Index(got, OutputReference(ref)) < close {
+		t.Fatalf("output hint must follow the untrusted block: %q", got)
 	}
 
 	trusted := ToolResult{Preview: "status"}
@@ -46,7 +45,7 @@ func TestNormalizeResultCapsExplicitPreviewWithoutDroppingRetained(t *testing.T)
 	retained := strings.Repeat("retained", maxOutput)
 	preview := strings.Repeat("preview", maxOutput)
 	tool := Tool{
-		Def: llm.NewTool("preview", "", `{"type":"object"}`),
+		Def: models.NewTool("preview", "", `{"type":"object"}`),
 		RunResult: func(context.Context, json.RawMessage) (ToolResult, error) {
 			return ToolResult{
 				Preview:       preview,

@@ -27,8 +27,8 @@ flowchart TB
     subgraph agents["agents & persistence — internal/agent"]
         TASK["task<br/>subagent, background: true<br/>for concurrent work"]
         TODO["todowrite<br/>conversation-scoped plan,<br/>reinjected each round"]
-        ALIST["artifact_list<br/>session-scoped metadata"]
-        AREAD["artifact_read<br/>bounded id + byte range"]
+        ALIST["output_list<br/>session-scoped metadata"]
+        AREAD["output_read<br/>bounded id + byte range"]
         HSEARCH["history_search<br/>FTS5 session search"]
         HREAD["history_read<br/>bounded raw history recall"]
     end
@@ -60,24 +60,26 @@ flowchart TB
 
 `grep`, `glob`, and `find_files` are native, read-only workspace searches. They
 avoid a shell process, honor cancellation, and produce deterministic output.
+`grep` streams matches directly using `rg --json` when `rg` is available on `$PATH`,
+falling back automatically to an in-process Go walker.
 `grep` accepts one regular expression or a `patterns` OR array, groups matches
 by file, ranks touched/modified and narrow-path results, and defaults to 25
-matches per page. `glob` is exact; `find_files` scores every candidate before
-selecting fuzzy path matches. Each search can return a cursor for a stable
-session snapshot.
+matches per page (capped at 250 matches or 8 KiB). `glob` is exact; `find_files`
+scores every candidate before selecting fuzzy path matches. Each search can return a
+cursor for a stable session snapshot.
 
 `grep` and `glob` load nested `.gitignore` files with negation, anchoring, and
 directory-only rules. All three skip `.git`, symlinks, and non-regular files;
 `grep` also skips binaries. The default root is the current working directory;
 an explicit root is allowed but all native traversal remains inside an `os.Root`.
-The model-facing search page is capped at 8 KiB, while the cursor snapshot is
-bounded by the artifact ceiling. Results cap at 10,000 and traversal stops at
-100,000 entries with an explicit incomplete-retention warning. Large retained
-snapshots use the normal artifact path.
+The model-facing search page is capped at 8 KiB or 250 matches, while the cursor snapshot
+is bounded to 2,000 results. The live search snapshot registry holds up to 16 snapshots
+per session with LRU eviction and a 30-second file index cache TTL. Large retained
+snapshots use the content-addressed output store.
 
 ## read observations and edit
 
-`read` returns at most 500 complete numbered lines (1,000 maximum) and a
+`read` returns at most 250 complete numbered lines (1,000 maximum) and a
 64 KiB output budget. It includes an opaque observation id and continuation
 offset, and stores the exact original line bytes in the session registry. A
 primary `edit` uses `mode: "observed"` with one `edits` array; operations are
@@ -96,27 +98,28 @@ publish each with rename, and best-effort roll back earlier publications on a
 later failure. Results contain a compact diff, changed-line readback, and LSP
 diagnostics. File modes and line endings are preserved.
 
-## artifact_list and artifact_read
+## output_list and output_read
 
 Large or externally sourced tool results use the structured result path. The
 model receives a bounded preview; the agent may retain a deterministic
 head/tail payload and show a `sha256:<hash>` reference. The payload is marked
 as `<untrusted_tool_output>` when it is inserted into a provider request, so
 instructions found in a file, command output, MCP response, or recovered
-artifact remain data rather than agent policy.
+output remain data rather than agent policy.
 
-`artifact_list` lists current-session metadata only: artifact id, originating
+`output_list` lists current-session metadata only: output id, originating
 tool/call, original and stored sizes, retention state, and creation time. It
 accepts optional exact tool/call filters, a metadata query, RFC3339 time bounds,
 and a bounded `limit` (100 by default, 1,000 maximum). It never returns a
 filesystem path.
 
-`artifact_read` takes an id plus an optional zero-based byte `offset` and
+`output_read` takes an id plus an optional zero-based byte `offset` and
 bounded `limit` (64 KiB by default, 1 MiB maximum). The session catalog checks
 ownership before the payload store reads the derived content-addressed path;
 paths and cross-session ids are rejected. A payload retained as head/tail is
 reported as incomplete, so the model cannot mistake missing middle bytes for
-evidence.
+evidence. The legacy `artifact_list` and `artifact_read` names remain accepted
+as aliases.
 
 ## bash
 
@@ -127,15 +130,16 @@ Runs through `internal/tools/bashrun` so the agent can:
   redirect without executing. Pipelines, `git grep`, advanced predicates, and
   paths outside the workspace remain an explicit bash escape hatch.
 
-- **stay within context** — recognized search/listing output previews are
-  capped near 8 KiB; ordinary commands near 14 KiB. The retained result still
-  follows the artifact policy, and JSON runs receive per-tool byte/redirect
-  telemetry.
+- **stay within context** — recognized search/listing output previews and compound
+  inspection pipelines are capped near 8 KiB; ordinary commands near 14 KiB.
+  The retained result still follows the output policy, and JSON runs receive
+  per-tool byte/redirect telemetry.
 
 - **see progress** — non-interactive calls publish accumulated stdout/stderr
-  snapshots at most every 100ms. The agent event carries the tool-call id and
-  the TUI shows the last three lines while the call is running; the completed
-  result is still the only persisted tool output.
+  snapshots at most every 100ms using a bounded rolling UTF-8 preview buffer,
+  avoiding $O(\text{total output})$ copies per tick. The agent event carries the
+  tool-call id and the TUI shows the last three lines while the call is running;
+  the completed result is still the only persisted tool output.
 - **interrupt** — ctrl+c once interrupts the foreground command; twice quits
   ghg and kills agent-spawned child processes (process-group cleanup).
 - **authenticate** — `interactive: true` runs in a PTY so `sudo`/ssh-style

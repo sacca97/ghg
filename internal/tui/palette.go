@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"context"
 	"fmt"
 	"slices"
 	"sort"
@@ -9,7 +10,11 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/x/ansi"
 
+	"github.com/sacca97/ghg/internal/auth"
+	"github.com/sacca97/ghg/internal/config"
+	"github.com/sacca97/ghg/internal/goal"
 	"github.com/sacca97/ghg/internal/mcp"
+	"github.com/sacca97/ghg/internal/models"
 )
 
 // paletteItem is one row in the ctrl+p command settings. It mirrors opencode's
@@ -32,7 +37,8 @@ type paletteItem struct {
 	suggested bool // pinned into a "Suggested" group when the filter is empty
 
 	// action rows: enter runs it (settings stays open)
-	run func(m *model) (tea.Model, tea.Cmd)
+	command string
+	action  paletteAction
 
 	// sub-panel rows: enter/→ drills in (push), esc pops back
 	panel func(m *model) *ppanel
@@ -41,6 +47,17 @@ type paletteItem struct {
 	stepBack func(m *model)
 	stepFwd  func(m *model)
 }
+
+type paletteAction uint8
+
+const (
+	paletteActionNone paletteAction = iota
+	paletteActionPlanPrompt
+	paletteActionReviewPrompt
+	paletteActionRewind
+	paletteActionExportPrompt
+	paletteActionToggleThinking
+)
 
 // panelKind enumerates the settings's sub-panels.
 type panelKind int
@@ -52,7 +69,6 @@ const (
 	panelEffort
 	panelGoal
 	panelCompact
-	panelTheme
 )
 
 // ppanel is a settings sub-panel: the interactive editor behind a row. Key
@@ -73,14 +89,14 @@ type ppanel struct {
 	prepare string // panelGoal: text submitted when the editor closes
 
 	cands []string // panelCompact: model names from config
-	list  []string // panelCompact: "default (…)" + cands; panelTheme: {"auto","light","dark"}
-	midx  int      // panelCompact: selection, 0 = the built-in default; panelTheme: selection
+	list  []string // panelCompact: "default (…)" + cands
+	midx  int      // panelCompact: selection, 0 = the built-in default
 
 	err    string // inline error from a failed apply (bad compact model, …)
 	offset int    // first visible rendered row in a scrollable panel
 
-	// direct marks a panel a slash command opened straight into (bare /effort,
-	// /theme): enter applies and closes the whole settings instead of popping
+	// direct marks a panel a slash command opened straight into (bare /effort):
+	// enter applies and closes the whole settings instead of popping
 	// back to the root list, since the user never asked for ctrl+p.
 	direct bool
 }
@@ -153,28 +169,19 @@ func (m *model) paletteItems() []paletteItem {
 		{title: "Plan", category: "Agent", suggested: true,
 			dynDesc: func(m *model) string { return slashHint(m, "/plan") },
 			dynHint: func(m *model) string { return "/plan <goal>" },
-			run: func(m *model) (tea.Model, tea.Cmd) {
-				m.settings = nil
-				m.input.SetValue("/plan ")
-				m.input.CursorEnd()
-				m.refreshMenu()
-				return m, nil
-			}},
+			action:  paletteActionPlanPrompt},
 		{title: "Execute plan", category: "Agent", suggested: true,
 			dynDesc: func(m *model) string { return slashHint(m, "/execute") },
 			dynHint: func(m *model) string { return "/execute" },
-			run: func(m *model) (tea.Model, tea.Cmd) {
-				m.settings = nil
-				return m.command("/execute")
-			}},
+			command: "/execute"},
+		{title: "Review", category: "Agent", suggested: true,
+			dynDesc: func(m *model) string { return slashHint(m, "/review") },
+			dynHint: func(m *model) string { return "/review <target>" },
+			action:  paletteActionReviewPrompt},
 		{title: "Resume session", category: "Session", suggested: true,
 			dynDesc: func(m *model) string { return slashHint(m, "/resume") },
 			dynHint: func(m *model) string { return "/resume" },
-			run: func(m *model) (tea.Model, tea.Cmd) {
-				m.settings = nil
-				m.openPicker()
-				return m, nil
-			}},
+			command: "/resume"},
 		{title: "Rewind conversation", category: "Session", suggested: true,
 			dynDesc: func(m *model) string {
 				if len(m.future) > 0 {
@@ -183,62 +190,31 @@ func (m *model) paletteItems() []paletteItem {
 				return "jump back (or forward) to any earlier message"
 			},
 			dynHint: func(m *model) string { return palHintRewind },
-			run: func(m *model) (tea.Model, tea.Cmd) {
-				m.settings = nil
-				if m.busy {
-					return m, nil
-				}
-				m.openRewind()
-				return m, nil
-			}},
+			action:  paletteActionRewind},
 		{title: "Fork session", category: "Session",
 			dynDesc: func(m *model) string { return slashHint(m, "/fork") },
 			dynHint: func(m *model) string { return "/fork" },
-			run: func(m *model) (tea.Model, tea.Cmd) {
-				m.settings = nil
-				if !m.busy {
-					m.forkCommand("")
-				}
-				return m, nil
-			}},
+			command: "/fork"},
 		{title: "Export chat", category: "Session",
 			dynDesc: func(m *model) string { return "export the full conversation to Markdown or JSON" },
 			dynHint: func(m *model) string { return "/export-result chat" },
-			run: func(m *model) (tea.Model, tea.Cmd) {
-				m.settings = nil
-				return m.exportResultCommand("/export-result chat")
-			}},
+			command: "/export-result chat"},
 		{title: "Export latest plan", category: "Session",
 			dynDesc: func(m *model) string { return "export latest plan to Markdown or JSON" },
 			dynHint: func(m *model) string { return "/export-result plan" },
-			run: func(m *model) (tea.Model, tea.Cmd) {
-				m.settings = nil
-				return m.exportResultCommand("/export-result plan")
-			}},
+			command: "/export-result plan"},
 		{title: "Export latest review", category: "Session",
 			dynDesc: func(m *model) string { return "export latest review to Markdown or JSON" },
 			dynHint: func(m *model) string { return "/export-result review" },
-			run: func(m *model) (tea.Model, tea.Cmd) {
-				m.settings = nil
-				return m.exportResultCommand("/export-result review")
-			}},
+			command: "/export-result review"},
 		{title: "Export last message", category: "Session",
 			dynDesc: func(m *model) string { return "export last assistant reply to a file" },
 			dynHint: func(m *model) string { return "/export-result last" },
-			run: func(m *model) (tea.Model, tea.Cmd) {
-				m.settings = nil
-				return m.exportResultCommand("/export-result last")
-			}},
+			command: "/export-result last"},
 		{title: "Export workflow result", category: "Session",
 			dynDesc: func(m *model) string { return slashHint(m, "/export-result") },
 			dynHint: func(m *model) string { return "/export-result" },
-			run: func(m *model) (tea.Model, tea.Cmd) {
-				m.settings = nil
-				m.input.SetValue("/export-result ")
-				m.input.CursorEnd()
-				m.refreshMenu()
-				return m, nil
-			}},
+			action:  paletteActionExportPrompt},
 		{title: "Rename session", category: "Session",
 			dynDesc: func(m *model) string {
 				if m.sessionID == "" || m.store == nil {
@@ -250,36 +226,27 @@ func (m *model) paletteItems() []paletteItem {
 				return "retitle this session"
 			},
 			dynHint: func(m *model) string { return "/rename " + slashHint(m, "/rename") },
-			run: func(m *model) (tea.Model, tea.Cmd) {
-				m.settings = nil
-				if !m.busy {
-					m.renameCommand("")
-				}
-				return m, nil
-			}},
+			command: "/rename"},
 		{title: "New session", category: "Session",
 			dynDesc: func(m *model) string { return slashHint(m, "/clear") },
 			dynHint: func(m *model) string { return "/clear" },
-			run: func(m *model) (tea.Model, tea.Cmd) {
-				m.settings = nil
-				return m.command("/clear")
-			}},
+			command: "/clear"},
 		{title: "Compact session", category: "Session", suggested: true,
 			dynDesc: func(m *model) string { return slashHint(m, "/compact") },
 			dynHint: func(m *model) string { return "/compact" },
-			run:     func(m *model) (tea.Model, tea.Cmd) { return m.command("/compact") }},
+			command: "/compact"},
 		{title: "Context doctor", category: "Session",
 			dynDesc: func(m *model) string { return slashHint(m, "/context-doctor") },
 			dynHint: func(m *model) string { return "/context-doctor" },
-			run:     func(m *model) (tea.Model, tea.Cmd) { return m.command("/context-doctor") }},
+			command: "/context-doctor"},
 		{title: "Bug report", category: "Session",
 			dynDesc: func(m *model) string { return slashHint(m, "/report") },
 			dynHint: func(m *model) string { return "/report" },
-			run:     func(m *model) (tea.Model, tea.Cmd) { return m.command("/report") }},
+			command: "/report"},
 		{title: "MCP servers", category: "Session",
 			dynDesc: func(m *model) string { return slashHint(m, "/mcp") }, // live count: [n/n ready] badge
 			dynHint: func(m *model) string { return "/mcp" },
-			run:     func(m *model) (tea.Model, tea.Cmd) { return m.command("/mcp") }},
+			command: "/mcp"},
 		{title: "Compaction model", category: "Session",
 			dynDesc: func(m *model) string {
 				if m.compactModel == "" {
@@ -328,45 +295,19 @@ func (m *model) paletteItems() []paletteItem {
 				return pp
 			}},
 		{title: "Thinking timer", category: "Display",
-			dynDesc: func(m *model) string { return "show or hide elapsed thinking time" },
-			dynHint: func(m *model) string { return palHintThinking },
-			run: func(m *model) (tea.Model, tea.Cmd) {
-				m.toggleThinking()
-				return m, nil
-			},
+			dynDesc:  func(m *model) string { return "show or hide elapsed thinking time" },
+			dynHint:  func(m *model) string { return palHintThinking },
+			action:   paletteActionToggleThinking,
 			stepBack: func(m *model) { m.setThinking(false) },
 			stepFwd:  func(m *model) { m.setThinking(true) }},
-		{title: "Theme", category: "Display",
-			dynDesc: func(m *model) string { return "current: " + CurrentTheme() },
-			dynHint: func(m *model) string { return "/theme " + slashHint(m, "/theme") },
-			panel: func(m *model) *ppanel {
-				list := []string{"auto", "light", "dark"}
-				cur := m.cfg.Theme
-				if cur == "" {
-					cur = "auto"
-				}
-				pp := &ppanel{kind: panelTheme, title: "Theme", list: list}
-				for i, t := range list {
-					if t == cur {
-						pp.midx = i
-						break
-					}
-				}
-				return pp
-			},
-			stepBack: func(m *model) { m.setTheme("light") },
-			stepFwd:  func(m *model) { m.setTheme("dark") }},
 		{title: "Help", category: "App",
 			dynDesc: func(m *model) string { return slashHint(m, "/help") },
 			dynHint: func(m *model) string { return "/help" },
-			run: func(m *model) (tea.Model, tea.Cmd) {
-				m.settings = nil
-				return m.command("/help")
-			}},
+			command: "/help"},
 		{title: "Quit", category: "App",
 			dynDesc: func(m *model) string { return "exit ghg" },
 			dynHint: func(m *model) string { return "/quit · " + palHintQuit },
-			run:     func(m *model) (tea.Model, tea.Cmd) { return m, tea.Quit }},
+			command: "/quit"},
 	}
 }
 
@@ -377,8 +318,7 @@ func (m *model) openPalette() {
 }
 
 // openPaletteOn opens the settings and drills straight into the named row's
-// sub-panel (used by bare slash commands like /theme that should land on a
-// switcher, not toggle blindly). The invocation counts as being inside the
+// sub-panel. The invocation counts as being inside the
 // panel — not the settings — so enter applies AND closes; esc pops back to
 // the root list.
 func (m *model) openPaletteOn(title string) {
@@ -534,16 +474,7 @@ func (m *model) paletteKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.pushPanel(it)
 		}
 	case tea.KeyEnter:
-		it := p.selected()
-		if it == nil {
-			return m, nil
-		}
-		switch {
-		case it.panel != nil:
-			m.pushPanel(it)
-		case it.run != nil:
-			return it.run(m)
-		}
+		return m.activatePaletteSelection()
 	case tea.KeyBackspace, tea.KeyDelete:
 		if len(p.filter) > 0 {
 			p.filter = p.filter[:len(p.filter)-1]
@@ -588,7 +519,7 @@ func (m *model) paletteMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 			if len(pp.items) > 0 && pp.role == "" {
 				m.previewModel(pp.items[pp.idx])
 			}
-		case panelRole, panelMode, panelCompact, panelTheme:
+		case panelRole, panelMode, panelCompact:
 			pp.midx = paletteClamp(pp.midx+delta, 0, len(pp.list)-1)
 		case panelEffort:
 			pp.lidx = paletteClamp(pp.lidx+delta, 0, len(pp.levels)-1)
@@ -666,7 +597,7 @@ func (m *model) panelMouse(y int, pp *ppanel) (tea.Model, tea.Cmd) {
 			return m, nil // the empty-state row is not selectable
 		}
 		pp.idx = selected
-	case panelRole, panelMode, panelCompact, panelTheme:
+	case panelRole, panelMode, panelCompact:
 		if selected >= len(pp.list) {
 			return m, nil
 		}
@@ -694,8 +625,33 @@ func (m *model) activatePaletteSelection() (tea.Model, tea.Cmd) {
 		m.pushPanel(it)
 		return m, nil
 	}
-	if it.run != nil {
-		return it.run(m)
+	if it.command != "" {
+		m.settings = nil
+		return m.command(it.command)
+	}
+	switch it.action {
+	case paletteActionPlanPrompt:
+		m.settings = nil
+		m.input.SetValue("/plan ")
+		m.input.CursorEnd()
+		m.refreshMenu()
+	case paletteActionReviewPrompt:
+		m.settings = nil
+		m.input.SetValue("/review ")
+		m.input.CursorEnd()
+		m.refreshMenu()
+	case paletteActionRewind:
+		m.settings = nil
+		if !m.busy {
+			m.openRewind()
+		}
+	case paletteActionExportPrompt:
+		m.settings = nil
+		m.input.SetValue("/export-result ")
+		m.input.CursorEnd()
+		m.refreshMenu()
+	case paletteActionToggleThinking:
+		m.toggleThinking()
 	}
 	return m, nil
 }
@@ -725,7 +681,7 @@ func (m *model) panelKey(msg tea.KeyMsg, pp *ppanel) (tea.Model, tea.Cmd) {
 	p := m.settings
 	pop := func() {
 		p.stack = p.stack[:len(p.stack)-1]
-		// a slash command opened this panel directly (bare /effort, /theme):
+		// a slash command opened this panel directly (bare /effort):
 		// commit-and-close, never land on the root list the user didn't open
 		if pp.direct && len(p.stack) == 0 {
 			m.settings = nil
@@ -867,21 +823,6 @@ func (m *model) panelKey(msg tea.KeyMsg, pp *ppanel) (tea.Model, tea.Cmd) {
 			}
 		}
 
-	case panelTheme:
-		switch msg.Type {
-		case tea.KeyEsc, tea.KeyCtrlC:
-			pop()
-		case tea.KeyUp, tea.KeyCtrlP, tea.KeyShiftTab:
-			pp.midx = (pp.midx - 1 + len(pp.list)) % len(pp.list)
-		case tea.KeyDown, tea.KeyCtrlN, tea.KeyTab:
-			pp.midx = (pp.midx + 1) % len(pp.list)
-		case tea.KeyLeft, tea.KeyRight, tea.KeyEnter:
-			m.setTheme(pp.list[pp.midx]) // applies live; re-renders the transcript
-			if msg.Type == tea.KeyEnter {
-				pop()
-			}
-		}
-
 	case panelGoal:
 		switch msg.Type {
 		case tea.KeyEsc, tea.KeyCtrlC:
@@ -907,54 +848,40 @@ func (m *model) previewModel(it modelItem) {
 	if it.model == m.modelName && it.provider == m.provName {
 		return
 	}
-	ag, mn, pn, err := buildAgent(m.cfg, it.model, it.provider, m.sysPrompt)
-	if err != nil {
-		return // unresolved routes stay visible but unselectable-feeling
-	}
-	ag.ReasoningToggle = m.reasoningToggleFor(pn, ag.Model)
-	if m.agent != nil {
-		ag.Effort = m.agent.Effort
-		ag.Messages = append(ag.Messages, m.agent.Messages[1:]...) // carry history
-		ag.CompactBackend, ag.CompactModel = m.agent.CompactBackend, m.agent.CompactModel
-		ag.CompactProvider, ag.CompactProtocol = m.agent.CompactProvider, m.agent.CompactProtocol
-		ag.CompactThreshold = m.agent.CompactThreshold
-	} else {
-		ag.Effort = m.cfg.DefaultEffort
-		if ag.Effort == "" {
-			ag.Effort = "medium"
+	if m.workerOnly {
+		route, err := resolveDisplayRoute(m.cfg, m.profiles, it.model, it.provider, config.RoleDefault)
+		if err == nil {
+			m.modelName, m.provName, m.modelID = route.ModelName, route.ProviderName, route.APIID
+			m.protocol, m.role, m.contextLimit = route.Protocol, route.Role, route.ContextLimit
+			m.effort = m.maxEffort()
+			m.modelSlotW = m.statusModelSlotWidth()
 		}
-		ag.CompactThreshold = compactThresholdFor(m.cfg)
+		return
 	}
-	m.agent, m.modelName, m.provName = ag, mn, pn
-	m.configureArtifactAgent(m.agent)
-	m.applyCompactModel()
-	m.wireTasks()
-	if !slices.Contains(m.effortsFor(), ag.Effort) {
-		m.setEffort("") // the previewed model doesn't support the current level
-	}
+	_ = m.rebuildAgent(it.model, it.provider, config.RoleDefault, true)
 }
 
 // commitGoal applies the goal panel's text: set, clear (empty), or resume.
 // Resuming an unchanged goal continues with the check prompt; a fresh or
 // edited goal starts at round 0 (mirrors /goal resume vs /goal <text>).
 func (m *model) commitGoal(pp *ppanel) {
-	goal := strings.TrimSpace(pp.prepare)
-	if goal == m.goal {
-		if goal != "" && !m.busy {
+	objective := strings.TrimSpace(pp.prepare)
+	if objective == m.goal {
+		if objective != "" && !m.busy {
 			m.goalRounds = 0
-			m.append(dimStyle.Render("◎ resuming goal: " + goal))
-			m.submitGoal(goalContinuePrompt(goal))
+			m.append(dimStyle.Render("◎ resuming goal: " + objective))
+			m.submitGoal(goal.ContinuePrompt(objective))
 		}
 		return
 	}
-	m.setGoal(goal)
-	if goal == "" {
+	m.setGoal(objective)
+	if objective == "" {
 		m.append(dimStyle.Render("(goal cleared)"))
 		return
 	}
-	m.append(dimStyle.Render("◎ goal set: " + goal))
+	m.append(dimStyle.Render("◎ goal set: " + objective))
 	if !m.busy {
-		m.submit(goal)
+		m.submit(objective)
 	}
 }
 
@@ -1279,25 +1206,6 @@ func (m *model) panelContent(pp *ppanel) (rows []string, selected int, footer []
 		}
 		footer = append(footer, "", dimStyle.Render("  ↑/↓ select · enter/←/→ apply · esc back"))
 
-	case panelTheme:
-		cur := m.cfg.Theme
-		if cur == "" {
-			cur = "auto"
-		}
-		for i, name := range pp.list {
-			mark := ""
-			if name == cur {
-				mark = dimStyle.Render("  (current)")
-			}
-			if i == pp.midx {
-				selected = len(rows)
-				rows = append(rows, botStyle.Render(" → "+name)+mark)
-			} else {
-				rows = append(rows, "   "+name+mark)
-			}
-		}
-		footer = []string{"", dimStyle.Render("  ↑/↓ select · enter/←/→ apply · esc back")}
-
 	case panelGoal:
 		rows = []string{" " + youStyle.Render("❯ ") + pp.prepare + dimStyle.Render("█")}
 		footer = []string{"", dimStyle.Render(fmt.Sprintf("  type the goal · empty clears · enter/esc apply · max %d rounds (/goal rounds)", m.goalMaxRounds()))}
@@ -1349,4 +1257,223 @@ func (m *model) panelView(pp *ppanel) string {
 	}
 	visible = append(visible, footer...)
 	return paletteFitLines(visible, m.width, 0)
+}
+
+type modelItem struct {
+	model             string
+	provider          string
+	url               string
+	fromCatalog       bool
+	unavailable       bool
+	unavailableReason string
+}
+
+func resolveModelFuzzy(cfg *config.Config, name string) (string, bool, []string) {
+	if _, ok := cfg.Models[name]; ok {
+		return name, true, nil
+	}
+	for p := range cfg.Providers {
+		if cat, ok := config.LoadCatalogs()[p]; ok && cat.Find(name) != nil {
+			return name, true, nil
+		}
+	}
+	q := strings.ToLower(name)
+	type hit struct {
+		model string
+		tier  int
+	}
+	var hits []hit
+	for _, it := range buildModelItems(cfg) {
+		tm, tp := matchTier(it.model, q), matchTier(it.provider, q)
+		tier := tm
+		if tier < 0 || (tp >= 0 && tp < tier) {
+			tier = tp
+		}
+		if tier >= 0 {
+			hits = append(hits, hit{it.model, tier})
+		}
+	}
+	if len(hits) == 0 {
+		return "", false, nil
+	}
+	best := hits[0].tier
+	seen := map[string]bool{}
+	var models []string
+	for _, h := range hits {
+		if h.tier != best || seen[h.model] {
+			continue
+		}
+		seen[h.model] = true
+		models = append(models, h.model)
+	}
+	if len(models) > 1 {
+		return "", false, models
+	}
+	return models[0], true, nil
+}
+
+func buildModelItems(cfg *config.Config) []modelItem {
+	names := make([]string, 0, len(cfg.Models))
+	for name := range cfg.Models {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	var items []modelItem
+	for _, name := range names {
+		for _, p := range cfg.Models[name].Providers {
+			url := ""
+			if prov, ok := cfg.Providers[p]; ok {
+				url = prov.BaseURL
+			}
+			items = append(items, modelItem{model: name, provider: p, url: url})
+		}
+	}
+	return appendCatalogRoutes(items, cfg, config.LoadCatalogs())
+}
+
+func (m *model) availableModelItems() []modelItem {
+	if m == nil || m.cfg == nil {
+		return nil
+	}
+	all := buildModelItems(m.cfg)
+	items := make([]modelItem, 0, len(all))
+	for _, item := range all {
+		if m.modelRouteConfigured(item) {
+			items = append(items, item)
+		}
+	}
+	return items
+}
+
+func (m *model) modelRouteConfigured(item modelItem) bool {
+	route, err := m.cfg.Resolve(item.model, item.provider)
+	if err != nil {
+		return false
+	}
+	resolved, err := m.profiles.ResolveModel(config.ProviderInstance(route.ProviderName, route.Provider), route.APIID)
+	if err != nil {
+		return false
+	}
+	if !resolved.RequiresAPIKey() {
+		return true
+	}
+	key, err := route.Provider.ResolveKey()
+	return err == nil && strings.TrimSpace(key) != ""
+}
+
+func annotateModelAvailability(cfg *config.Config, profiles models.Profiles, items []modelItem) []modelItem {
+	for i := range items {
+		route, err := cfg.Resolve(items[i].model, items[i].provider)
+		if err != nil {
+			continue
+		}
+		resolved, err := profiles.ResolveModel(config.ProviderInstance(route.ProviderName, route.Provider), route.APIID)
+		if err != nil {
+			items[i].unavailable = true
+			items[i].unavailableReason = err.Error()
+			continue
+		}
+		key := ""
+		if resolved.RequiresAPIKey() {
+			key = "capability-probe"
+		}
+		if _, err := auth.NewBackend(resolved, key, route.Model.API, 0); err != nil {
+			items[i].unavailable = true
+			items[i].unavailableReason = err.Error()
+		}
+	}
+	return items
+}
+
+func appendCatalogRoutes(items []modelItem, cfg *config.Config, cats map[string]config.Catalog) []modelItem {
+	provs := make([]string, 0, len(cfg.Providers))
+	for name := range cfg.Providers {
+		provs = append(provs, name)
+	}
+	sort.Strings(provs)
+	var extra []modelItem
+	for _, p := range provs {
+		cat, ok := cats[p]
+		if !ok {
+			continue
+		}
+		for _, mi := range cat.Models {
+			if _, configured := cfg.Models[mi.ID]; configured {
+				continue
+			}
+			extra = append(extra, modelItem{model: mi.ID, provider: p, url: cat.BaseURL, fromCatalog: true})
+		}
+	}
+	sort.Slice(extra, func(a, b int) bool {
+		if extra[a].model != extra[b].model {
+			return extra[a].model < extra[b].model
+		}
+		return extra[a].provider < extra[b].provider
+	})
+	return append(items, extra...)
+}
+
+func staleCatalogs(cfg *config.Config, cats map[string]config.Catalog) []string {
+	var out []string
+	for name := range cfg.Providers {
+		if cat, ok := cats[name]; !ok || cat.Stale() {
+			out = append(out, name)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func (m *model) openModelPicker() {
+	if len(m.availableModelItems()) == 0 {
+		m.append(errStyle.Render("no models available from configured providers"))
+		return
+	}
+	m.openPaletteOn("Model")
+}
+
+func modelItemLabel(it modelItem) string {
+	line := it.provider + "/" + it.model
+	if it.fromCatalog {
+		line += " (new)"
+	}
+	if it.unavailable {
+		line += " (unsupported: " + it.unavailableReason + ")"
+	}
+	return line
+}
+
+func (m *model) modelsDevProviderIDs(instanceName string) []string {
+	if m.cfg == nil {
+		return []string{instanceName}
+	}
+	prov, ok := m.cfg.Providers[instanceName]
+	if !ok {
+		return []string{instanceName}
+	}
+	return config.ModelsDevProviderIDs(m.profiles, instanceName, prov)
+}
+
+func (m *model) reasoningToggleFor(provName, apiID string) bool {
+	if cat, ok := m.catalogs[provName]; ok {
+		if info := cat.Find(apiID); info != nil && info.ReasoningToggle {
+			return true
+		}
+	}
+	metadata := config.LoadModelsDev()
+	info, ok := metadata.ReasoningFor(apiID, m.modelsDevProviderIDs(provName)...)
+	return ok && info.Toggle
+}
+
+func (m *model) fetchCatalogs(force bool, providers map[string]config.Provider) {
+	if m.cfg == nil {
+		return
+	}
+	cfg := *m.cfg
+	cfg.Providers = providers
+	cats, err := config.FetchCatalogs(context.Background(), &cfg, m.profiles, force, config.CatalogBackendFactory(auth.NewBackend))
+	if err != nil {
+		config.LogEvent("catalog.fetch", err.Error())
+	}
+	sendProg(m.prog, catalogsMsg(cats))
 }
