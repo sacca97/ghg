@@ -111,9 +111,11 @@ func (a *Agent) SetTodos(items []Todo) error {
 // round while the agent is in Plan mode. It is kept as a plain constant here
 // (alongside the mode implementation) rather than routed through prompt
 // loading — Plan mode is a collaboration mode, not an agent definition.
-const planModePrompt = `You are planning in a read-only collaboration mode. You have only these read-only tools: read, grep, glob, lsp, find_files, output_list, output_read, history_search, and history_read. You cannot write, edit, run shell commands, spawn tasks, or mutate memory — treat them as unavailable.
+const planModePrompt = `You are planning in a read-only collaboration mode. Use only the read-only tools currently exposed in this request. You cannot write, edit, run shell commands, spawn tasks, or mutate memory — treat them as unavailable.
 
-Inspect only the code necessary to understand requirements, locate relevant components, and resolve ambiguity. Do not reread files already inspected. Once you have sufficient evidence to make implementation decisions complete, synthesize your findings and produce the plan.
+Use grep for text, structural_search for syntax-aware code shapes, lsp for semantic symbol questions, and read only for the exact source needed. Prefer composite lsp operations when they eliminate an otherwise deterministic locate→navigate→read sequence.
+
+Inspect only the code necessary to understand requirements, locate relevant components, and resolve ambiguity. Reuse evidence already gathered and do not reread unchanged source. Once the remaining uncertainties cannot materially change the implementation decisions, stop exploring and produce the plan.
 
 End your response with a Markdown implementation plan in a single, exact block:
 
@@ -125,22 +127,23 @@ A response without that block is valid only when actively gathering necessary in
 
 const askModePrompt = `You are answering the user's question in a read-only mode. Answer the question directly; it may be about the repository or a general subject, and infer which from the question.
 
-If the question concerns the repository, inspect only the files and evidence needed to answer accurately. You have read-only tools: read, grep, glob, lsp, find_files, output_list, output_read, history_search, and history_read. You cannot write or edit files, run shell commands, spawn tasks, update goals, or otherwise mutate anything. Do not propose an implementation plan unless the user explicitly asks for one.`
+If the question concerns the repository, inspect only the files and evidence needed to answer accurately. Use only the read-only tools currently exposed in this request. You cannot write or edit files, run shell commands, spawn tasks, update goals, or otherwise mutate anything. Do not propose an implementation plan unless the user explicitly asks for one.`
 
 // planSafeTools is the read-only allowlist shared by Plan and Ask modes. Enforcement
 // happens when building "available", not only through prompting, so mutating
 // and side-effecting tools are structurally unreachable in Plan mode. MCP tools
 // are intentionally excluded because ghg cannot prove they are read-only.
 var planSafeTools = map[string]bool{
-	"read":           true,
-	"grep":           true,
-	"glob":           true,
-	"lsp":            true,
-	"find_files":     true,
-	"output_list":    true,
-	"output_read":    true,
-	"history_search": true,
-	"history_read":   true,
+	"read":              true,
+	"grep":              true,
+	"structural_search": true,
+	"glob":              true,
+	"lsp":               true,
+	"find_files":        true,
+	"output_list":       true,
+	"output_read":       true,
+	"history_search":    true,
+	"history_read":      true,
 }
 
 // planTools returns the read-only tool allowlist. It intentionally

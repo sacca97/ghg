@@ -207,7 +207,8 @@ func buildBubblewrapBase(p *Policy) []string {
 		"--unshare-uts",
 		"--unshare-ipc",
 		"--cap-drop", "ALL",
-		"--no-new-privs",
+		// bubblewrap applies PR_SET_NO_NEW_PRIVS itself; it has no
+		// --no-new-privs command-line option.
 		"--tmpfs", "/",
 		"--proc", "/proc",
 		"--dev", "/dev",
@@ -270,8 +271,9 @@ func splitMountPath(root string) []string {
 }
 
 type bubblewrapMounts struct {
-	args *([]string)
-	dirs map[string]bool
+	args       *([]string)
+	dirs       map[string]bool
+	boundRoots []string
 }
 
 func newBubblewrapMounts(args *[]string) *bubblewrapMounts {
@@ -285,6 +287,7 @@ func (m *bubblewrapMounts) bind(kind, root string) {
 	root = filepath.Clean(root)
 	m.mkdir(root)
 	*m.args = append(*m.args, kind, root, root)
+	m.boundRoots = append(m.boundRoots, root)
 }
 
 func (m *bubblewrapMounts) mkdir(root string) {
@@ -293,13 +296,25 @@ func (m *bubblewrapMounts) mkdir(root string) {
 	}
 	root = filepath.Clean(root)
 	mkdir := []string{}
-	for current := root; !m.dirs[current]; current = filepath.Dir(current) {
+	for current := root; !m.dirs[current] && !m.boundByAncestor(current); current = filepath.Dir(current) {
 		mkdir = append(mkdir, current)
 	}
 	for i := len(mkdir) - 1; i >= 0; i-- {
 		*m.args = append(*m.args, "--dir", mkdir[i])
+		// Keep unbound siblings from being created in the synthetic tree;
+		// explicitly bound cache/workspace roots are mounted afterward.
+		*m.args = append(*m.args, "--chmod", "0555", mkdir[i])
 		m.dirs[mkdir[i]] = true
 	}
+}
+
+func (m *bubblewrapMounts) boundByAncestor(path string) bool {
+	for _, root := range m.boundRoots {
+		if path == root || within(path, root) {
+			return true
+		}
+	}
+	return false
 }
 
 func pathExists(path string) bool {

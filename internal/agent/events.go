@@ -29,13 +29,17 @@ type Events struct {
 	OnCompactionReady func(messages []models.Message, summary string, cutoff int) error
 }
 
-// ToolTelemetry records the distinction between what a tool produced, what
-// was retained for recovery, and what the model actually saw. It is emitted
-// after output attachment so the output reference is included in the same
-// lifecycle boundary as the tool result.
+// ToolTelemetry records one tool's batch position, execution duration, and
+// the distinction between what it produced, what was retained for recovery,
+// and what the model actually saw. It is emitted after output attachment so
+// the output reference is included in the same lifecycle boundary as the tool
+// result.
 type ToolTelemetry struct {
 	ID            string            `json:"id,omitempty"`
 	Name          string            `json:"name"`
+	BatchSize     int               `json:"batch_size"`
+	SameToolCount int               `json:"same_tool_count"`
+	DurationMS    int64             `json:"duration_ms"`
 	PreviewBytes  int               `json:"preview_bytes"`
 	RetainedBytes int               `json:"retained_bytes"`
 	OriginalBytes int64             `json:"original_bytes"`
@@ -57,16 +61,19 @@ type ModelCallStart struct {
 	Purpose  string `json:"purpose,omitempty"`
 }
 
-// ModelCallEnd completes a ModelCallStart with request timing and provider
-// metadata. Usage is included even when all its fields are zero: some
+// ModelCallEnd completes a ModelCallStart with request timing, provider
+// metadata, and the one-shot exploration checkpoint state for the next model
+// response. Usage is included even when all its fields are zero: some
 // providers omit accounting, and consumers should not infer that a call did
 // not happen from a zero value.
 type ModelCallEnd struct {
 	ModelCallStart
-	LatencyMS    int64        `json:"latency_ms"`
-	FinishReason string       `json:"finish_reason,omitempty"`
-	Usage        models.Usage `json:"usage"`
-	Error        string       `json:"error,omitempty"`
+	LatencyMS                int64        `json:"latency_ms"`
+	FinishReason             string       `json:"finish_reason,omitempty"`
+	Usage                    models.Usage `json:"usage"`
+	CheckpointLevel          int          `json:"checkpoint_level"`
+	ContinuedAfterCheckpoint bool         `json:"continued_after_checkpoint"`
+	Error                    string       `json:"error,omitempty"`
 }
 
 // PromptView records bounded request-shape telemetry without retaining the

@@ -70,7 +70,7 @@ type findFilesArgs struct {
 func grepTool() Tool {
 	return resultTool(models.NewTool("grep",
 		"Search text files for a regular expression. Prefer this for text; use patterns for one OR search. Results respect nested .gitignore files, skip binaries and symlinks, are grouped by file, and paginate with cursor.",
-		`{"type":"object","properties":{"pattern":{"type":"string","description":"Regular expression to search for; use patterns for multiple alternatives"},"patterns":{"type":"array","items":{"type":"string"},"description":"Regular expressions ORed together and searched in one traversal"},"path":{"type":"string","description":"File or directory to search (default: current working directory)"},"include":{"type":"string","description":"Optional glob filter such as *.go"},"max_results":{"type":"integer","description":"Matches per page (default 25, maximum 10000)"},"cursor":{"type":"string","description":"Cursor returned by an earlier page; reuse it with max_results to continue"},"case_sensitive":{"type":"boolean","description":"Whether the expression is case-sensitive (default true)"},"literal":{"type":"boolean","description":"Treat patterns as literal text instead of regular expressions"}},"required":["pattern"]}`),
+		`{"type":"object","properties":{"pattern":{"type":"string","description":"Regular expression to search for; use patterns for multiple alternatives"},"patterns":{"type":"array","items":{"type":"string"},"description":"Regular expressions ORed together and searched in one traversal"},"path":{"type":"string","description":"File or directory to search (default: current working directory)"},"include":{"type":"string","description":"Optional glob filter such as *.go"},"max_results":{"type":"integer","description":"Matches per page (default 25, maximum 10000)"},"cursor":{"type":"string","description":"Cursor returned by an earlier page; reuse it with max_results to continue"},"case_sensitive":{"type":"boolean","description":"Whether the expression is case-sensitive (default true)"},"literal":{"type":"boolean","description":"Treat patterns as literal text instead of regular expressions"}},"anyOf":[{"required":["pattern"]},{"required":["patterns"]},{"required":["cursor"]}]}`),
 		runGrepResult)
 }
 
@@ -531,6 +531,9 @@ func selectSearchPage(snapshot search.Snapshot, chunks [][]search.Item, offset, 
 					lastPath = item.Path
 				}
 				chunkBytes += len(item.Text) + 12 // "  %d:%s\n"
+				if snapshot.Kind == structuralSearchKind {
+					chunkBytes += 64 + len(item.ObservationID)
+				}
 			}
 		} else {
 			for _, item := range chunk {
@@ -596,7 +599,15 @@ func renderSearchPage(kind string, items []search.Item, total, displayed, remain
 					b.WriteString(":\n")
 					lastPath = item.Path
 				}
-				fmt.Fprintf(&b, "  %d:%s\n", item.Line, item.Text)
+				if kind == structuralSearchKind {
+					fmt.Fprintf(&b, "  %s", structuralRange(item))
+					if item.ObservationID != "" {
+						fmt.Fprintf(&b, " [observation %s]", item.ObservationID)
+					}
+					fmt.Fprintf(&b, ": %s\n", item.Text)
+				} else {
+					fmt.Fprintf(&b, "  %d:%s\n", item.Line, item.Text)
+				}
 			}
 		} else {
 			for _, item := range items {
@@ -615,6 +626,13 @@ func renderSearchPage(kind string, items []search.Item, total, displayed, remain
 		fmt.Fprintf(&b, "[incomplete search snapshot: %s; omitted results are unavailable]", snapshot.Reason)
 	}
 	return strings.TrimSuffix(b.String(), "\n")
+}
+
+func structuralRange(item search.Item) string {
+	if item.StartColumn <= 0 || item.EndLine <= 0 || item.EndColumn <= 0 {
+		return fmt.Sprint(item.Line)
+	}
+	return fmt.Sprintf("%d:%d-%d:%d", item.Line, item.StartColumn, item.EndLine, item.EndColumn)
 }
 
 func grepSnapshotFile(ctx context.Context, fsys fs.FS, name, display string, matcher *regexp.Regexp, out *searchCollector) error {
@@ -686,7 +704,19 @@ func rankSearchItems(items []search.Item, scope *searchScope, requested string, 
 		if a.Path != b.Path {
 			return a.Path < b.Path
 		}
-		return a.Line < b.Line
+		if a.Line != b.Line {
+			return a.Line < b.Line
+		}
+		if a.StartColumn != b.StartColumn {
+			return a.StartColumn < b.StartColumn
+		}
+		if a.EndLine != b.EndLine {
+			return a.EndLine < b.EndLine
+		}
+		if a.EndColumn != b.EndColumn {
+			return a.EndColumn < b.EndColumn
+		}
+		return a.Pattern < b.Pattern
 	})
 }
 

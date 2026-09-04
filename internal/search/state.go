@@ -24,9 +24,16 @@ import (
 // Item is one stable search result. Line is zero for path-only results such as
 // glob and find_files.
 type Item struct {
-	Path string `json:"path"`
-	Line int    `json:"line,omitempty"`
-	Text string `json:"text,omitempty"`
+	Path          string `json:"path"`
+	Line          int    `json:"line,omitempty"`
+	Text          string `json:"text,omitempty"`
+	StartColumn   int    `json:"start_column,omitempty"`
+	EndLine       int    `json:"end_line,omitempty"`
+	EndColumn     int    `json:"end_column,omitempty"`
+	StartByte     int    `json:"start_byte,omitempty"`
+	EndByte       int    `json:"end_byte,omitempty"`
+	Pattern       int    `json:"pattern,omitempty"`
+	ObservationID string `json:"-"`
 }
 
 // Snapshot is the bounded result set behind a pagination cursor. It is

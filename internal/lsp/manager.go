@@ -132,6 +132,40 @@ func (m *Manager) SetRuntime(runtime *tools.ToolRuntime) {
 	}
 }
 
+// CapabilityStatus performs the deterministic part of LSP preflight without
+// starting a server. A manager can still report a server as failed later if
+// its initialize handshake or project setup fails.
+func (m *Manager) CapabilityStatus() (bool, []string) {
+	if m == nil {
+		return false, nil
+	}
+	m.mu.Lock()
+	specs := make(map[string]ServerSpec, len(m.specs))
+	for name, spec := range m.specs {
+		specs[name] = spec
+	}
+	m.mu.Unlock()
+
+	available := false
+	var missing []string
+	for _, name := range slices.Sorted(maps.Keys(specs)) {
+		spec := specs[name]
+		if spec.Disabled || len(spec.Command) == 0 {
+			continue
+		}
+		if _, err := exec.LookPath(spec.Command[0]); err != nil {
+			if name == "gopls" {
+				missing = append(missing, fmt.Sprintf("gopls unavailable: Go LSP operations are unavailable because %s is not on PATH", spec.Command[0]))
+			} else {
+				missing = append(missing, fmt.Sprintf("%s unavailable: %s is not on PATH", name, spec.Command[0]))
+			}
+			continue
+		}
+		available = true
+	}
+	return available, missing
+}
+
 type clientState struct {
 	cli              *client
 	cmd              *exec.Cmd

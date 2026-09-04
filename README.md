@@ -7,7 +7,7 @@ Go GHG Go
 </pre>
 </div>
 
-An LLM tool-use loop (bash / read / write / edit / grep / glob / find_files / lsp / task), an interactive
+An LLM tool-use loop (bash / read / write / edit / grep / structural_search / glob / find_files / lsp / task), an interactive
 bubbletea session, and provider-routable models. One binary, no runtime,
 config you can read.
 

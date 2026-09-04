@@ -107,7 +107,7 @@ func truncateNote(value string) string {
 	if len(value) <= MaxNoteBytes {
 		return value
 	}
-	return value[:MaxNoteBytes]
+	return value[:utf8Prefix(value, MaxNoteBytes)]
 }
 
 const GoalToolName = "update_goal"
@@ -269,7 +269,11 @@ func truncateField(s string, n int) string {
 	s = strings.ReplaceAll(s, "\n", " ")
 	s = strings.TrimSpace(s)
 	if len(s) > n {
-		return s[:n-1] + "…"
+		const suffix = "…"
+		if n <= len(suffix) {
+			return s[:utf8Prefix(s, n)]
+		}
+		return s[:utf8Prefix(s, n-len(suffix))] + suffix
 	}
 	return s
 }

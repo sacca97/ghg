@@ -198,7 +198,7 @@ func TestRunPlanOnlyUsesReadOnlyPlannerAndExits(t *testing.T) {
 	}
 	for _, name := range names {
 		switch name {
-		case "read", "grep", "glob", "find_files", "lsp", "output_list", "output_read", "history_search", "history_read":
+		case "read", "grep", "structural_search", "glob", "find_files", "lsp", "output_list", "output_read", "history_search", "history_read":
 		default:
 			t.Fatalf("planner exposed non-read-only tool %q (all tools: %q)", name, strings.Join(names, ","))
 		}

@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/sacca97/ghg/internal/models"
 	"github.com/sacca97/ghg/internal/session"
@@ -71,6 +72,14 @@ func TestReadCoverageSuppressesRedundantRanges(t *testing.T) {
 	next := run(readCall("read-4", fmt.Sprintf(`{"path":%q,"offset":121,"limit":140}`, path)))[0]
 	if next.ExitCode != 0 || next.Metadata["duplicate_suppressed"] == "true" || !strings.Contains(next.Preview, "121\tline 121") {
 		t.Fatalf("pagination read was not executed: %+v", next)
+	}
+	eof := run(readCall("read-eof", fmt.Sprintf(`{"path":%q,"offset":401,"limit":200}`, path)))[0]
+	eofRepeat := run(readCall("read-eof-repeat", fmt.Sprintf(`{"path":%q,"offset":401,"limit":200}`, path)))[0]
+	if eof.ExitCode != 0 || eof.Metadata["observation_next_offset"] != "0" {
+		t.Fatalf("EOF read metadata = %+v", eof)
+	}
+	if eofRepeat.ExitCode != 0 || !strings.Contains(eofRepeat.Preview, "already reaches EOF") || strings.Contains(eofRepeat.Preview, "offset 501") {
+		t.Fatalf("EOF repeat guidance = %+v", eofRepeat)
 	}
 
 	batch := run(
@@ -263,13 +272,25 @@ func TestToolTelemetryReportsPreviewRetentionAndRedirect(t *testing.T) {
 			},
 		},
 	}
-	var got ToolTelemetry
-	a.runToolResultsWithTools(context.Background(), []models.ToolCall{{ID: "call-1", Function: struct {
-		Name      string `json:"name"`
-		Arguments string `json:"arguments"`
-	}{Name: "probe", Arguments: `{}`}}}, Events{OnToolTelemetry: func(value ToolTelemetry) { got = value }}, a.AllTools())
-	if got.Name != "probe" || got.ID != "call-1" || got.PreviewBytes != len("preview") || got.RetainedBytes != 100 || got.OriginalBytes != 100 || !got.Truncated {
-		t.Fatalf("telemetry = %+v", got)
+	var telemetryMu sync.Mutex
+	var telemetry []ToolTelemetry
+	calls := []models.ToolCall{{ID: "call-1"}, {ID: "call-2"}}
+	for i := range calls {
+		calls[i].Function.Name = "probe"
+		calls[i].Function.Arguments = fmt.Sprintf(`{"probe":%d}`, i)
+	}
+	a.runToolResultsWithTools(context.Background(), calls, Events{OnToolTelemetry: func(value ToolTelemetry) {
+		telemetryMu.Lock()
+		telemetry = append(telemetry, value)
+		telemetryMu.Unlock()
+	}}, a.AllTools())
+	if len(telemetry) != 2 {
+		t.Fatalf("telemetry events = %d, want 2", len(telemetry))
+	}
+	for _, got := range telemetry {
+		if got.Name != "probe" || got.BatchSize != 2 || got.SameToolCount != 2 || got.DurationMS < 0 || got.PreviewBytes != len("preview") || got.RetainedBytes != 100 || got.OriginalBytes != 100 || !got.Truncated {
+			t.Fatalf("telemetry = %+v", got)
+		}
 	}
 
 	redirect := tools.ExecuteResult(context.Background(), tools.All(), "bash", json.RawMessage(`{"command":"grep -r TODO ."}`))
@@ -778,6 +799,34 @@ func TestTurnAuthoredMarksMessage(t *testing.T) {
 	}
 }
 
+func TestContinueReplaysOnlyAuthoredMessageParts(t *testing.T) {
+	srv := textServer(t, func(n int, req models.Request) string { return "done" })
+	defer srv.Close()
+
+	image := models.ImagePart("png", []byte{1, 2, 3})
+	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
+	ag.Messages = append(ag.Messages, models.Message{
+		Role: "user", Content: "inspect this image", Parts: []models.ContentPart{image}, Authored: true,
+	})
+	if _, err := ag.TurnAuthored(context.Background(), "continue", Events{}); err != nil {
+		t.Fatal(err)
+	}
+	if got := ag.Messages[1]; got.Content != "inspect this image" || !got.Authored || len(got.Parts) != 1 {
+		t.Fatalf("authored continue did not preserve the message: %+v", got)
+	}
+
+	injected := New(testBackend(srv.URL, "k"), "m", 100, "sys")
+	injected.Messages = append(injected.Messages, models.Message{
+		Role: "user", Content: "injected prompt", Parts: []models.ContentPart{image},
+	})
+	if _, err := injected.TurnAuthored(context.Background(), "continue", Events{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(injected.Messages) != 4 || injected.Messages[1].Content != "injected prompt" || len(injected.Messages[1].Parts) != 1 || injected.Messages[2].Content != "continue" {
+		t.Fatalf("injected continue was incorrectly replayed: %+v", injected.Messages)
+	}
+}
+
 // TestUsageAccumulates verifies every stream call folds its usage into the
 // session totals (input/output/cached) and fires OnUsage per request.
 func TestUsageAccumulates(t *testing.T) {
@@ -843,7 +892,12 @@ func TestSteerContinuesTurn(t *testing.T) {
 	ag.Steer("also do this") // queued before the first response completes
 	var steered []string
 	final, err := ag.Turn(context.Background(), "go", Events{
-		OnSteer: func(s string) { steered = append(steered, s) },
+		OnSteer: func(s string) {
+			steered = append(steered, s)
+			if got := ag.MessageCount(); got == 0 {
+				t.Error("message snapshot callback saw no conversation")
+			}
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -863,6 +917,112 @@ func TestNoSteerEndsTurn(t *testing.T) {
 	final, err := ag.Turn(context.Background(), "go", Events{})
 	if err != nil || final != "done" {
 		t.Fatalf("%q %v", final, err)
+	}
+}
+
+func TestUnavailableCapabilitiesAreNotAdvertised(t *testing.T) {
+	t.Setenv("SHELL", filepath.Join(t.TempDir(), "missing-shell"))
+	backend := &fakeBackend{}
+	ag := New(backend, "model", 100, "system")
+	ag.Runtime = &tools.ToolRuntime{}
+	if _, err := ag.Turn(context.Background(), "answer", Events{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(backend.streamRequests) != 1 {
+		t.Fatalf("stream requests = %d, want 1", len(backend.streamRequests))
+	}
+	req := backend.streamRequests[0]
+	for _, tool := range req.Tools {
+		if tool.Function.Name == "bash" || tool.Function.Name == "lsp" || tool.Function.Name == "lsp_rename" {
+			t.Fatalf("unavailable tool advertised: %q", tool.Function.Name)
+		}
+	}
+	for _, message := range req.Messages {
+		if strings.Contains(message.Content, "bash") {
+			t.Fatalf("unavailable bash mentioned in request context: %q", message.Content)
+		}
+	}
+	if !requestContains(req, "lsp unavailable") {
+		t.Fatalf("capability notice missing: %+v", req.Messages)
+	}
+}
+
+type checkpointBackend struct {
+	responses []models.Message
+	requests  []models.Request
+}
+
+func (b *checkpointBackend) Stream(_ context.Context, req models.Request, _ models.EventSink) (models.Message, models.Usage, error) {
+	b.requests = append(b.requests, req)
+	if len(b.requests) > len(b.responses) {
+		return models.Message{Role: "assistant", Content: "done"}, models.Usage{}, nil
+	}
+	return b.responses[len(b.requests)-1], models.Usage{}, nil
+}
+
+func (b *checkpointBackend) Complete(_ context.Context, _ models.Request) (models.Message, models.Usage, error) {
+	return models.Message{Role: "assistant", Content: "done"}, models.Usage{}, nil
+}
+
+func TestExplorationCheckpointsAreTransientAndNonBlocking(t *testing.T) {
+	call := func(id, name, args string) models.ToolCall {
+		return models.ToolCall{ID: id, Type: "function", Function: struct {
+			Name      string `json:"name"`
+			Arguments string `json:"arguments"`
+		}{Name: name, Arguments: args}}
+	}
+	responses := []models.Message{{
+		Role: "assistant",
+		ToolCalls: []models.ToolCall{
+			call("write-1", "write", `{"path":"changed.go"}`),
+			call("grep-1", "grep", `{"pattern":"after-write"}`),
+		},
+	}, {
+		Role:      "assistant",
+		ToolCalls: []models.ToolCall{call("read-verify", "read", `{"path":"changed.go"}`)},
+	}}
+	for i := 0; i < explorationCheckpointFinal; i++ {
+		responses = append(responses, models.Message{
+			Role:      "assistant",
+			ToolCalls: []models.ToolCall{call(fmt.Sprintf("grep-%d", i+2), "grep", fmt.Sprintf(`{"pattern":"query-%d"}`, i))},
+		})
+	}
+	responses = append(responses, models.Message{Role: "assistant", Content: "done"})
+
+	backend := &checkpointBackend{responses: responses}
+	ag := New(backend, "model", 100, "system")
+	ag.Tools = []tools.Tool{
+		{Def: models.NewTool("read", "read", `{"type":"object"}`), Run: func(context.Context, json.RawMessage) (string, error) { return "ok", nil }},
+		{Def: models.NewTool("grep", "grep", `{"type":"object"}`), Run: func(context.Context, json.RawMessage) (string, error) { return "ok", nil }},
+		{Def: models.NewTool("write", "write", `{"type":"object"}`), Run: func(context.Context, json.RawMessage) (string, error) { return "ok", nil }},
+	}
+	var ends []ModelCallEnd
+	if _, err := ag.Turn(context.Background(), "explore", Events{OnModelCallEnd: func(end ModelCallEnd) { ends = append(ends, end) }}); err != nil {
+		t.Fatal(err)
+	}
+	if len(backend.requests) != explorationCheckpointFinal+3 || len(ends) != len(backend.requests) {
+		t.Fatalf("model calls = %d/%d, want %d", len(backend.requests), len(ends), explorationCheckpointFinal+3)
+	}
+	for index, level := range map[int]int{explorationCheckpointOne + 2: 1, explorationCheckpointTwo + 2: 2, explorationCheckpointFinal + 2: 3} {
+		if !requestContains(backend.requests[index], fmt.Sprintf(`level="%d"`, level)) {
+			t.Fatalf("request %d lacks checkpoint level %d", index+1, level)
+		}
+		if ends[index].CheckpointLevel != level {
+			t.Fatalf("model call %d checkpoint level = %d, want %d", index+1, ends[index].CheckpointLevel, level)
+		}
+	}
+	if ends[explorationCheckpointFinal+2].ContinuedAfterCheckpoint {
+		t.Fatal("final response incorrectly reported continuation after checkpoint")
+	}
+	for i, req := range backend.requests {
+		if i != explorationCheckpointOne+2 && i != explorationCheckpointTwo+2 && i != explorationCheckpointFinal+2 && requestContains(req, "<exploration_checkpoint") {
+			t.Fatalf("checkpoint reminder repeated at request %d", i+1)
+		}
+	}
+	for _, message := range ag.MessagesSnapshot() {
+		if strings.Contains(message.Content, "<exploration_checkpoint") {
+			t.Fatal("checkpoint reminder was persisted in conversation history")
+		}
 	}
 }
 
@@ -1022,6 +1182,7 @@ func TestTurnAutoCompactsOnContextLimit(t *testing.T) {
 			models.Message{Role: "assistant", Content: fmt.Sprintf("a%d", i)},
 		)
 	}
+	ag.compacted = true // a prior review checkpoint must not disable this turn's retry
 	var compacted int
 	final, err := ag.Turn(context.Background(), "go", Events{
 		OnCompact: func(took, kept int) { compacted++ },
@@ -1318,8 +1479,23 @@ func (b *routeBackend) Complete(context.Context, models.Request) (models.Message
 func TestCompactTooLittleHistory(t *testing.T) {
 	ag := New(testBackend("http://unused", "k"), "m", 100, "sys")
 	ag.Messages = append(ag.Messages, models.Message{Role: "user", Content: "hi"})
-	if _, _, err := ag.compactWithEvents(context.Background(), Events{}); err == nil {
+	if _, _, err := ag.compactWithEvents(context.Background(), Events{}); !errors.Is(err, ErrNotEnoughHistory) {
 		t.Fatal("expected error compacting a tiny history")
+	}
+}
+
+func TestAgentBoundedTextPreservesUTF8(t *testing.T) {
+	note := truncateNote(strings.Repeat("界", MaxNoteBytes))
+	if !utf8.ValidString(note) || len(note) > MaxNoteBytes {
+		t.Fatalf("truncated note is not valid and bounded UTF-8: bytes=%d", len(note))
+	}
+	field := truncateField(strings.Repeat("界", 100), 10)
+	if !utf8.ValidString(field) || len(field) > 10 {
+		t.Fatalf("truncated field is not valid and bounded UTF-8: %q", field)
+	}
+	content := shrinkCompactionContent(strings.Repeat("界", 1000)+"\n[output ref]", 100)
+	if !utf8.ValidString(content) || len(content) > 100 {
+		t.Fatalf("shrunk compaction content is not valid and bounded UTF-8: bytes=%d", len(content))
 	}
 }
 
@@ -1943,6 +2119,92 @@ func TestSecondMalformedToolCallTerminatesTurn(t *testing.T) {
 	}
 }
 
+func TestOversizedValidToolBatchIsRetriedWithoutMutation(t *testing.T) {
+	args := fmt.Sprintf(`{"data":%q}`, strings.Repeat("x", 200*1024))
+	calls := make([]models.ToolCall, 3)
+	for i := range calls {
+		calls[i] = models.ToolCall{ID: fmt.Sprintf("call-%d", i), Type: "function"}
+		calls[i].Function.Name = "test_tool"
+		calls[i].Function.Arguments = args
+	}
+	if malformed, tooLarge := findMalformedToolCalls(calls); len(malformed) != 0 || !tooLarge {
+		t.Fatalf("valid oversized batch classified incorrectly: malformed=%v tooLarge=%t", malformed, tooLarge)
+	}
+
+	var executed int
+	backend := &mockAgentBackend{responses: []models.Message{
+		{Role: "assistant", ToolCalls: calls},
+		{Role: "assistant", Content: "recovered"},
+	}}
+	ag := New(backend, "test-model", 1000, "sys")
+	ag.Tools = []tools.Tool{{
+		Def: models.NewTool("test_tool", "test tool", "{}"),
+		Run: func(context.Context, json.RawMessage) (string, error) {
+			executed++
+			return "unexpected", nil
+		},
+	}}
+	got, err := ag.Turn(context.Background(), "do work", Events{})
+	if err != nil || got != "recovered" {
+		t.Fatalf("oversized batch recovery: result=%q err=%v", got, err)
+	}
+	if executed != 0 {
+		t.Fatalf("oversized valid calls must not execute, got %d executions", executed)
+	}
+	var retained bool
+	for _, msg := range ag.Messages {
+		if msg.Role == "assistant" && len(msg.ToolCalls) == len(calls) {
+			retained = true
+			if msg.ToolCalls[0].Function.Arguments != args {
+				t.Fatal("valid oversized arguments were mutated")
+			}
+		}
+		if msg.Role == "tool" && !strings.Contains(msg.Content, "aggregate argument size") {
+			t.Fatalf("oversized batch error missing from tool result: %q", msg.Content)
+		}
+	}
+	if !retained {
+		t.Fatal("oversized assistant tool call was not retained for retry")
+	}
+}
+
+func TestToolFailureClassificationUsesExitCode(t *testing.T) {
+	if _, failed := toolResultError(tools.ToolResult{Preview: "Error: successful output"}); failed {
+		t.Fatal("successful output beginning with Error: was classified as a failure")
+	}
+	text, failed := toolResultError(tools.ToolResult{Preview: "Error: failed output", ExitCode: 1})
+	if !failed || text != "failed output" {
+		t.Fatalf("failed result classification: text=%q failed=%t", text, failed)
+	}
+}
+
+func TestDuplicateToolDiagnosticUsesResponseOrder(t *testing.T) {
+	ag := New(nil, "model", 100, "sys")
+	call := func(id, name string) models.ToolCall {
+		return models.ToolCall{ID: id, Type: "function", Function: struct {
+			Name      string `json:"name"`
+			Arguments string `json:"arguments"`
+		}{Name: name, Arguments: `{}`}}
+	}
+	err := ag.validateToolBatch([]models.ToolCall{
+		call("read-1", "read"), call("read-2", "read"),
+		call("write-1", "write"), call("write-2", "write"),
+	})
+	if err == nil || !strings.Contains(err.Error(), "duplicate tool calls: read repeated 2 times") {
+		t.Fatalf("duplicate diagnostic was not response-ordered: %v", err)
+	}
+}
+
+func TestSeenOperationTelemetryIsBounded(t *testing.T) {
+	ag := &Agent{}
+	for i := 0; i <= maxSeenOperations; i++ {
+		ag.seenOperationCount(fmt.Sprintf("fingerprint-%d", i))
+	}
+	if len(ag.seenOperation) > maxSeenOperations {
+		t.Fatalf("seen operation telemetry grew beyond limit: %d", len(ag.seenOperation))
+	}
+}
+
 func TestSandboxCapabilityFailureTerminatesTurn(t *testing.T) {
 	sandboxTool := tools.Tool{
 		Def: models.NewTool("bash", "bash", "{}"),
@@ -1991,6 +2253,9 @@ func TestSandboxCapabilityFailureTerminatesTurn(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "sandbox capability failure") {
 		t.Fatalf("expected sandbox capability failure error, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), "go test ./...") {
+		t.Fatalf("expected denied command in capability error, got: %v", err)
 	}
 	if backend.callCount != 1 {
 		t.Fatalf("expected exactly 1 model call without retry, got %d", backend.callCount)
@@ -2054,14 +2319,14 @@ func TestDisabledOutputsExplainUnrecoverableOutput(t *testing.T) {
 }
 func TestSubagentGuidanceMatchesBoundedExplorationTools(t *testing.T) {
 	prompt := subagentPrompt()
-	for _, fragment := range []string{"grep", "glob", "find_files", "lsp", "lsp_rename", "bounded read", "observed edit ranges"} {
+	for _, fragment := range []string{"currently exposed", "bounded repository-navigation", "observed edit ranges"} {
 		if !strings.Contains(prompt, fragment) {
 			t.Errorf("subagent prompt lacks %q: %s", fragment, prompt)
 		}
 	}
 	parent := New(nil, "model", 100, "system")
 	description := taskTool(parent).Def.Function.Description
-	for _, fragment := range []string{"grep", "glob", "find_files", "lsp", "lsp_rename", "observed edit ranges"} {
+	for _, fragment := range []string{"currently available tools", "bounded repository navigation", "observed edit ranges"} {
 		if !strings.Contains(description, fragment) {
 			t.Errorf("task description lacks %q: %s", fragment, description)
 		}

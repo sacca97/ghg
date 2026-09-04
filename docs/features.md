@@ -38,7 +38,8 @@ a concurrency counter), `TestSamePathEditsSerialize`, `TestToolMutationPath`,
 ### Native grep, glob, and fuzzy path search
 
 `internal/tools/search.go` provides read-only native `grep`, `glob`, and
-`find_files` tools. `grep` accepts a regular expression or an OR `patterns`
+`find_files` tools; `internal/tools/structural_search.go` adds bounded,
+Go-only structural matching with metavariables. `grep` accepts a regular expression or an OR `patterns`
 array, groups matching lines by file, ranks narrow/touched/modified paths, and
 returns stable cursor pages with a small per-file cap. `glob` returns exact
 relative-pattern matches; `find_files` uses the shared fuzzy path index and

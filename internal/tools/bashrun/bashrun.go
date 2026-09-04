@@ -49,6 +49,14 @@ func userShell() string {
 	return "bash"
 }
 
+// Available reports whether the shell selected by Run can be started. It is
+// deliberately a PATH check only; execution still owns the real start/error
+// path.
+func Available() bool {
+	_, err := exec.LookPath(userShell())
+	return err == nil
+}
+
 // passwdShell reads the current user's shell field from /etc/passwd (last
 // colon-separated field of their entry). Empty when unresolvable — NIS/LDAP
 // users fall through to bash, same as before this change.

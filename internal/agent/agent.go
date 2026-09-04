@@ -27,10 +27,18 @@ const (
 
 	planFinalizationToolError   = "Error: exploration is complete for this plan. Tools are disabled; emit the final <proposed_plan> block now."
 	reviewFinalizationToolError = "Error: exploration is complete for this review. Only submit_review is available; submit the best evidence-backed result now."
-	malformedToolCallError      = "Error: tool call arguments were malformed (invalid JSON or exceeded size limit) and were omitted. Reissue the call with valid JSON arguments."
+	malformedToolCallError      = "Error: tool call arguments were malformed (invalid JSON or exceeded the per-call size limit) and were omitted. Reissue the call with valid JSON arguments."
+	oversizedToolBatchError     = "Error: the tool-call batch exceeded the aggregate argument size limit. Split the calls into smaller batches and reissue them with valid JSON arguments."
 
 	maxToolCallArgBytes  = 256 * 1024 // 256 KiB
 	maxToolBatchArgBytes = 512 * 1024 // 512 KiB
+	// ponytail: bound duplicate telemetry memory; retain an LRU only if older
+	// duplicate history becomes a product requirement.
+	maxSeenOperations = 4096
+
+	explorationCheckpointOne   = 10
+	explorationCheckpointTwo   = 20
+	explorationCheckpointFinal = 30
 )
 
 // HistoryCatalog is the durable session boundary for bounded history recall.
@@ -536,6 +544,9 @@ func (a *Agent) seenOperationCount(fingerprint string) int {
 	if a.seenOperation == nil {
 		a.seenOperation = make(map[string]int)
 	}
+	if _, exists := a.seenOperation[fingerprint]; !exists && len(a.seenOperation) >= maxSeenOperations {
+		a.seenOperation = make(map[string]int, maxSeenOperations)
+	}
 	a.seenOperation[fingerprint]++
 	return a.seenOperation[fingerprint]
 }
@@ -557,8 +568,9 @@ func (a *Agent) validateToolBatch(calls []models.ToolCall) error {
 		return fmt.Errorf("model returned an unsafe tool batch: %d calls exceeds limit %d", len(calls), maxToolCallsPerResponse)
 	}
 	seenIDs := make(map[string]bool, len(calls))
-	seenFingerprints := make(map[string]string, len(calls))
+	seenFingerprints := make(map[string]struct{}, len(calls))
 	duplicateCounts := make(map[string]int)
+	firstDuplicateTool := ""
 
 	for _, tc := range calls {
 		if tc.ID == "" {
@@ -576,27 +588,24 @@ func (a *Agent) validateToolBatch(calls []models.ToolCall) error {
 		fp := a.operationFingerprint(tc.Function.Name, tc.Function.Arguments)
 		if _, exists := seenFingerprints[fp]; exists {
 			duplicateCounts[tc.Function.Name]++
+			if firstDuplicateTool == "" {
+				firstDuplicateTool = tc.Function.Name
+			}
 		} else {
-			seenFingerprints[fp] = tc.ID
+			seenFingerprints[fp] = struct{}{}
 		}
 	}
 
-	if len(duplicateCounts) > 0 {
-		var firstTool string
-		var count int
-		for name, c := range duplicateCounts {
-			firstTool = name
-			count = c + 1 // including the initial occurrence
-			break
-		}
-		return fmt.Errorf("model returned duplicate tool calls: %s repeated %d times", firstTool, count)
+	if firstDuplicateTool != "" {
+		return fmt.Errorf("model returned duplicate tool calls: %s repeated %d times", firstDuplicateTool, duplicateCounts[firstDuplicateTool]+1)
 	}
 	return nil
 }
 
 // findMalformedToolCalls returns indices of tool calls whose arguments are invalid
-// JSON, exceed the per-call or batch size limits, or lack required identifiers.
-func findMalformedToolCalls(calls []models.ToolCall) []int {
+// JSON, exceed the per-call size limit, or lack required identifiers. The second
+// result reports an otherwise-valid batch that exceeds the aggregate size limit.
+func findMalformedToolCalls(calls []models.ToolCall) ([]int, bool) {
 	var malformed []int
 	totalBytes := 0
 	for i, tc := range calls {
@@ -605,16 +614,11 @@ func findMalformedToolCalls(calls []models.ToolCall) []int {
 			malformed = append(malformed, i)
 		}
 	}
-	if totalBytes > maxToolBatchArgBytes && len(malformed) == 0 {
-		for i := range calls {
-			malformed = append(malformed, i)
-		}
-	}
-	return malformed
+	return malformed, totalBytes > maxToolBatchArgBytes
 }
 
 func toolResultError(res tools.ToolResult) (string, bool) {
-	if res.ExitCode == 0 && !strings.HasPrefix(res.Preview, "Error:") {
+	if res.ExitCode == 0 {
 		return "", false
 	}
 	text := res.Preview
@@ -626,6 +630,19 @@ func toolResultError(res tools.ToolResult) (string, bool) {
 		text = "tool execution failed"
 	}
 	return text, true
+}
+
+func toolDiagnosticName(call models.ToolCall) string {
+	if call.Function.Name != "bash" {
+		return call.Function.Name
+	}
+	var args struct {
+		Command string `json:"command"`
+	}
+	if json.Unmarshal([]byte(call.Function.Arguments), &args) == nil && strings.TrimSpace(args.Command) != "" {
+		return truncateField(args.Command, 200)
+	}
+	return call.Function.Name
 }
 
 // MessagesSnapshot returns a copy of the conversation safe to read while a
@@ -695,7 +712,11 @@ func (a *Agent) AllTools() []tools.Tool {
 // Usage accounting remains with the caller because different call paths fold
 // it into different agent/session owners.
 func (a *Agent) Stream(ctx context.Context, req models.Request, sink models.EventSink, ev Events) (models.Message, models.Usage, error) {
-	return a.callStream(ctx, a.Backend, a.Role, a.Provider, a.Protocol, req, sink, ev)
+	return a.callStream(ctx, a.Backend, a.Role, a.Provider, a.Protocol, req, sink, ev, 0)
+}
+
+func (a *Agent) streamForTurn(ctx context.Context, req models.Request, sink models.EventSink, ev Events, checkpointLevel int) (models.Message, models.Usage, error) {
+	return a.callStream(ctx, a.Backend, a.Role, a.Provider, a.Protocol, req, sink, ev, checkpointLevel)
 }
 
 // Complete performs one non-streaming model call with the same telemetry
@@ -729,7 +750,7 @@ func (a *Agent) callInfo(backend models.Backend, role, provider, protocol, model
 	return ModelCallStart{Role: role, Provider: provider, Model: model, Protocol: protocol}
 }
 
-func (a *Agent) callStream(ctx context.Context, backend models.Backend, role, provider, protocol string, req models.Request, sink models.EventSink, ev Events) (models.Message, models.Usage, error) {
+func (a *Agent) callStream(ctx context.Context, backend models.Backend, role, provider, protocol string, req models.Request, sink models.EventSink, ev Events, checkpointLevel int) (models.Message, models.Usage, error) {
 	if req.SessionID == "" {
 		req.SessionID = a.currentSessionID()
 	}
@@ -741,11 +762,11 @@ func (a *Agent) callStream(ctx context.Context, backend models.Backend, role, pr
 	}
 	if backend == nil {
 		err := errors.New("agent: nil backend")
-		a.emitCallEnd(ev, call, start, models.Message{}, models.Usage{}, err)
+		a.emitCallEnd(ev, call, start, models.Message{}, models.Usage{}, err, checkpointLevel)
 		return models.Message{}, models.Usage{}, err
 	}
 	msg, usage, err := backend.Stream(ctx, req, sink)
-	a.emitCallEnd(ev, call, start, msg, usage, err)
+	a.emitCallEnd(ev, call, start, msg, usage, err, checkpointLevel)
 	return msg, usage, err
 }
 
@@ -762,11 +783,11 @@ func (a *Agent) callCompletePurpose(ctx context.Context, backend models.Backend,
 	}
 	if backend == nil {
 		err := errors.New("agent: nil backend")
-		a.emitCallEnd(ev, call, start, models.Message{}, models.Usage{}, err)
+		a.emitCallEnd(ev, call, start, models.Message{}, models.Usage{}, err, 0)
 		return models.Message{}, models.Usage{}, err
 	}
 	msg, usage, err := backend.Complete(ctx, req)
-	a.emitCallEnd(ev, call, start, msg, usage, err)
+	a.emitCallEnd(ev, call, start, msg, usage, err, 0)
 	return msg, usage, err
 }
 
@@ -784,20 +805,64 @@ func (a *Agent) emitPromptView(ev Events, call ModelCallStart, req models.Reques
 	})
 }
 
-func (a *Agent) emitCallEnd(ev Events, call ModelCallStart, start time.Time, msg models.Message, usage models.Usage, err error) {
+func (a *Agent) emitCallEnd(ev Events, call ModelCallStart, start time.Time, msg models.Message, usage models.Usage, err error, checkpointLevel int) {
 	if ev.OnModelCallEnd == nil {
 		return
 	}
 	end := ModelCallEnd{
-		ModelCallStart: call,
-		LatencyMS:      time.Since(start).Milliseconds(),
-		FinishReason:   msg.StopReason,
-		Usage:          usage,
+		ModelCallStart:           call,
+		LatencyMS:                time.Since(start).Milliseconds(),
+		FinishReason:             msg.StopReason,
+		Usage:                    usage,
+		CheckpointLevel:          checkpointLevel,
+		ContinuedAfterCheckpoint: checkpointLevel > 0 && len(msg.ToolCalls) > 0,
 	}
 	if err != nil {
 		end.Error = err.Error()
 	}
 	ev.OnModelCallEnd(end)
+}
+
+func isRepositoryNavigationTool(name string) bool {
+	switch name {
+	case "read", "grep", "structural_search", "glob", "find_files", "lsp",
+		"output_list", "output_read", "artifact_list", "artifact_read", "history_search", "history_read":
+		return true
+	default:
+		return false
+	}
+}
+
+func explorationBatch(calls []models.ToolCall) (hasNavigation, hasMutation bool) {
+	for _, call := range calls {
+		hasNavigation = hasNavigation || isRepositoryNavigationTool(call.Function.Name)
+		hasMutation = hasMutation || potentiallyMutatingReadGuardTool(call.Function.Name, call.Function.Arguments)
+	}
+	return hasNavigation, hasMutation
+}
+
+func explorationCheckpointLevel(round int) int {
+	switch round {
+	case explorationCheckpointOne:
+		return 1
+	case explorationCheckpointTwo:
+		return 2
+	case explorationCheckpointFinal:
+		return 3
+	default:
+		return 0
+	}
+}
+
+func explorationCheckpointReminder(level, rounds int) string {
+	prompt := "Before another repository-navigation call, state the specific unresolved question and why the call can materially change the result. Tools remain available."
+	switch level {
+	case 2:
+		prompt = "Reassess whether more exploration is necessary. If you continue, state the specific unresolved question and why the next call can materially change the result. Tools remain available."
+	case 3:
+		prompt = "This is the final exploration checkpoint. Continue only for a concrete unresolved question, state why the next call can materially change the result, then synthesize or implement. Tools remain available."
+	}
+	return fmt.Sprintf("<exploration_checkpoint level=\"%d\">\nYou have completed %d repository-exploration rounds in this turn.\n%s\n</exploration_checkpoint>", level, rounds, prompt)
 }
 
 // Turn sends user input and loops until the model stops calling tools.
@@ -861,26 +926,69 @@ func (a *Agent) collaborationPrompt() string {
 	return ""
 }
 
+// currentToolGuidance is transient request context. It describes only the
+// tools that survived deterministic preflight for this turn.
+func currentToolGuidance(ts []tools.Tool, notices []string) string {
+	names := make([]string, 0, len(ts))
+	hasBash, hasLSP := false, false
+	for _, tool := range ts {
+		name := tool.Def.Function.Name
+		names = append(names, name)
+		switch name {
+		case "bash":
+			hasBash = true
+		case "lsp":
+			hasLSP = true
+		}
+	}
+	var b strings.Builder
+	b.WriteString("Current tool availability for this request (authoritative): ")
+	if len(names) == 0 {
+		b.WriteString("none")
+	} else {
+		b.WriteString(strings.Join(names, ", "))
+	}
+	for _, notice := range notices {
+		b.WriteString("\n- ")
+		b.WriteString(notice)
+	}
+	if hasBash {
+		b.WriteString("\n- Reserve bash for builds, tests, git, and operations the dedicated tools cannot express.")
+	}
+	if hasLSP {
+		b.WriteString("\n- Use lsp for semantic identity, references, and symbol context.")
+	}
+	return b.String()
+}
+
 // assembleRequestMessages constructs the model request messages while keeping
 // a byte-stable prefix across turns and tool rounds:
 //  1. Base system prompt (history[0])
 //  2. Stable collaboration-mode prompt (planModePrompt / reviewModePrompt)
-//  3. Budget reminder (if non-empty)
-//  4. Conversation history (history[1:])
-//  5. Trailing transient blocks (todoContent, goalContent)
-func (a *Agent) assembleRequestMessages(history []models.Message, todoContent, goalContent, budgetReminder string) []models.Message {
+//  3. Current capability guidance (if non-empty)
+//  4. Exploration checkpoint reminder (if non-empty)
+//  5. Budget reminder (if non-empty)
+//  6. Conversation history (history[1:])
+//  7. Trailing transient blocks (todoContent, goalContent)
+func (a *Agent) assembleRequestMessages(history []models.Message, todoContent, goalContent, budgetReminder, capabilityGuidance, explorationReminder string) []models.Message {
 	if len(history) == 0 {
 		return history
 	}
-	if !a.readOnlyCollaborationMode() && todoContent == "" && goalContent == "" && budgetReminder == "" {
+	if !a.readOnlyCollaborationMode() && todoContent == "" && goalContent == "" && budgetReminder == "" && capabilityGuidance == "" && explorationReminder == "" {
 		return history
 	}
 	prefixCount := 1
 	if a.readOnlyCollaborationMode() {
 		prefixCount++
-		if budgetReminder != "" {
-			prefixCount++
-		}
+	}
+	if capabilityGuidance != "" {
+		prefixCount++
+	}
+	if explorationReminder != "" {
+		prefixCount++
+	}
+	if a.readOnlyCollaborationMode() && budgetReminder != "" {
+		prefixCount++
 	}
 	suffixCount := 0
 	if todoContent != "" {
@@ -893,6 +1001,14 @@ func (a *Agent) assembleRequestMessages(history []models.Message, todoContent, g
 	reqMsgs = append(reqMsgs, history[0])
 	if a.readOnlyCollaborationMode() {
 		reqMsgs = append(reqMsgs, models.Message{Role: "system", Content: a.collaborationPrompt()})
+	}
+	if capabilityGuidance != "" {
+		reqMsgs = append(reqMsgs, models.Message{Role: "system", Content: capabilityGuidance})
+	}
+	if explorationReminder != "" {
+		reqMsgs = append(reqMsgs, models.Message{Role: "system", Content: explorationReminder})
+	}
+	if a.readOnlyCollaborationMode() {
 		if budgetReminder != "" {
 			reqMsgs = append(reqMsgs, models.Message{Role: "system", Content: budgetReminder})
 		}
@@ -910,6 +1026,7 @@ func (a *Agent) assembleRequestMessages(history []models.Message, todoContent, g
 }
 
 func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPart, authored bool, goalCtx *GoalRecord, ev Events) (string, error) {
+	a.compacted = false // compaction retry state is scoped to this turn
 	var activeGoal *GoalRecord
 	if goalCtx != nil {
 		goal := *goalCtx
@@ -926,10 +1043,11 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 		msg.SentAt = &now
 	}
 	a.msgsMu.Lock()
-	if len(a.Messages) > 0 && a.Messages[len(a.Messages)-1].Role == "user" && len(parts) == 0 && (strings.TrimSpace(input) == "continue" || strings.TrimSpace(input) == "Continue") {
+	if len(a.Messages) > 0 && a.Messages[len(a.Messages)-1].Role == "user" && a.Messages[len(a.Messages)-1].Authored && len(parts) == 0 && (strings.TrimSpace(input) == "continue" || strings.TrimSpace(input) == "Continue") {
 		// User is explicitly asking to continue the prior unanswered prompt.
 		prev := a.Messages[len(a.Messages)-1]
 		msg.Content = prev.Content
+		msg.Parts = append([]models.ContentPart(nil), prev.Parts...)
 		a.Messages[len(a.Messages)-1] = msg
 	} else {
 		a.Messages = append(a.Messages, msg)
@@ -961,12 +1079,22 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 	if activeGoal != nil && !a.readOnlyCollaborationMode() {
 		turnTools = append(turnTools, GoalTool(*activeGoal))
 	}
+	var capabilityGuidance string
+	if a.Runtime != nil {
+		var capabilityNotices []string
+		turnTools, capabilityNotices = tools.FilterAvailable(turnTools, a.Runtime)
+		capabilityGuidance = currentToolGuidance(turnTools, capabilityNotices)
+	}
 	turnDefs := tools.Defs(turnTools)
 	var synthesisDefs []models.Tool
 
 	turnErrors := make(map[string]int)
 	malformedRoundsInTurn := 0
 	rounds := 0
+	explorationRounds := 0
+	explorationReminder := ""
+	checkpointLevel := 0
+	postEditVerification := false
 	for {
 		if a.MaxTurns > 0 && rounds >= a.MaxTurns {
 			return "", fmt.Errorf("max turns (%d) reached — the model kept calling tools; re-run with a higher -max-turns or a more specific prompt", a.MaxTurns)
@@ -975,6 +1103,10 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 		if err := a.maybeCompact(ctx, compactionEvents); err != nil {
 			return "", err
 		}
+		requestCheckpointLevel := checkpointLevel
+		checkpointLevel = 0
+		requestExplorationReminder := explorationReminder
+		explorationReminder = ""
 
 		finalizing := planBudget != nil && planBudget.IsReserveCrossed()
 		var budgetReminder string
@@ -986,7 +1118,7 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 		if activeGoal != nil {
 			goalContent = GoalContextBlock(*activeGoal)
 		}
-		msgs := a.assembleRequestMessages(a.Messages, todoContent, goalContent, budgetReminder)
+		msgs := a.assembleRequestMessages(a.Messages, todoContent, goalContent, budgetReminder, capabilityGuidance, requestExplorationReminder)
 
 		reqDefs := turnDefs
 		available := turnTools
@@ -1020,14 +1152,14 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 		} else {
 			sink.OnText = ev.OnText
 		}
-		msg, usage, err := a.Stream(ctx, models.Request{
+		msg, usage, err := a.streamForTurn(ctx, models.Request{
 			Model:            a.Model,
 			Messages:         msgs,
 			Tools:            reqDefs,
 			ReasoningEffort:  reasoningEffort,
 			ReasoningEnabled: reasoningEnabled,
 			SessionID:        a.currentSessionID(),
-		}, sink, ev)
+		}, sink, ev, requestCheckpointLevel)
 		if a.PlanMode && parser != nil {
 			parser.close()
 		}
@@ -1101,21 +1233,44 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 			}
 			return "", err
 		}
+		hasNavigation, hasMutation := explorationBatch(msg.ToolCalls)
+		if hasMutation {
+			postEditVerification = true
+		} else if hasNavigation {
+			if postEditVerification {
+				// ponytail: skip only the first navigation-only response after a
+				// mutation; distinguishing later exploration from verification
+				// would require intent/path tracking.
+				postEditVerification = false
+			} else {
+				explorationRounds++
+				if level := explorationCheckpointLevel(explorationRounds); level > 0 {
+					checkpointLevel = level
+					explorationReminder = explorationCheckpointReminder(level, explorationRounds)
+				}
+			}
+		}
 		if len(msg.ToolCalls) > 0 {
-			if malformedIndices := findMalformedToolCalls(msg.ToolCalls); len(malformedIndices) > 0 {
+			malformedIndices, batchTooLarge := findMalformedToolCalls(msg.ToolCalls)
+			if len(malformedIndices) > 0 || batchTooLarge {
 				if malformedRoundsInTurn > 0 {
+					if batchTooLarge {
+						return "", errors.New("model tool batch remained oversized")
+					}
 					return "", errors.New("model tool channel remained malformed")
 				}
 				malformedRoundsInTurn++
-				malformedSet := make(map[int]bool, len(malformedIndices))
-				for _, idx := range malformedIndices {
-					malformedSet[idx] = true
-				}
-				for i := range msg.ToolCalls {
-					if malformedSet[i] {
-						msg.ToolCalls[i].Function.Arguments = "{}"
-						if msg.ToolCalls[i].ID == "" {
-							msg.ToolCalls[i].ID = fmt.Sprintf("malformed_call_%d", i)
+				if !batchTooLarge {
+					malformedSet := make(map[int]bool, len(malformedIndices))
+					for _, idx := range malformedIndices {
+						malformedSet[idx] = true
+					}
+					for i := range msg.ToolCalls {
+						if malformedSet[i] {
+							msg.ToolCalls[i].Function.Arguments = "{}"
+							if msg.ToolCalls[i].ID == "" {
+								msg.ToolCalls[i].ID = fmt.Sprintf("malformed_call_%d", i)
+							}
 						}
 					}
 				}
@@ -1123,10 +1278,14 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 				msg.Model = a.Model + " @ " + a.Provider
 				a.msgsMu.Lock()
 				a.Messages = append(a.Messages, msg)
+				errorMessage := malformedToolCallError
+				if batchTooLarge {
+					errorMessage = oversizedToolBatchError
+				}
 				for _, tc := range msg.ToolCalls {
 					a.Messages = append(a.Messages, models.Message{
 						Role:       "tool",
-						Content:    malformedToolCallError,
+						Content:    errorMessage,
 						ToolCallID: tc.ID,
 						Name:       tc.Function.Name,
 					})
@@ -1168,7 +1327,7 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 			a.msgsMu.Unlock()
 			for i, res := range results {
 				if res.Metadata != nil && res.Metadata["failure_kind"] == "sandbox_network_denied" {
-					cmdName := msg.ToolCalls[i].Function.Name
+					cmdName := toolDiagnosticName(msg.ToolCalls[i])
 					return "", fmt.Errorf("sandbox capability failure (%s): local network listener denied by sandbox policy", cmdName)
 				}
 			}
@@ -1177,10 +1336,7 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 					fp := a.operationFingerprint(tc.Function.Name+":error", errText)
 					turnErrors[fp]++
 					if turnErrors[fp] >= 3 {
-						snippet := strings.ReplaceAll(errText, "\n", " ")
-						if len(snippet) > 200 {
-							snippet = snippet[:200] + "..."
-						}
+						snippet := truncateField(strings.ReplaceAll(errText, "\n", " "), 200)
 						return "", fmt.Errorf("tool %s failed repeatedly with the same error: %s", tc.Function.Name, snippet)
 					}
 				}
@@ -1201,15 +1357,15 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 		steered := a.drainPending()
 		if len(steered) > 0 {
 			a.msgsMu.Lock()
-		}
-		for _, s := range steered {
-			if ev.OnSteer != nil {
-				ev.OnSteer(s.text)
+			for _, s := range steered {
+				a.Messages = append(a.Messages, models.Message{Role: "user", Content: s.text, Parts: s.parts})
 			}
-			a.Messages = append(a.Messages, models.Message{Role: "user", Content: s.text, Parts: s.parts})
-		}
-		if len(steered) > 0 {
 			a.msgsMu.Unlock()
+			if ev.OnSteer != nil {
+				for _, s := range steered {
+					ev.OnSteer(s.text)
+				}
+			}
 		}
 		if len(msg.ToolCalls) == 0 && len(steered) == 0 {
 			a.compacted = false // reset for the next Turn
@@ -1342,6 +1498,13 @@ func (a *Agent) runToolResultsWithPolicy(ctx context.Context, calls []models.Too
 	// subscribed; the duplicate tool-call guard is applied earlier by
 	// validateToolBatch with its own fingerprint pass.
 	observeTelemetry := ev.OnToolTelemetry != nil
+	batchSize := len(calls)
+	sameToolCounts := make(map[string]int)
+	if observeTelemetry {
+		for _, call := range calls {
+			sameToolCounts[call.Function.Name]++
+		}
+	}
 	for i, tc := range calls {
 		if i < len(decisions) && decisions[i].suppressed {
 			continue
@@ -1408,6 +1571,9 @@ func (a *Agent) runToolResultsWithPolicy(ctx context.Context, calls []models.Too
 				ev.OnToolTelemetry(ToolTelemetry{
 					ID:            tc.ID,
 					Name:          name,
+					BatchSize:     batchSize,
+					SameToolCount: sameToolCounts[name],
+					DurationMS:    ms,
 					PreviewBytes:  len(result.Preview),
 					RetainedBytes: len(result.Retained),
 					OriginalBytes: result.OriginalBytes,

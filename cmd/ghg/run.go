@@ -464,6 +464,8 @@ func setupWireEvents(ev *agent.Events, emit func(any)) {
 	ev.OnToolTelemetry = func(telemetry agent.ToolTelemetry) {
 		emit(map[string]any{
 			"type": "tool_telemetry", "id": telemetry.ID, "name": telemetry.Name,
+			"batch_size": telemetry.BatchSize, "same_tool_count": telemetry.SameToolCount,
+			"duration_ms":   telemetry.DurationMS,
 			"preview_bytes": telemetry.PreviewBytes, "retained_bytes": telemetry.RetainedBytes,
 			"original_bytes": telemetry.OriginalBytes, "truncated": telemetry.Truncated,
 			"bash_redirect": telemetry.BashRedirect, "fingerprint": telemetry.Fingerprint,
@@ -480,7 +482,9 @@ func setupWireEvents(ev *agent.Events, emit func(any)) {
 		emit(map[string]any{
 			"type": "model_call_end", "role": call.Role, "provider": call.Provider,
 			"model": call.Model, "protocol": call.Protocol, "latency_ms": call.LatencyMS,
-			"purpose": call.Purpose, "finish_reason": call.FinishReason, "usage": call.Usage, "error": call.Error,
+			"checkpoint_level":           call.CheckpointLevel,
+			"continued_after_checkpoint": call.ContinuedAfterCheckpoint,
+			"purpose":                    call.Purpose, "finish_reason": call.FinishReason, "usage": call.Usage, "error": call.Error,
 		})
 	}
 	ev.OnPromptView = func(view agent.PromptView) {

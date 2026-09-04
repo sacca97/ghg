@@ -122,7 +122,7 @@ func SessionIDFromContext(ctx context.Context) string {
 }
 
 func lspTool() Tool {
-	return resultTool(models.NewTool("lsp", "Use the language server for bounded definitions, references, document symbols, or hover information. Paths and positions are workspace-authorized; columns are one-based Unicode-rune columns.", `{"type":"object","properties":{"operation":{"type":"string","enum":["definition","references","document_symbol","hover"]},"path":{"type":"string"},"line":{"type":"integer","description":"One-based line; required except document_symbol"},"column":{"type":"integer","description":"One-based Unicode-rune column; required except document_symbol"},"include_declaration":{"type":"boolean","description":"References only"}},"required":["operation","path"]}`), runLSPResult)
+	return resultTool(models.NewTool("lsp", "Use the language server for bounded definitions, references, document symbols, hover information, or exact-symbol references/context. Paths and positions are workspace-authorized; columns are one-based Unicode-rune columns.", `{"type":"object","properties":{"operation":{"type":"string","enum":["definition","references","document_symbol","hover","symbol_references","symbol_context"]},"path":{"type":"string"},"symbol":{"type":"string","description":"Exact symbol name; required for symbol_references and symbol_context"},"line":{"type":"integer","description":"One-based line; required for position-based operations"},"column":{"type":"integer","description":"One-based Unicode-rune column; required for position-based operations"},"include_declaration":{"type":"boolean","description":"References and symbol_references only"}},"required":["operation","path"]}`), runLSPResult)
 }
 
 func lspRenameTool() Tool {
@@ -133,6 +133,7 @@ func runLSPResult(ctx context.Context, args json.RawMessage) (ToolResult, error)
 	var request struct {
 		Operation          string `json:"operation"`
 		Path               string `json:"path"`
+		Symbol             string `json:"symbol"`
 		Line               int    `json:"line"`
 		Column             int    `json:"column"`
 		IncludeDeclaration bool   `json:"include_declaration"`
@@ -153,15 +154,22 @@ func runLSPResult(ctx context.Context, args json.RawMessage) (ToolResult, error)
 		if request.IncludeDeclaration {
 			return ToolResult{}, errors.New("include_declaration applies only to references")
 		}
+	case "symbol_references", "symbol_context":
+		if strings.TrimSpace(request.Symbol) == "" {
+			return ToolResult{}, fmt.Errorf("lsp %s requires symbol", operation)
+		}
 	default:
 		return ToolResult{}, fmt.Errorf("unsupported lsp operation %q", request.Operation)
 	}
-	if operation != "references" && request.IncludeDeclaration {
+	if operation != "references" && operation != "symbol_references" && request.IncludeDeclaration {
 		return ToolResult{}, errors.New("include_declaration applies only to references")
 	}
 	runtime := RuntimeFromContext(ctx)
 	if runtime == nil || runtime.LanguageService == nil {
 		return ToolResult{}, errors.New("lsp is unavailable")
+	}
+	if operation == "symbol_references" || operation == "symbol_context" {
+		return runSymbolLSPResult(ctx, runtime.LanguageService, operation, request.Path, request.Symbol, request.IncludeDeclaration)
 	}
 	result, err := runtime.LanguageService.Navigate(ctx, NavigationRequest{
 		Operation: operation, Path: request.Path, Line: request.Line, Column: request.Column,
@@ -172,6 +180,81 @@ func runLSPResult(ctx context.Context, args json.RawMessage) (ToolResult, error)
 	}
 	raw := renderNavigation(result)
 	return MarkUntrusted(textResult(raw, Truncate(raw), 0), "lsp"), nil
+}
+
+const maxSymbolCandidates = 20
+
+func runSymbolLSPResult(ctx context.Context, service LanguageService, operation, path, name string, includeDeclaration bool) (ToolResult, error) {
+	authorizedPath, err := AuthorizePath(ctx, path, sandbox.AccessRead, false)
+	if err != nil {
+		return ToolResult{}, err
+	}
+	symbols, err := service.Navigate(ctx, NavigationRequest{Operation: "document_symbol", Path: authorizedPath})
+	if err != nil {
+		return ToolResult{}, err
+	}
+	exact := make([]LSPSymbol, 0, len(symbols.Symbols))
+	for _, symbol := range symbols.Symbols {
+		if symbol.Name == strings.TrimSpace(name) {
+			exact = append(exact, symbol)
+		}
+	}
+	if len(exact) == 0 {
+		raw := fmt.Sprintf("symbol %q not found in %s", strings.TrimSpace(name), authorizedPath)
+		if symbols.Omitted > 0 {
+			raw += fmt.Sprintf(" (%d other symbols omitted)", symbols.Omitted)
+		}
+		return MarkUntrusted(textResult(raw, Truncate(raw), 0), "lsp"), nil
+	}
+	if len(exact) > 1 {
+		raw := renderAmbiguousSymbols(strings.TrimSpace(name), exact)
+		return MarkUntrusted(textResult(raw, Truncate(raw), 0), "lsp"), nil
+	}
+	symbol := exact[0]
+	if operation == "symbol_context" {
+		result, err := runObservedRead(ctx, struct {
+			Path   string `json:"path"`
+			Offset int    `json:"offset"`
+			Limit  int    `json:"limit"`
+		}{
+			Path:   symbol.Path,
+			Offset: symbol.Range.Start.Line,
+			Limit:  symbol.Range.End.Line - symbol.Range.Start.Line + 1,
+		})
+		if err != nil {
+			return ToolResult{}, err
+		}
+		return MarkUntrusted(result, "lsp"), nil
+	}
+	references, err := service.Navigate(ctx, NavigationRequest{
+		Operation:          "references",
+		Path:               symbol.Path,
+		Line:               symbol.SelectionRange.Start.Line,
+		Column:             symbol.SelectionRange.Start.Column,
+		IncludeDeclaration: includeDeclaration,
+	})
+	if err != nil {
+		return ToolResult{}, err
+	}
+	raw := renderNavigation(references)
+	return MarkUntrusted(textResult(raw, Truncate(raw), 0), "lsp"), nil
+}
+
+func renderAmbiguousSymbols(name string, symbols []LSPSymbol) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "symbol %q is ambiguous; use a position-based lsp operation:\n", name)
+	limit := min(len(symbols), maxSymbolCandidates)
+	for _, symbol := range symbols[:limit] {
+		fmt.Fprintf(&b, "- %s", symbol.Name)
+		if symbol.Kind != "" {
+			fmt.Fprintf(&b, " (%s)", symbol.Kind)
+		}
+		fmt.Fprintf(&b, " %s [%s]\n", symbol.Path, formatLSPRange(symbol.Range))
+	}
+	if omitted := len(symbols) - limit; omitted > 0 {
+		fmt.Fprintf(&b, "... [%d candidates omitted]\n", omitted)
+	}
+	return strings.TrimSuffix(b.String(), "\n")
 }
 
 func runLSPRenameResult(ctx context.Context, args json.RawMessage) (ToolResult, error) {

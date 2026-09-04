@@ -122,6 +122,7 @@ func TestPlanModeRestrictsTools(t *testing.T) {
 	ag.Tools = []tools.Tool{
 		{Def: models.NewTool("read", "", "")},
 		{Def: models.NewTool("grep", "", "")},
+		{Def: models.NewTool("structural_search", "", "")},
 		{Def: models.NewTool("bash", "", "")},
 		{Def: models.NewTool("write", "", "")},
 		{Def: models.NewTool("edit", "", "")},
@@ -130,12 +131,12 @@ func TestPlanModeRestrictsTools(t *testing.T) {
 	}
 
 	planTools := ag.planTools()
-	if len(planTools) != 3 {
-		t.Fatalf("expected 3 safe tools, got %d", len(planTools))
+	if len(planTools) != 4 {
+		t.Fatalf("expected 4 safe tools, got %d", len(planTools))
 	}
 	for _, pt := range planTools {
 		name := pt.Def.Function.Name
-		if name != "read" && name != "grep" && name != "lsp" {
+		if name != "read" && name != "grep" && name != "structural_search" && name != "lsp" {
 			t.Errorf("unexpected tool in plan mode: %s", name)
 		}
 	}
@@ -239,7 +240,7 @@ func TestAssembleRequestMessagesStablePrefix(t *testing.T) {
 		{Role: "tool", Content: "tool result", ToolCallID: "tc-1"},
 	}
 
-	assembled := ag.assembleRequestMessages(history, "todo block", "", "<rollout_budget>reminder</rollout_budget>")
+	assembled := ag.assembleRequestMessages(history, "todo block", "", "<rollout_budget>reminder</rollout_budget>", "", "")
 	if len(assembled) != 7 {
 		t.Fatalf("expected 7 messages, got %d", len(assembled))
 	}

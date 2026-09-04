@@ -135,10 +135,13 @@ func TestBubblewrapArgsContainIsolationAndProtectedRebind(t *testing.T) {
 	policy, workspace, gitRoot := backendTestPolicy(t, NetworkDeny)
 	args := bubblewrapArgs(policy, CommandSpec{Dir: workspace})
 	joined := strings.Join(args, " ")
-	for _, required := range []string{"--tmpfs /", "--ro-bind /usr /usr", "--unshare-net", "--no-new-privs", "--bind " + workspace + " " + workspace, "--ro-bind " + gitRoot + " " + gitRoot} {
+	for _, required := range []string{"--tmpfs /", "--ro-bind /usr /usr", "--unshare-net", "--chmod 0555", "--bind " + workspace + " " + workspace, "--ro-bind " + gitRoot + " " + gitRoot} {
 		if !strings.Contains(joined, required) {
 			t.Fatalf("bubblewrap args missing %q: %s", required, joined)
 		}
+	}
+	if strings.Contains(joined, "--no-new-privs") {
+		t.Fatalf("bubblewrap args contain unsupported --no-new-privs option: %s", joined)
 	}
 	if strings.Contains(joined, "--ro-bind / /") {
 		t.Fatalf("bubblewrap args expose the host root: %s", joined)

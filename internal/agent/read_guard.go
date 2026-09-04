@@ -161,7 +161,7 @@ func normalizeReadRequest(name, args string) (readRequest, bool) {
 
 func potentiallyMutatingReadGuardTool(name, args string) bool {
 	switch name {
-	case "read", "grep", "glob", "find_files", "lsp", "output_list", "output_read", "artifact_list", "artifact_read", "history_search", "history_read", "submit_review":
+	case "read", "grep", "structural_search", "glob", "find_files", "lsp", "output_list", "output_read", "artifact_list", "artifact_read", "history_search", "history_read", "submit_review":
 		return false
 	case "lsp_rename":
 		var input struct {
@@ -251,7 +251,7 @@ func readCoverageFromResult(result tools.ToolResult) (readCoverage, bool) {
 }
 
 func readGuardResultSucceeded(result tools.ToolResult) bool {
-	return result.ExitCode == 0 && !strings.HasPrefix(result.Preview, "Error:")
+	return result.ExitCode == 0
 }
 
 func (t *readCoverageTracker) record(result tools.ToolResult) {
@@ -269,6 +269,10 @@ func (t *readCoverageTracker) record(result tools.ToolResult) {
 func (t *readCoverageTracker) apply(a *Agent, ev Events, calls []models.ToolCall, results []tools.ToolResult, decisions []readDecision) {
 	if t == nil {
 		return
+	}
+	sameToolCounts := make(map[string]int)
+	for _, call := range calls {
+		sameToolCounts[call.Function.Name]++
 	}
 	for i, decision := range decisions {
 		if !decision.suppressed {
@@ -290,6 +294,8 @@ func (t *readCoverageTracker) apply(a *Agent, ev Events, calls []models.ToolCall
 			ev.OnToolTelemetry(ToolTelemetry{
 				ID:            calls[i].ID,
 				Name:          calls[i].Function.Name,
+				BatchSize:     len(calls),
+				SameToolCount: sameToolCounts[calls[i].Function.Name],
 				PreviewBytes:  len(result.Preview),
 				RetainedBytes: len(result.Retained),
 				OriginalBytes: result.OriginalBytes,
@@ -377,11 +383,10 @@ func decisionResult(decision readDecision, results []tools.ToolResult) tools.Too
 }
 
 func redundantReadResult(coverage readCoverage) tools.ToolResult {
-	nextOffset := coverage.nextOffset
-	if nextOffset <= 0 {
-		nextOffset = coverage.end + 1
+	if coverage.nextOffset <= 0 {
+		return readGuidanceResult(fmt.Sprintf("Skipped redundant read: lines %d-%d are already available from\nobservation %s, and that observation already reaches EOF. There is no continuation offset.", coverage.start, coverage.end, coverage.observation), coverage)
 	}
-	return readGuidanceResult(fmt.Sprintf("Skipped redundant read: lines %d-%d are already available from\nobservation %s. Continue at offset %d or use grep/lsp for a different area.", coverage.start, coverage.end, coverage.observation, nextOffset), coverage)
+	return readGuidanceResult(fmt.Sprintf("Skipped redundant read: lines %d-%d are already available from\nobservation %s. Continue at offset %d or use grep/lsp for a different area.", coverage.start, coverage.end, coverage.observation, coverage.nextOffset), coverage)
 }
 
 func readGuidanceResult(text string, coverage readCoverage) tools.ToolResult {

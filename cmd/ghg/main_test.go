@@ -80,7 +80,7 @@ func TestSystemPromptAppendsTrustedProjectInstructions(t *testing.T) {
 
 func TestSystemPromptPrefersBoundedExplorationTools(t *testing.T) {
 	prompt := systemPrompt()
-	for _, fragment := range []string{"Prefer grep for text", "glob for exact paths", "find_files for fuzzy paths", "read with offset/limit", "Reserve bash for builds, tests, git"} {
+	for _, fragment := range []string{"use grep for literal or regex text", "glob for exact path patterns", "find_files for fuzzy paths", "read for exact bounded source ranges", "When multiple independent repository queries are already known"} {
 		if !strings.Contains(prompt, fragment) {
 			t.Errorf("system prompt lacks %q", fragment)
 		}

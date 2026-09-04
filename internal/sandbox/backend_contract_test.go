@@ -385,7 +385,7 @@ func TestWrappedChildRunsCachedGoTest(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(workspace, "go.mod"), []byte("module sandbox-contract\n\ngo 1.27\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(workspace, "go.mod"), []byte("module sandbox-contract\n\ngo 1.26.5\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(workspace, "contract_test.go"), []byte("package contract\n\nimport \"testing\"\n\nfunc TestContract(t *testing.T) {}\n"), 0o600); err != nil {
