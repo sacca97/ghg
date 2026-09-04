@@ -169,7 +169,7 @@ func TestWorkflowResultsRoundTripForkAndRewind(t *testing.T) {
 	}
 
 	// Rewind original session to seq 3: should remove reviewRes (seq 4 >= 3) and keep planRes (seq 2 < 3)
-	if err := st.DeleteFrom(sessionID, 3); err != nil {
+	if err := st.DeleteFrom(sessionID, 3, nil); err != nil {
 		t.Fatalf("delete from: %v", err)
 	}
 	afterRewind, err := st.ListWorkflowResults(ctx, sessionID, "review")

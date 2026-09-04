@@ -2,19 +2,18 @@ package tui
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/x/ansi"
-	"github.com/sacca97/ghg/internal/agent"
-	"github.com/sacca97/ghg/internal/config"
-	"github.com/sacca97/ghg/internal/models"
-	"github.com/sacca97/ghg/internal/session"
-	"github.com/sacca97/ghg/internal/tools/bashrun"
-	workerwire "github.com/sacca97/ghg/internal/worker"
 	"slices"
 	"strings"
 	"time"
+
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
+	"github.com/sacca97/ghg/internal/models"
+	"github.com/sacca97/ghg/internal/session"
+	workerwire "github.com/sacca97/ghg/internal/worker"
 )
 
 type picker struct {
@@ -113,143 +112,7 @@ func (p *picker) loadPreview(store *session.Store) {
 }
 
 func (m *model) resume(id string) error {
-	if m.workerOnly {
-		return m.resumeDisplay(id)
-	}
-	meta, msgs, err := m.store.Load(id)
-	if err != nil {
-		return err
-	}
-	var restoredGoal agent.GoalRecord
-	hasGoal, err := func() (bool, error) {
-		record, ok, err := m.store.LoadGoal(meta.ID)
-		if err != nil {
-			return false, err
-		}
-		if !ok && strings.TrimSpace(meta.Goal) != "" {
-			record = agent.NewGoal(meta.Goal)
-			record.ID = "legacy-" + meta.ID
-			ok = true
-		}
-		if ok {
-			restoredGoal = record
-			if restoredGoal.Status == agent.GoalStatusActive {
-				restoredGoal.Status = agent.GoalStatusPaused
-				restoredGoal.Blocker = "process ended; resume explicitly"
-				restoredGoal.UpdatedAt = m.nowFn().UTC()
-				if err := m.store.CheckpointGoal(meta.ID, restoredGoal); err != nil {
-					return false, err
-				}
-			}
-		}
-		return ok, nil
-	}()
-	if err != nil {
-		return err
-	}
-	effort := meta.Effort
-	if effort == "" {
-		effort = m.agent.Effort
-	}
-	if ag, mn, pn, err := agent.NewConfigured(agent.BuildOptions{
-		Config: m.cfg, Profiles: m.profiles, Model: meta.Model, Provider: meta.Provider,
-		Role: config.RoleDefault, SystemPrompt: m.sysPrompt,
-	}); err == nil {
-		m.agent, m.modelName, m.provName = ag, mn, pn
-	} else {
-		m.agent = agent.New(m.agent.Backend, m.agent.Model, m.agent.MaxTokens, m.sysPrompt)
-		m.agent.ModelName, m.agent.Provider = m.modelName, m.provName
-		m.agent.ContextLimit = m.contextLimitFor(m.provName, m.agent.Model)
-	}
-	m.configureOutputAgent(m.agent)
-	m.applyCompactModel()
-	m.agent.CompactThreshold = config.CompactThreshold(m.cfg)
-	m.wireTasks()
-	m.agent.Tasks().SetSessionID(meta.ID)
-	m.agent.SetSessionID(meta.ID)
-	if err := m.agent.BindState(context.Background()); err != nil {
-		config.LogEvent("session.state", "bind failed: "+err.Error())
-	}
-	if tasks, terr := m.store.LoadTasks(meta.ID); terr == nil {
-		for _, st := range tasks {
-			status := agent.TaskStatus(st.Status)
-			if status == agent.TaskRunning {
-				status, st.Report = agent.TaskError, "interrupted — ghg exited before this subagent finished"
-			}
-			m.agent.RestoreTask(agent.BackgroundTask{
-				ID: st.ID, Description: st.Description, Prompt: st.Prompt,
-				Status: status, Report: st.Report,
-				StartedAt: st.StartedAt, EndedAt: st.EndedAt,
-				Restored: true,
-			})
-		}
-	} else {
-		config.LogEvent("session.task", "load failed: "+terr.Error())
-	}
-	m.agent.Messages = append(m.agent.Messages, msgs...)
-	m.agent.RebuildTouched(msgs)
-	m.agent.LoadTodosJSON(m.store.Todos(meta.ID))
-	m.snapshots = m.store.Snapshots(meta.ID)
-	in, cached, out := meta.UsageIn, meta.UsageCached, meta.UsageOut
-	if in == 0 && out == 0 {
-		for _, msg := range msgs {
-			if msg.Usage != nil {
-				in += msg.Usage.PromptTokens
-				out += msg.Usage.CompletionTokens
-				cached += msg.Usage.Cached()
-			}
-		}
-	}
-	if in > 0 || out > 0 {
-		u := models.Usage{PromptTokens: in, CompletionTokens: out}
-		u.AddCached(cached)
-		m.agent.SetUsage(u)
-	}
-	if slices.Contains(m.effortsFor(), effort) {
-		m.agent.Effort = effort
-	}
-	m.sessionID = meta.ID
-	bashrun.SetMarkers(meta.ID, m.agent.Model)
-	m.saved = len(m.agent.Messages)
-	seen := make(map[string]bool, len(m.hist))
-	for _, h := range m.hist {
-		seen[h] = true
-	}
-	for _, msg := range msgs {
-		text := msg.TextContent()
-		if msg.Role == "user" && msg.Authored && !seen[text] {
-			seen[text] = true
-			m.hist = append(m.hist, text)
-		}
-	}
-	m.histIdx = len(m.hist)
-	m.blocks = nil
-	m.msgBlock = nil
-	m.future = nil
-	m.proposedPlanMD = ""
-	m.planCurrent = ""
-	m.goalRecord = nil
-	if hasGoal {
-		m.applyGoalRecord(restoredGoal)
-	} else {
-		m.goal = ""
-		m.goalRounds = 0
-	}
-	m.append(dimStyle.Render(fmt.Sprintf("resumed %s · %s · %s @ %s", meta.ID, meta.Title, m.modelName, m.provName)))
-	interrupted := 0
-	for _, msg := range msgs {
-		if msg.Role == "tool" && strings.HasPrefix(msg.Content, "Error: tool call interrupted") {
-			interrupted++
-		}
-	}
-	if interrupted > 0 {
-		m.append(dimStyle.Render(fmt.Sprintf("⚠ %d tool call(s) were interrupted when this session last ended; the model knows and can retry them.", interrupted)))
-	}
-	if hasGoal {
-		m.append(dimStyle.Render(fmt.Sprintf("◎ goal %s restored (%s) — /goal resume to keep working on it", restoredGoal.ID, restoredGoal.Status)))
-	}
-	m.seedTranscript(msgs, 1)
-	return nil
+	return m.resumeDisplay(id)
 }
 
 func (m *model) resumeDisplay(id string) error {
@@ -290,10 +153,8 @@ func (m *model) resumeDisplay(id string) error {
 	}
 	m.setMessages(msgs)
 	m.sessionID = meta.ID
-	m.saved = len(msgs)
 	m.usage = usageFromMeta(meta, msgs)
 	m.workerContextTokens = 0
-	m.snapshots = m.store.Snapshots(meta.ID)
 	m.workerTasks = nil
 	if tasks, taskErr := m.store.LoadTasks(meta.ID); taskErr == nil {
 		m.workerTasks = make(map[string]workerwire.TaskState, len(tasks))
@@ -309,11 +170,18 @@ func (m *model) resumeDisplay(id string) error {
 		m.applyGoalRecord(record)
 	} else {
 		m.goalRecord = nil
-		m.goal, m.goalRounds = "", 0
 	}
 	m.modelSlotW = m.statusModelSlotWidth()
 	m.future = nil
 	m.proposedPlanMD = ""
+	if m.store != nil {
+		if planRecord, ok, err := m.store.LatestWorkflowResult(context.Background(), meta.ID, "plan"); err == nil && ok {
+			var payload map[string]string
+			if json.Unmarshal([]byte(planRecord.Payload), &payload) == nil && payload["markdown"] != "" {
+				m.proposedPlanMD = payload["markdown"]
+			}
+		}
+	}
 	m.planCurrent = ""
 	m.blocks = nil
 	m.msgBlock = nil
@@ -321,6 +189,15 @@ func (m *model) resumeDisplay(id string) error {
 	m.append(dimStyle.Render(fmt.Sprintf("resumed %s · %s · %s @ %s", meta.ID, meta.Title, m.modelName, m.provName)))
 	if routeErr != nil {
 		m.append(errStyle.Render("resume route: " + routeErr.Error()))
+	}
+	interrupted := 0
+	for _, msg := range msgs {
+		if msg.Role == "tool" && strings.HasPrefix(msg.Content, "Error: tool call interrupted") {
+			interrupted++
+		}
+	}
+	if interrupted > 0 {
+		m.append(dimStyle.Render(fmt.Sprintf("⚠ %d tool call(s) were interrupted when this session last ended; the model knows and can retry them.", interrupted)))
 	}
 	m.workerStartFailed = false
 	m.workerStartError = ""
@@ -376,70 +253,6 @@ func (m *model) seedTranscript(msgs []models.Message, base int) {
 	m.refreshVP()
 }
 
-func (m *model) ensureSession() bool {
-	if m.store == nil || m.sessionID != "" {
-		return m.sessionID != ""
-	}
-	id, err := m.store.Create(cwd(), m.modelName, m.provName)
-	if err != nil {
-		config.LogEvent("session.save", "create failed: "+err.Error())
-		m.append(errStyle.Render("session save failed: " + err.Error()))
-		return false
-	}
-	m.sessionID = id
-	if m.workerOnly {
-		m.messages = []models.Message{{Role: "system", Content: m.sysPrompt}}
-		m.saved = len(m.messages)
-		m.snapshots = map[int]string{}
-		return true
-	}
-	if m.agent == nil {
-		return false
-	}
-	bashrun.SetMarkers(id, m.agent.Model)
-	m.agent.Tasks().SetSessionID(id)
-	m.agent.SetSessionID(id)
-	if err := m.agent.BindState(context.Background()); err != nil {
-		config.LogEvent("session.state", "bind failed: "+err.Error())
-	}
-	return true
-}
-
-func (m *model) persist() {
-	if m.workerOnly || m.workerClient != nil || m.workerProcess != nil {
-		return
-	}
-	if m.store == nil || m.agent == nil {
-		return
-	}
-	msgs := m.agent.MessagesSnapshot()
-	if m.sessionID == "" {
-		if len(msgs) <= m.saved {
-			return
-		}
-		if !m.ensureSession() {
-			return
-		}
-	}
-	if record, ok := m.goalRecordForSession(); ok {
-		m.persistGoal(record, false)
-	}
-	_ = m.store.SetEffort(m.sessionID, m.agent.Effort)
-	_ = m.store.SetTodos(m.sessionID, m.agent.TodosJSON())
-	if u := m.agent.Usage(); u.PromptTokens > 0 || u.CompletionTokens > 0 {
-		_ = m.store.SetUsage(m.sessionID, u.PromptTokens, u.Cached(), u.CompletionTokens)
-	}
-	if len(msgs) <= m.saved {
-		return
-	}
-	if err := m.store.Save(m.sessionID, m.saved, msgs, m.modelName, m.provName); err != nil {
-		config.LogEvent("session.save", "FAILED id="+m.sessionID+": "+err.Error())
-		m.append(errStyle.Render("session save failed: " + err.Error()))
-		return
-	}
-	m.saved = len(msgs)
-}
-
 // /fork copies the conversation (whole, or up to a rewind-picker selection)
 // into a NEW session with a chosen title and switches to it — "copy
 // conversation with new name"; the original stays untouched and /resume-able
@@ -449,16 +262,12 @@ func (m *model) persist() {
 
 // forkCommand implements /fork [name].
 func (m *model) forkCommand(arg string) {
-	if !m.workerOnly && m.agent == nil {
-		m.append(m.degradedProviderNote())
-		return
-	}
 	if m.store == nil {
 		m.append(errStyle.Render("no session store"))
 		return
 	}
 	if arg != "" {
-		m.fork(len(m.messagesSnapshot()), arg)
+		m.fork(m.messageCount(), arg)
 		return
 	}
 	// bare: suggest "<title> (fork #N)" and let the user rename inline
@@ -470,7 +279,7 @@ func (m *model) forkCommand(arg string) {
 			}
 		}
 	}
-	m.openForkPrompt(len(m.messagesSnapshot()), false, suggest)
+	m.openForkPrompt(m.messageCount(), false, suggest)
 }
 
 // openForkPrompt asks for a name, then forks at cut. picker notes when the
@@ -489,57 +298,8 @@ func (m *model) openForkPrompt(cut int, picker bool, suggest ...string) {
 }
 
 // fork copies the history through conversation index cut (inclusive) into a
-// new session and switches to it.
 func (m *model) fork(cut int, title string) {
-	if m.workerOnly {
-		m.forkWorker(cut, title)
-		return
-	}
-	if m.agent == nil {
-		m.append(m.degradedProviderNote())
-		return
-	}
-	title = strings.TrimSpace(title)
-	if title == "" {
-		m.append(errStyle.Render("fork needs a name"))
-		return
-	}
-	if len(m.agent.Messages)+len(m.future) <= 1 {
-		m.append(dimStyle.Render("(nothing to fork yet)"))
-		return
-	}
-	// picker cuts may point into the redo stack (beyond the live messages):
-	// the clipped tail up to the cut comes along. Rewind to just after the
-	// entry first so persist() writes those rows before the copy.
-	if len(m.future) > 0 {
-		if cut+1 <= len(m.agent.Messages) {
-			m.future = nil
-		} else {
-			m.applyRewind(cut + 1)
-		}
-	}
-	m.persist() // every row must exist in the DB before the copy
-	if m.sessionID == "" {
-		return // persist failed; it already reported why
-	}
-	cut = min(max(cut, 0), len(m.agent.Messages)-1)
-	oldID := m.sessionID
-	oldTitle := oldID
-	if meta, _, err := m.store.Load(oldID); err == nil && meta.Title != "" {
-		oldTitle = meta.Title
-	}
-	newID, err := m.store.Fork(oldID, cut, title) // copies stored rows seq < cut
-	if err != nil {
-		m.append(errStyle.Render("fork failed: " + err.Error()))
-		return
-	}
-	m.sessionID = newID
-	m.agent.Tasks().SetSessionID(newID)
-	m.agent.Messages = m.agent.Messages[:cut+1]
-	m.future = nil
-	m.saved = cut + 1
-	m.rebuildTranscript()
-	m.append(dimStyle.Render(fmt.Sprintf("⑂ forked %q → %q (%s) — the original is under /resume", oldTitle, title, newID)))
+	m.forkWorker(cut, title)
 }
 
 func (m *model) forkWorker(cut int, title string) {
@@ -548,7 +308,7 @@ func (m *model) forkWorker(cut int, title string) {
 		m.append(errStyle.Render("fork needs a name"))
 		return
 	}
-	if m.store == nil || m.sessionID == "" {
+	if m.sessionID == "" {
 		m.append(errStyle.Render("no session to fork"))
 		return
 	}
@@ -556,38 +316,15 @@ func (m *model) forkWorker(cut int, title string) {
 		m.append(dimStyle.Render("(worker is busy — fork after this work finishes)"))
 		return
 	}
-	messages := m.messagesSnapshot()
-	all := append(slices.Clone(messages), m.future...)
-	if len(all) <= 1 {
-		m.append(dimStyle.Render("(nothing to fork yet)"))
+	if m.workerClient == nil && !m.ensureWorker() {
+		m.append(errStyle.Render("fork failed: worker unavailable: " + m.workerStartError))
 		return
 	}
-	cut = min(max(cut, 1), len(all)-1)
-	if cut > len(messages)-1 {
-		if err := m.store.DeleteFrom(m.sessionID, len(messages)); err != nil {
-			m.append(errStyle.Render("fork failed: " + err.Error()))
-			return
-		}
-		if err := m.store.Save(m.sessionID, len(messages), all[:cut+1], m.modelName, m.provName); err != nil {
-			m.append(errStyle.Render("fork failed: " + err.Error()))
-			return
-		}
-	}
-	oldID := m.sessionID
-	oldTitle := oldID
-	if meta, _, err := m.store.Load(oldID); err == nil && meta.Title != "" {
-		oldTitle = meta.Title
-	}
-	newID, err := m.store.Fork(oldID, cut, title)
-	if err != nil {
+	requestID := workerRequestID("fork")
+	if err := m.workerClient.Send(workerwire.CommandFork, requestID, workerwire.ForkRequest{Cut: cut, Title: title}); err != nil {
 		m.append(errStyle.Render("fork failed: " + err.Error()))
 		return
 	}
-	if err := m.resumeDisplay(newID); err != nil {
-		m.append(errStyle.Render("fork failed: " + err.Error()))
-		return
-	}
-	m.append(dimStyle.Render(fmt.Sprintf("⑂ forked %q → %q (%s) — the original is under /resume", oldTitle, title, newID)))
 }
 
 // renameCommand implements /rename [title].
@@ -615,15 +352,19 @@ func (m *model) rename(title string) {
 		m.append(errStyle.Render("rename needs a title"))
 		return
 	}
-	m.persist() // a session row must exist before it can be titled
 	if m.sessionID == "" {
+		m.append(errStyle.Render("no session to rename"))
 		return
 	}
-	if err := m.store.SetTitle(m.sessionID, title); err != nil {
+	if m.workerClient == nil && !m.ensureWorker() {
+		m.append(errStyle.Render("rename failed: worker unavailable: " + m.workerStartError))
+		return
+	}
+	requestID := workerRequestID("rename")
+	if err := m.workerClient.Send(workerwire.CommandRename, requestID, workerwire.RenameRequest{Title: title}); err != nil {
 		m.append(errStyle.Render("rename failed: " + err.Error()))
 		return
 	}
-	m.append(dimStyle.Render("✎ session renamed: " + title))
 }
 
 // Rewind: double-esc while idle opens a picker over the conversation's
@@ -665,26 +406,9 @@ type rewindState struct {
 type escArmMsg struct{} // disarms the idle double-esc window
 
 func (m *model) rewindEntries() []rewindEntry {
-	if m.workerOnly {
-		var out []rewindEntry
-		for i, msg := range m.messagesSnapshot() {
-			if msg.Role == "user" && msg.Authored {
-				out = append(out, rewindEntry{cut: i, text: oneLine(msg.TextContent()), when: msg.SentAt})
-			}
-		}
-		base := len(m.messagesSnapshot())
-		for i, msg := range m.future {
-			if msg.Role == "user" && msg.Authored {
-				out = append(out, rewindEntry{cut: base + i, text: oneLine(msg.TextContent()), when: msg.SentAt, future: true})
-			}
-		}
-		return out
-	}
-	if m.agent == nil {
-		return nil
-	}
+	messages := m.messagesSnapshot()
 	var out []rewindEntry
-	for i, msg := range m.agent.Messages {
+	for i, msg := range messages {
 		if msg.Role == "user" && msg.Authored {
 			out = append(out, rewindEntry{cut: i, text: oneLine(msg.TextContent()), when: msg.SentAt})
 		}
@@ -692,7 +416,7 @@ func (m *model) rewindEntries() []rewindEntry {
 	for i, msg := range m.future {
 		if msg.Role == "user" && msg.Authored {
 			out = append(out, rewindEntry{
-				cut: len(m.agent.Messages) + i, text: oneLine(msg.TextContent()), when: msg.SentAt, future: true,
+				cut: len(messages) + i, text: oneLine(msg.TextContent()), when: msg.SentAt, future: true,
 			})
 		}
 	}
@@ -716,10 +440,6 @@ func (m *model) scrollToMsg(msgIdx int) {
 }
 
 func (m *model) openRewind() {
-	if !m.workerOnly && m.agent == nil {
-		m.append(m.degradedProviderNote())
-		return
-	}
 	entries := m.rewindEntries()
 	if len(entries) == 0 {
 		m.append(dimStyle.Render("(nothing to rewind to yet)"))
@@ -744,18 +464,9 @@ func (m *model) rewindKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.scrollToMsg(sel().cut)
 	case tea.KeyEnter:
 		e := sel()
-		if m.workerOnly {
-			m.requestWorkerRewind(e.cut)
-			m.rew = nil
-			return m, nil
-		}
-		text := m.applyRewind(e.cut)
+		m.requestWorkerRewind(e.cut)
 		m.rew = nil
-		if !e.future {
-			m.input.SetValue(text) // restore the rewound message for editing
-			m.input.CursorEnd()
-			m.growInput()
-		}
+		return m, nil
 	case tea.KeyRunes:
 		if string(msg.Runes) == "f" {
 			e := sel()
@@ -802,117 +513,33 @@ func (m *model) requestWorkerRewind(cut int) {
 	m.append(dimStyle.Render("⟲ rewinding conversation…"))
 }
 
-// applyRewind moves the conversation boundary to cut (an index into
-// agent.Messages, clamped to the system prompt). Anything beyond it becomes
-// the redo stack; the DB and transcript follow. Returns the authored user
-// text at the cut, if any, for restoring into the input.
-func (m *model) applyRewind(cut int) string {
-	if m.workerOnly {
-		return ""
-	}
-	if m.agent == nil {
-		return ""
-	}
-	cut = max(cut, 1) // keep the system prompt
-	base := len(m.agent.Messages)
-	restored, restoreErr := 0, error(nil)
-	switch {
-	case cut > base: // forward: pull clipped messages back in
-		m.agent.Messages = append(m.agent.Messages, m.future[:cut-base]...)
-		m.future = slices.Clone(m.future[cut-base:])
-	case cut < base: // back: clip the tail into the redo stack (oldest first)
-		clipped := slices.Clone(m.agent.Messages[cut:])
-		m.future = append(clipped, m.future...)
-		m.agent.Messages = m.agent.Messages[:cut]
-		m.saved = min(m.saved, cut)
-		if m.store != nil && m.sessionID != "" {
-			if err := m.store.DeleteFrom(m.sessionID, cut); err != nil {
-				m.append(errStyle.Render("session save failed: " + err.Error()))
-			}
-		}
-		// restore the workspace to the earliest snapshot being rewound past
-		// (the state before the oldest clipped turn ran). Consumed snapshots
-		// are dropped from map and DB (DeleteFrom trimmed the rows above) so
-		// a later rewind doesn't re-apply them.
-		best, bestIdx := "", -1
-		for idx, ref := range m.snapshots {
-			if idx >= cut && (bestIdx == -1 || idx < bestIdx) {
-				best, bestIdx = ref, idx
-			}
-		}
-		if best != "" {
-			restored, restoreErr = session.RestoreWorkspace(cwd(), best)
-			for idx := range m.snapshots {
-				if idx >= cut {
-					delete(m.snapshots, idx)
-				}
-			}
-		}
-	}
-	m.persist() // re-save any rows pulled back in; no-op otherwise
-	m.rebuildTranscript()
-	// the workspace note lands AFTER the rebuild — rebuildTranscript resets
-	// the block list, so anything appended before it is wiped
-	switch {
-	case restoreErr != nil:
-		m.append(errStyle.Render("workspace rewind failed: " + restoreErr.Error()))
-	case restored > 0:
-		m.append(dimStyle.Render(fmt.Sprintf("⟲ workspace rewound — %d file(s) restored", restored)))
-	}
-	text := ""
-	if cut < len(m.agent.Messages)+len(m.future) {
-		if msg := m.messageAt(cut); msg.Role == "user" && msg.Authored {
-			text = msg.TextContent()
-		}
-	}
-	return text
-}
-
 // messageAt reads conversation index i across the live/redo boundary.
 func (m *model) messageAt(i int) models.Message {
-	if m.workerOnly {
-		if i < len(m.messages) {
-			return m.messages[i]
-		}
-		if i-len(m.messages) < len(m.future) {
-			return m.future[i-len(m.messages)]
-		}
+	if i < 0 {
 		return models.Message{}
 	}
-	if m.agent == nil {
-		return models.Message{}
+	messages := m.messagesSnapshot()
+	if i < len(messages) {
+		return messages[i]
 	}
-	if i < len(m.agent.Messages) {
-		return m.agent.Messages[i]
+	i -= len(messages)
+	if i < len(m.future) {
+		return m.future[i]
 	}
-	return m.future[i-len(m.agent.Messages)]
+	return models.Message{}
 }
 
-// rebuildTranscript resets the block list from agent.Messages (rewind moves
-// the boundary, so blocks beyond the cut must go).
+// rebuildTranscript resets the block list from stored messages.
 func (m *model) rebuildTranscript() {
-	if m.workerOnly {
-		m.blocks = nil
-		m.msgBlock = nil
-		m.workerContextTokens = m.usage.PromptTokens + m.usage.CompletionTokens
-		messages := m.messagesSnapshot()
-		if len(messages) > 0 && messages[0].Role == "system" {
-			m.seedTranscript(messages[1:], 1)
-		} else {
-			m.seedTranscript(messages, 0)
-		}
-		return
-	}
-	if m.agent == nil {
-		m.blocks = nil
-		m.msgBlock = nil
-		m.workerContextTokens = 0
-		return
-	}
 	m.blocks = nil
 	m.msgBlock = nil
-	m.workerContextTokens = m.agent.ContextTokens()
-	m.seedTranscript(m.agent.Messages[1:], 1) // skip the system prompt
+	m.workerContextTokens = m.usage.PromptTokens + m.usage.CompletionTokens
+	messages := m.messagesSnapshot()
+	if len(messages) > 0 && messages[0].Role == "system" {
+		m.seedTranscript(messages[1:], 1)
+	} else {
+		m.seedTranscript(messages, 0)
+	}
 }
 
 // rewindView renders the picker strip above the input: oldest at the top,
@@ -961,36 +588,21 @@ func (m *model) resetSessionState() {
 		m.stopWorker()
 		m.workerStartFailed = false
 	}
-	if m.agent != nil {
-		m.agent.Messages = m.agent.Messages[:1] // keep system prompt
-		m.agent.ResetUsage()                    // zero the status line's spend counters
-		m.agent.Tasks().SetSessionID("")
-		m.agent.SetSessionID("")
-		m.agent.ResetState()
-	}
-	if m.workerOnly {
-		m.messages = []models.Message{{Role: "system", Content: m.sysPrompt}}
-		m.modelID = ""
-		m.usage = models.Usage{}
-		m.contextLimit = 0
-		m.workerTasks = nil
-		m.workerStartError = ""
-	}
+	m.messages = []models.Message{{Role: "system", Content: m.sysPrompt}}
+	m.modelID = ""
+	m.usage = models.Usage{}
+	m.contextLimit = 0
+	m.workerTasks = nil
+	m.workerStartError = ""
 	m.workerContextTokens = 0
 	m.blocks = nil
 	m.msgBlock = nil
 	m.future = nil
 	m.proposedPlanMD = ""
 	m.planCurrent = ""
-	if m.workerOnly {
-		m.goal = ""
-		m.goalRounds = 0
-	} else {
-		m.setGoal("")
-	}
+	m.setGoal("")
 	m.goalRecord = nil
 	m.sessionID = ""
-	m.saved = 1
 }
 
 const previewLines = 5

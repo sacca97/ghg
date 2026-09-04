@@ -142,6 +142,15 @@ func (w *workerProcessState) Command(_ context.Context, command workerwire.Comma
 			return workerwire.CommandResult{}, errors.New("worker is busy or stopping")
 		}
 		return workerwire.CommandResult{Payload: json.RawMessage(`{"accepted":true}`)}, nil
+	case workerwire.CommandShell:
+		var request workerwire.ShellRequest
+		if err := json.Unmarshal(command.Payload, &request); err != nil || strings.TrimSpace(request.Command) == "" {
+			return workerwire.CommandResult{}, errors.New("worker shell payload is invalid")
+		}
+		if !w.startShell(strings.TrimSpace(request.Command)) {
+			return workerwire.CommandResult{}, errors.New("worker shell is busy or stopping")
+		}
+		return workerwire.CommandResult{Payload: json.RawMessage(`{"accepted":true}`)}, nil
 	case workerwire.CommandChdir:
 		if err := w.requireIdleHistory(); err != nil {
 			return workerwire.CommandResult{}, err
@@ -169,6 +178,34 @@ func (w *workerProcessState) Command(_ context.Context, command workerwire.Comma
 		}
 		w.appendContent(request.Content)
 		return workerwire.CommandResult{Payload: json.RawMessage(`{"accepted":true}`)}, nil
+	case workerwire.CommandFork:
+		var request workerwire.ForkRequest
+		if err := json.Unmarshal(command.Payload, &request); err != nil {
+			return workerwire.CommandResult{}, errors.New("fork payload is invalid")
+		}
+		result, err := w.fork(request)
+		if err != nil {
+			return workerwire.CommandResult{}, err
+		}
+		data, err := json.Marshal(result)
+		if err != nil {
+			return workerwire.CommandResult{}, fmt.Errorf("marshal fork: %w", err)
+		}
+		return workerwire.CommandResult{Payload: data}, nil
+	case workerwire.CommandRename:
+		var request workerwire.RenameRequest
+		if err := json.Unmarshal(command.Payload, &request); err != nil {
+			return workerwire.CommandResult{}, errors.New("rename payload is invalid")
+		}
+		result, err := w.rename(request)
+		if err != nil {
+			return workerwire.CommandResult{}, err
+		}
+		data, err := json.Marshal(result)
+		if err != nil {
+			return workerwire.CommandResult{}, fmt.Errorf("marshal rename: %w", err)
+		}
+		return workerwire.CommandResult{Payload: data}, nil
 	case workerwire.CommandDetach:
 		w.mu.Lock()
 		allowed := w.state == workerwire.StateRunning || w.state == workerwire.StateWaitingApproval || w.hasLiveWork()
@@ -427,6 +464,9 @@ func (w *workerProcessState) publish(kind string, data any, important bool) {
 }
 
 func (w *workerProcessState) humanGate(req tools.GateRequest) (tools.GateDecision, string) {
+	if w.perms != nil && w.perms.CoveredBy(req) {
+		return tools.GateAllowOnce, ""
+	}
 	id := fmt.Sprintf("approval-%d", w.approvalSeq.Add(1))
 	pending := &workerApproval{ID: id, Tool: req.Tool, Command: req.Command, Rule: req.Rule}
 	flight := &workerApprovalFlight{done: make(chan struct{}), request: *pending}
@@ -464,6 +504,13 @@ func (w *workerProcessState) answerApproval(answer workerApprovalAnswer) bool {
 		decision = tools.GateAllowOnce
 	case "allow_always":
 		decision = tools.GateAllowAlways
+		if w.perms != nil {
+			rule := flight.request.Rule
+			if flight.request.Tool != "bash" {
+				rule = flight.request.Command
+			}
+			w.perms.AllowAlways(flight.request.Tool, rule)
+		}
 	case "reject":
 	default:
 		return false

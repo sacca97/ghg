@@ -1,6 +1,11 @@
 package agent
 
-import "testing"
+import (
+	"strings"
+	"testing"
+
+	"github.com/sacca97/ghg/internal/models"
+)
 
 func TestUpdateValidationKeepsHostStatesHostControlled(t *testing.T) {
 	for _, status := range []GoalStatus{GoalStatusPaused, GoalStatusUsageLimited, GoalStatusBudgetLimited} {
@@ -37,5 +42,44 @@ func TestRecordValidationAndLifecycleHelpers(t *testing.T) {
 	}
 	if !GoalStatusComplete.Terminal() || GoalStatusComplete.Resumable() || !GoalStatusPaused.Resumable() {
 		t.Fatal("lifecycle helper mismatch")
+	}
+}
+
+func TestGoalFromContextPrompt(t *testing.T) {
+	call := models.ToolCall{}
+	call.Function.Name = "bash"
+	call.Function.Arguments = `{"cmd":"go test ./..."}`
+	tail := []models.Message{
+		{Role: "user", Content: "make the tests green"},
+		{Role: "assistant", Content: "I'll fix the flaky test and run go test.", ToolCalls: []models.ToolCall{call}},
+	}
+	p := BuildGoalFromContextPrompt(tail)
+	for _, want := range []string{"make the tests green", "flaky test", "assistant called bash(", "ONLY the goal"} {
+		if !strings.Contains(p, want) {
+			t.Fatalf("prompt missing %q:\n%s", want, p)
+		}
+	}
+
+	msgs := []models.Message{
+		{Role: "system", Content: "sys"},
+		{Role: "user", Content: "old"},
+		{Role: "assistant", Content: "older"},
+		{Role: "user", Content: "recent ask"},
+		{Role: "assistant", Content: "recent reply"},
+	}
+	got, err := GoalFromContextMessages(msgs, 2)
+	if err != nil || len(got) != 2 || got[0].Content != "recent ask" || got[1].Content != "recent reply" {
+		t.Fatalf("window: %v %v", got, err)
+	}
+	got, err = GoalFromContextMessages(msgs, 50)
+	if err != nil || len(got) != 4 || got[0].Content != "old" {
+		t.Fatalf("clamped window: %v %v", got, err)
+	}
+	got, err = GoalFromContextMessages(msgs, 0)
+	if err != nil || len(got) != 4 {
+		t.Fatalf("default window: %v %v", got, err)
+	}
+	if _, err := GoalFromContextMessages(msgs[:2], 8); err == nil {
+		t.Fatal("two conversation messages required")
 	}
 }

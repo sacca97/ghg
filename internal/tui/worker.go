@@ -15,6 +15,8 @@ import (
 	"github.com/sacca97/ghg/internal/agent"
 	"github.com/sacca97/ghg/internal/config"
 	"github.com/sacca97/ghg/internal/models"
+	"github.com/sacca97/ghg/internal/search"
+	"github.com/sacca97/ghg/internal/session"
 	"github.com/sacca97/ghg/internal/tools"
 	workerwire "github.com/sacca97/ghg/internal/worker"
 )
@@ -39,6 +41,56 @@ type workerEvent struct {
 	Data json.RawMessage `json:"data"`
 }
 
+type workerStateEvent struct {
+	State    workerwire.State `json:"state"`
+	Detached bool             `json:"detached"`
+	Mode     string           `json:"mode"`
+}
+
+type workerToolStartEvent struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	Args string `json:"args"`
+}
+
+type workerToolEndEvent struct {
+	ID     string `json:"id"`
+	Name   string `json:"name"`
+	Result string `json:"result"`
+}
+
+func decodeEvent[T any](data json.RawMessage) (T, bool) {
+	var value T
+	if err := json.Unmarshal(data, &value); err != nil {
+		return value, false
+	}
+	return value, true
+}
+
+func workerError(message string) error {
+	if message == "" {
+		return nil
+	}
+	lower := strings.ToLower(message)
+	if strings.Contains(lower, "context canceled") || strings.Contains(lower, "interrupted") {
+		return context.Canceled
+	}
+	return errors.New(message)
+}
+
+func workerStateBusy(state workerwire.State) bool {
+	return state == workerwire.StateRunning || state == workerwire.StateWaitingApproval
+}
+
+func (m *model) attachWorkerClient(client *workerwire.Client, runtimeFile workerwire.Runtime) uint64 {
+	m.workerRuntime = runtimeFile
+	m.workerClient = client
+	m.workerGeneration++
+	generation := m.workerGeneration
+	m.pumpWorker(client, generation)
+	return generation
+}
+
 func (m *model) startWorkerProcess(cautious bool) error {
 	if m.store == nil {
 		return errors.New("worker requires a session store")
@@ -46,8 +98,8 @@ func (m *model) startWorkerProcess(cautious bool) error {
 	if m.modelName == "" || m.provName == "" {
 		return errors.New(m.degradedProviderNote())
 	}
-	if m.sessionID == "" && !m.ensureSession() {
-		return errors.New("worker could not reserve a session")
+	if m.sessionID == "" {
+		m.sessionID = session.NewSessionID()
 	}
 	dir, err := config.Dir()
 	if err != nil {
@@ -67,10 +119,7 @@ func (m *model) startWorkerProcess(cautious bool) error {
 		if cerr != nil {
 			return cerr
 		}
-		m.workerRuntime = runtimeFile
-		m.workerClient = client
-		m.workerGeneration++
-		m.pumpWorker(client, m.workerGeneration)
+		m.attachWorkerClient(client, runtimeFile)
 		return nil
 	}
 	if err := runtimeFile.WritePrompt(m.sysPrompt); err != nil {
@@ -108,11 +157,8 @@ func (m *model) startWorkerProcess(cautious bool) error {
 		return err
 	}
 	m.workerProcess = proc
-	m.workerRuntime = runtimeFile
-	m.workerClient = client
-	m.workerGeneration++
-	m.pumpWorker(client, m.workerGeneration)
-	m.monitorWorker(proc, runtimeFile, m.workerGeneration)
+	generation := m.attachWorkerClient(client, runtimeFile)
+	m.monitorWorker(proc, runtimeFile, generation)
 	return nil
 }
 
@@ -149,10 +195,7 @@ func (m *model) attachWorkerProcess(sessionID string) error {
 	if err != nil {
 		return fmt.Errorf("attach worker: %w", err)
 	}
-	m.workerClient = client
-	m.workerRuntime = runtimeFile
-	m.workerGeneration++
-	m.pumpWorker(client, m.workerGeneration)
+	m.attachWorkerClient(client, runtimeFile)
 	return nil
 }
 
@@ -179,9 +222,6 @@ func (m *model) ensureWorker() bool {
 	if m.workerClient != nil || m.workerStartFailed || m.prog == nil || m.store == nil {
 		return m.workerClient != nil
 	}
-	if !m.workerOnly && m.agent == nil {
-		return m.workerClient != nil
-	}
 	if err := m.startWorkerProcess(m.cautious); err != nil {
 		m.workerStartFailed = true
 		m.workerStartError = err.Error()
@@ -206,13 +246,9 @@ func (m *model) syncWorkerConfiguration(updateEffort bool) {
 	if m.workerClient == nil {
 		return
 	}
-	role, effort := m.role, m.effort
-	if !m.workerOnly && m.agent != nil {
-		role, effort = m.agent.Role, m.agent.Effort
-	}
 	if err := m.workerClient.Send(workerwire.CommandConfigure, workerRequestID("configure"), workerwire.ConfigureRequest{
-		Model: m.modelName, Provider: m.provName, Role: role,
-		Effort: effort, UpdateEffort: updateEffort,
+		Model: m.modelName, Provider: m.provName, Role: m.currentRole(),
+		Effort: m.currentEffort(), UpdateEffort: updateEffort,
 		Mode: m.uiMode(),
 	}); err != nil {
 		m.append(errStyle.Render("worker configuration failed: " + err.Error()))
@@ -299,23 +335,18 @@ func workerRequestID(prefix string) string {
 	return fmt.Sprintf("%s-%d", prefix, time.Now().UnixNano())
 }
 
-func (m *model) submitWorkerTurn(text string, authored bool, prepared string, parts []models.ContentPart, at int, snap string, goalCtx *agent.GoalRecord) (tea.Model, tea.Cmd) {
+func (m *model) submitWorkerTurn(text string, authored bool, prepared string, parts []models.ContentPart, at int, snap string, goalCtx *agent.GoalRecord, ask bool) (tea.Model, tea.Cmd) {
 	if m.workerClient == nil {
 		return m, nil
 	}
-	if !m.workerOnly && m.agent != nil {
-		message := models.Message{Role: "user", Content: prepared, Parts: parts, Authored: authored}
-		if authored {
-			now := m.nowFn()
-			message.SentAt = &now
-		}
-		m.agent.Messages = append(m.agent.Messages, message)
+	message := models.Message{Role: "user", Content: prepared, Parts: parts, Authored: authored}
+	if authored {
+		now := m.nowFn()
+		message.SentAt = &now
 	}
+	m.messages = append(m.messages, message)
 	requestID := workerRequestID("turn")
 	systemPrompt := m.sysPrompt
-	if !m.workerOnly && m.agent != nil && len(m.agent.Messages) > 0 {
-		systemPrompt = m.agent.Messages[0].Content
-	}
 	m.cancel = func() {
 		if m.workerClient != nil {
 			_ = m.workerClient.Send(workerwire.CommandCancel, requestID+"-cancel", nil)
@@ -324,8 +355,9 @@ func (m *model) submitWorkerTurn(text string, authored bool, prepared string, pa
 	if err := m.workerClient.Send(workerwire.CommandInput, requestID, workerwire.Input{
 		Input: prepared, Authored: authored, Parts: parts, Goal: goalCtx,
 		SystemPrompt: systemPrompt, At: at, Snap: snap,
-		PlanMode:   !m.reviewing && m.uiMode() == uiModePlan,
-		ReviewMode: m.reviewing,
+		PlanMode:   !ask && !m.reviewing && m.uiMode() == uiModePlan,
+		ReviewMode: !ask && m.reviewing,
+		AskMode:    ask,
 	}); err != nil {
 		m.cancel = nil
 		m.busy = false
@@ -366,6 +398,7 @@ func (m *model) handleWorkerFrame(frame workerwire.Frame) (tea.Model, tea.Cmd) {
 		if strings.HasPrefix(frame.RequestID, "mcp-") {
 			var statuses []workerwire.MCPStatus
 			if err := json.Unmarshal(frame.Payload, &statuses); err == nil {
+				m.workerMCPStatuses = statuses
 				m.append(renderWorkerMCPStatuses(statuses))
 			}
 		}
@@ -379,7 +412,6 @@ func (m *model) handleWorkerFrame(frame workerwire.Frame) (tea.Model, tea.Cmd) {
 			var result workerwire.HistoryResult
 			if err := json.Unmarshal(frame.Payload, &result); err == nil {
 				m.setMessages(result.Messages)
-				m.saved = len(result.Messages)
 				m.usage = result.Usage
 				m.workerContextTokens = result.ContextTokens
 				m.rebuildTranscript()
@@ -406,6 +438,23 @@ func (m *model) handleWorkerFrame(frame workerwire.Frame) (tea.Model, tea.Cmd) {
 				}
 			}
 			m.workerChdirRequest = ""
+		}
+		if strings.HasPrefix(frame.RequestID, "fork-") {
+			var result workerwire.ForkResult
+			if err := json.Unmarshal(frame.Payload, &result); err == nil && result.NewSessionID != "" {
+				m.stopWorker()
+				if err := m.resumeDisplay(result.NewSessionID); err != nil {
+					m.append(errStyle.Render("fork resume failed: " + err.Error()))
+				} else {
+					m.append(dimStyle.Render(fmt.Sprintf("⑂ forked %q → %q (%s) — the original is under /resume", result.OldTitle, result.Title, result.NewSessionID)))
+				}
+			}
+		}
+		if strings.HasPrefix(frame.RequestID, "rename-") {
+			var result workerwire.RenameResult
+			if err := json.Unmarshal(frame.Payload, &result); err == nil && result.Title != "" {
+				m.append(dimStyle.Render("✎ session renamed: " + result.Title))
+			}
 		}
 	case workerwire.TypeDetachAck:
 		if frame.RequestID == m.detachRequestID {
@@ -457,7 +506,6 @@ func (m *model) applyWorkerSnapshot(snapshot workerwire.Snapshot) {
 		// finished between the initial DB load and this attach still shows
 		// its completed blocks (and stale tool rows do not linger).
 		m.rebuildTranscript()
-		m.saved = len(m.messages)
 	}
 	if snapshot.Mode != "" {
 		m.mode = snapshot.Mode
@@ -466,12 +514,12 @@ func (m *model) applyWorkerSnapshot(snapshot workerwire.Snapshot) {
 	m.workerState = snapshot.State
 	m.workerDetached = snapshot.Detached
 	m.workerTasks = make(map[string]workerwire.TaskState, len(snapshot.Tasks))
-	m.workerLiveWork = snapshot.State == workerwire.StateRunning || snapshot.State == workerwire.StateWaitingApproval
+	m.workerLiveWork = workerStateBusy(snapshot.State)
 	for _, task := range snapshot.Tasks {
 		m.workerTasks[task.ID] = task
 		m.workerLiveWork = m.workerLiveWork || task.Status == "running"
 	}
-	m.busy = snapshot.State == workerwire.StateRunning || snapshot.State == workerwire.StateWaitingApproval
+	m.busy = workerStateBusy(snapshot.State)
 	if m.busy {
 		if snapshot.LiveText != "" {
 			m.current = snapshot.LiveText
@@ -503,8 +551,7 @@ func (m *model) applyWorkerSnapshot(snapshot workerwire.Snapshot) {
 func (m *model) workerEvent(event workerEvent) tea.Cmd {
 	switch event.Kind {
 	case "route":
-		var value workerwire.ConfigureRequest
-		if json.Unmarshal(event.Data, &value) == nil {
+		if value, ok := decodeEvent[workerwire.ConfigureRequest](event.Data); ok {
 			m.modelID = value.Model
 			m.modelName, m.provName = value.ModelName, value.Provider
 			if m.modelName == "" {
@@ -520,24 +567,19 @@ func (m *model) workerEvent(event workerEvent) tea.Cmd {
 		}
 		return nil
 	case "state":
-		var value struct {
-			State    workerwire.State `json:"state"`
-			Detached bool             `json:"detached"`
-			Mode     string           `json:"mode"`
-		}
-		if json.Unmarshal(event.Data, &value) == nil {
+		if value, ok := decodeEvent[workerStateEvent](event.Data); ok {
 			m.workerState = value.State
 			m.workerDetached = value.Detached
 			if value.Mode != "" {
 				m.mode = value.Mode
 			}
-			m.busy = value.State == workerwire.StateRunning || value.State == workerwire.StateWaitingApproval
+			m.busy = workerStateBusy(value.State)
 			m.workerLiveWork = m.busy || m.workerHasLiveTask()
 		}
 		return nil
 	case "task":
-		var value workerwire.TaskState
-		if json.Unmarshal(event.Data, &value) == nil {
+		search.InvalidateFileIndex(mustWorkingDirectory())
+		if value, ok := decodeEvent[workerwire.TaskState](event.Data); ok {
 			if m.workerTasks == nil {
 				m.workerTasks = make(map[string]workerwire.TaskState)
 			}
@@ -547,44 +589,41 @@ func (m *model) workerEvent(event workerEvent) tea.Cmd {
 		}
 		return nil
 	case "mcp":
-		var value []workerwire.MCPStatus
-		if json.Unmarshal(event.Data, &value) == nil {
+		if value, ok := decodeEvent[[]workerwire.MCPStatus](event.Data); ok {
 			return func() tea.Msg { return mcpStatusMsg{statuses: value} }
 		}
 		return nil
 	case "text":
-		var value string
-		if json.Unmarshal(event.Data, &value) == nil {
+		if value, ok := decodeEvent[string](event.Data); ok {
 			return func() tea.Msg { return textMsg(value) }
 		}
 	case "think":
-		var value string
-		if json.Unmarshal(event.Data, &value) == nil {
+		if value, ok := decodeEvent[string](event.Data); ok {
 			return func() tea.Msg { return thinkMsg(value) }
 		}
 	case workerwire.EventPlanDelta:
-		var value string
-		if json.Unmarshal(event.Data, &value) == nil {
+		if value, ok := decodeEvent[string](event.Data); ok {
 			return func() tea.Msg { return planDeltaMsg(value) }
 		}
+	case workerwire.EventShellDone:
+		search.InvalidateFileIndex(mustWorkingDirectory())
+		if value, ok := decodeEvent[workerwire.ShellResult](event.Data); ok {
+			return func() tea.Msg { return shellDoneMsg{cmd: value.Command, out: value.Output} }
+		}
 	case "steer":
-		var value string
-		if json.Unmarshal(event.Data, &value) == nil {
+		if value, ok := decodeEvent[string](event.Data); ok {
 			return func() tea.Msg { return steeredMsg(value) }
 		}
 	case "tool_start":
-		var value struct{ ID, Name, Args string }
-		if json.Unmarshal(event.Data, &value) == nil {
+		if value, ok := decodeEvent[workerToolStartEvent](event.Data); ok {
 			return func() tea.Msg { return toolStartMsg{value.ID, value.Name, value.Args} }
 		}
 	case "tool_end":
-		var value struct{ ID, Name, Result string }
-		if json.Unmarshal(event.Data, &value) == nil {
+		if value, ok := decodeEvent[workerToolEndEvent](event.Data); ok {
 			return func() tea.Msg { return toolEndMsg{value.ID, value.Name, value.Result} }
 		}
 	case "usage":
-		var value models.Usage
-		if json.Unmarshal(event.Data, &value) == nil {
+		if value, ok := decodeEvent[models.Usage](event.Data); ok {
 			m.usage.Add(value)
 			if total := value.PromptTokens + value.CompletionTokens; total > 0 {
 				m.workerContextTokens = total
@@ -592,25 +631,21 @@ func (m *model) workerEvent(event workerEvent) tea.Cmd {
 			return func() tea.Msg { return usageMsg(value) }
 		}
 	case "goal_update":
-		var value agent.GoalUpdate
-		if json.Unmarshal(event.Data, &value) == nil {
+		if value, ok := decodeEvent[agent.GoalUpdate](event.Data); ok {
 			return func() tea.Msg { return goalUpdateMsg{update: value} }
 		}
 	case "retry":
-		var value models.RetryEvent
-		if json.Unmarshal(event.Data, &value) == nil {
+		if value, ok := decodeEvent[models.RetryEvent](event.Data); ok {
 			return func() tea.Msg {
 				return noticeMsg(fmt.Sprintf("⚠ request failed (%s) — retrying in %s (attempt %d/%d)", value.Err, value.Delay.Round(time.Millisecond), value.Attempt+1, value.Max))
 			}
 		}
 	case "goal":
-		var value agent.GoalRecord
-		if json.Unmarshal(event.Data, &value) == nil {
+		if value, ok := decodeEvent[agent.GoalRecord](event.Data); ok {
 			return func() tea.Msg { return goalUpdateRecordMsg{record: value} }
 		}
 	case "goal_from_context":
-		var value workerwire.GoalFromContextResult
-		if json.Unmarshal(event.Data, &value) == nil {
+		if value, ok := decodeEvent[workerwire.GoalFromContextResult](event.Data); ok {
 			var err error
 			if value.Error != "" {
 				err = errors.New(value.Error)
@@ -629,23 +664,14 @@ func (m *model) workerEvent(event workerEvent) tea.Cmd {
 			}
 		}
 	case "schedule":
-		var value string
-		if json.Unmarshal(event.Data, &value) == nil {
+		if value, ok := decodeEvent[string](event.Data); ok {
 			return func() tea.Msg { return noticeMsg(value) }
 		}
 	case "compact":
 		return func() tea.Msg { return noticeMsg("◎ compacted — raw history preserved") }
 	case "compact_done":
-		var value workerwire.CompactResult
-		if json.Unmarshal(event.Data, &value) == nil {
-			var err error
-			if value.Error != "" {
-				if strings.Contains(strings.ToLower(value.Error), "context canceled") || strings.Contains(strings.ToLower(value.Error), "interrupted") {
-					err = context.Canceled
-				} else {
-					err = errors.New(value.Error)
-				}
-			}
+		if value, ok := decodeEvent[workerwire.CompactResult](event.Data); ok {
+			err := workerError(value.Error)
 			if len(value.Messages) > 0 {
 				m.setMessages(value.Messages)
 				m.workerContextTokens = agent.EstimateTokens(value.Messages)
@@ -656,23 +682,15 @@ func (m *model) workerEvent(event workerEvent) tea.Cmd {
 			}
 		}
 	case "permission_request":
-		var value workerwire.PermissionRequest
-		if json.Unmarshal(event.Data, &value) == nil {
+		if value, ok := decodeEvent[workerwire.PermissionRequest](event.Data); ok {
 			return func() tea.Msg {
 				return workerPermissionMsg{approval: value.Approval}
 			}
 		}
 	case "turn_done":
-		var value workerwire.TurnResult
-		if json.Unmarshal(event.Data, &value) == nil {
-			var err error
-			if value.Error != "" {
-				if strings.Contains(strings.ToLower(value.Error), "context canceled") || strings.Contains(strings.ToLower(value.Error), "interrupted") {
-					err = context.Canceled
-				} else {
-					err = errors.New(value.Error)
-				}
-			}
+		search.InvalidateFileIndex(mustWorkingDirectory())
+		if value, ok := decodeEvent[workerwire.TurnResult](event.Data); ok {
+			err := workerError(value.Error)
 			if len(value.Messages) > 0 {
 				m.setMessages(value.Messages)
 			}

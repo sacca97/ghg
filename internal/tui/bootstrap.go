@@ -16,8 +16,6 @@ import (
 	"github.com/sacca97/ghg/internal/models"
 	"github.com/sacca97/ghg/internal/session"
 	"github.com/sacca97/ghg/internal/skills"
-	"github.com/sacca97/ghg/internal/tools/bashrun"
-
 	"golang.org/x/term"
 )
 
@@ -74,18 +72,16 @@ func runTUI(cfg *config.Config, modelName, provName, sysPrompt, resumeID string,
 		modelID: route.APIID, protocol: route.Protocol, role: route.Role,
 		effort: route.Effort, contextLimit: route.ContextLimit,
 		messages:  []models.Message{{Role: "system", Content: sysPrompt}},
-		sysPrompt: sysPrompt, workerOnly: true,
-		input: ti, spin: spinner.New(spinner.WithSpinner(spinner.Dot)), follow: true, saved: 1,
+		sysPrompt: sysPrompt,
+		input:     ti, spin: spinner.New(spinner.WithSpinner(spinner.Dot)), follow: true,
 		catalogs: config.LoadCatalogs(), profiles: profiles, mouseOn: mouseOn, now: time.Now, showThinking: showThinking,
 		compactModel: cfg.CompactModel, compactProv: cfg.CompactProvider,
 		mode:      uiModeExecute,
 		cautious:  cautious,
 		skillScan: func() []skills.Skill { return skills.Scan(skills.DefaultDirs()...) },
 		shortCWD:  shortCWD(),
-		progDone:  make(chan struct{}),
 	}
 	m.modelSlotW = m.statusModelSlotWidth()
-	m.perms = loadPermRules()
 	if dir, derr := config.Dir(); derr == nil {
 		if st, serr := session.Open(dir + "/sessions.db"); serr == nil {
 			m.store = st
@@ -128,24 +124,11 @@ func runTUI(cfg *config.Config, modelName, provName, sysPrompt, resumeID string,
 	}
 	stopSignals := forwardSignals(p)
 	defer stopSignals()
-	if m.progDone != nil {
-		defer func() {
-			if m.progDone != nil {
-				close(m.progDone)
-				m.progDone = nil
-			}
-		}()
-	}
 	_, err = p.Run()
-	if m.progDone != nil {
-		close(m.progDone)
-		m.progDone = nil
-	}
 	if restoreTTY != nil {
 		restoreTTY()
 	}
 	m.stopWorker()
-	bashrun.KillAll()
 	return m.sessionID, err
 }
 
@@ -164,11 +147,8 @@ func (m *model) startupReport() {
 	for _, p := range problems {
 		warnLines = append(warnLines, fmt.Sprintf("  ⚠ %s: %s", p.Path, p.Err))
 	}
-	if (m.workerOnly && (m.modelName == "" || m.provName == "")) || (!m.workerOnly && m.agent == nil) {
+	if m.modelName == "" || m.provName == "" {
 		warnLines = append(warnLines, m.degradedProviderNote())
-	}
-	if !m.workerOnly && m.mcpMgr != nil {
-		infoLines = append(infoLines, m.mcpStatusView())
 	}
 	if len(warnLines) == 0 && len(infoLines) == 0 {
 		return

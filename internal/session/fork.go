@@ -1,9 +1,7 @@
 package session
 
 import (
-	"crypto/rand"
 	"database/sql"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -14,9 +12,7 @@ import (
 
 // Fork copies stored rows through uptoSeq into a new session.
 func (s *Store) Fork(srcID string, uptoSeq int, title string) (string, error) {
-	b := make([]byte, 4)
-	rand.Read(b)
-	newID := hex.EncodeToString(b)
+	newID := NewSessionID()
 	tx, err := s.db.Begin()
 	if err != nil {
 		return "", err

@@ -98,6 +98,48 @@ func TestFuzzyFilesTopKEqualsFullSortPrefix(t *testing.T) {
 	}
 }
 
+func TestFileIndexInvalidationAndBound(t *testing.T) {
+	fileIndexes.Lock()
+	previous := fileIndexes.entries
+	fileIndexes.entries = make(map[string]fileIndexEntry)
+	fileIndexes.Unlock()
+	t.Cleanup(func() {
+		fileIndexes.Lock()
+		fileIndexes.entries = previous
+		fileIndexes.Unlock()
+	})
+
+	root := t.TempDir()
+	path := filepath.Join(root, "before.go")
+	if err := os.WriteFile(path, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := FuzzyFiles(root, "before", 8); len(got) != 1 {
+		t.Fatalf("initial index = %v", got)
+	}
+	if err := os.WriteFile(filepath.Join(root, "after.go"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	InvalidateFileIndex(root)
+	if got := FuzzyFiles(root, "after", 8); len(got) != 1 {
+		t.Fatalf("invalidated index = %v", got)
+	}
+
+	for i := 0; i < maxFileIndexRoots+1; i++ {
+		other := t.TempDir()
+		if err := os.WriteFile(filepath.Join(other, "file.go"), nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		FuzzyFiles(other, "file", 1)
+	}
+	fileIndexes.Lock()
+	got := len(fileIndexes.entries)
+	fileIndexes.Unlock()
+	if got > maxFileIndexRoots {
+		t.Fatalf("file index roots = %d, want <= %d", got, maxFileIndexRoots)
+	}
+}
+
 func TestRegistrySnapshotEviction(t *testing.T) {
 	registry := NewRegistry()
 	for i := 1; i <= 20; i++ {
@@ -120,4 +162,3 @@ func TestRegistrySnapshotEviction(t *testing.T) {
 		t.Fatalf("expected newest snapshot 't-snap' to be present: %v", err)
 	}
 }
-

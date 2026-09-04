@@ -76,6 +76,7 @@ type workerProcessState struct {
 	state           workerwire.State
 	detached        bool
 	activeCancel    context.CancelFunc
+	shellCancel     context.CancelFunc
 	activeTool      string
 	stopRequested   bool
 	stopInterrupted bool
@@ -93,6 +94,7 @@ type workerProcessState struct {
 	liveThink       string
 	liveToolOutput  string
 	livePlan        string
+	perms           *tools.PermRules
 }
 
 func runWorkerProcess() error {
@@ -176,13 +178,24 @@ func newWorkerProcess(runtimeFile workerwire.Runtime) (*workerProcessState, erro
 		return nil, err
 	}
 	sessionID := runtimeFile.SessionID
+	modelName := os.Getenv(workerModelEnv)
+	providerName := os.Getenv(workerProviderEnv)
+	if _, _, loadErr := store.Load(sessionID); loadErr != nil {
+		cwd, cwdErr := os.Getwd()
+		if cwdErr != nil {
+			store.Close()
+			return nil, cwdErr
+		}
+		if err := store.CreateWithID(sessionID, cwd, modelName, providerName); err != nil {
+			store.Close()
+			return nil, err
+		}
+	}
 	meta, msgs, err := store.Load(sessionID)
 	if err != nil {
 		store.Close()
 		return nil, err
 	}
-	modelName := os.Getenv(workerModelEnv)
-	providerName := os.Getenv(workerProviderEnv)
 	if modelName == "" {
 		modelName = meta.Model
 	}
@@ -253,6 +266,7 @@ func newWorkerProcess(runtimeFile workerwire.Runtime) (*workerProcessState, erro
 		runtimeFile:  runtimeFile, sessionID: sessionID, modelName: modelName,
 		provider: providerName, role: role, mode: mode, saved: len(ag.Messages), state: workerwire.StateIdle,
 		pending: make(map[string]*workerApprovalFlight), done: make(chan struct{}),
+		perms: tools.LoadPermRules(),
 	}
 	store.Outputs = outputStore
 	ag.Runtime = configuredRuntime
@@ -411,11 +425,13 @@ func (w *workerProcessState) setState(state workerwire.State, detached bool, det
 func (w *workerProcessState) requestStop(interrupted bool, detail string) {
 	w.stopOnce.Do(func() {
 		var cancel context.CancelFunc
+		var shellCancel context.CancelFunc
 		w.transition(func() (workerwire.State, bool, string, bool) {
 			w.stopRequested = true
 			w.stopInterrupted = interrupted
 			w.stopDetail = detail
 			cancel = w.activeCancel
+			shellCancel = w.shellCancel
 			if w.disconnect != nil {
 				w.disconnect.Stop()
 				w.disconnect = nil
@@ -428,6 +444,9 @@ func (w *workerProcessState) requestStop(interrupted bool, detail string) {
 		})
 		if cancel != nil {
 			cancel()
+		}
+		if shellCancel != nil {
+			shellCancel()
 		}
 		if w.ag != nil {
 			for _, task := range w.ag.Tasks().List() {

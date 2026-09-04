@@ -4,11 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/sacca97/ghg/internal/agent"
 	"github.com/sacca97/ghg/internal/auth"
 	"github.com/sacca97/ghg/internal/config"
-	"github.com/sacca97/ghg/internal/goal"
 	"github.com/sacca97/ghg/internal/models"
 	workerwire "github.com/sacca97/ghg/internal/worker"
 
@@ -214,109 +214,28 @@ func (m *model) applyAuthResult(res authResultMsg) {
 	// mode's role when it belongs to the provider just authenticated. A running
 	// session only accepts auth refreshes for its current provider, preserving
 	// its conversation and route.
-	if m.workerOnly {
-		modelName := ""
-		roleName := ""
-		if len(m.cfg.Roles) > 0 {
-			if target, roleErr := m.cfg.ResolveRole(m.modeRole()); roleErr == nil && target.Model != "" && target.Provider == res.name {
-				modelName, roleName = target.Model, target.Role
-			}
-		}
-		if modelName == "" && catalogSeeded {
-			modelName = firstCatalogModel(res.models)
-		}
-		if modelName == "" {
-			modelName = m.cfg.DefaultModel
-		}
-		if modelName == "" {
-			m.append(dimStyle.Render(fmt.Sprintf("✓ %s configured — choose a model with /model before starting a turn", res.name)))
+	modelName, roleName := m.authRoute(res.name, res.models, catalogSeeded)
+	if modelName == "" {
+		m.append(dimStyle.Render(fmt.Sprintf("✓ %s configured — choose a model with /model before starting a turn", res.name)))
+		return
+	}
+	if roleName == "" {
+		m.cfg.DefaultModel = modelName
+		m.cfg.DefaultProvider = res.name
+		if err := m.cfg.Save(); err != nil {
+			m.append(errStyle.Render("config save failed: " + err.Error()))
 			return
-		}
-		if roleName == "" {
-			m.cfg.DefaultModel = modelName
-			m.cfg.DefaultProvider = res.name
-			if err := m.cfg.Save(); err != nil {
-				m.append(errStyle.Render("config save failed: " + err.Error()))
-				return
-			}
-		}
-		route, err := resolveDisplayRoute(m.cfg, m.profiles, modelName, res.name, roleName)
-		if err != nil {
-			m.append(errStyle.Render("provider configured but route could not be selected: " + err.Error()))
-			return
-		}
-		m.modelName, m.provName, m.modelID = route.ModelName, route.ProviderName, route.APIID
-		m.protocol, m.role, m.contextLimit = route.Protocol, route.Role, route.ContextLimit
-		m.effort = m.maxEffort()
-		m.modelSlotW = m.statusModelSlotWidth()
-	} else if m.agent == nil {
-		modelName := ""
-		roleName := ""
-		if len(m.cfg.Roles) > 0 {
-			if target, roleErr := m.cfg.ResolveRole(m.modeRole()); roleErr == nil && target.Model != "" && target.Provider == res.name {
-				modelName, roleName = target.Model, target.Role
-			}
-		}
-		if catalogSeeded {
-			if modelName == "" {
-				modelName = firstCatalogModel(res.models)
-			}
-		}
-		if modelName == "" {
-			modelName = m.cfg.DefaultModel
-		}
-		if modelName == "" {
-			m.append(dimStyle.Render(fmt.Sprintf("✓ %s configured — choose a model with /model before starting a turn", res.name)))
-			return
-		}
-		if roleName == "" {
-			m.cfg.DefaultModel = modelName
-			m.cfg.DefaultProvider = res.name
-			if err := m.cfg.Save(); err != nil {
-				m.append(errStyle.Render("config save failed: " + err.Error()))
-				return
-			}
-		}
-		var ag *agent.Agent
-		var mn, pn string
-		var err error
-		if roleName != "" {
-			ag, mn, pn, err = agent.NewConfiguredForRole(m.cfg, m.profiles, roleName, m.sysPrompt, false)
-		} else {
-			ag, mn, pn, err = agent.NewConfigured(agent.BuildOptions{
-				Config: m.cfg, Profiles: m.profiles, Model: modelName, Provider: res.name,
-				Role: config.RoleDefault, SystemPrompt: m.sysPrompt,
-			})
-		}
-		if err != nil {
-			m.append(errStyle.Render("provider configured but first agent could not be built: " + err.Error()))
-			return
-		}
-		m.agent, m.modelName, m.provName = ag, mn, pn
-		ag.Effort = m.maxEffort()
-		m.configureOutputAgent(m.agent)
-		m.applyCompactModel()
-		m.agent.CompactThreshold = config.CompactThreshold(m.cfg)
-		m.wireTasks()
-	} else if m.provName == res.name && m.modelName != "" {
-		role := m.agent.Role
-		if ag, _, _, err := agent.NewConfigured(agent.BuildOptions{
-			Config: m.cfg, Profiles: m.profiles, Model: m.modelName, Provider: m.provName,
-			Role: role, SystemPrompt: m.sysPrompt,
-		}); err == nil {
-			ag.Effort = m.agent.Effort
-			ag.Role = role
-			if len(m.agent.Messages) > 1 {
-				ag.Messages = append(ag.Messages, m.agent.Messages[1:]...)
-			}
-			ag.CompactBackend, ag.CompactModel = m.agent.CompactBackend, m.agent.CompactModel
-			ag.CompactProvider, ag.CompactProtocol = m.agent.CompactProvider, m.agent.CompactProtocol
-			ag.CompactThreshold = m.agent.CompactThreshold
-			m.agent = ag
-			m.configureOutputAgent(m.agent)
-			m.wireTasks()
 		}
 	}
+	route, err := resolveDisplayRoute(m.cfg, m.profiles, modelName, res.name, roleName)
+	if err != nil {
+		m.append(errStyle.Render("provider configured but route could not be selected: " + err.Error()))
+		return
+	}
+	m.modelName, m.provName, m.modelID = route.ModelName, route.ProviderName, route.APIID
+	m.protocol, m.role, m.contextLimit = route.Protocol, route.Role, route.ContextLimit
+	m.effort = m.maxEffort()
+	m.modelSlotW = m.statusModelSlotWidth()
 	if m.workerClient != nil {
 		m.syncWorkerConfiguration(true)
 	}
@@ -341,6 +260,21 @@ func firstCatalogModel(models []models.ModelInfo) string {
 		}
 	}
 	return ""
+}
+
+func (m *model) authRoute(provider string, infos []models.ModelInfo, catalogSeeded bool) (modelName, roleName string) {
+	if len(m.cfg.Roles) > 0 {
+		if target, err := m.cfg.ResolveRole(m.modeRole()); err == nil && target.Model != "" && target.Provider == provider {
+			return target.Model, target.Role
+		}
+	}
+	if catalogSeeded {
+		modelName = firstCatalogModel(infos)
+	}
+	if modelName == "" {
+		modelName = m.cfg.DefaultModel
+	}
+	return modelName, ""
 }
 
 type authOAuthWaitingMsg struct {
@@ -446,60 +380,24 @@ func (m *model) goalMaxRounds() int {
 	return config.DefaultGoalMaxRounds
 }
 
-// currentGoalRecord returns the authoritative in-memory goal. The legacy
-// string fields remain as a compatibility seam for older headless tests and
-// callers that construct a model directly; production state always has the
-// structured record populated by setGoal/resume.
+// currentGoalRecord returns the authoritative in-memory goal.
 func (m *model) currentGoalRecord() (agent.GoalRecord, bool) {
 	if m.goalRecord == nil {
-		if strings.TrimSpace(m.goal) == "" {
-			return agent.GoalRecord{}, false
-		}
-		record := agent.NewGoal(m.goal)
-		record.ID = "legacy-" + agent.NewGoalID()
-		record.Rounds = max(m.goalRounds, 0)
-		m.goalRecord = &record
-		return record, true
+		return agent.GoalRecord{}, false
 	}
-	record := *m.goalRecord
-	// Direct model construction in older tests writes m.goal. Treat a
-	// non-empty mismatch as that test/caller's latest objective while keeping
-	// the structured record authoritative in normal TUI operation.
-	if strings.TrimSpace(m.goal) != "" && strings.TrimSpace(m.goal) != record.Objective {
-		record.Objective = strings.TrimSpace(m.goal)
-		record.Status = agent.GoalStatusActive
-		record.Blocker = ""
+	return *m.goalRecord, true
+}
+
+func (m *model) currentGoal() string {
+	if m.goalRecord != nil && m.goalRecord.Status == agent.GoalStatusActive {
+		return m.goalRecord.Objective
 	}
-	if m.goalRounds > record.Rounds {
-		record.Rounds = m.goalRounds
-	}
-	return record, true
+	return ""
 }
 
 func (m *model) applyGoalRecord(record agent.GoalRecord) {
-	m.goalRecord = &record
-	m.goalRounds = record.Rounds
-	if record.Status == agent.GoalStatusActive {
-		m.goal = record.Objective
-	} else {
-		m.goal = ""
-	}
-}
-
-func (m *model) persistGoal(record agent.GoalRecord, checkpoint bool) {
-	if m.store == nil || m.sessionID == "" {
-		return
-	}
-	var err error
-	if checkpoint {
-		err = m.store.CheckpointGoal(m.sessionID, record)
-	} else {
-		err = m.store.SaveGoal(m.sessionID, record)
-	}
-	if err != nil {
-		config.LogEvent("session.goal", "save failed: "+err.Error())
-		m.append(errStyle.Render("goal save failed: " + err.Error()))
-	}
+	copy := record
+	m.goalRecord = &copy
 }
 
 func (m *model) goalRecordForSession() (agent.GoalRecord, bool) {
@@ -516,14 +414,8 @@ func (m *model) goalRecordForSession() (agent.GoalRecord, bool) {
 	return record, true
 }
 
-func (m *model) saveGoalCheckpoint(record agent.GoalRecord) {
-	record.UpdatedAt = m.nowFn().UTC()
-	m.applyGoalRecord(record)
-	m.persistGoal(record, true)
-}
-
-// applyGoalUpdate persists a model checkpoint as soon as it arrives from the
-// live turn. The update is accepted only while the same goal ID is active;
+// applyGoalUpdate applies a worker checkpoint to the in-memory projection. The
+// update is accepted only while the same goal ID is active;
 // clearing a goal while a request is in flight therefore wins over a late
 // model callback.
 func (m *model) applyGoalUpdate(update agent.GoalUpdate) bool {
@@ -532,7 +424,7 @@ func (m *model) applyGoalUpdate(update agent.GoalUpdate) bool {
 		return false
 	}
 	before := record
-	accepted, err := goal.ApplyUpdate(&record, update)
+	accepted, err := agent.ApplyUpdate(&record, update)
 	if err != nil {
 		m.append(errStyle.Render("invalid goal update: " + err.Error()))
 		return false
@@ -545,44 +437,7 @@ func (m *model) applyGoalUpdate(update agent.GoalUpdate) bool {
 	}
 	record.UpdatedAt = m.nowFn().UTC()
 	m.applyGoalRecord(record)
-	m.persistGoal(record, true)
 	return true
-}
-
-func (m *model) goalTurnFinished(msg turnDoneMsg, canceled bool) bool {
-	record, ok := m.goalRecordForSession()
-	if !ok {
-		return false
-	}
-	if record.Status == agent.GoalStatusActive {
-		for _, update := range msg.goalUpdates {
-			if !m.applyGoalUpdate(update) {
-				continue
-			}
-			record, _ = m.goalRecordForSession()
-			if record.Status == agent.GoalStatusBlocked || record.Status == agent.GoalStatusComplete {
-				break
-			}
-		}
-	}
-	result := goal.FinishTurn(record, msg.goalUsage, msg.err, canceled, m.goalMaxRounds(), m.nowFn())
-	if result.Checkpoint {
-		m.saveGoalCheckpoint(result.Record)
-		if msg.err == nil {
-			switch result.Record.Status {
-			case agent.GoalStatusComplete:
-				m.append(dimStyle.Render(fmt.Sprintf("◎ goal %s complete after %d round(s)", result.Record.ID, result.Record.Rounds)))
-			case agent.GoalStatusBlocked:
-				m.append(errStyle.Render("◎ goal blocked: " + result.Record.Blocker + " — /goal resume to continue"))
-			case agent.GoalStatusBudgetLimited:
-				m.append(errStyle.Render(fmt.Sprintf("◎ goal paused after %d rounds — /goal resume to continue, /goal clear to drop", result.Record.Rounds)))
-			}
-		}
-	} else if result.Continue {
-		m.applyGoalRecord(result.Record)
-		m.persistGoal(result.Record, false)
-	}
-	return result.Continue
 }
 
 // goalRoundsCommand implements /goal rounds: bare reports the effective cap
@@ -671,16 +526,12 @@ func overriddenNote(proj int) string {
 // planCommand switches to Plan mode and submits the goal as an ordinary turn.
 func (m *model) planCommand(text string) (tea.Model, tea.Cmd) {
 	goal := strings.TrimSpace(strings.TrimPrefix(text, "/plan"))
-	if goal == "" {
-		if err := m.setMode(uiModePlan); err != nil {
-			m.append(errStyle.Render("plan mode failed: " + err.Error()))
-			return m, nil
-		}
-		m.append(dimStyle.Render("switched to plan mode (read-only exploration)"))
-		return m, nil
-	}
 	if err := m.setMode(uiModePlan); err != nil {
 		m.append(errStyle.Render("plan mode failed: " + err.Error()))
+		return m, nil
+	}
+	if goal == "" {
+		m.append(dimStyle.Render("switched to plan mode (read-only exploration)"))
 		return m, nil
 	}
 	return m.submitTurn(goal, true)
@@ -733,11 +584,24 @@ func (m *model) reviewCommand(text string) (tea.Model, tea.Cmd) {
 	}
 
 	m.reviewing = true
-	if m.agent != nil {
-		m.agent.ReviewMode = true
-		m.agent.PlanMode = false
-	}
 	return m.submitTurn(target, true)
+}
+
+// askCommand answers a question with read-only repository access.
+func (m *model) askCommand(text string) (tea.Model, tea.Cmd) {
+	if m.busy {
+		m.append(dimStyle.Render("(busy — /ask after this turn)"))
+		return m, nil
+	}
+	question := strings.TrimSpace(strings.TrimPrefix(text, "/ask"))
+	if question == "" {
+		m.append(dimStyle.Render("usage: /ask <question>"))
+		return m, nil
+	}
+	if !m.requireAgent() {
+		return m, nil
+	}
+	return m.submitAsk(question)
 }
 
 // /me — open ~/.ghg/me.md in $EDITOR. The file is appended to every
@@ -775,31 +639,8 @@ type meEditedMsg struct {
 // blocker history are not silently discarded.
 func (m *model) setGoal(objective string) {
 	objective = strings.TrimSpace(objective)
-	if m.workerOnly {
-		if m.workerClient == nil && !m.ensureWorker() {
-			m.append(errStyle.Render("goal: worker unavailable: " + m.workerStartError))
-			return
-		}
-		if objective == "" {
-			if record, ok := m.goalRecordForSession(); ok {
-				record.Status = agent.GoalStatusPaused
-				record.Progress = ""
-				record.Blocker = "cleared by user"
-				record.UpdatedAt = m.nowFn().UTC()
-				m.applyGoalRecord(record)
-				m.sendWorkerGoal(record, "clear")
-			} else {
-				m.goal, m.goalRounds, m.goalRecord = "", 0, nil
-			}
-			return
-		}
-		record := agent.NewGoal(objective)
-		if err := record.Validate(); err != nil {
-			m.append(errStyle.Render("goal: " + err.Error()))
-			return
-		}
-		m.applyGoalRecord(record)
-		m.sendWorkerGoal(record, "set")
+	if m.workerClient == nil && !m.ensureWorker() {
+		m.append(errStyle.Render("goal: worker unavailable: " + m.workerStartError))
 		return
 	}
 	if objective == "" {
@@ -808,17 +649,13 @@ func (m *model) setGoal(objective string) {
 			record.Progress = ""
 			record.Blocker = "cleared by user"
 			record.UpdatedAt = m.nowFn().UTC()
-			m.applyGoalRecord(record)
-			m.persistGoal(record, true)
+			m.sendWorkerGoal(record, "clear")
 		} else {
-			m.goal = ""
-			m.goalRounds = 0
 			m.goalRecord = nil
 			if m.store != nil && m.sessionID != "" {
 				_ = m.store.ClearGoal(m.sessionID)
 			}
 		}
-		m.goal = ""
 		return
 	}
 	record := agent.NewGoal(objective)
@@ -827,7 +664,7 @@ func (m *model) setGoal(objective string) {
 		return
 	}
 	m.applyGoalRecord(record)
-	m.persistGoal(record, true)
+	m.sendWorkerGoal(record, "set")
 }
 
 func (m *model) sendWorkerGoal(record agent.GoalRecord, action string) {
@@ -855,11 +692,7 @@ func (m *model) resumeGoal() bool {
 	record.Blocker = ""
 	record.UpdatedAt = m.nowFn().UTC()
 	m.applyGoalRecord(record)
-	if m.workerOnly {
-		m.sendWorkerGoal(record, "resume")
-	} else {
-		m.persistGoal(record, true)
-	}
+	m.sendWorkerGoal(record, "resume")
 	m.append(dimStyle.Render("◎ resuming goal " + record.ID + ": " + record.Objective))
 	return true
 }

@@ -137,14 +137,26 @@ func (s *Store) Close() error { return s.db.Close() }
 
 func now() string { return time.Now().UTC().Format(time.RFC3339) }
 
+// NewSessionID returns an id suitable for a session and worker runtime.
+func NewSessionID() string {
+	b := make([]byte, 4)
+	if _, err := rand.Read(b); err == nil {
+		return hex.EncodeToString(b)
+	}
+	return fmt.Sprintf("%x", time.Now().UnixNano())
+}
+
 // Create inserts a new session and returns its id.
 func (s *Store) Create(cwd, model, provider string) (string, error) {
-	b := make([]byte, 4)
-	rand.Read(b)
-	id := hex.EncodeToString(b)
+	id := NewSessionID()
+	return id, s.CreateWithID(id, cwd, model, provider)
+}
+
+// CreateWithID inserts a session with a caller-owned id.
+func (s *Store) CreateWithID(id, cwd, model, provider string) error {
 	_, err := s.db.Exec(`INSERT INTO sessions (id, created_at, updated_at, cwd, model, provider) VALUES (?,?,?,?,?,?)`,
 		id, now(), now(), cwd, model, provider)
-	return id, err
+	return err
 }
 
 // Save persists msgs[from:] (the conversation without the system prompt) and
@@ -263,16 +275,39 @@ func DeterministicTitle(text string) string {
 	return title
 }
 
-// DeleteSession removes a session and its database-owned history. It does not
-// remove immutable payload files; run ReferencedOutputHashes followed by
-// OutputStore.GarbageCollect to reclaim payloads no longer referenced by
-// any session.
+// DeleteSession removes a session, its database-owned history, and its Git
+// snapshot refs. It does not remove immutable payload files; run
+// ReferencedOutputHashes followed by OutputStore.GarbageCollect to reclaim
+// payloads no longer referenced by any session.
 func (s *Store) DeleteSession(id string) error {
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	var cwd string
+	if err := tx.QueryRow(`SELECT cwd FROM sessions WHERE id=?`, id).Scan(&cwd); err != nil && err != sql.ErrNoRows {
+		return err
+	}
+	rows, err := tx.Query(`SELECT ref FROM snapshots WHERE session_id=?`, id)
+	if err != nil {
+		return err
+	}
+	var refs []string
+	for rows.Next() {
+		var ref string
+		if err := rows.Scan(&ref); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		refs = append(refs, ref)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
 	for _, table := range []string{"artifacts", "messages", "history_fts", "tasks", "snapshots", "schedules", "compactions", "goal_checkpoints", "goals", "observations", "search_snapshots", "workflow_results"} {
 		if _, err := tx.Exec(`DELETE FROM `+table+` WHERE session_id=?`, id); err != nil {
 			return err
@@ -281,7 +316,15 @@ func (s *Store) DeleteSession(id string) error {
 	if _, err := tx.Exec(`DELETE FROM sessions WHERE id=?`, id); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	for _, ref := range refs {
+		if cwd != "" {
+			DropSnapshot(cwd, ref)
+		}
+	}
+	return nil
 }
 
 // Load resolves idOrPrefix to a session and returns its metadata and messages.
@@ -423,32 +466,39 @@ func (s *Store) LastExchange(id string) (user, assistant string) {
 	return user, assistant
 }
 
-// DeleteFrom drops every stored message with seq >= from, plus the workspace
-// snapshots for those turns (their refs stop being restorable once the
-// conversation no longer contains the turn). seq equals the conversation
-// index (Save persists msgs[i] at seq i; the system prompt is never
-// persisted). Used by rewind: the clipped tail is deleted from disk but kept
-// in memory for forward travel.
-func (s *Store) DeleteFrom(id string, from int) error {
+// DeleteFrom drops the stored tail at a conversation-view boundary, plus
+// snapshots and workflow results for those turns. Compacted sessions map the
+// view boundary back to raw message sequence numbers before deleting.
+func (s *Store) DeleteFrom(id string, from int, before []models.Message) error {
+	rawFrom := from
+	events := s.Compactions(id)
+	if len(events) > 0 {
+		rawFrom = s.RawCutoff(id, from, before)
+	}
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	if _, err := tx.Exec(`DELETE FROM messages WHERE session_id=? AND seq>=?`, id, from); err != nil {
+	if _, err := tx.Exec(`DELETE FROM messages WHERE session_id=? AND seq>=?`, id, rawFrom); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(`DELETE FROM history_fts WHERE session_id=? AND seq>=?`, id, from); err != nil {
+	if _, err := tx.Exec(`DELETE FROM history_fts WHERE session_id=? AND seq>=?`, id, rawFrom); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(`DELETE FROM snapshots WHERE session_id=? AND seq>=?`, id, from); err != nil {
 		return err
 	}
-	if _, err := tx.Exec(`DELETE FROM artifacts WHERE session_id=? AND message_seq>=?`, id, from); err != nil {
+	if _, err := tx.Exec(`DELETE FROM artifacts WHERE session_id=? AND message_seq>=?`, id, rawFrom); err != nil {
 		return err
 	}
 	if _, err := tx.Exec(`DELETE FROM workflow_results WHERE session_id=? AND message_seq>=?`, id, from); err != nil {
 		return err
+	}
+	if len(events) > 0 && rawFrom < events[len(events)-1].Cutoff {
+		if _, err := tx.Exec(`DELETE FROM compactions WHERE session_id=?`, id); err != nil {
+			return err
+		}
 	}
 	return tx.Commit()
 }

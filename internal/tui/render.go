@@ -65,11 +65,8 @@ func linkifyFilePaths(s string, exists func(string) bool) string {
 	})
 }
 
-// isFileRef gates the disk check to strings shaped like a file reference:
-// a dotted extension. The regex can't enforce the multi-letter minimum for
-// bare filenames (Go regexp {2,10} accepts "go"), so the extension length is
-// checked here: paths with a slash take any extension, bare filenames need
-// at least two letters (links_test.go yes, tui.go no — too prose-shaped).
+// isFileRef rejects extension dots that belong to a directory segment. The
+// regex handles the multi-letter minimum for bare filenames.
 func isFileRef(path string) bool {
 	dot := strings.LastIndexByte(path, '.')
 	if dot < 0 {
@@ -80,11 +77,6 @@ func isFileRef(path string) bool {
 	if strings.ContainsRune(ext, '/') {
 		return false // dot was in a directory segment
 	}
-	if strings.Contains(path, "/") {
-		return len(ext) >= 1
-	}
-	// bare filename with any dotted extension (tui.go, links_test.go): the
-	// existence check below is the real gate
 	return len(ext) >= 1
 }
 

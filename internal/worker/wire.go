@@ -22,6 +22,7 @@ type Input struct {
 	Snap         string               `json:"snap,omitempty"`
 	PlanMode     bool                 `json:"plan_mode,omitempty"`
 	ReviewMode   bool                 `json:"review_mode,omitempty"`
+	AskMode      bool                 `json:"ask_mode,omitempty"`
 }
 
 // TurnResult reports a finished turn.
@@ -75,6 +76,17 @@ type HistoryResult struct {
 // ChdirResult reports the worker's canonical working directory.
 type ChdirResult struct {
 	CWD string `json:"cwd"`
+}
+
+// ShellRequest asks the worker to run one shell escape.
+type ShellRequest struct {
+	Command string `json:"command"`
+}
+
+// ShellResult reports a completed shell escape.
+type ShellResult struct {
+	Command string `json:"command"`
+	Output  string `json:"output"`
 }
 
 type GoalRequest struct {
@@ -197,4 +209,29 @@ type MCPRequest struct {
 
 type ContextDoctorResult struct {
 	Report string `json:"report"`
+}
+
+// ForkRequest asks the worker to create a new session branching from the current one.
+type ForkRequest struct {
+	Cut   int    `json:"cut"`
+	Title string `json:"title"`
+}
+
+// ForkResult reports the newly created session.
+type ForkResult struct {
+	NewSessionID string `json:"new_session_id"`
+	OldSessionID string `json:"old_session_id"`
+	Title        string `json:"title"`
+	OldTitle     string `json:"old_title"`
+}
+
+// RenameRequest asks the worker to rename the session.
+type RenameRequest struct {
+	Title string `json:"title"`
+}
+
+// RenameResult reports the renamed session.
+type RenameResult struct {
+	SessionID string `json:"session_id"`
+	Title     string `json:"title"`
 }

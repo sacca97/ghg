@@ -7,8 +7,7 @@
 // focuses it; ↑/↓ (or the mouse wheel over the strip) moves the selection,
 // enter opens the selected task's detail view, and esc backs out: detail →
 // dock → main thread. The detail view is a scrollback pane filled from the
-// task's live event stream (registry.Subscribe) while it runs, and from the
-// stored Report once it settles.
+// worker snapshot.
 package tui
 
 import (
@@ -23,34 +22,12 @@ import (
 	"github.com/sacca97/ghg/internal/agent"
 )
 
-// taskEventMsg is one live event from an opened background task (OnText /
-// OnToolStart / OnToolEnd fire from the subagent's worker goroutine; prog.Send
-// funnels them onto the UI thread like every other stream).
-type taskEventMsg struct {
-	id   string
-	kind int // 0 = text, 1 = tool start, 2 = tool end
-	s    string
-	s2   string // tool args (start) or result (end)
-}
-
-// sendTaskMsg hands a task event to the UI without ever blocking the subagent
-// worker goroutine: prog.Send parks while the UI event queue is backed up, so
-// the send is detached into its own goroutine. Program.Send is safe for
-// concurrent use (it just selects on the program's msg channel), and if the
-// program exits first, bubbletea unblocks every pending Send — no leak. The
-// pane resyncs from the task's Report on the next paint, so a reordered or
-// lost interim frame is cosmetic; the worker must never stall on the UI.
-func sendTaskMsg(p *tea.Program, msg taskEventMsg) {
-	sendProg(p, msg)
-}
-
-// taskView is the open per-task pane: the live transcript of one background
+// taskView is the open per-task pane: the worker snapshot of one background
 // subagent (or its stored report once settled).
 type taskView struct {
-	id   string
-	vp   viewport.Model
-	buf  strings.Builder // full transcript text; vp shows a window into it
-	live bool            // subscribed to the task's event stream
+	id  string
+	vp  viewport.Model
+	buf strings.Builder // full transcript text; vp shows a window into it
 }
 
 // tasksDockHeight is the maximum number of screen rows the dock strip
@@ -67,39 +44,22 @@ const dockSettledGrace = time.Minute
 // within dockSettledGrace, never restored ones — newest first. Bare test
 // models have no agent; the dock is simply empty.
 func (m *model) dockTasks() []agent.BackgroundTask {
-	if m.workerOnly {
-		var out []agent.BackgroundTask
-		for _, task := range m.workerTasks {
-			if task.Restored {
-				continue
-			}
-			t := agent.BackgroundTask{ID: task.ID, Description: task.Description, Prompt: task.Prompt, Status: agent.TaskStatus(task.Status), Report: task.Report, StartedAt: task.StartedAt, EndedAt: task.EndedAt}
-			if t.Status == agent.TaskRunning || time.Since(t.EndedAt) < dockSettledGrace {
-				out = append(out, t)
-			}
-		}
-		slices.SortStableFunc(out, func(a, b agent.BackgroundTask) int {
-			if n := b.StartedAt.Compare(a.StartedAt); n != 0 {
-				return n
-			}
-			return strings.Compare(b.ID, a.ID)
-		})
-		return out
-	}
-	if m.agent == nil {
-		return nil
-	}
 	var out []agent.BackgroundTask
-	for _, t := range m.agent.Tasks().List() {
-		if t.Restored {
-			continue // resume history belongs in /tasks, not the dock
+	for _, task := range m.workerTasks {
+		if task.Restored {
+			continue
 		}
-		// running always shows; zero EndedAt (never settled) sorts with them
+		t := agent.BackgroundTask{ID: task.ID, Description: task.Description, Prompt: task.Prompt, Status: agent.TaskStatus(task.Status), Report: task.Report, StartedAt: task.StartedAt, EndedAt: task.EndedAt}
 		if t.Status == agent.TaskRunning || time.Since(t.EndedAt) < dockSettledGrace {
 			out = append(out, t)
 		}
 	}
-	slices.Reverse(out)
+	slices.SortStableFunc(out, func(a, b agent.BackgroundTask) int {
+		if n := b.StartedAt.Compare(a.StartedAt); n != 0 {
+			return n
+		}
+		return strings.Compare(b.ID, a.ID)
+	})
 	return out
 }
 
@@ -140,7 +100,7 @@ func (m *model) tasksDock() string {
 		icon := toolStyle.Render("⏳")
 		switch t.Status {
 		case agent.TaskDone:
-			icon = "✓"
+			icon = toolStyle.Render("✓")
 		case agent.TaskError, agent.TaskCancelled:
 			icon = errStyle.Render("✗")
 		}
@@ -168,52 +128,18 @@ func (m *model) tasksDock() string {
 }
 
 // openTask opens the detail view for one task: a scrollback pane seeded with
-// the prompt, then the live event stream while the task runs, or the stored
-// report once it has settled.
+// the prompt, or the stored report once it has settled.
 func (m *model) openTask(id string) {
-	if m.workerOnly {
-		t, ok := m.workerTasks[id]
-		if !ok {
-			return
-		}
-		tv := &taskView{id: id, live: t.Status == string(agent.TaskRunning)}
-		fmt.Fprintf(&tv.buf, "%s %s  %s\n\n%s %s\n", toolStyle.Render("⚙"), t.ID, t.Description, youStyle.Render("prompt:"), t.Prompt)
-		if t.Status == string(agent.TaskRunning) {
-			fmt.Fprintf(&tv.buf, "\n%s\n", dimStyle.Render("  running…"))
-		} else {
-			fmt.Fprintf(&tv.buf, "\n%s %s\n", toolStyle.Render(t.Status+":"), t.Report)
-		}
-		m.taskVP = tv
-		m.refreshTaskVP()
-		return
-	}
-	if m.agent == nil {
-		return
-	}
-	t, ok := m.agent.Tasks().Get(id)
+	t, ok := m.workerTasks[id]
 	if !ok {
 		return
 	}
-	tv := &taskView{id: id, live: t.Status == agent.TaskRunning}
-	fmt.Fprintf(&tv.buf, "%s %s  %s\n\n%s %s\n",
-		toolStyle.Render("⚙"), t.ID, t.Description,
-		youStyle.Render("prompt:"), t.Prompt)
-	if t.Status == agent.TaskRunning {
+	tv := &taskView{id: id}
+	fmt.Fprintf(&tv.buf, "%s %s  %s\n\n%s %s\n", toolStyle.Render("⚙"), t.ID, t.Description, youStyle.Render("prompt:"), t.Prompt)
+	if t.Status == string(agent.TaskRunning) {
 		fmt.Fprintf(&tv.buf, "\n%s\n", dimStyle.Render("  running…"))
-		p := m.prog
-		m.agent.Tasks().Subscribe(id, agent.Events{
-			OnText: func(s string) {
-				sendTaskMsg(p, taskEventMsg{id: id, kind: 0, s: s})
-			},
-			OnToolStart: func(_, n, a string) {
-				sendTaskMsg(p, taskEventMsg{id: id, kind: 1, s: n, s2: a})
-			},
-			OnToolEnd: func(_, n, r string) {
-				sendTaskMsg(p, taskEventMsg{id: id, kind: 2, s: n, s2: r})
-			},
-		})
 	} else {
-		fmt.Fprintf(&tv.buf, "\n%s %s\n", toolStyle.Render(string(t.Status)+":"), t.Report)
+		fmt.Fprintf(&tv.buf, "\n%s %s\n", toolStyle.Render(t.Status+":"), t.Report)
 	}
 	m.taskVP = tv
 	m.refreshTaskVP()
@@ -239,7 +165,7 @@ func (m *model) refreshTaskVP() {
 // to the pane, x cancels a running task, esc backs out to the main thread.
 func (m *model) taskViewKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	tv := m.taskVP
-	if tv == nil || (m.agent == nil && !m.workerOnly) {
+	if tv == nil {
 		m.taskVP = nil
 		return m, nil
 	}
@@ -254,11 +180,7 @@ func (m *model) taskViewKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case tea.KeyRunes:
 		if string(msg.Runes) == "x" {
-			if m.workerOnly {
-				m.append(dimStyle.Render("task cancellation is not available from the worker view"))
-			} else {
-				m.agent.Tasks().Cancel(tv.id)
-			}
+			m.append(dimStyle.Render("task cancellation is not available from the worker view"))
 			return m, nil
 		}
 	}
@@ -270,22 +192,14 @@ func (m *model) taskViewKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 // taskViewView renders the open task pane full-screen, between the header
 // row and a footer hint (View's layout mirrors View's structure).
 func (m *model) taskViewView() string {
-	if (m.agent == nil && !m.workerOnly) || m.taskVP == nil {
+	if m.taskVP == nil {
 		return dimStyle.Render("no provider configured — run /auth first")
 	}
 	status := "running"
 	description := ""
 	var restored bool
-	if m.workerOnly {
-		t, ok := m.workerTasks[m.taskVP.id]
-		if ok {
-			status, description, restored = t.Status, t.Description, t.Restored
-		}
-	} else {
-		t, ok := m.agent.Tasks().Get(m.taskVP.id)
-		if ok {
-			status, description, restored = string(t.Status), t.Description, t.Restored
-		}
+	if t, ok := m.workerTasks[m.taskVP.id]; ok {
+		status, description, restored = t.Status, t.Description, t.Restored
 	}
 	if restored {
 		status += ", restored"

@@ -196,6 +196,10 @@ func NewID(prefix string) string {
 // into a full recursive walk.
 const fileIndexTTL = 30 * time.Second
 
+// ponytail: keep at most 16 workspace indexes; use an LRU only if this cap
+// becomes a measured memory or hit-rate problem.
+const maxFileIndexRoots = 16
+
 type fileIndexEntry struct {
 	builtAt time.Time
 	files   []string
@@ -215,6 +219,30 @@ func InvalidateFileIndex(root string) {
 		delete(fileIndexes.entries, root)
 	}
 	fileIndexes.Unlock()
+}
+
+func pruneFileIndexes(now time.Time) {
+	for root, entry := range fileIndexes.entries {
+		if now.Sub(entry.builtAt) >= fileIndexTTL {
+			delete(fileIndexes.entries, root)
+		}
+	}
+}
+
+func evictOldestFileIndex() {
+	if len(fileIndexes.entries) < maxFileIndexRoots {
+		return
+	}
+	oldestRoot := ""
+	var oldest time.Time
+	for root, entry := range fileIndexes.entries {
+		if oldestRoot == "" || entry.builtAt.Before(oldest) || (entry.builtAt.Equal(oldest) && root < oldestRoot) {
+			oldestRoot, oldest = root, entry.builtAt
+		}
+	}
+	if oldestRoot != "" {
+		delete(fileIndexes.entries, oldestRoot)
+	}
 }
 
 type fuzzyHit struct {
@@ -357,7 +385,9 @@ func indexedFiles(root string) []string {
 	if fileIndexes.entries == nil {
 		fileIndexes.entries = make(map[string]fileIndexEntry)
 	}
-	if entry, ok := fileIndexes.entries[root]; ok && time.Since(entry.builtAt) < fileIndexTTL {
+	now := time.Now()
+	pruneFileIndexes(now)
+	if entry, ok := fileIndexes.entries[root]; ok {
 		files := slices.Clone(entry.files)
 		fileIndexes.Unlock()
 		return files
@@ -391,6 +421,8 @@ func indexedFiles(root string) []string {
 	sort.Strings(files)
 
 	fileIndexes.Lock()
+	pruneFileIndexes(time.Now())
+	evictOldestFileIndex()
 	fileIndexes.entries[root] = fileIndexEntry{builtAt: time.Now(), files: slices.Clone(files)}
 	fileIndexes.Unlock()
 	return files

@@ -2,22 +2,18 @@ package tui
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
 	"time"
 
+	"github.com/charmbracelet/bubbles/cursor"
 	"github.com/charmbracelet/bubbles/spinner"
 	"github.com/charmbracelet/bubbles/viewport"
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/sacca97/ghg/internal/agent"
 	"github.com/sacca97/ghg/internal/config"
-	"github.com/sacca97/ghg/internal/export"
-	"github.com/sacca97/ghg/internal/goal"
-	"github.com/sacca97/ghg/internal/mcp"
-	"github.com/sacca97/ghg/internal/session"
 	"github.com/sacca97/ghg/internal/tools"
 	workerwire "github.com/sacca97/ghg/internal/worker"
 )
@@ -34,9 +30,9 @@ func sendProg(p *tea.Program, msg tea.Msg) {
 // jumpy in terminals that report a wheel event for each detent. Handling the
 // vertical path here also works for zero-value viewports used by headless
 // tests, before Bubble's lazy viewport initialization has run.
-func scrollMouseWheel(vp *viewport.Model, msg tea.MouseMsg) bool {
+func scrollMouseWheel(vp *viewport.Model, msg tea.MouseMsg) {
 	if vp == nil || msg.Action != tea.MouseActionPress || msg.Shift {
-		return false
+		return
 	}
 	switch msg.Button {
 	case tea.MouseButtonWheelUp:
@@ -44,9 +40,8 @@ func scrollMouseWheel(vp *viewport.Model, msg tea.MouseMsg) bool {
 	case tea.MouseButtonWheelDown:
 		vp.ScrollDown(1)
 	default:
-		return false
+		return
 	}
-	return true
 }
 
 type wheelState struct {
@@ -121,6 +116,91 @@ func (m *model) applyWheelFrame() {
 	}
 }
 
+func (m *model) flushStreaming() {
+	m.flushThink()
+	m.flushCurrent()
+}
+
+func (m *model) finishTurnState() {
+	m.busy = false
+	m.cancel = nil
+	m.interrupt1 = false
+	m.turnStart = time.Time{}
+}
+
+func (m *model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	// The middle row of the bottom status box owns the model, effort, and mode
+	// controls, so clicks there must not fall through to transcript scrolling.
+	if m.settings == nil && m.picker == nil && m.taskVP == nil &&
+		m.height > 0 && msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft && msg.Y == statusInfoRow(m.height) {
+		if m.statusModelW > 0 && msg.X >= m.statusModelX && msg.X < m.statusModelX+m.statusModelW {
+			m.cycleStatusModel()
+			return m, nil
+		}
+		if m.statusEffortW > 0 && msg.X >= m.statusEffortX && msg.X < m.statusEffortX+m.statusEffortW {
+			m.setEffort(nextEffort(m.effortsFor(), m.currentEffort()))
+			return m, nil
+		}
+		if m.statusModeW > 0 && msg.X >= m.statusModeX && msg.X < m.statusModeX+m.statusModeW {
+			m.cycleStatusMode()
+			return m, nil
+		}
+	}
+	if m.taskVP != nil {
+		// the open task pane owns the free area: wheel scrolls it
+		scrollMouseWheel(&m.taskVP.vp, msg)
+		return m, nil
+	}
+	if m.settings != nil {
+		return m.paletteMouse(msg)
+	}
+	if m.picker == nil {
+		// dock rows sit just above the input box: click selects/opens,
+		// wheel scrolls the selection through the strip
+		if top, n := m.dockTop(), len(m.dockTasks()); n > 0 && msg.Y >= top && msg.Y < top+n {
+			if msg.Button == tea.MouseButtonWheelUp || msg.Button == tea.MouseButtonWheelDown {
+				m.tasksFocus = true
+				if msg.Button == tea.MouseButtonWheelUp {
+					m.taskSel = max(m.taskSel-1, 0)
+				} else {
+					m.taskSel = min(m.taskSel+1, n-1)
+				}
+				return m, nil
+			}
+			if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft {
+				sel := m.taskSel
+				if m.tasksFocus {
+					sel = msg.Y - top
+				}
+				m.tasksFocus = true
+				m.taskSel = min(sel, n-1)
+				// re-fetch: the list can change between the hitbox check
+				// above and this open (settled tasks age out)
+				if tasks := m.dockTasks(); len(tasks) > 0 {
+					m.openTask(tasks[min(m.taskSel, len(tasks)-1)].ID)
+				}
+				return m, nil
+			}
+		}
+		if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft && msg.Y >= m.height-3 {
+			m.follow = true
+			m.vp.GotoBottom()
+			return m, nil
+		}
+		if msg.Button == tea.MouseButtonWheelUp || msg.Button == tea.MouseButtonWheelDown {
+			return m, m.scrollTranscriptWheel(msg)
+		}
+		if handled, cmd := m.handleTranscriptMouse(msg); handled {
+			return m, cmd
+		}
+		var cmd tea.Cmd
+		m.vp, cmd = m.vp.Update(msg)
+		m.follow = m.vp.AtBottom()
+		return m, cmd
+	}
+	return m, nil
+}
+
 func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	// Spinner ticks only change the busy indicator. Avoid relaying them through
 	// layout, which otherwise recomputes the whole TUI on every animation frame.
@@ -130,6 +210,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		var cmd tea.Cmd
 		m.spin, cmd = m.spin.Update(tick)
+		return m, cmd
+	}
+	if _, ok := msg.(cursor.BlinkMsg); ok {
+		var cmd tea.Cmd
+		m.input, cmd = m.input.Update(msg)
 		return m, cmd
 	}
 	defer m.layout()
@@ -151,16 +236,8 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.WindowSizeMsg:
-		resized := msg.Width != m.width // width change → re-wrap the whole transcript
 		m.width, m.height = msg.Width, msg.Height
 		m.input.SetWidth(msg.Width - 2)
-		if resized {
-			m.refreshVP() // every block re-renders at the new width (floored at minRenderWidth)
-		}
-		return m, nil
-
-	case permRequest:
-		m.permDialog = &permDialog{req: msg.req, reply: msg.reply}
 		return m, nil
 
 	case workerFrameMsg:
@@ -200,17 +277,13 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.workerState = workerwire.StateInterrupted
 			m.workerLiveWork = false
 			m.workerDetached = false
-			m.busy = false
-			m.cancel = nil
-			m.interrupt1 = false
+			m.finishTurnState()
 			m.flushThink()
 			m.thinkStart = time.Time{}
-			m.turnStart = time.Time{}
 		}
 		if msg.err != nil && !wasDetached {
 			m.append(errStyle.Render("worker: " + msg.err.Error()))
 		}
-		m.refreshVP()
 		return m, nil
 
 	case workerPermissionMsg:
@@ -224,80 +297,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.key(msg)
 
 	case tea.MouseMsg:
-		// The middle row of the bottom status box owns the model, effort, and mode
-		// controls, so clicks there must not fall through to transcript scrolling.
-		if m.settings == nil && m.picker == nil && m.taskVP == nil &&
-			m.height > 0 && msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft && msg.Y == statusInfoRow(m.height) {
-			if m.statusModelW > 0 && msg.X >= m.statusModelX && msg.X < m.statusModelX+m.statusModelW {
-				m.cycleStatusModel()
-				return m, nil
-			}
-			if m.statusEffortW > 0 && msg.X >= m.statusEffortX && msg.X < m.statusEffortX+m.statusEffortW {
-				if m.agent != nil {
-					m.setEffort(nextEffort(m.effortsFor(), m.agent.Effort))
-				}
-				return m, nil
-			}
-			if m.statusModeW > 0 && msg.X >= m.statusModeX && msg.X < m.statusModeX+m.statusModeW {
-				m.cycleStatusMode()
-				return m, nil
-			}
-		}
-		if m.taskVP != nil {
-			// the open task pane owns the free area: wheel scrolls it
-			if scrollMouseWheel(&m.taskVP.vp, msg) {
-				return m, nil
-			}
-			return m, nil
-		}
-		if m.settings != nil {
-			return m.paletteMouse(msg)
-		}
-		if m.picker == nil && m.settings == nil {
-			// dock rows sit just above the input box: click selects/opens,
-			// wheel scrolls the selection through the strip
-			if top, n := m.dockTop(), len(m.dockTasks()); n > 0 && msg.Y >= top && msg.Y < top+n {
-				if msg.Button == tea.MouseButtonWheelUp || msg.Button == tea.MouseButtonWheelDown {
-					m.tasksFocus = true
-					if msg.Button == tea.MouseButtonWheelUp {
-						m.taskSel = max(m.taskSel-1, 0)
-					} else {
-						m.taskSel = min(m.taskSel+1, n-1)
-					}
-					return m, nil
-				}
-				if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft {
-					sel := m.taskSel
-					if m.tasksFocus {
-						sel = msg.Y - top
-					}
-					m.tasksFocus = true
-					m.taskSel = min(sel, n-1)
-					// re-fetch: the list can change between the hitbox check
-					// above and this open (settled tasks age out)
-					if tasks := m.dockTasks(); len(tasks) > 0 {
-						m.openTask(tasks[min(m.taskSel, len(tasks)-1)].ID)
-					}
-					return m, nil
-				}
-			}
-			if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft && msg.Y >= m.height-3 {
-				m.follow = true
-				m.vp.GotoBottom()
-				return m, nil
-			}
-			if msg.Button == tea.MouseButtonWheelUp || msg.Button == tea.MouseButtonWheelDown {
-				return m, m.scrollTranscriptWheel(msg)
-			}
-			if handled, cmd := m.handleTranscriptMouse(msg); handled {
-				return m, cmd
-			}
-			var cmd tea.Cmd
-			m.vp, cmd = m.vp.Update(msg)
-			m.follow = m.vp.AtBottom()
-			return m, cmd
-		}
-		return m, nil
+		return m.handleMouse(msg)
 
 	case textMsg:
 		m.flushThink() // reasoning always precedes the answer text
@@ -312,8 +312,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case planDeltaMsg:
-		m.flushThink()
-		m.flushCurrent()
+		m.flushStreaming()
 		m.planCurrent += string(msg)
 		if i := strings.LastIndexByte(m.planCurrent, '\n'); i >= 0 {
 			done := m.planCurrent[:i]
@@ -332,11 +331,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case toolStartMsg:
-		m.flushThink()
-		m.flushCurrent()
+		m.flushStreaming()
 		row := toolStyle.Render("⚒ "+msg.name+" ") + dimStyle.Render(msg.args)
 		m.blocks = append(m.blocks, block{kind: blockToolRun, text: row, toolID: msg.id, toolRunning: true})
-		m.refreshVP()
+		m.transcriptDirty = true
 		return m, nil
 
 	case toolEndMsg:
@@ -357,10 +355,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 				}
 				b.stale = true
+				m.transcriptDirty = true
 				break
 			}
 		}
-		m.refreshVP()
 		return m, nil
 
 	case meEditedMsg:
@@ -377,8 +375,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// passthrough mode: route keystrokes into the PTY. The output pane is
 		// shown by View(); a fresh toolStartMsg-style banner is appended so the
 		// user sees "bash (interactive)" inline with the transcript.
-		m.flushThink()
-		m.flushCurrent()
+		m.flushStreaming()
 		m.iactive = &interactive{keys: msg.keys}
 		m.append(toolStyle.Render("⚒ bash ") + dimStyle.Render("(interactive — type to respond, 15s inactivity timeout)"))
 		return m, nil
@@ -407,13 +404,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			lines := strings.Split(strings.TrimRight(msg.output, "\n"), "\n")
 			// cap the persisted preview like toolEndMsg, but keep the full text
 			// available to the model (it's already in the tool result string)
-			preview := lines
-			if len(preview) > 5 {
-				preview = preview[:5]
-			}
+			preview := toolPreview(lines)
 			out := dimStyle.Render("  " + strings.Join(preview, "\n  "))
-			if len(lines) > 5 {
-				out += dimStyle.Render(fmt.Sprintf("\n  … +%d lines", len(lines)-5))
+			if len(lines) > len(preview) {
+				out += dimStyle.Render(fmt.Sprintf("\n  … +%d lines", len(lines)-len(preview)))
 			}
 			if msg.exit != "" {
 				out += "\n" + dimStyle.Render("  ("+msg.exit+")")
@@ -424,22 +418,17 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case steeredMsg:
-		m.flushThink()
-		m.flushCurrent()
+		m.flushStreaming()
 		m.append(youStyle.Render("❯ ") + linkifyFilePaths(string(msg), realFileExists) + dimStyle.Render("  (steered)"))
 		return m, nil
 
 	case shellDoneMsg:
 		// a `!` escape finished; its output lands behind any in-flight text
-		m.flushThink()
-		m.flushCurrent()
+		m.flushStreaming()
 		m.applyShellDone(msg)
 		return m, nil
 
 	case goalUpdateMsg:
-		if m.workerOnly {
-			return m, nil
-		}
 		m.applyGoalUpdate(msg.update)
 		return m, nil
 
@@ -450,20 +439,16 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case goalFromContextMsg:
 		// the formulation call finished between turns; on success set the
 		// goal and kick off the goal loop exactly like /goal <text>
-		m.flushThink()
-		m.flushCurrent()
+		m.flushStreaming()
 		switch {
 		case msg.err == context.Canceled:
-			m.busy = false
-			m.cancel = nil
+			m.finishTurnState()
 			m.append(dimStyle.Render("(interrupted)"))
 		case msg.err != nil:
-			m.busy = false
-			m.cancel = nil
+			m.finishTurnState()
 			m.append(errStyle.Render("goal-from-context failed: " + msg.err.Error()))
 		case strings.TrimSpace(msg.goal) == "":
-			m.busy = false
-			m.cancel = nil
+			m.finishTurnState()
 			m.append(errStyle.Render("goal-from-context: model returned an empty goal"))
 		default:
 			goal := strings.TrimSpace(msg.goal)
@@ -473,10 +458,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.setGoal(goal)
 			}
 			m.append(dimStyle.Render("◎ goal set: " + goal))
-			if m.workerOnly {
-				return m.submitGoal(goal)
-			}
-			return m.submit(goal)
+			return m.submitGoal(goal)
 		}
 		return m, nil
 
@@ -487,8 +469,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// retryable (/compact retry). A live turn fires two compactMsgs per
 		// compaction (OnCompact's counts, then OnCompacted's summary); only the
 		// one carrying the summary adds the note.
-		m.flushThink()
-		m.flushCurrent()
+		m.flushStreaming()
 		switch {
 		case msg.err != nil:
 			m.append(errStyle.Render("compact failed: " + msg.err.Error()))
@@ -499,34 +480,17 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.append(dimStyle.Render(fmt.Sprintf("◎ compacted — summarized %d msgs, %d kept · raw history preserved", msg.took, msg.kept)))
 			m.future = nil   // compaction rewrote history; stale redo entries would resurrect it
 			m.msgBlock = nil // indices no longer match; rebuilt as blocks stream in
-			// The compacted prompt is a derived view. Align the local save
-			// cursor with that view once a session already owns the raw rows;
-			// Store.Save then appends later messages to the raw SQLite tail.
-			// With no session yet, leave saved at its initial value so the
-			// turn-complete persist still creates and saves the conversation.
-			if m.agent != nil && m.store != nil && m.sessionID != "" {
-				m.saved = len(m.agent.MessagesSnapshot())
-			}
-			m.persist() // append the new tail; the raw pre-cutover rows are already saved
 		}
 		return m, nil
 
 	case workerCompactDoneMsg:
-		m.flushThink()
-		m.flushCurrent()
-		m.busy = false
-		m.cancel = nil
-		m.interrupt1 = false
-		m.turnStart = time.Time{}
+		m.flushStreaming()
+		m.finishTurnState()
 		m.future = nil
 		m.msgBlock = nil
-		if m.workerOnly {
-			m.usage = msg.usage
-			if msg.contextTokens > 0 {
-				m.workerContextTokens = msg.contextTokens
-			}
-		} else if m.agent != nil {
-			m.agent.SetUsage(msg.usage)
+		m.usage = msg.usage
+		if msg.contextTokens > 0 {
+			m.workerContextTokens = msg.contextTokens
 		}
 		if msg.err != nil {
 			if errors.Is(msg.err, context.Canceled) {
@@ -538,139 +502,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case turnDoneMsg:
-		m.flushThink()
-		m.flushCurrent()
-		m.busy = false
-		m.cancel = nil
-		m.interrupt1 = false
-		m.turnStart = time.Time{}
-		// Cancellation arrives wrapped from the in-flight http request
-		// ("Post ...: context canceled"), so identity comparison misses it —
-		// which would strand the queue instead of draining it.
-		canceled := errors.Is(msg.err, context.Canceled)
-		if msg.err != nil && !canceled {
-			m.append(errStyle.Render("error: " + msg.err.Error()))
-		} else if canceled {
-			m.append(dimStyle.Render("(interrupted — any running tool calls will be recorded as interrupted; ghg can retry them next turn)"))
-		}
-		continueGoal := false
-		if m.workerOnly {
-			if msg.goal != nil {
-				m.applyGoalRecord(*msg.goal)
-			}
-			continueGoal = msg.goalContinue && msg.err == nil && !canceled
-		} else {
-			continueGoal = m.goalTurnFinished(msg, canceled)
-		}
-		if m.reviewing {
-			m.reviewing = false
-			if !m.workerOnly && m.agent != nil {
-				m.agent.ReviewMode = false
-				m.agent.PlanMode = (m.uiMode() == uiModePlan)
-			}
-			if msg.err == nil && !canceled && msg.final != "" {
-				if m.workerOnly {
-					if msg.reviewMarkdown != "" {
-						m.appendAssistant(msg.reviewMarkdown)
-					} else {
-						m.appendAssistant(msg.final)
-					}
-				} else if !m.workerOnly {
-					if rev, err := agent.ParseReview(msg.final); err == nil {
-						rendered := export.RenderReviewMarkdown(rev)
-						m.appendAssistant(rendered)
-						if m.store != nil && m.sessionID != "" {
-							msgSeq := 0
-							role := ""
-							if m.agent != nil {
-								msgSeq = len(m.agent.MessagesSnapshot())
-								role = m.agent.Role
-							}
-							_ = m.store.SaveWorkflowResult(context.Background(), session.WorkflowResultRecord{
-								ResultID:   fmt.Sprintf("review-%x", time.Now().UnixNano()),
-								SessionID:  m.sessionID,
-								Kind:       "review",
-								Version:    1,
-								Payload:    msg.final,
-								Role:       role,
-								MessageSeq: msgSeq,
-								CreatedAt:  time.Now().UTC(),
-							})
-						}
-					}
-				}
-			}
-		} else if m.uiMode() == uiModePlan && msg.final != "" {
-			if m.workerOnly {
-				if msg.plan != "" {
-					m.proposedPlanMD = msg.plan
-				}
-			} else if planMD, ok := agent.ExtractProposedPlan(msg.final); ok {
-				m.proposedPlanMD = planMD
-				if m.store != nil && m.sessionID != "" {
-					planJSON, _ := json.Marshal(map[string]string{"markdown": planMD})
-					msgSeq := 0
-					role := ""
-					if m.agent != nil {
-						msgSeq = len(m.agent.MessagesSnapshot())
-						role = m.agent.Role
-					}
-					_ = m.store.SaveWorkflowResult(context.Background(), session.WorkflowResultRecord{
-						ResultID:   fmt.Sprintf("plan-%x", time.Now().UnixNano()),
-						SessionID:  m.sessionID,
-						Kind:       "plan",
-						Version:    2,
-						Payload:    string(planJSON),
-						Role:       role,
-						MessageSeq: msgSeq,
-						CreatedAt:  time.Now().UTC(),
-					})
-				}
-			}
-		}
-		if !m.workerOnly {
-			m.persist()
-			switch {
-			case msg.snap != "" && msg.clean:
-				session.DropSnapshot(cwd(), msg.snap) // the turn changed no files; nothing to roll back
-			case msg.snap != "":
-				if m.snapshots == nil {
-					m.snapshots = map[int]string{}
-				}
-				m.snapshots[msg.at] = msg.snap
-				if m.store != nil && m.sessionID != "" {
-					_ = m.store.SetSnapshot(m.sessionID, msg.at, msg.snap)
-				}
-			}
-		} else if msg.snap != "" && !msg.clean {
-			if m.snapshots == nil {
-				m.snapshots = map[int]string{}
-			}
-			m.snapshots[msg.at] = msg.snap
-		}
-		// codex-style follow-up: send queued messages one turn at a time;
-		// `!` shell escapes execute locally instead of starting a turn.
-		// A canceled turn also drains the queue: the empty-enter steer path
-		// cancels intentionally so the queued messages go out immediately.
-		for len(m.queue) > 0 && (msg.err == nil || canceled) {
-			next := m.queue[0]
-			if strings.HasPrefix(next, "!") {
-				m.queue = m.queue[1:]
-				m.queueSel = -1
-				m.runShellQueued(next)
-				continue
-			}
-			return m.drainQueueHead()
-		}
-		// Structured update_goal controls continuation. A plain assistant
-		// response never completes or pauses an active goal.
-		if continueGoal {
-			record, ok := m.goalRecordForSession()
-			if ok && record.Status == agent.GoalStatusActive {
-				return m.submitGoal(goal.ContinuePrompt(record.Objective))
-			}
-		}
-		return m, nil
+		return m.handleTurnDone(msg)
 
 	case catalogsMsg:
 		m.updateCatalogs(msg)
@@ -705,76 +537,12 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case taskUpdateMsg:
-		// a background subagent started or settled; the dock shows it. An
-		// open view of a settled task reloads from the stored report.
-		if !m.workerOnly && m.agent != nil && m.taskVP != nil {
-			if t, ok := m.agent.Tasks().Get(m.taskVP.id); ok && t.Status != agent.TaskRunning && m.taskVP.live {
-				m.openTask(m.taskVP.id) // reseed with the final report
-			} else {
-				m.refreshTaskVP()
-			}
-		}
 		return m, nil
 
 	case mcpStatusMsg:
-		if len(msg.statuses) > 0 || m.workerOnly {
-			if len(msg.statuses) > 0 {
-				m.append(renderWorkerMCPStatuses(msg.statuses))
-			}
-			return m, nil
+		if len(msg.statuses) > 0 {
+			m.append(renderWorkerMCPStatuses(msg.statuses))
 		}
-		// An MCP server changed state. Announce each server's FIRST settle in
-		// the transcript (one line, once per session per server) so arrivals
-		// and failures are visible without typing /mcp — later transitions
-		// (auto-reconnect, toggles) stay quiet to avoid flapping noise.
-		if m.mcpMgr != nil {
-			if m.agent != nil {
-				m.agent.SetMCPTools(m.mcpMgr.Tools())
-			}
-			if m.mcpSeen == nil {
-				m.mcpSeen = map[string]bool{}
-			}
-			for _, srv := range m.mcpMgr.Statuses() {
-				if m.mcpSeen[srv.Name] || srv.Status == mcp.StatusConnecting {
-					continue
-				}
-				m.mcpSeen[srv.Name] = true
-				switch srv.Status {
-				case mcp.StatusReady:
-					m.append(dimStyle.Render(fmt.Sprintf("⚡ mcp: %s ready (%d tools)", srv.Name, srv.Tools)))
-				case mcp.StatusFailed:
-					line := fmt.Sprintf("✗ mcp: %s failed: %s", srv.Name, srv.Err)
-					if srv.Source != "" {
-						line += " (" + srv.Source + ")"
-					}
-					m.append(errStyle.Render(line + fmt.Sprintf(" (/mcp %s reconnect)", srv.Name)))
-				case mcp.StatusDisabled:
-					m.append(dimStyle.Render(fmt.Sprintf("○ mcp: %s disabled", srv.Name)))
-				}
-			}
-		}
-		return m, nil
-
-	case taskEventMsg:
-		// one live event from the open task's subagent stream; append it to
-		// the pane's transcript (deltas coalesce into lines before append)
-		tv := m.taskVP
-		if tv == nil || msg.id != tv.id {
-			return m, nil
-		}
-		switch msg.kind {
-		case 0: // text delta
-			tv.buf.WriteString(msg.s)
-		case 1: // tool start
-			fmt.Fprintf(&tv.buf, "\n%s %s %s\n", toolStyle.Render("⚒"), msg.s, dimStyle.Render(msg.s2))
-		case 2: // tool end
-			preview := strings.Split(strings.TrimRight(msg.s2, "\n"), "\n")
-			if len(preview) > 4 {
-				preview = append(preview[:4], fmt.Sprintf("… +%d lines", len(msg.s2)-4))
-			}
-			fmt.Fprintf(&tv.buf, "%s\n", dimStyle.Render("  "+strings.Join(preview, "\n  ")))
-		}
-		m.refreshTaskVP()
 		return m, nil
 
 	case imageMsg:
@@ -794,4 +562,59 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	m.input, cmd = m.input.Update(msg)
 	return m, cmd
+}
+
+func (m *model) handleTurnDone(msg turnDoneMsg) (tea.Model, tea.Cmd) {
+	m.flushStreaming()
+	m.finishTurnState()
+	// Cancellation arrives wrapped from the in-flight http request
+	// ("Post ...: context canceled"), so identity comparison misses it —
+	// which would strand the queue instead of draining it.
+	canceled := errors.Is(msg.err, context.Canceled)
+	if msg.err != nil && !canceled {
+		m.append(errStyle.Render("error: " + msg.err.Error()))
+	} else if canceled {
+		m.append(dimStyle.Render("(interrupted — any running tool calls will be recorded as interrupted; ghg can retry them next turn)"))
+	}
+	continueGoal := msg.goalContinue && msg.err == nil && !canceled
+	if msg.goal != nil {
+		m.applyGoalRecord(*msg.goal)
+	}
+	if m.reviewing {
+		m.reviewing = false
+		if msg.err == nil && !canceled && msg.final != "" {
+			if msg.reviewMarkdown != "" {
+				m.appendAssistant(msg.reviewMarkdown)
+			} else {
+				m.appendAssistant(msg.final)
+			}
+		}
+	} else if m.uiMode() == uiModePlan && msg.final != "" {
+		if msg.plan != "" {
+			m.proposedPlanMD = msg.plan
+		}
+	}
+	// codex-style follow-up: send queued messages one turn at a time;
+	// `!` shell escapes go to the worker instead of starting a turn.
+	// A canceled turn also drains the queue: the empty-enter steer path
+	// cancels intentionally so the queued messages go out immediately.
+	for len(m.queue) > 0 && (msg.err == nil || canceled) {
+		next := m.queue[0]
+		if strings.HasPrefix(next, "!") {
+			m.queue = m.queue[1:]
+			m.queueSel = -1
+			m.runShellQueued(next)
+			continue
+		}
+		return m.drainQueueHead()
+	}
+	// Structured update_goal controls continuation. A plain assistant
+	// response never completes or pauses an active goal.
+	if continueGoal {
+		record, ok := m.goalRecordForSession()
+		if ok && record.Status == agent.GoalStatusActive {
+			return m.submitGoal(agent.ContinuePrompt(record.Objective))
+		}
+	}
+	return m, nil
 }

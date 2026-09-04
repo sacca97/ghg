@@ -8,7 +8,6 @@ import (
 	"github.com/sacca97/ghg/internal/config"
 	"github.com/sacca97/ghg/internal/models"
 	"github.com/sacca97/ghg/internal/skills"
-	"github.com/sacca97/ghg/internal/tempdir"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -103,7 +102,7 @@ func xselImage() (string, []byte, error) {
 }
 
 func pngpasteImage() (string, []byte, error) {
-	tmp, err := os.CreateTemp(tempdir.Base(), "ghg-paste-*.png")
+	tmp, err := os.CreateTemp("/tmp", "ghg-paste-*.png")
 	if err != nil {
 		return "", nil, err
 	}

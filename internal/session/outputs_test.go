@@ -71,7 +71,7 @@ func TestOutputMetadataRoundTripForkAndRewind(t *testing.T) {
 		t.Fatalf("fork outputs = %+v, %v", forked, err)
 	}
 
-	if err := st.DeleteFrom(id, 2); err != nil {
+	if err := st.DeleteFrom(id, 2, nil); err != nil {
 		t.Fatal(err)
 	}
 	remaining, err := st.ListOutputs(ctx, id, OutputFilter{}, 10)

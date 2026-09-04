@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/sacca97/ghg/internal/models"
 	"github.com/sacca97/ghg/internal/search"
@@ -330,7 +331,23 @@ func boundedHistoryDisplay(value string, limit int) string {
 	if len(value) <= limit {
 		return value
 	}
-	return value[:limit-1] + "…"
+	const suffix = "…"
+	if limit < len(suffix) {
+		return value[:utf8Prefix(value, limit)]
+	}
+	return value[:utf8Prefix(value, limit-len(suffix))] + suffix
+}
+
+func utf8Prefix(value string, limit int) int {
+	end := 0
+	for end < len(value) {
+		_, size := utf8.DecodeRuneInString(value[end:])
+		if end+size > limit {
+			break
+		}
+		end += size
+	}
+	return end
 }
 
 func renderHistoryRead(snapshot search.Snapshot, cursor historyCursor) (tools.ToolResult, bool) {

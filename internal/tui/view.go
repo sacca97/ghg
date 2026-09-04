@@ -81,45 +81,15 @@ func (b *block) renderAt(width int) string {
 func (b block) render(width int) string {
 	switch b.kind {
 	case blockAssistant:
-		w := width - 2 // body indents under the "● " marker
-		if w <= 0 {
-			w = 80 // no terminal size yet: sane default
-		}
-		body := indentLines(renderMarkdown(b.text, w), 2)
-		return botStyle.Render("● ") + strings.TrimPrefix(body, "  ")
+		return renderMarkdownBlock("●", b.text, width)
 	case blockPlan:
-		w := width - 2 // body indents under the "◎ " marker
-		if w <= 0 {
-			w = 80 // no terminal size yet: sane default
-		}
-		body := indentLines(renderMarkdown(b.text, w), 2)
-		return botStyle.Render("◎ ") + strings.TrimPrefix(body, "  ")
+		return renderMarkdownBlock("◎", b.text, width)
 	case blockTool:
 		lines := strings.Split(strings.TrimRight(b.text, "\n"), "\n")
 		if b.expanded || len(lines) <= toolPreviewLines {
 			return wrap(dimStyle.Render("  "+strings.Join(lines, "\n  ")), width)
 		}
-		var preview []string
-		if strings.HasSuffix(lines[len(lines)-1], "```") {
-			const maxDiffPreviewLines = 8
-			for _, l := range lines {
-				if strings.HasPrefix(l, "```") {
-					continue
-				}
-				if strings.HasPrefix(l, "-") || strings.HasPrefix(l, "+") {
-					if !strings.HasPrefix(l, "---") && !strings.HasPrefix(l, "+++") {
-						if len(preview) < maxDiffPreviewLines+1 {
-							preview = append(preview, l)
-						}
-					}
-				} else if len(preview) < 2 {
-					preview = append(preview, l)
-				}
-			}
-		}
-		if len(preview) == 0 {
-			preview = lines[:toolPreviewLines]
-		}
+		preview := toolPreview(lines)
 		out := dimStyle.Render("  " + strings.Join(preview, "\n  "))
 		hint := fmt.Sprintf("\n  … +%d lines (ctrl+e or click to expand)", len(lines)-len(preview))
 		return wrap(out+dimStyle.Render(hint), width)
@@ -128,6 +98,41 @@ func (b block) render(width int) string {
 	default:
 		return wrap(b.text, width)
 	}
+}
+
+func renderMarkdownBlock(marker, text string, width int) string {
+	w := width - 2
+	if w <= 0 {
+		w = 80
+	}
+	body := indentLines(renderMarkdown(text, w), 2)
+	return botStyle.Render(marker+" ") + strings.TrimPrefix(body, "  ")
+}
+
+func toolPreview(lines []string) []string {
+	if len(lines) <= toolPreviewLines {
+		return lines
+	}
+	if strings.HasSuffix(lines[len(lines)-1], "```") {
+		const maxDiffPreviewLines = 8
+		var preview []string
+		for _, line := range lines {
+			if strings.HasPrefix(line, "```") {
+				continue
+			}
+			if strings.HasPrefix(line, "-") || strings.HasPrefix(line, "+") {
+				if !strings.HasPrefix(line, "---") && !strings.HasPrefix(line, "+++") && len(preview) < maxDiffPreviewLines+1 {
+					preview = append(preview, line)
+				}
+			} else if len(preview) < 2 {
+				preview = append(preview, line)
+			}
+		}
+		if len(preview) > 0 {
+			return preview
+		}
+	}
+	return lines[:toolPreviewLines]
 }
 
 // expand toggles a tool block and returns whether it changed.
@@ -160,7 +165,10 @@ func (m *model) appendPlanBlock(s string) {
 
 func (m *model) appendRaw(kind blockKind, text string) {
 	m.blocks = append(m.blocks, block{kind: kind, text: text})
-	m.refreshVP()
+	m.transcriptDirty = true
+	if m.prog == nil {
+		m.refreshVP()
+	}
 }
 
 // refreshVP rebuilds the viewport content, bottom-anchored: short transcripts
@@ -205,6 +213,7 @@ func (m *model) refreshVP() {
 	if m.follow {
 		m.vp.GotoBottom()
 	}
+	m.transcriptDirty = false
 }
 
 // contentPad is the number of blank lines refreshVP prepends when the
@@ -345,7 +354,7 @@ func (m *model) layout() {
 	// the viewport to 1 col and re-slice the transcript into a one-char strip,
 	// regardless of the render floor in refreshVP.
 	w, h := max(m.width, minRenderWidth), max(m.height-chrome, 1)
-	if m.vp.Width != w || m.vp.Height != h {
+	if m.vp.Width != w || m.vp.Height != h || m.transcriptDirty {
 		m.vp.Width, m.vp.Height = w, h
 		m.refreshVP()
 	}
@@ -382,9 +391,6 @@ func (m *model) contextLimitFor(provName, apiID string) int {
 		}
 	}
 	modelName := m.modelName
-	if modelName == "" && m.agent != nil {
-		modelName = m.agent.Model
-	}
 	if m.cfg != nil {
 		if mdl, ok := m.cfg.Models[modelName]; ok {
 			if n := mdl.ContextWindow(); n > 0 {
@@ -404,13 +410,6 @@ func (m *model) contextLimitFor(provName, apiID string) int {
 func (m *model) contextStatus() string {
 	used := m.workerContextTokens
 	limit := m.contextLimit
-	if !m.workerOnly && m.workerClient == nil && m.workerProcess == nil && m.workerState == "" && m.agent != nil {
-		used = m.agent.ContextTokens()
-		limit = m.agent.ContextLimit
-	}
-	if limit <= 0 && !m.workerOnly && m.agent != nil {
-		limit = m.agent.ContextLimit
-	}
 	if limit <= 0 {
 		return "ctx " + fmtTok(used)
 	}
@@ -434,23 +433,16 @@ func (m *model) sessionCost() (float64, bool) {
 
 // tasksView renders the background-subagent list for /tasks.
 func (m *model) tasksView() string {
-	if m.agent == nil && !m.workerOnly {
-		return dimStyle.Render("(no provider configured — run /auth first)")
-	}
 	var tasks []agent.BackgroundTask
-	if m.workerOnly {
-		for _, task := range m.workerTasks {
-			tasks = append(tasks, agent.BackgroundTask{ID: task.ID, Description: task.Description, Prompt: task.Prompt, Status: agent.TaskStatus(task.Status), Report: task.Report, StartedAt: task.StartedAt, EndedAt: task.EndedAt, Restored: task.Restored})
-		}
-		slices.SortStableFunc(tasks, func(a, b agent.BackgroundTask) int {
-			if n := b.StartedAt.Compare(a.StartedAt); n != 0 {
-				return n
-			}
-			return strings.Compare(b.ID, a.ID)
-		})
-	} else {
-		tasks = m.agent.Tasks().List()
+	for _, task := range m.workerTasks {
+		tasks = append(tasks, agent.BackgroundTask{ID: task.ID, Description: task.Description, Prompt: task.Prompt, Status: agent.TaskStatus(task.Status), Report: task.Report, StartedAt: task.StartedAt, EndedAt: task.EndedAt, Restored: task.Restored})
 	}
+	slices.SortStableFunc(tasks, func(a, b agent.BackgroundTask) int {
+		if n := b.StartedAt.Compare(a.StartedAt); n != 0 {
+			return n
+		}
+		return strings.Compare(b.ID, a.ID)
+	})
 	if len(tasks) == 0 {
 		return dimStyle.Render("(no background subagents)")
 	}
@@ -491,7 +483,10 @@ func (m *model) appendAssistant(s string) {
 	if m.inMsg && len(m.blocks) > 0 && m.blocks[len(m.blocks)-1].kind == blockAssistant {
 		m.blocks[len(m.blocks)-1].text += "\n\n" + s // same message: merge
 		m.blocks[len(m.blocks)-1].stale = true
-		m.refreshVP()
+		m.transcriptDirty = true
+		if m.prog == nil {
+			m.refreshVP()
+		}
 		return
 	}
 	m.appendAssistantBlock(s)

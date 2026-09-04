@@ -17,6 +17,7 @@ import (
 	"github.com/sacca97/ghg/internal/models"
 	"github.com/sacca97/ghg/internal/session"
 	"github.com/sacca97/ghg/internal/skills"
+	"github.com/sacca97/ghg/internal/tools"
 	workerwire "github.com/sacca97/ghg/internal/worker"
 )
 
@@ -30,6 +31,38 @@ func (w *workerProcessState) startTurn(input workerInput) bool {
 
 func (w *workerProcessState) startGoalFromContext(window int) bool {
 	return w.startOperation("goal formulation", func(ctx context.Context) { w.runGoalFromContext(ctx, window) })
+}
+
+func (w *workerProcessState) startShell(command string) bool {
+	w.mu.Lock()
+	if w.stopRequested || w.shellCancel != nil {
+		w.mu.Unlock()
+		return false
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	w.shellCancel = cancel
+	w.turns.Add(1)
+	w.mu.Unlock()
+
+	go func() {
+		defer w.turns.Done()
+		defer func() {
+			w.mu.Lock()
+			w.shellCancel = nil
+			w.mu.Unlock()
+		}()
+
+		args, err := json.Marshal(workerwire.ShellRequest{Command: command})
+		if err != nil {
+			return
+		}
+		result := tools.ExecuteResult(tools.WithRuntime(ctx, w.runtime), w.ag.AllTools(), "bash", args)
+		if ctx.Err() != nil {
+			return
+		}
+		w.publish(workerwire.EventShellDone, workerwire.ShellResult{Command: command, Output: result.Preview}, true)
+	}()
+	return true
 }
 
 func (w *workerProcessState) startOperation(detail string, run func(context.Context)) bool {
@@ -248,7 +281,7 @@ func (w *workerProcessState) rewind(request workerwire.RewindRequest) (workerwir
 			}
 		}
 	}
-	if err := w.store.DeleteFrom(w.sessionID, cut); err != nil {
+	if err := w.store.DeleteFrom(w.sessionID, cut, request.Messages); err != nil {
 		return workerwire.HistoryResult{}, err
 	}
 	messages := slices.Clone(request.Messages)
@@ -332,15 +365,22 @@ func (w *workerProcessState) runTurn(ctx context.Context, input workerInput) {
 		additions = append(additions, w.mcp.InstructionsBlock())
 	}
 	w.ag.SetSystemPrompt(agent.CompileSystemPrompt(systemPrompt, additions...))
-	if input.ReviewMode {
+	if input.AskMode {
+		w.ag.AskMode = true
+		w.ag.ReviewMode = false
+		w.ag.PlanMode = false
+	} else if input.ReviewMode {
 		w.ag.ReviewMode = true
 		w.ag.PlanMode = false
+		w.ag.AskMode = false
 	} else if input.PlanMode || w.mode == "plan" {
 		w.ag.PlanMode = true
 		w.ag.ReviewMode = false
+		w.ag.AskMode = false
 	} else {
 		w.ag.PlanMode = false
 		w.ag.ReviewMode = false
+		w.ag.AskMode = false
 	}
 	var turnUsage models.Usage
 	addUsage := func(u models.Usage) {
@@ -449,6 +489,7 @@ func (w *workerProcessState) runTurn(ctx context.Context, input workerInput) {
 	}
 	w.ag.ReviewMode = false
 	w.ag.PlanMode = (w.mode == "plan")
+	w.ag.AskMode = false
 
 	w.mu.Lock()
 	modelID, modelName, provider, role, protocol, effort := w.ag.Model, w.modelName, w.provider, w.ag.Role, w.ag.Protocol, w.ag.Effort
@@ -648,4 +689,58 @@ func truncateWorkerGoalNote(value string) string {
 		return value
 	}
 	return value[:agent.MaxNoteBytes]
+}
+
+func (w *workerProcessState) fork(request workerwire.ForkRequest) (workerwire.ForkResult, error) {
+	if err := w.requireIdleHistory(); err != nil {
+		return workerwire.ForkResult{}, err
+	}
+	if w.store == nil || w.sessionID == "" {
+		return workerwire.ForkResult{}, errors.New("session store unavailable")
+	}
+	title := strings.TrimSpace(request.Title)
+	if title == "" {
+		return workerwire.ForkResult{}, errors.New("fork needs a title")
+	}
+	w.persist()
+	if w.ag == nil {
+		return workerwire.ForkResult{}, errors.New("no active agent to fork")
+	}
+	msgs := w.ag.MessagesSnapshot()
+	if len(msgs) <= 1 {
+		return workerwire.ForkResult{}, errors.New("nothing to fork yet")
+	}
+	cut := min(max(request.Cut, 0), len(msgs)-1)
+	oldID := w.sessionID
+	oldTitle := oldID
+	if meta, _, err := w.store.Load(oldID); err == nil && meta.Title != "" {
+		oldTitle = meta.Title
+	}
+	newID, err := w.store.Fork(oldID, cut, title)
+	if err != nil {
+		return workerwire.ForkResult{}, fmt.Errorf("fork: %w", err)
+	}
+	return workerwire.ForkResult{
+		NewSessionID: newID,
+		OldSessionID: oldID,
+		Title:        title,
+		OldTitle:     oldTitle,
+	}, nil
+}
+
+func (w *workerProcessState) rename(request workerwire.RenameRequest) (workerwire.RenameResult, error) {
+	if w.store == nil || w.sessionID == "" {
+		return workerwire.RenameResult{}, errors.New("session store unavailable")
+	}
+	title := strings.TrimSpace(request.Title)
+	if title == "" {
+		return workerwire.RenameResult{}, errors.New("title is required")
+	}
+	if err := w.store.SetTitle(w.sessionID, title); err != nil {
+		return workerwire.RenameResult{}, fmt.Errorf("rename: %w", err)
+	}
+	return workerwire.RenameResult{
+		SessionID: w.sessionID,
+		Title:     title,
+	}, nil
 }

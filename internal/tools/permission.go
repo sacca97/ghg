@@ -11,8 +11,10 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"unicode"
 
+	"github.com/sacca97/ghg/internal/config"
 	"github.com/sacca97/ghg/internal/sandbox"
 )
 
@@ -1017,4 +1019,58 @@ func isDeviceSink(path string) bool {
 	default:
 		return false
 	}
+}
+
+// PermRules is the saved "allow always" set, persisted to
+// ~/.ghg/permissions.json as a flat list of "tool:rule" strings.
+type PermRules struct {
+	mu    sync.RWMutex
+	rules map[string]bool
+}
+
+// LoadPermRules reads stored permission rules from ~/.ghg/permissions.json.
+func LoadPermRules() *PermRules {
+	out := &PermRules{rules: make(map[string]bool)}
+	var list []string
+	if err := config.ReadJSON("permissions.json", &list); err == nil {
+		for _, r := range list {
+			out.rules[r] = true
+		}
+	}
+	return out
+}
+
+// PermRuleKey returns the stored rule key: tool + ":" + arity-collapsed command/path.
+func PermRuleKey(tool, rule string) string { return tool + ":" + rule }
+
+// CoveredBy reports whether a saved rule covers this call.
+func (r *PermRules) CoveredBy(req GateRequest) bool {
+	if r == nil {
+		return false
+	}
+	rule := req.Rule
+	if req.Tool != "bash" {
+		rule = req.Command
+	}
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.rules[PermRuleKey(req.Tool, rule)]
+}
+
+// AllowAlways installs and persists an "allow always" rule for tool and rule.
+func (r *PermRules) AllowAlways(tool, rule string) {
+	if r == nil {
+		return
+	}
+	r.mu.Lock()
+	if r.rules == nil {
+		r.rules = make(map[string]bool)
+	}
+	r.rules[PermRuleKey(tool, rule)] = true
+	list := make([]string, 0, len(r.rules))
+	for k := range r.rules {
+		list = append(list, k)
+	}
+	r.mu.Unlock()
+	_ = config.WriteJSON("permissions.json", list)
 }

@@ -141,6 +141,42 @@ func TestPlanModeRestrictsTools(t *testing.T) {
 	}
 }
 
+func TestAskModeAnswersWithReadOnlyTools(t *testing.T) {
+	backend := &fakeBackend{}
+	ag := New(backend, "model", 100, "system")
+	ag.AskMode = true
+	ag.Tools = []tools.Tool{
+		{Def: models.NewTool("read", "", "")},
+		{Def: models.NewTool("grep", "", "")},
+		{Def: models.NewTool("bash", "", "")},
+		{Def: models.NewTool("write", "", "")},
+		{Def: models.NewTool("task", "", "")},
+	}
+
+	answer, err := ag.TurnAuthored(context.Background(), "what is this?", Events{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if answer != "reply" {
+		t.Fatalf("answer = %q, want reply", answer)
+	}
+	if len(backend.streamRequests) != 1 {
+		t.Fatalf("stream calls = %d, want 1", len(backend.streamRequests))
+	}
+	req := backend.streamRequests[0]
+	if !requestContains(req, askModePrompt) {
+		t.Fatal("ask prompt was not included")
+	}
+	if len(req.Tools) != 2 {
+		t.Fatalf("ask tools = %d, want 2", len(req.Tools))
+	}
+	for _, tool := range req.Tools {
+		if tool.Function.Name != "read" && tool.Function.Name != "grep" {
+			t.Fatalf("unexpected ask tool %q", tool.Function.Name)
+		}
+	}
+}
+
 func TestRolloutBudgetWeightedUsageAndThresholds(t *testing.T) {
 	budget := newPlanRolloutBudget()
 	if budget.Remaining() != defaultPlanBudgetLimit {

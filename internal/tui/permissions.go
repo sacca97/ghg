@@ -3,101 +3,18 @@ package tui
 import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/x/ansi"
-	"github.com/sacca97/ghg/internal/config"
 	"github.com/sacca97/ghg/internal/tools"
 	workerwire "github.com/sacca97/ghg/internal/worker"
 	"strings"
 )
 
-// Permission prompts: when the agent is about to run a gated tool (bash,
-// write, edit) and no saved rule covers it, the turn pauses and a modal asks
-// Allow once / Allow always / Reject. "Always" previews the exact rule it
-// installs (arity-collapsed: "git checkout main" → rule "git checkout");
-// Reject takes a free-text redirect back to the model.
-//
-// The gate runs on a tool goroutine; the dialog runs on the UI thread. They
-// meet on a channel: the gate sends a request, the UI answers it.
-
-// permRequest is the gate→UI half; the answer comes back on reply.
-type permRequest struct {
-	req   tools.GateRequest
-	reply chan permAnswer
-}
-
-type permAnswer struct {
-	decision tools.GateDecision
-	redirect string // free-text redirect on reject
-}
-
 // permDialog is the UI-thread modal state while a request is open.
 type permDialog struct {
 	req       tools.GateRequest
-	reply     chan permAnswer
 	workerID  string
 	sel       int  // 0=allow once, 1=allow always, 2=reject
 	rejecting bool // typing the redirect message
 	rejectIn  string
-}
-
-// permRules is the saved "allow always" set, persisted to
-// ~/.ghg/permissions.json as a flat list of "tool:rule" strings.
-type permRules map[string]bool
-
-func loadPermRules() permRules {
-	out := permRules{}
-	var list []string
-	if err := config.ReadJSON("permissions.json", &list); err == nil {
-		for _, r := range list {
-			out[r] = true
-		}
-	}
-	return out
-}
-
-func (r permRules) save() {
-	list := make([]string, 0, len(r))
-	for k := range r {
-		list = append(list, k)
-	}
-	_ = config.WriteJSON("permissions.json", list) // best-effort; next save retries
-}
-
-// ruleKey is the stored rule: tool + the arity-collapsed command/path.
-func ruleKey(tool, rule string) string { return tool + ":" + rule }
-
-// coveredBy reports whether a saved rule covers this call. bash matches on
-// the collapsed command rule; write/edit match on the exact path (a file
-// rule is already specific — collapsing paths is overreach).
-func (r permRules) coveredBy(req tools.GateRequest) bool {
-	rule := req.Rule
-	if req.Tool != "bash" {
-		rule = req.Command // path rules are exact
-	}
-	return r[ruleKey(req.Tool, rule)]
-}
-
-// askPermission is the human decision layer used both by the legacy cautious
-// gate and by execution-policy capability escalation. A missing UI fails
-// closed; headless runs use ToolRuntime's never/auto-review modes instead.
-func (m *model) askPermission(req tools.GateRequest) (tools.GateDecision, string) {
-	if m.perms.coveredBy(req) {
-		return tools.GateAllowOnce, ""
-	}
-	if m.prog == nil {
-		return tools.GateReject, "no interactive reviewer is available"
-	}
-	reply := make(chan permAnswer, 1)
-	sendProg(m.prog, permRequest{req: req, reply: reply})
-	if m.progDone != nil {
-		select {
-		case ans := <-reply:
-			return ans.decision, ans.redirect
-		case <-m.progDone:
-			return tools.GateReject, "interactive reviewer closed"
-		}
-	}
-	ans := <-reply // block the tool goroutine until the user answers
-	return ans.decision, ans.redirect
 }
 
 // permKey handles keys while the dialog is open. Returns (handled).
@@ -106,31 +23,29 @@ func (m *model) permKey(msg tea.KeyMsg) bool {
 	if d == nil {
 		return false
 	}
-	answer := func(a permAnswer) {
+	answer := func(decision tools.GateDecision, redirect string) {
 		if d.workerID != "" {
-			decision := "reject"
-			switch a.decision {
+			decisionName := "reject"
+			switch decision {
 			case tools.GateAllowOnce:
-				decision = "allow_once"
+				decisionName = "allow_once"
 			case tools.GateAllowAlways:
-				decision = "allow_always"
+				decisionName = "allow_always"
 			}
 			if m.workerClient != nil {
 				if err := m.workerClient.Send(workerwire.CommandApprove, workerRequestID("approve"), workerwire.ApprovalAnswer{
-					ID: d.workerID, Decision: decision, Redirect: a.redirect,
+					ID: d.workerID, Decision: decisionName, Redirect: redirect,
 				}); err != nil {
 					m.append(errStyle.Render("approval failed: " + err.Error()))
 				}
 			}
-		} else if d.reply != nil {
-			d.reply <- a
 		}
 		m.permDialog = nil
 	}
 	if d.rejecting {
 		switch msg.Type {
 		case tea.KeyEnter:
-			answer(permAnswer{tools.GateReject, strings.TrimSpace(d.rejectIn)})
+			answer(tools.GateReject, strings.TrimSpace(d.rejectIn))
 		case tea.KeyEsc:
 			d.rejecting, d.rejectIn = false, "" // back to the buttons
 		case tea.KeyBackspace:
@@ -153,35 +68,23 @@ func (m *model) permKey(msg tea.KeyMsg) bool {
 	case tea.KeyEnter:
 		switch d.sel {
 		case 0:
-			answer(permAnswer{decision: tools.GateAllowOnce})
+			answer(tools.GateAllowOnce, "")
 		case 1:
-			rule := d.req.Rule
-			if d.req.Tool != "bash" {
-				rule = d.req.Command
-			}
-			m.perms[ruleKey(d.req.Tool, rule)] = true
-			m.perms.save()
-			answer(permAnswer{decision: tools.GateAllowAlways})
+			answer(tools.GateAllowAlways, "")
 		case 2:
 			d.rejecting = true // take the redirect text
 		}
 	case tea.KeyRunes:
 		switch string(msg.Runes) {
 		case "a":
-			answer(permAnswer{decision: tools.GateAllowOnce})
+			answer(tools.GateAllowOnce, "")
 		case "A":
-			rule := d.req.Rule
-			if d.req.Tool != "bash" {
-				rule = d.req.Command
-			}
-			m.perms[ruleKey(d.req.Tool, rule)] = true
-			m.perms.save()
-			answer(permAnswer{decision: tools.GateAllowAlways})
+			answer(tools.GateAllowAlways, "")
 		case "r":
 			d.rejecting = true
 		}
 	case tea.KeyEsc:
-		answer(permAnswer{tools.GateReject, "rejected without a reason"})
+		answer(tools.GateReject, "rejected without a reason")
 	}
 	return true
 }
@@ -204,7 +107,7 @@ func (m *model) permView() string {
 	if d.req.Tool != "bash" {
 		rule = d.req.Command
 	}
-	b.WriteString(dimStyle.Render("\n  always allows: " + ruleKey(d.req.Tool, rule)))
+	b.WriteString(dimStyle.Render("\n  always allows: " + d.req.Tool + ":" + rule))
 	if d.rejecting {
 		b.WriteString("\n" + youStyle.Render("  reject with message: ") + d.rejectIn + "█")
 		b.WriteString(dimStyle.Render("\n  enter sends · esc back"))

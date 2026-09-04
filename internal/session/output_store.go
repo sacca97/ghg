@@ -15,7 +15,6 @@ import (
 	"time"
 
 	"github.com/sacca97/ghg/internal/models"
-	"github.com/sacca97/ghg/internal/tempdir"
 )
 
 const (
@@ -64,7 +63,7 @@ func NewTempOutputStore(limits ...int64) (*OutputStore, error) {
 }
 
 func NewTempOutputStoreWithLimit(maxBytes int64) (*OutputStore, error) {
-	root, err := os.MkdirTemp(tempdir.Base(), "ghg-outputs-")
+	root, err := os.MkdirTemp("/tmp", "ghg-outputs-")
 	if err != nil {
 		return nil, fmt.Errorf("create temporary output store: %w", err)
 	}

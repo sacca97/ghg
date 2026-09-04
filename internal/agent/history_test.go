@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/sacca97/ghg/internal/agent"
 	"github.com/sacca97/ghg/internal/models"
@@ -31,7 +32,7 @@ func TestHistoryToolsSearchPaginateAndReadAsUntrustedEvidence(t *testing.T) {
 		{Role: "system", Content: "policy"},
 		{Role: "user", Content: "find the history needle"},
 		{Role: "assistant", Content: "I will inspect it", ToolCalls: []models.ToolCall{call}},
-		{Role: "tool", Content: "needle result", Source: "read", Name: "read", ToolCallID: call.ID},
+		{Role: "tool", Content: strings.Repeat("é", 2000) + " needle result", Source: "read", Name: "read", ToolCallID: call.ID},
 		{Role: "user", Content: "the follow-up needle"},
 	}
 	if err := st.Save(id, 0, msgs, "m", "p"); err != nil {
@@ -70,6 +71,9 @@ func TestHistoryToolsSearchPaginateAndReadAsUntrustedEvidence(t *testing.T) {
 	}
 	if strings.Contains(read.Preview, `"tool_calls"`) || strings.Contains(read.Preview, "old-call") {
 		t.Fatalf("history read leaked provider protocol data: %q", read.Preview)
+	}
+	if !utf8.ValidString(read.Preview) {
+		t.Fatalf("history read returned invalid UTF-8")
 	}
 	tooBroad := tools.ExecuteResult(context.Background(), toolSet, "history_read", json.RawMessage(`{"start_seq":0,"end_seq":256}`))
 	if !strings.Contains(tooBroad.Preview, "too broad") {

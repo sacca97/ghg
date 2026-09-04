@@ -5,23 +5,21 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
+	"slices"
+	"strconv"
+	"strings"
+	"time"
+
 	tea "github.com/charmbracelet/bubbletea"
-	"github.com/sacca97/ghg/internal/agent"
 	"github.com/sacca97/ghg/internal/config"
 	"github.com/sacca97/ghg/internal/export"
-	"github.com/sacca97/ghg/internal/mcp"
 	"github.com/sacca97/ghg/internal/memory"
 	"github.com/sacca97/ghg/internal/models"
 	"github.com/sacca97/ghg/internal/schedule"
 	"github.com/sacca97/ghg/internal/session"
-	"github.com/sacca97/ghg/internal/skills"
 	workerwire "github.com/sacca97/ghg/internal/worker"
-	"os"
-	"path/filepath"
-	"sort"
-	"strconv"
-	"strings"
-	"time"
 )
 
 func (m *model) cdCommand(arg string) {
@@ -37,41 +35,20 @@ func (m *model) cdCommand(arg string) {
 		}
 		arg = home + arg[1:]
 	}
-	if m.workerOnly {
-		if m.busy || m.workerLiveWork {
-			m.append(dimStyle.Render("(worker is busy — /cd after this turn)"))
-			return
-		}
-		if m.workerClient == nil && !m.ensureWorker() {
-			m.append(errStyle.Render("/cd: worker unavailable: " + m.workerStartError))
-			return
-		}
-		requestID := workerRequestID("chdir")
-		if err := m.workerClient.Send(workerwire.CommandChdir, requestID, arg); err != nil {
-			m.append(errStyle.Render("/cd: worker: " + err.Error()))
-			return
-		}
-		m.workerChdirRequest = requestID
+	if m.busy || m.workerLiveWork {
+		m.append(dimStyle.Render("(worker is busy — /cd after this turn)"))
 		return
 	}
-	if m.workerClient != nil {
-		if m.busy || m.workerLiveWork {
-			m.append(dimStyle.Render("(worker is busy — /cd after this turn)"))
-			return
-		}
-		requestID := workerRequestID("chdir")
-		if err := m.workerClient.Send(workerwire.CommandChdir, requestID, arg); err != nil {
-			m.append(errStyle.Render("/cd: worker: " + err.Error()))
-			return
-		}
-		m.workerChdirRequest = requestID
+	if m.workerClient == nil && !m.ensureWorker() {
+		m.append(errStyle.Render("/cd: worker unavailable: " + m.workerStartError))
 		return
 	}
-	if err := os.Chdir(arg); err != nil {
-		m.append(errStyle.Render("/cd: " + err.Error()))
+	requestID := workerRequestID("chdir")
+	if err := m.workerClient.Send(workerwire.CommandChdir, requestID, arg); err != nil {
+		m.append(errStyle.Render("/cd: worker: " + err.Error()))
 		return
 	}
-	m.append(dimStyle.Render("→ " + cwd()))
+	m.workerChdirRequest = requestID
 }
 
 // Compaction events are recorded in raw-log coordinates (session.Store.RawCutoff
@@ -82,58 +59,26 @@ func (m *model) cdCommand(arg string) {
 // raw log. This is the whole point of recording compactions as events: a bad
 // summary is inspectable (/compact log) and erasable without losing history.
 func (m *model) compactRetry() {
-	if m.workerOnly {
-		if m.store == nil || m.sessionID == "" {
-			m.append(dimStyle.Render("(no session to retry a compaction in)"))
-			return
-		}
-		if m.workerClient == nil && !m.ensureWorker() {
-			m.append(errStyle.Render("compact retry: worker unavailable: " + m.workerStartError))
-			return
-		}
-		if m.busy {
-			m.append(dimStyle.Render("(busy — /compact retry after this turn)"))
-			return
-		}
-		requestID := workerRequestID("compact-retry")
-		m.workerHistoryRequest = requestID
-		if err := m.workerClient.Send(workerwire.CommandCompactRetry, requestID, nil); err != nil {
-			m.workerHistoryRequest = ""
-			m.append(errStyle.Render("/compact retry: " + err.Error()))
-			return
-		}
-		m.append(dimStyle.Render("⟲ retrying compaction…"))
-		return
-	}
-	if m.agent == nil {
-		m.append(m.degradedProviderNote())
-		return
-	}
 	if m.store == nil || m.sessionID == "" {
 		m.append(dimStyle.Render("(no session to retry a compaction in)"))
 		return
 	}
-	events := m.store.Compactions(m.sessionID)
-	if len(events) == 0 {
-		m.append(dimStyle.Render("(no compaction to retry)"))
+	if m.workerClient == nil && !m.ensureWorker() {
+		m.append(errStyle.Render("compact retry: worker unavailable: " + m.workerStartError))
 		return
 	}
-	last := events[len(events)-1]
-	if err := m.store.DeleteCompaction(m.sessionID, last.Seq); err != nil {
+	if m.busy {
+		m.append(dimStyle.Render("(busy — /compact retry after this turn)"))
+		return
+	}
+	requestID := workerRequestID("compact-retry")
+	m.workerHistoryRequest = requestID
+	if err := m.workerClient.Send(workerwire.CommandCompactRetry, requestID, nil); err != nil {
+		m.workerHistoryRequest = ""
 		m.append(errStyle.Render("/compact retry: " + err.Error()))
 		return
 	}
-	m.append(dimStyle.Render("⟲ compaction " + strconv.Itoa(last.Seq) + " undone — raw history restored; run /compact to re-compact"))
-	// rebuild the in-memory conversation from the raw log so the next
-	// compaction (or turn) starts from the unfolded history
-	_, msgs, err := m.store.Load(m.sessionID)
-	if err != nil {
-		m.append(errStyle.Render("/compact retry: reload failed: " + err.Error()))
-		return
-	}
-	m.agent.Messages = append(m.agent.Messages[:1], msgs[1:]...)
-	m.saved = 1 // re-save from scratch next persist
-	m.rebuildTranscript()
+	m.append(dimStyle.Render("⟲ retrying compaction…"))
 }
 
 // /compact log — the recorded compaction events (the inspection surface).
@@ -157,206 +102,6 @@ func (m *model) compactLog() {
 		b.WriteString("\n  " + dimStyle.Render("#"+strconv.Itoa(c.Seq)+" folded through message "+strconv.Itoa(c.Cutoff)+": ") + summary)
 	}
 	m.append(b.String())
-}
-
-// /context-doctor — audit what a FRESH session injects before
-// the user types anything, and what each piece costs in estimated tokens.
-// The audience is someone arriving from claude/codex whose first call carries
-// tens of thousands of tokens of skill/MCP/tool-schema bloat they never asked
-// for; the doctor names every source and its cost so it can be audited (and
-// trimmed) instead of silently paid.
-
-// ctxRow is one line of the audit.
-type ctxRow struct {
-	label string
-	bytes int
-	note  string
-}
-
-func (r ctxRow) tokens() int { return (r.bytes + 3) / 4 }
-
-// doctorReport builds the audit as pure data (testable), then renders.
-func (m *model) doctorReport() string {
-	var rows []ctxRow
-
-	// Base system prompt; skills/MCP blocks are appended per turn in
-	// prepareTurn. Project instructions are called out separately so the audit
-	// identifies the trusted repository input instead of hiding it in the base
-	// total.
-	baseBytes := len(m.sysPrompt)
-	if wd, err := os.Getwd(); err == nil {
-		if project := config.ProjectInstructions(wd, config.Trusted(wd)); project != "" {
-			if strings.Contains(m.sysPrompt, project) && baseBytes >= len(project)+2 {
-				baseBytes -= len(project) + 2 // systemPrompt joins blocks with two newlines
-			}
-			rows = append(rows, ctxRow{"project instructions (AGENTS.md)", len(project), "trusted project"})
-		}
-	}
-	rows = append(rows, ctxRow{"system prompt (base)", baseBytes, ""})
-
-	// Skills: block total + the worst offenders, each named with the directory
-	// it was discovered from — "where does this skill come from?" should be
-	// answerable here, not by hunting ~/.ghg/skills vs .agents/skills.
-	scan := m.skillScan
-	if scan == nil { // headless tests build models without the seam
-		scan = func() []skills.Skill { return skills.Scan(skills.DefaultDirs()...) }
-	}
-	sk := scan()
-	block := skills.PromptBlock(sk)
-	row := ctxRow{fmt.Sprintf("skills (%d loaded)", len(sk)), len(block), ""}
-	// Per-skill line cost in the block: "- name: desc (path)\n".
-	type sc struct {
-		name string
-		dir  string // the skills dir the SKILL.md lives under
-		n    int
-	}
-	var per []sc
-	for _, s := range sk {
-		n := len(s.Name) + min(len(s.Description), 300) + len(s.Path) + 8
-		per = append(per, sc{s.Name, filepath.Dir(filepath.Dir(s.Path)), n})
-	}
-	sort.Slice(per, func(i, j int) bool { return per[i].n > per[j].n })
-	var top []string
-	for i := 0; i < len(per) && i < 5; i++ {
-		top = append(top, fmt.Sprintf("%s ~%dtok (%s)", per[i].name, (per[i].n+3)/4, shortSkillsDir(per[i].dir)))
-	}
-	if len(top) > 0 {
-		row.note = "biggest: " + strings.Join(top, ", ")
-	}
-	rows = append(rows, row)
-
-	// MCP: per-server tool schemas as they'd appear in the request.
-	if m.mcpMgr != nil {
-		toolBytes := map[string]int{}
-		for _, t := range m.mcpMgr.Tools() {
-			n := t.Def.Function.Name
-			srv := n
-			if i := strings.Index(strings.TrimPrefix(n, "mcp__"), "__"); i >= 0 {
-				srv = strings.TrimPrefix(n, "mcp__")[:i]
-			}
-			schema, _ := json.Marshal(t.Def)
-			toolBytes[srv] += len(schema) + len(n) + 8
-		}
-		for _, st := range m.mcpMgr.Statuses() {
-			switch st.Status {
-			case mcp.StatusReady:
-				b := toolBytes[st.Name]
-				rows = append(rows, ctxRow{fmt.Sprintf("mcp: %s (%d tools)", st.Name, st.Tools), b, ""})
-			case mcp.StatusFailed:
-				rows = append(rows, ctxRow{"mcp: " + st.Name, 0, "failed — contributes 0 tools"})
-			case mcp.StatusDisabled:
-				rows = append(rows, ctxRow{"mcp: " + st.Name, 0, "disabled"})
-			default:
-				rows = append(rows, ctxRow{"mcp: " + st.Name, 0, "still connecting — 0 tools yet"})
-			}
-		}
-		if ib := m.mcpMgr.InstructionsBlock(); ib != "" {
-			rows = append(rows, ctxRow{"mcp: server instructions", len(ib), ""})
-		}
-	}
-
-	// Built-in tool schemas (what the provider is sent every request).
-	var tb int
-	var toolCount int
-	if m.agent != nil {
-		toolCount = len(m.agent.AllTools())
-		for _, t := range m.agent.AllTools() {
-			schema, _ := json.Marshal(t.Def)
-			tb += len(schema) + 8
-		}
-	}
-	note := "sent with every request"
-	if m.agent == nil {
-		note = "unavailable until a provider is configured"
-	}
-	rows = append(rows, ctxRow{fmt.Sprintf("tool schemas (%d tools)", toolCount), tb, note})
-
-	// History: tokens already in the conversation (0 on a fresh session).
-	var hist int
-	if m.agent != nil {
-		hist = agent.EstimateTokens(m.agent.Messages)
-	}
-	if hist > 0 {
-		rows = append(rows, ctxRow{"conversation history", hist * 4, "estimated"})
-	}
-	// Session spend so far (real usage, if any request has happened).
-	if m.agent != nil {
-		if u := m.agent.Usage(); u.PromptTokens > 0 {
-			rows = append(rows, ctxRow{"session spend so far", 0, fmt.Sprintf("%s in / %s out (actual)", tok(u.PromptTokens), tok(u.CompletionTokens))})
-		}
-	}
-
-	// Render.
-	var b strings.Builder
-	b.WriteString("Fresh-session context audit (estimated tokens)\n")
-	total := 0
-	w := 0
-	for _, r := range rows {
-		if len(r.label) > w {
-			w = len(r.label)
-		}
-		total += r.tokens()
-	}
-	for _, r := range rows {
-		line := fmt.Sprintf("  %-*s %7s", w, r.label, "~"+tok(r.tokens()))
-		if r.note != "" {
-			line += "  " + r.note
-		}
-		b.WriteString(line + "\n")
-	}
-	fmt.Fprintf(&b, "  %-*s %7s\n", w, "TOTAL injected before you type", "~"+tok(total))
-	if m.runtime != nil && m.runtime.Policy != nil {
-		status := m.runtime.Policy.Status()
-		fmt.Fprintf(&b, "\nExecution policy: %s · backend: %s · network: %s\n", status.Mode, status.Backend, status.Network)
-		fmt.Fprintf(&b, "  workspace: %s\n", status.Workspace)
-		fmt.Fprintf(&b, "  read roots: %s\n", strings.Join(status.ReadRoots, ", "))
-		fmt.Fprintf(&b, "  write roots: %s\n", strings.Join(status.WriteRoots, ", "))
-		fmt.Fprintf(&b, "  immutable roots: %s\n", strings.Join(status.ImmutableRoots, ", "))
-		fmt.Fprintf(&b, "  protected roots: %s\n", strings.Join(status.ProtectedRoots, ", "))
-		if status.Degraded {
-			fmt.Fprintf(&b, "  degraded: %s\n", status.Reason)
-		}
-		for _, audit := range m.runtime.Audits() {
-			if audit.Error == "" {
-				continue
-			}
-			fmt.Fprintf(&b, "  recent denial: %s (%s)\n", audit.Error, audit.Request.Fingerprint)
-		}
-	}
-	b.WriteString("\nTrim: /mcp <name> disable · remove a skill from .agents/skills · /context-doctor again")
-	return b.String()
-}
-
-// shortSkillsDir compacts a skills directory for the doctor's per-skill
-// attribution: home-relative ("~/.ghg/skills") when under the user's home,
-// cwd-relative ("./.agents/skills") when under the working directory,
-// absolute otherwise.
-func shortSkillsDir(dir string) string {
-	if home, err := os.UserHomeDir(); err == nil && home != "" {
-		if rel, err := filepath.Rel(home, dir); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-			if rel == "." {
-				return "~"
-			}
-			return "~" + string(filepath.Separator) + rel
-		}
-	}
-	if wd, err := os.Getwd(); err == nil {
-		if rel, err := filepath.Rel(wd, dir); err == nil && !strings.HasPrefix(rel, "..") {
-			if rel == "." {
-				return "."
-			}
-			return "." + string(filepath.Separator) + rel
-		}
-	}
-	return dir
-}
-
-// tok renders a token count compactly (1.2k, 350).
-func tok(n int) string {
-	if n >= 1000 {
-		return fmt.Sprintf("%.1fk", float64(n)/1000)
-	}
-	return fmt.Sprintf("%d", n)
 }
 
 // /memory — the visible half of the memory feature: the user sees exactly
@@ -462,7 +207,6 @@ func (m *model) scheduleCommand(args []string) {
 			m.append(errStyle.Render("/schedule: no session store"))
 			return
 		}
-		m.persist() // a schedule needs a session row to hang off
 		if m.sessionID == "" {
 			m.append(errStyle.Render("/schedule: start a session first (send a message)"))
 			return
@@ -478,7 +222,7 @@ func (m *model) scheduleCommand(args []string) {
 			return
 		}
 		m.append(dimStyle.Render(fmt.Sprintf("✓ scheduled task %d: %s — %s", id, s.String(), prompt)))
-		if m.workerOnly && m.workerClient == nil && m.prog != nil && !m.ensureWorker() {
+		if m.workerClient == nil && m.prog != nil && !m.ensureWorker() {
 			m.append(errStyle.Render("scheduled task saved; worker unavailable: " + m.workerStartError))
 		}
 	}
@@ -515,54 +259,34 @@ func (m *model) compactCommand(args []string) {
 	if !m.requireAgent() {
 		return
 	}
-	if m.workerOnly {
-		if args[0] == "off" {
-			m.compactModel, m.compactProv = "", ""
-		} else {
-			if _, ok := m.cfg.Models[args[0]]; !ok {
-				m.append(errStyle.Render("unknown model " + args[0]))
-				return
-			}
-			m.compactModel = args[0]
-			m.compactProv = ""
-			if len(args) > 1 {
-				m.compactProv = args[1]
-			}
-		}
-		m.cfg.CompactModel, m.cfg.CompactProvider = m.compactModel, m.compactProv
-		_ = m.saveConfig()
-		if m.workerClient != nil {
-			_ = m.workerClient.Send(workerwire.CommandConfigure, workerRequestID("configure"), workerwire.ConfigureRequest{
-				Model: m.modelName, Provider: m.provName, Role: m.currentRole(),
-				Effort: m.currentEffort(), UpdateEffort: false, Mode: m.uiMode(),
-				CompactModel: m.compactModel, CompactProvider: m.compactProv, UpdateCompact: true,
-			})
-		}
+	compactModel, compactProv, _, err := m.parseCompactTarget(args)
+	if err != nil {
+		m.append(errStyle.Render(err.Error()))
 		return
 	}
-	if args[0] == "off" {
-		m.compactModel, m.compactProv = "", ""
-		m.applyCompactModel()
-		m.cfg.CompactModel, m.cfg.CompactProvider = "", ""
-		_ = m.saveConfig()
-		return
-	}
-	if _, ok := m.cfg.Models[args[0]]; !ok {
-		m.append(errStyle.Render("unknown model " + args[0]))
-		return
-	}
-	m.compactModel = args[0]
-	m.compactProv = ""
-	if len(args) > 1 {
-		m.compactProv = args[1]
-	}
-	m.applyCompactModel()
-	if m.agent.CompactModel == "" { // resolve failed; don't persist a broken pick
-		m.compactModel, m.compactProv = "", ""
-		return
-	}
+	m.compactModel, m.compactProv = compactModel, compactProv
 	m.cfg.CompactModel, m.cfg.CompactProvider = m.compactModel, m.compactProv
 	_ = m.saveConfig()
+	if m.workerClient != nil {
+		_ = m.workerClient.Send(workerwire.CommandConfigure, workerRequestID("configure"), workerwire.ConfigureRequest{
+			Model: m.modelName, Provider: m.provName, Role: m.currentRole(),
+			Effort: m.currentEffort(), UpdateEffort: false, Mode: m.uiMode(),
+			CompactModel: m.compactModel, CompactProvider: m.compactProv, UpdateCompact: true,
+		})
+	}
+}
+
+func (m *model) parseCompactTarget(args []string) (model, provider string, off bool, err error) {
+	if args[0] == "off" {
+		return "", "", true, nil
+	}
+	if _, ok := m.cfg.Models[args[0]]; !ok {
+		return "", "", false, fmt.Errorf("unknown model %s", args[0])
+	}
+	if len(args) > 1 {
+		provider = args[1]
+	}
+	return args[0], provider, false, nil
 }
 
 // compactPct returns the live threshold percent (the default when unset).
@@ -587,25 +311,25 @@ func (m *model) setCompactPct(pct int) {
 		return
 	}
 	pct = min(max(pct, 10), 90)
-	if m.workerOnly {
-		m.cfg.CompactPct = pct
-		_ = m.saveConfig()
-		if m.workerClient != nil {
-			_ = m.workerClient.Send(workerwire.CommandConfigure, workerRequestID("configure"), workerwire.ConfigureRequest{
-				Model: m.modelName, Provider: m.provName, Role: m.currentRole(),
-				Effort: m.currentEffort(), Mode: m.uiMode(),
-				CompactThreshold: float64(pct) / 100, UpdateCompactThreshold: true,
-			})
-		}
-		return
-	}
-	m.agent.CompactThreshold = float64(pct) / 100
 	m.cfg.CompactPct = pct
 	_ = m.saveConfig()
+	if m.workerClient != nil {
+		_ = m.workerClient.Send(workerwire.CommandConfigure, workerRequestID("configure"), workerwire.ConfigureRequest{
+			Model: m.modelName, Provider: m.provName, Role: m.currentRole(),
+			Effort: m.currentEffort(), Mode: m.uiMode(),
+			CompactThreshold: float64(pct) / 100, UpdateCompactThreshold: true,
+		})
+	}
 }
 
-// exportResultCommand handles `/export` and `/export-result` with `[chat|plan|review|last|message] [dest] [--format json|markdown] [--force]`.
-func (m *model) exportResultCommand(text string) (tea.Model, tea.Cmd) {
+type exportOptions struct {
+	kind   string
+	dest   string
+	format string
+	force  bool
+}
+
+func parseExportOptions(text string) exportOptions {
 	trimmed := text
 	for _, pfx := range []string{"/export-result", "/export"} {
 		if strings.HasPrefix(trimmed, pfx) {
@@ -614,138 +338,140 @@ func (m *model) exportResultCommand(text string) (tea.Model, tea.Cmd) {
 		}
 	}
 	args := strings.Fields(strings.TrimSpace(trimmed))
-	var kind, dest, format string
-	var force bool
+	var opts exportOptions
 
 	for i := 0; i < len(args); i++ {
 		arg := args[i]
 		switch {
 		case arg == "--force" || arg == "-f":
-			force = true
+			opts.force = true
 		case arg == "--format" || arg == "-format":
 			if i+1 < len(args) {
 				i++
-				format = args[i]
+				opts.format = args[i]
 			}
 		case strings.HasPrefix(arg, "--format="):
-			format = strings.TrimPrefix(arg, "--format=")
+			opts.format = strings.TrimPrefix(arg, "--format=")
 		case arg == "plan" || arg == "review" || arg == "last" || arg == "message" || arg == "response" || arg == "chat" || arg == "log" || arg == "transcript":
-			if kind == "" {
-				kind = arg
-			} else if dest == "" {
-				dest = arg
+			if opts.kind == "" {
+				opts.kind = arg
+			} else if opts.dest == "" {
+				opts.dest = arg
 			}
 		default:
-			if dest == "" {
-				dest = arg
+			if opts.dest == "" {
+				opts.dest = arg
 			}
 		}
 	}
 
-	if format == "" {
-		if strings.HasSuffix(strings.ToLower(dest), ".json") {
-			format = export.FormatJSON
+	switch opts.kind {
+	case "last", "message", "response":
+		opts.kind = "message"
+	case "log", "transcript":
+		opts.kind = "chat"
+	}
+	if opts.format == "" {
+		if strings.HasSuffix(strings.ToLower(opts.dest), ".json") {
+			opts.format = export.FormatJSON
 		} else {
-			format = export.FormatMarkdown
+			opts.format = export.FormatMarkdown
 		}
 	}
+	return opts
+}
 
-	ctx := context.Background()
-	var rec session.WorkflowResultRecord
-	var ok bool
+func newExportRecord(prefix, sessionID, kind string, version int, payload string) session.WorkflowResultRecord {
+	now := time.Now()
+	return session.WorkflowResultRecord{
+		ResultID:  fmt.Sprintf("%s-%x", prefix, now.UnixNano()),
+		SessionID: sessionID,
+		Kind:      kind,
+		Version:   version,
+		Payload:   payload,
+		CreatedAt: now.UTC(),
+	}
+}
 
-	if kind == "chat" || kind == "log" || kind == "transcript" {
+func (m *model) exportRecord(kind string) (session.WorkflowResultRecord, bool, error) {
+	if kind == "chat" {
 		msgs := m.findChatMessages()
 		if len(msgs) == 0 {
-			m.append(dimStyle.Render("no chat messages found in this session to export"))
-			return m, nil
+			return session.WorkflowResultRecord{}, false, nil
 		}
 		rawPayload, _ := json.Marshal(msgs)
-		rec = session.WorkflowResultRecord{
-			ResultID:  fmt.Sprintf("chat-%x", time.Now().UnixNano()),
-			SessionID: m.sessionID,
-			Kind:      "chat",
-			Version:   1,
-			Payload:   string(rawPayload),
-			CreatedAt: time.Now().UTC(),
-		}
-		ok = true
-	} else if kind == "last" || kind == "message" || kind == "response" {
+		return newExportRecord("chat", m.sessionID, "chat", 1, string(rawPayload)), true, nil
+	}
+	if kind == "message" {
 		lastMsg, found := m.findLastAssistantMessage()
 		if !found {
-			m.append(dimStyle.Render("no assistant message found in this session to export"))
-			return m, nil
+			return session.WorkflowResultRecord{}, false, nil
 		}
 		rawPayload, _ := json.Marshal(lastMsg.TextContent())
-		rec = session.WorkflowResultRecord{
-			ResultID:  fmt.Sprintf("msg-%x", time.Now().UnixNano()),
-			SessionID: m.sessionID,
-			Kind:      "message",
-			Version:   1,
-			Payload:   string(rawPayload),
-			CreatedAt: time.Now().UTC(),
+		return newExportRecord("msg", m.sessionID, "message", 1, string(rawPayload)), true, nil
+	}
+
+	var rec session.WorkflowResultRecord
+	var ok bool
+	if m.store != nil && m.sessionID != "" {
+		var err error
+		rec, ok, err = m.store.LatestWorkflowResult(context.Background(), m.sessionID, kind)
+		if err != nil {
+			return session.WorkflowResultRecord{}, false, err
 		}
+	}
+	if !ok && (kind == "plan" || kind == "") && m.proposedPlanMD != "" {
+		planJSON, _ := json.Marshal(map[string]string{"markdown": m.proposedPlanMD})
+		rec = newExportRecord("plan", m.sessionID, "plan", 2, string(planJSON))
+		rec.Role = config.RoleSmart
 		ok = true
-	} else {
-		if m.store != nil && m.sessionID != "" {
-			var err error
-			rec, ok, err = m.store.LatestWorkflowResult(ctx, m.sessionID, kind)
-			if err != nil {
-				m.append(errStyle.Render("export lookup failed: " + err.Error()))
-				return m, nil
-			}
-		}
-		if !ok && (kind == "plan" || kind == "") && m.proposedPlanMD != "" {
-			planJSON, _ := json.Marshal(map[string]string{"markdown": m.proposedPlanMD})
-			rec = session.WorkflowResultRecord{
-				ResultID:  fmt.Sprintf("plan-%x", time.Now().UnixNano()),
-				SessionID: m.sessionID,
-				Kind:      "plan",
-				Version:   2,
-				Payload:   string(planJSON),
-				Role:      config.RoleSmart,
-				CreatedAt: time.Now().UTC(),
-			}
+	}
+	if !ok && kind == "" {
+		lastMsg, found := m.findLastAssistantMessage()
+		if found {
+			rawPayload, _ := json.Marshal(lastMsg.TextContent())
+			rec = newExportRecord("msg", m.sessionID, "message", 1, string(rawPayload))
 			ok = true
 		}
-		if !ok && kind == "" {
-			lastMsg, found := m.findLastAssistantMessage()
-			if found {
-				rawPayload, _ := json.Marshal(lastMsg.TextContent())
-				rec = session.WorkflowResultRecord{
-					ResultID:  fmt.Sprintf("msg-%x", time.Now().UnixNano()),
-					SessionID: m.sessionID,
-					Kind:      "message",
-					Version:   1,
-					Payload:   string(rawPayload),
-					CreatedAt: time.Now().UTC(),
-				}
-				ok = true
-			}
-		}
+	}
+	return rec, ok, nil
+}
+
+// exportResultCommand handles `/export` and `/export-result` with `[chat|plan|review|last|message] [dest] [--format json|markdown] [--force]`.
+func (m *model) exportResultCommand(text string) (tea.Model, tea.Cmd) {
+	opts := parseExportOptions(text)
+	rec, ok, err := m.exportRecord(opts.kind)
+	if err != nil {
+		m.append(errStyle.Render("export lookup failed: " + err.Error()))
+		return m, nil
 	}
 
 	if !ok {
-		if kind != "" {
-			m.append(dimStyle.Render(fmt.Sprintf("no completed %s result found in this session to export", kind)))
-		} else {
+		switch opts.kind {
+		case "chat":
+			m.append(dimStyle.Render("no chat messages found in this session to export"))
+		case "message":
+			m.append(dimStyle.Render("no assistant message found in this session to export"))
+		case "":
 			m.append(dimStyle.Render("no completed workflow result or assistant message found to export"))
+		default:
+			m.append(dimStyle.Render(fmt.Sprintf("no completed %s result found in this session to export", opts.kind)))
 		}
 		return m, nil
 	}
 
-	if dest == "" {
-		dest = export.DefaultExportFilename(rec.Kind, time.Now(), format)
+	if opts.dest == "" {
+		opts.dest = export.DefaultExportFilename(rec.Kind, time.Now(), opts.format)
 	}
 
-	rendered, err := export.RenderResult(rec, format)
+	rendered, err := export.RenderResult(rec, opts.format)
 	if err != nil {
 		m.append(errStyle.Render("export render failed: " + err.Error()))
 		return m, nil
 	}
 
 	cwd, _ := os.Getwd()
-	finalPath, err := export.WriteExportFile(dest, rendered, force, cwd)
+	finalPath, err := export.WriteExportFile(opts.dest, rendered, opts.force, cwd)
 	if err != nil {
 		if errors.Is(err, export.ErrDestinationExists) {
 			m.append(errStyle.Render(fmt.Sprintf("export target %s already exists (add --force to overwrite)", filepath.Base(finalPath))))
@@ -764,21 +490,14 @@ func (m *model) exportResultCommand(text string) (tea.Model, tea.Cmd) {
 }
 
 func (m *model) findLastAssistantMessage() (models.Message, bool) {
-	if m.agent != nil {
-		msgs := m.agent.MessagesSnapshot()
-		for i := len(msgs) - 1; i >= 0; i-- {
-			if (msgs[i].Role == "assistant" || msgs[i].Role == "model") && strings.TrimSpace(msgs[i].TextContent()) != "" {
-				return msgs[i], true
-			}
-		}
+	if msg, ok := lastAssistant(m.messages); ok {
+		return msg, true
 	}
 	if m.store != nil && m.sessionID != "" {
 		_, msgs, err := m.store.Load(m.sessionID)
 		if err == nil {
-			for i := len(msgs) - 1; i >= 0; i-- {
-				if (msgs[i].Role == "assistant" || msgs[i].Role == "model") && strings.TrimSpace(msgs[i].TextContent()) != "" {
-					return msgs[i], true
-				}
+			if msg, ok := lastAssistant(msgs); ok {
+				return msg, true
 			}
 		}
 	}
@@ -793,12 +512,18 @@ func (m *model) findLastAssistantMessage() (models.Message, bool) {
 	return models.Message{}, false
 }
 
-func (m *model) findChatMessages() []models.Message {
-	if m.agent != nil {
-		msgs := m.agent.MessagesSnapshot()
-		if len(msgs) > 1 || (len(msgs) == 1 && msgs[0].Role != "system") {
-			return msgs
+func lastAssistant(msgs []models.Message) (models.Message, bool) {
+	for i := len(msgs) - 1; i >= 0; i-- {
+		if (msgs[i].Role == "assistant" || msgs[i].Role == "model") && strings.TrimSpace(msgs[i].TextContent()) != "" {
+			return msgs[i], true
 		}
+	}
+	return models.Message{}, false
+}
+
+func (m *model) findChatMessages() []models.Message {
+	if len(m.messages) > 1 || (len(m.messages) == 1 && m.messages[0].Role != "system") {
+		return slices.Clone(m.messages)
 	}
 	if m.store != nil && m.sessionID != "" {
 		_, msgs, err := m.store.Load(m.sessionID)
@@ -818,9 +543,6 @@ func (m *model) findChatMessages() []models.Message {
 				out = append(out, models.Message{Role: "user", Content: b.text})
 			}
 		}
-	}
-	if len(out) == 0 && m.agent != nil {
-		return m.agent.MessagesSnapshot()
 	}
 	return out
 }

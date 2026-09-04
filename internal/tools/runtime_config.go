@@ -12,7 +12,6 @@ import (
 
 	"github.com/sacca97/ghg/internal/config"
 	"github.com/sacca97/ghg/internal/sandbox"
-	"github.com/sacca97/ghg/internal/tempdir"
 )
 
 type cacheLeaf struct {
@@ -70,11 +69,15 @@ func NewConfiguredRuntime(workspace string, cfg *config.ExecutionConfig, headles
 		approval = ApprovalNever
 	}
 
-	tempRoot, err := os.MkdirTemp(tempdir.Base(), "ghg-runtime-")
+	tempRoot, err := os.MkdirTemp("/tmp", "ghg-runtime-")
 	if err != nil {
 		return nil, func() {}, fmt.Errorf("execution temp root: %w", err)
 	}
 	cleanup := func() { _ = os.RemoveAll(tempRoot) }
+	if tempRoot, err = sandbox.CanonicalPath(tempRoot, false); err != nil {
+		cleanup()
+		return nil, func() {}, fmt.Errorf("canonicalize execution temp root: %w", err)
+	}
 
 	envOverrides, err := discoveredCacheEnvironment(tempRoot)
 	if err != nil {

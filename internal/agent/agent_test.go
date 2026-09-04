@@ -272,7 +272,7 @@ func TestToolTelemetryReportsPreviewRetentionAndRedirect(t *testing.T) {
 		t.Fatalf("telemetry = %+v", got)
 	}
 
-	redirect := tools.ExecuteResult(context.Background(), tools.All(), "bash", json.RawMessage(`{"command":"find ."}`))
+	redirect := tools.ExecuteResult(context.Background(), tools.All(), "bash", json.RawMessage(`{"command":"grep -r TODO ."}`))
 	if redirect.Metadata["bash_redirect"] != "true" {
 		t.Fatalf("redirect metadata = %+v", redirect.Metadata)
 	}

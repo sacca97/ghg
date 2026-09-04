@@ -4,27 +4,21 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/x/ansi"
-	"github.com/sacca97/ghg/internal/agent"
-	"github.com/sacca97/ghg/internal/auth"
-	"github.com/sacca97/ghg/internal/config"
-	"github.com/sacca97/ghg/internal/goal"
-	"github.com/sacca97/ghg/internal/mcp"
-	"github.com/sacca97/ghg/internal/memory"
-	"github.com/sacca97/ghg/internal/models"
-	"github.com/sacca97/ghg/internal/session"
-	"github.com/sacca97/ghg/internal/skills"
-	"io"
-	"net/http"
-	"net/http/httptest"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
 	"time"
+
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/sacca97/ghg/internal/agent"
+	"github.com/sacca97/ghg/internal/auth"
+	"github.com/sacca97/ghg/internal/config"
+	"github.com/sacca97/ghg/internal/models"
+	"github.com/sacca97/ghg/internal/session"
+	workerwire "github.com/sacca97/ghg/internal/worker"
 )
 
 func authTestModel(t *testing.T) *model {
@@ -180,11 +174,8 @@ func TestAuthResultColdStartUsesFastRole(t *testing.T) {
 		validated: true,
 	})
 
-	if m.agent == nil {
-		t.Fatal("auth should promote a cold TUI to an agent")
-	}
-	if m.agent.Role != config.RoleFast || m.modelName != "fast-model" || m.provName != "generic-openai" {
-		t.Fatalf("cold auth route = role %q, model %q, provider %q; want fast-model @ generic-openai", m.agent.Role, m.modelName, m.provName)
+	if m.role != config.RoleFast || m.modelName != "fast-model" || m.provName != "generic-openai" {
+		t.Fatalf("cold auth route = role %q, model %q, provider %q; want fast-model @ generic-openai", m.role, m.modelName, m.provName)
 	}
 	if m.cfg.DefaultModel != legacyDefault {
 		t.Fatalf("role-driven auth should not replace legacy defaultModel, got %q (want %q)", m.cfg.DefaultModel, legacyDefault)
@@ -245,15 +236,7 @@ func TestAuthResultRekeysLiveSession(t *testing.T) {
 	}
 	m.cfg.Models["gpt-test"] = config.Model{Providers: []string{"generic-openai"}, ID: "gpt-test", Context: 128000}
 	m.modelName, m.provName = "gpt-test", "generic-openai"
-	ag, _, _, err := agent.NewConfigured(agent.BuildOptions{
-		Config: m.cfg, Profiles: m.profiles, Model: m.modelName, Provider: m.provName,
-		Role: config.RoleDefault, SystemPrompt: "sys",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	m.agent = ag
-	m.agent.Messages = append(m.agent.Messages, models.Message{Role: "user", Content: "hi", Authored: true})
+	m.messages = []models.Message{{Role: "system", Content: "sys"}, {Role: "user", Content: "hi", Authored: true}}
 
 	m.applyAuthResult(authResultMsg{
 		name:      "generic-openai",
@@ -265,7 +248,7 @@ func TestAuthResultRekeysLiveSession(t *testing.T) {
 	if got := m.cfg.Providers["generic-openai"].Key(); got != "sk-generic-new" {
 		t.Errorf("live provider should be rebuilt with the new key, got %q", got)
 	}
-	if len(m.agent.Messages) != 2 || m.agent.Messages[1].Content != "hi" {
+	if len(m.messages) != 2 || m.messages[1].Content != "hi" {
 		t.Error("history must survive the hot-swap")
 	}
 }
@@ -317,9 +300,6 @@ func TestBuildAgentWithProfilesOptionalDegradesOnlyForMissingCredentials(t *test
 
 func TestColdTUICommandsRemainSafeAndActionable(t *testing.T) {
 	m := authTestModel(t)
-	m.agent = nil
-	m.modelName = m.cfg.DefaultModel
-	m.provName = "inference"
 	m.width, m.height = 80, 24
 
 	note := m.degradedProviderNote()
@@ -386,7 +366,6 @@ func TestColdTUICommandsRemainSafeAndActionable(t *testing.T) {
 
 func TestAuthResultPromotesColdTUIToFirstAgent(t *testing.T) {
 	m := authTestModel(t)
-	m.agent = nil
 	m.modelName = m.cfg.DefaultModel
 	m.provName = "inference"
 	resolved := authResolved(t, m, "generic-openai")
@@ -397,9 +376,6 @@ func TestAuthResultPromotesColdTUIToFirstAgent(t *testing.T) {
 		key:       "sk-first-agent",
 		validated: true,
 	})
-	if m.agent == nil {
-		t.Fatal("successful auth should create the first live agent")
-	}
 	if m.provName != "generic-openai" || m.modelName != m.cfg.DefaultModel {
 		t.Fatalf("first agent should use the authenticated route: %q @ %q", m.modelName, m.provName)
 	}
@@ -471,7 +447,6 @@ func TestAuthCompletionUsesProfileIDs(t *testing.T) {
 // the key.
 func TestAuthMaskedRender(t *testing.T) {
 	m := authTestModel(t)
-	m.agent = &agent.Agent{}
 	m.authCommand([]string{"anthropic"})
 	m.input.SetValue("sk-anthropic-hidden")
 	out := m.View()
@@ -556,14 +531,9 @@ func compactCmdModel() *model {
 	// NOTE: any test that drives setEffort/switchModel/compactCommand writes
 	// through cfg.Save(); TestMain points GHG_HOME at a scratch dir so
 	// those writes can never reach the real ~/.ghg/config.json.
-	// serve the compaction summary so a bare /compact completes in-test
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{"choices":[{"message":{"content":"sim"}}]}`))
-	}))
 	m := &model{
 		input:   newInput(),
 		mouseOn: true, // matches the Run() default (wheel scroll + app selection)
-		agent:   agent.New(testBackend(srv.URL, "k"), "kimi-k3-fast", 100, "sys"),
 		cfg: &config.Config{
 			DefaultModel: "kimi-k3-fast",
 			Providers:    map[string]config.Provider{"inference": {BaseURL: "https://x", APIKey: "k"}},
@@ -576,6 +546,7 @@ func compactCmdModel() *model {
 		},
 		modelName: "kimi-k3-fast",
 		provName:  "inference",
+		effort:    "",
 		catalogs: map[string]config.Catalog{
 			"inference": {Models: []config.ModelInfoLite{
 				{ID: "kimi-k3-fast", ContextLength: 131072},
@@ -585,6 +556,47 @@ func compactCmdModel() *model {
 	m.width = 80
 	m.input.SetWidth(78)
 	return m
+}
+
+func TestAskCommandSendsReadOnlyWorkerTurn(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	defer serverConn.Close()
+	defer clientConn.Close()
+
+	m := compactCmdModel()
+	m.workerClient = workerwire.NewClient(clientConn, "test-ask")
+
+	frameCh := make(chan workerwire.Frame, 1)
+	go func() {
+		frame, err := workerwire.NewDecoder(serverConn).Read()
+		if err == nil {
+			frameCh <- frame
+		}
+	}()
+
+	m.command("/ask what is the answer?")
+	select {
+	case frame := <-frameCh:
+		var command workerwire.CommandRequest
+		if err := json.Unmarshal(frame.Payload, &command); err != nil {
+			t.Fatal(err)
+		}
+		if command.Name != workerwire.CommandInput {
+			t.Fatalf("command = %q, want input", command.Name)
+		}
+		var input workerwire.Input
+		if err := json.Unmarshal(command.Payload, &input); err != nil {
+			t.Fatal(err)
+		}
+		if input.Input != "what is the answer?" {
+			t.Fatalf("input = %q", input.Input)
+		}
+		if !input.AskMode || input.PlanMode || input.ReviewMode {
+			t.Fatalf("unexpected mode flags: %+v", input)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for ask worker input")
+	}
 }
 
 // Regression guard for the config corruption bug: running a persistence
@@ -609,14 +621,11 @@ func TestCompactCommandSelectsModel(t *testing.T) {
 	if m.compactModel != "glm-5.2-fast" || m.compactProv != "" {
 		t.Fatalf("compact model state: %q @ %q", m.compactModel, m.compactProv)
 	}
-	if m.agent.CompactModel != "glm-5.2-fast" || m.agent.CompactBackend == nil {
-		t.Fatalf("agent should summarize with glm-5.2-fast on its own client")
-	}
 	if m.cfg.CompactModel != "glm-5.2-fast" {
 		t.Fatalf("config should persist the pick, got %q", m.cfg.CompactModel)
 	}
 	m.compactCommand([]string{"off"})
-	if m.compactModel != "" || m.agent.CompactModel != config.DefaultCompactModel || m.agent.CompactBackend == nil {
+	if m.compactModel != "" {
 		t.Fatalf("off should restore the default compaction model: %q", m.compactModel)
 	}
 	if len(m.blocks) != blocks {
@@ -624,50 +633,94 @@ func TestCompactCommandSelectsModel(t *testing.T) {
 	}
 }
 
-// An empty compactModel resolves the built-in default from the config at
-// apply time, so users who never picked one compact on deepseek-v4-flash.
-func TestCompactModelEmptyResolvesDefault(t *testing.T) {
-	m := compactCmdModel()
-	m.applyCompactModel()
-	if m.agent.CompactModel != config.DefaultCompactModel || m.agent.CompactBackend == nil {
-		t.Fatalf("empty compactModel should resolve the default, got %q", m.agent.CompactModel)
-	}
-}
-
-func TestCompactModelUsesTinyRole(t *testing.T) {
-	m := compactCmdModel()
-	m.cfg.Roles = map[string]config.RoleConfig{
-		config.RoleTiny: {Model: "glm-5.2-fast", Provider: "inference"},
-	}
-	m.applyCompactModel()
-	if m.agent.CompactModel != "glm-5.2-fast" || m.agent.CompactBackend == nil {
-		t.Fatalf("tiny role should provide the compaction route, got %q / %T", m.agent.CompactModel, m.agent.CompactBackend)
-	}
-}
-
-// When the default model isn't in the user's config, the override clears and
-// compaction falls back to the conversation's own model — no error note.
-func TestCompactModelDefaultFallsBack(t *testing.T) {
-	m := compactCmdModel()
-	delete(m.cfg.Models, config.DefaultCompactModel)
-	blocks := len(m.blocks)
-	m.applyCompactModel()
-	if m.agent.CompactBackend != nil || m.agent.CompactModel != "" {
-		t.Fatal("unresolvable default should fall back to the current model")
-	}
-	if len(m.blocks) != blocks {
-		t.Fatal("a missing default should not nag — only picked models earn an error note")
-	}
-}
-
 func TestCompactCommandRejectsUnknownModel(t *testing.T) {
 	m := compactCmdModel()
 	m.compactCommand([]string{"nope"})
-	if m.compactModel != "" || m.agent.CompactModel != "" {
+	if m.compactModel != "" {
 		t.Fatal("unknown model must not become the compaction model")
 	}
 	if !strings.Contains(m.blocks[len(m.blocks)-1].text, "unknown model") {
 		t.Fatalf("expected an error note, got %v", m.blocks)
+	}
+}
+
+func TestWorkerLSPStatusAckRendersAllStates(t *testing.T) {
+	m := compactCmdModel()
+	payload, err := json.Marshal([]workerwire.LSPStatus{
+		{Name: "gopls", Root: "/workspace", State: "connected"},
+		{Name: "typescript", State: "not started"},
+		{Name: "rust-analyzer", State: "failed", Error: "rust-analyzer not on PATH"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.handleWorkerFrame(workerwire.Frame{Type: workerwire.TypeAck, RequestID: "lsp-1", Payload: payload})
+	last := m.blocks[len(m.blocks)-1].text
+	for _, want := range []string{
+		"● gopls",
+		"connected (root: /workspace)",
+		"○ typescript",
+		"idle — starts on first matching file",
+		"✗ rust-analyzer",
+		"rust-analyzer not on PATH",
+	} {
+		if !strings.Contains(last, want) {
+			t.Errorf("worker status view missing %q: %q", want, last)
+		}
+	}
+}
+
+func TestWorkerLSPAndMCPCommands(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	defer serverConn.Close()
+	defer clientConn.Close()
+
+	m := compactCmdModel()
+	m.sessionID = "test-worker-integrations"
+	m.workerClient = workerwire.NewClient(clientConn, "test-worker-integrations")
+
+	// 1. Dispatch /lsp
+	readFrame := make(chan workerwire.Frame, 1)
+	go func() {
+		dec := workerwire.NewDecoder(serverConn)
+		f, _ := dec.Read()
+		readFrame <- f
+	}()
+	m.lspCommand(nil)
+	frame := <-readFrame
+	if frame.Type != workerwire.TypeCommand {
+		t.Fatalf("frame type = %q, want %q", frame.Type, workerwire.TypeCommand)
+	}
+	var cmdReq workerwire.CommandRequest
+	_ = json.Unmarshal(frame.Payload, &cmdReq)
+	if cmdReq.Name != workerwire.CommandLSPStatus {
+		t.Fatalf("command = %q, want %q", cmdReq.Name, workerwire.CommandLSPStatus)
+	}
+
+	// 2. Dispatch /mcp
+	go func() {
+		dec := workerwire.NewDecoder(serverConn)
+		f, _ := dec.Read()
+		readFrame <- f
+	}()
+	m.mcpCommand([]string{"/mcp"})
+	frame = <-readFrame
+	_ = json.Unmarshal(frame.Payload, &cmdReq)
+	if cmdReq.Name != workerwire.CommandMCPStatus {
+		t.Fatalf("command = %q, want %q", cmdReq.Name, workerwire.CommandMCPStatus)
+	}
+
+	// 3. Dispatch /mcp myserver reconnect
+	go func() {
+		dec := workerwire.NewDecoder(serverConn)
+		f, _ := dec.Read()
+		readFrame <- f
+	}()
+	m.mcpCommand([]string{"/mcp", "myserver", "reconnect"})
+	frame = <-readFrame
+	_ = json.Unmarshal(frame.Payload, &cmdReq)
+	if cmdReq.Name != workerwire.CommandMCPReconnect {
+		t.Fatalf("command = %q, want %q", cmdReq.Name, workerwire.CommandMCPReconnect)
 	}
 }
 
@@ -679,13 +732,13 @@ func TestContextLimitFromCatalog(t *testing.T) {
 	if got := m.contextLimitFor("inference", "unknown"); got != 0 {
 		t.Fatalf("unknown model: %d", got)
 	}
-	// a fresh /models fetch re-resolves the agent's limit
+	// a fresh /models fetch re-resolves the active limit
 	cats := map[string]config.Catalog{
 		"inference": {Models: []config.ModelInfoLite{{ID: "kimi-k3-fast", ContextLength: 262144}}},
 	}
 	m.updateCatalogs(cats)
-	if m.agent.ContextLimit != 262144 {
-		t.Fatalf("agent limit should follow the catalog, got %d", m.agent.ContextLimit)
+	if m.contextLimit != 262144 {
+		t.Fatalf("active limit should follow the catalog, got %d", m.contextLimit)
 	}
 }
 
@@ -723,21 +776,6 @@ func TestContextLimitFallsBackToModelsDev(t *testing.T) {
 	}
 }
 
-// Bare /compact with no history reports there's nothing to fold rather than
-// touching the compaction-model selection. (The busy path is exercised
-// end-to-end in the running TUI; here m.prog is nil so we stay on the
-// synchronous error branch.)
-func TestCompactBareKeepsSelection(t *testing.T) {
-	m := compactCmdModel()
-	m.compactModel, m.compactProv = "glm-5.2-fast", ""
-	m.applyCompactModel()
-	m.busy = true // busy path: synchronous, never starts the goroutine
-	m.command("/compact")
-	if m.compactModel != "glm-5.2-fast" || m.agent.CompactModel != "glm-5.2-fast" {
-		t.Fatal("bare /compact must not change the compaction-model selection")
-	}
-}
-
 func TestCompactThresholdFor(t *testing.T) {
 	cases := []struct {
 		pct  int
@@ -759,20 +797,18 @@ func TestCompactThresholdFor(t *testing.T) {
 
 func TestSetCompactPct(t *testing.T) {
 	m := compactCmdModel()
-	m.agent.CompactThreshold = 0.5
-
 	m.setCompactPct(60)
-	if m.agent.CompactThreshold != 0.6 || m.cfg.CompactPct != 60 || m.compactPct() != 60 {
-		t.Fatalf("setCompactPct(60): agent=%v cfg=%d", m.agent.CompactThreshold, m.cfg.CompactPct)
+	if m.cfg.CompactPct != 60 || m.compactPct() != 60 {
+		t.Fatalf("setCompactPct(60): cfg=%d", m.cfg.CompactPct)
 	}
 
 	m.setCompactPct(120) // clamps to the 90 ceiling
-	if m.agent.CompactThreshold != 0.9 || m.cfg.CompactPct != 90 {
-		t.Fatalf("setCompactPct(120) should clamp to 90: agent=%v cfg=%d", m.agent.CompactThreshold, m.cfg.CompactPct)
+	if m.cfg.CompactPct != 90 {
+		t.Fatalf("setCompactPct(120) should clamp to 90: cfg=%d", m.cfg.CompactPct)
 	}
 	m.setCompactPct(0) // clamps to the 10 floor
-	if m.agent.CompactThreshold != 0.1 || m.cfg.CompactPct != 10 {
-		t.Fatalf("setCompactPct(0) should clamp to 10: agent=%v cfg=%d", m.agent.CompactThreshold, m.cfg.CompactPct)
+	if m.cfg.CompactPct != 10 {
+		t.Fatalf("setCompactPct(0) should clamp to 10: cfg=%d", m.cfg.CompactPct)
 	}
 }
 
@@ -809,8 +845,8 @@ func TestEffortCompletion(t *testing.T) {
 
 func TestEffortsForAdvertisedLevels(t *testing.T) {
 	m := &model{
-		provName: "inference",
-		agent:    &agent.Agent{Model: "deepseek-v4-flash"},
+		provName:  "inference",
+		modelName: "deepseek-v4-flash",
 		catalogs: map[string]config.Catalog{
 			"inference": {Models: []config.ModelInfoLite{
 				{ID: "deepseek-v4-flash", ReasoningEfforts: []string{"low", "high", "max"}, ReasoningToggle: true},
@@ -837,7 +873,7 @@ func TestEffortsForAdvertisedLevels(t *testing.T) {
 	}
 
 	// "none" collapses into off ("")
-	m.agent.Model = "claude-opus-5"
+	m.modelName = "claude-opus-5"
 	got := m.effortsFor()
 	if got[0] != "" || len(got) != 7 {
 		t.Fatalf("claude levels: %v", got)
@@ -849,16 +885,16 @@ func TestEffortsForAdvertisedLevels(t *testing.T) {
 	}
 
 	// no advertised levels → defaults
-	m.agent.Model = "gemini-3.5-flash"
+	m.modelName = "gemini-3.5-flash"
 	if got := m.effortsFor(); len(got) != len(defaultEfforts) {
 		t.Fatalf("gemini should fall back to defaults: %v", got)
 	}
 
-	m.agent.Model = "toggle-only"
+	m.modelName = "toggle-only"
 	if got := m.effortsFor(); len(got) != 2 || got[0] != "" || got[1] != "on" {
 		t.Fatalf("toggle-only model should expose off/on: %v", got)
 	}
-	m.agent.Model = "no-controls"
+	m.modelName = "no-controls"
 	if got := m.effortsFor(); len(got) != 1 || got[0] != "" {
 		t.Fatalf("known model without controls should expose off only: %v", got)
 	}
@@ -882,7 +918,7 @@ func TestEffortBareOpensSelector(t *testing.T) {
 	if pp == nil || pp.kind != panelEffort {
 		t.Fatalf("expected the effort panel, got %+v", pp)
 	}
-	if len(pp.levels) != len(defaultEfforts) || pp.levels[pp.lidx] != m.agent.Effort {
+	if len(pp.levels) != len(defaultEfforts) || pp.levels[pp.lidx] != m.effort {
 		t.Fatalf("effort panel should list the model's levels on the current one: %v @%d", pp.levels, pp.lidx)
 	}
 	// scroll down to low and apply with enter
@@ -890,8 +926,8 @@ func TestEffortBareOpensSelector(t *testing.T) {
 	m = tm.(*model)
 	tm, _ = m.paletteKey(tea.KeyMsg{Type: tea.KeyEnter})
 	m = tm.(*model)
-	if m.agent.Effort != "low" {
-		t.Fatalf("selecting low in the selector should apply it, got %q", m.agent.Effort)
+	if m.effort != "low" {
+		t.Fatalf("selecting low in the selector should apply it, got %q", m.effort)
 	}
 	// the selector came from /effort, not ctrl+p: commit-and-close, don't
 	// strand the user on a settings root they never opened
@@ -900,28 +936,16 @@ func TestEffortBareOpensSelector(t *testing.T) {
 	}
 }
 
-// A user-picked effort is both the new global default (config.json) and the
-// live session's restore value (sessions.db); a reconciliation reset touches
-// only the session.
-func TestSetEffortPersistsGlobalAndSession(t *testing.T) {
+// A user-picked effort updates the global default; the worker persists the
+// live session value when it receives the route change.
+func TestSetEffortPersistsGlobal(t *testing.T) {
 	m := compactCmdModel()
 	m.cfg.DefaultEffort = "medium"
-	m.agent.Effort = "medium"
-	st, err := session.Open(filepath.Join(t.TempDir(), "s.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { st.Close() })
-	m.store = st
-	id, err := st.Create("/tmp", m.modelName, m.provName)
-	if err != nil {
-		t.Fatal(err)
-	}
-	m.sessionID = id
+	m.effort = "medium"
 
 	m.setEffort("low") // the user picks a level
-	if m.agent.Effort != "low" {
-		t.Fatalf("agent effort: %q", m.agent.Effort)
+	if m.effort != "low" {
+		t.Fatalf("effort: %q", m.effort)
 	}
 	reloaded, err := config.Load()
 	if err != nil {
@@ -930,24 +954,11 @@ func TestSetEffortPersistsGlobalAndSession(t *testing.T) {
 	if reloaded.DefaultEffort != "low" {
 		t.Fatalf("global default should follow the pick, got %q", reloaded.DefaultEffort)
 	}
-	meta, _, err := st.Load(id)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if meta.Effort != "low" {
-		t.Fatalf("session row should carry the pick, got %q", meta.Effort)
-	}
-
-	// a reconciliation (catalog refresh drops the level) must not rewrite the
-	// user's global default, only the live session
+	// A reconciliation must not rewrite the user's global default.
 	m.resetEffort("")
 	reloaded, _ = config.Load()
 	if reloaded.DefaultEffort != "low" {
 		t.Fatalf("reset must not touch the global default, got %q", reloaded.DefaultEffort)
-	}
-	meta, _, _ = st.Load(id)
-	if meta.Effort != "" {
-		t.Fatalf("session row should track the reset, got %q", meta.Effort)
 	}
 }
 
@@ -956,7 +967,7 @@ func TestSetEffortPersistsGlobalAndSession(t *testing.T) {
 func TestResumeRestoresEffort(t *testing.T) {
 	m := compactCmdModel()
 	m.cfg.DefaultEffort = "medium"
-	m.agent.Effort = "medium"
+	m.effort = "medium"
 	st, err := session.Open(filepath.Join(t.TempDir(), "s.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -977,12 +988,12 @@ func TestResumeRestoresEffort(t *testing.T) {
 	if err := st.SetEffort(id, "high"); err != nil {
 		t.Fatal(err)
 	}
-	m.agent.Effort = "low"
+	m.effort = "low"
 	if err := m.resume(id); err != nil {
 		t.Fatal(err)
 	}
-	if m.agent.Effort != "high" {
-		t.Fatalf("resume should restore the session effort, got %q", m.agent.Effort)
+	if m.effort != "high" {
+		t.Fatalf("resume should restore the session effort, got %q", m.effort)
 	}
 
 	// a legacy row (no effort) inherits the current default…
@@ -993,18 +1004,13 @@ func TestResumeRestoresEffort(t *testing.T) {
 	if err := st.Save(id2, 1, msgs, m.modelName, m.provName); err != nil {
 		t.Fatal(err)
 	}
-	m.agent.Effort = "low"
+	m.cfg.DefaultEffort = "low"
+	m.effort = "low"
 	if err := m.resume(id2); err != nil {
 		t.Fatal(err)
 	}
-	if m.agent.Effort != "low" {
-		t.Fatalf("legacy row should inherit the current default, got %q", m.agent.Effort)
-	}
-	// …and the next persist stamps it so a later default change can't leak in
-	m.persist()
-	meta, _, _ := st.Load(id2)
-	if meta.Effort != "low" {
-		t.Fatalf("persist should stamp the inherited effort, got %q", meta.Effort)
+	if m.effort != "low" {
+		t.Fatalf("legacy row should inherit the current default, got %q", m.effort)
 	}
 }
 
@@ -1035,20 +1041,13 @@ func TestResumeRestoresUsage(t *testing.T) {
 	if err := m.resume(id); err != nil {
 		t.Fatal(err)
 	}
-	u := m.agent.Usage()
+	u := m.usage
 	if u.PromptTokens != 12000 || u.Cached() != 8000 || u.CompletionTokens != 1500 {
 		t.Fatalf("resume should restore usage, got in=%d cached=%d out=%d", u.PromptTokens, u.Cached(), u.CompletionTokens)
 	}
 
 	// new spend accumulates on top of the restored totals…
-	m.agent.AddUsage(models.Usage{PromptTokens: 3000, CompletionTokens: 500})
-	// …and persists: the stored row is absolute, so a compaction (now a
-	// recorded event, no rewrite) can't zero it
-	m.persist()
-	meta, _, _ := st.Load(id)
-	if meta.UsageIn != 15000 || meta.UsageOut != 2000 {
-		t.Fatalf("persist should store cumulative totals, got in=%d out=%d", meta.UsageIn, meta.UsageOut)
-	}
+	m.usage.Add(models.Usage{PromptTokens: 3000, CompletionTokens: 500})
 
 	// legacy row (no usage columns stamped): totals are reconstructed from the
 	// per-message usage stored on assistant messages, then stamped on the next
@@ -1074,15 +1073,10 @@ func TestResumeRestoresUsage(t *testing.T) {
 	if err := m.resume(id2); err != nil {
 		t.Fatal(err)
 	}
-	u2 := m.agent.Usage()
+	u2 := m.usage
 	if u2.PromptTokens != 1500 || u2.Cached() != 600 || u2.CompletionTokens != 300 {
 		t.Fatalf("legacy row should reconstruct usage from messages, got in=%d cached=%d out=%d",
 			u2.PromptTokens, u2.Cached(), u2.CompletionTokens)
-	}
-	m.persist()
-	meta2, _, _ := st.Load(id2)
-	if meta2.UsageIn != 1500 || meta2.UsageCached != 600 || meta2.UsageOut != 300 {
-		t.Fatalf("persist should stamp the reconstructed totals, got %+v", meta2)
 	}
 
 	// a session with no usage anywhere (pre-usage tracking) stays zero
@@ -1096,7 +1090,7 @@ func TestResumeRestoresUsage(t *testing.T) {
 	if err := m.resume(id3); err != nil {
 		t.Fatal(err)
 	}
-	if u := m.agent.Usage(); u.PromptTokens != 0 || u.CompletionTokens != 0 {
+	if u := m.usage; u.PromptTokens != 0 || u.CompletionTokens != 0 {
 		t.Fatalf("usage-free session should start at zero, got %+v", u)
 	}
 }
@@ -1104,28 +1098,29 @@ func TestResumeRestoresUsage(t *testing.T) {
 func TestUpdateCatalogsResetsUnsupportedEffort(t *testing.T) {
 	t.Setenv("HOME", t.TempDir()) // keep setEffort's cfg.Save() away from the real config
 	m := &model{
-		cfg:      &config.Config{},
-		provName: "inference",
-		agent:    &agent.Agent{Model: "deepseek-v4-flash", Effort: "medium"},
+		cfg:       &config.Config{},
+		provName:  "inference",
+		modelName: "deepseek-v4-flash",
+		effort:    "medium",
 	}
 	m.updateCatalogs(map[string]config.Catalog{
 		"inference": {Models: []config.ModelInfoLite{
 			{ID: "deepseek-v4-flash", ReasoningEfforts: []string{"low", "high", "max"}},
 		}},
 	})
-	if m.agent.Effort != "" {
-		t.Fatalf("unsupported effort should reset to off, got %q", m.agent.Effort)
+	if m.effort != "" {
+		t.Fatalf("unsupported effort should reset to off, got %q", m.effort)
 	}
 
 	// a supported effort survives the refresh
-	m.agent.Effort = "high"
+	m.effort = "high"
 	m.updateCatalogs(map[string]config.Catalog{
 		"inference": {Models: []config.ModelInfoLite{
 			{ID: "deepseek-v4-flash", ReasoningEfforts: []string{"low", "high", "max"}},
 		}},
 	})
-	if m.agent.Effort != "high" {
-		t.Fatalf("supported effort should survive, got %q", m.agent.Effort)
+	if m.effort != "high" {
+		t.Fatalf("supported effort should survive, got %q", m.effort)
 	}
 }
 
@@ -1144,94 +1139,23 @@ func TestModelSwitchDefaultsToMaxEffort(t *testing.T) {
 	m.cfg.Models["no-controls"] = config.Model{Providers: []string{"inference"}}
 
 	m.switchModel("deepseek-v4-flash", "inference")
-	if m.agent.Effort != "max" {
-		t.Fatalf("expected max effort for deepseek-v4-flash, got %q", m.agent.Effort)
+	if m.effort != "max" {
+		t.Fatalf("expected max effort for deepseek-v4-flash, got %q", m.effort)
 	}
 
 	m.switchModel("toggle-only", "inference")
-	if m.agent.Effort != "on" {
-		t.Fatalf("expected on effort for toggle-only, got %q", m.agent.Effort)
+	if m.effort != "on" {
+		t.Fatalf("expected on effort for toggle-only, got %q", m.effort)
 	}
 
 	m.switchModel("no-controls", "inference")
-	if m.agent.Effort != "" {
-		t.Fatalf("expected empty effort for no-controls, got %q", m.agent.Effort)
-	}
-}
-
-// A prose claim never completes an active goal. Completion must arrive as a
-// validated update_goal result carrying a verification note.
-func TestGoalLoopRequiresStructuredCompletion(t *testing.T) {
-	m := &model{goal: "ship the thing", goalRounds: 0}
-	m.goalTurnFinished(turnDoneMsg{final: "Verified: all checks pass."}, false)
-	record, ok := m.currentGoalRecord()
-	if !ok || record.Status != agent.GoalStatusActive {
-		t.Fatalf("prose must not complete the goal: %+v", record)
-	}
-	if record.Rounds != 1 {
-		t.Fatalf("rounds = %d, want 1", record.Rounds)
-	}
-}
-
-func TestGoalLoopEndsOnStructuredCompletion(t *testing.T) {
-	m := &model{goal: "ship the thing", goalRounds: 1}
-	record, _ := m.currentGoalRecord()
-	updates := []agent.GoalUpdate{{
-		GoalID:   record.ID,
-		Status:   agent.GoalStatusComplete,
-		Progress: "tests and the release check passed",
-	}}
-	if m.goalTurnFinished(turnDoneMsg{final: "done", goalUpdates: updates}, false) {
-		t.Fatal("complete goal must not submit a continuation")
-	}
-	got, ok := m.currentGoalRecord()
-	if !ok || got.Status != agent.GoalStatusComplete {
-		t.Fatalf("goal status = %+v, want complete", got)
-	}
-	if m.goal != "" {
-		t.Fatalf("completed goal must leave the active compatibility mirror empty: %q", m.goal)
-	}
-}
-
-func TestResumePausesActiveGoalUntilExplicitResume(t *testing.T) {
-	m := compactCmdModel()
-	st, err := session.Open(filepath.Join(t.TempDir(), "s.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer st.Close()
-	m.store = st
-
-	id, err := st.Create("/tmp", "m", "p")
-	if err != nil {
-		t.Fatal(err)
-	}
-	record := agent.NewGoal("finish the migration")
-	record.ID = "goal-resume"
-	if err := st.CheckpointGoal(id, record); err != nil {
-		t.Fatal(err)
-	}
-	if err := m.resume(id); err != nil {
-		t.Fatal(err)
-	}
-	got, ok, err := st.LoadGoal(id)
-	if err != nil || !ok || got.Status != agent.GoalStatusPaused {
-		t.Fatalf("resume should pause active work: %+v %v %v", got, ok, err)
-	}
-	if m.goal != "" {
-		t.Fatalf("paused goal must not remain active in the compatibility mirror: %q", m.goal)
-	}
-	if !m.resumeGoal() {
-		t.Fatal("explicit resume should reactivate a paused goal")
-	}
-	got, ok, err = st.LoadGoal(id)
-	if err != nil || !ok || got.Status != agent.GoalStatusActive {
-		t.Fatalf("explicit resume status: %+v %v %v", got, ok, err)
+	if m.effort != "" {
+		t.Fatalf("expected empty effort for no-controls, got %q", m.effort)
 	}
 }
 
 func TestGoalHelpers(t *testing.T) {
-	p := goal.ContinuePrompt("ship the feature")
+	p := agent.ContinuePrompt("ship the feature")
 	if !strings.Contains(p, "ship the feature") || !strings.Contains(p, "update_goal") {
 		t.Fatalf("prompt: %q", p)
 	}
@@ -1321,209 +1245,14 @@ func TestGoalRoundsCommand(t *testing.T) {
 	}
 }
 
-// goalFromContextModel builds a headless model whose provider serves one
-// canned chat-completion body (or status) to the goal-formulation call.
-// m.prog stays nil, so the command's goroutine runs but never p.Sends; tests
-// poll m.goal / m.busy directly.
-func goalFromContextModel(t *testing.T, status int, body string) *model {
-	t.Helper()
-	return goalFromContextModelCapture(t, status, body, nil)
-}
-
-// goalFromContextModelCapture is goalFromContextModel plus a hook that
-// receives the raw request body of every call the command makes.
-func goalFromContextModelCapture(t *testing.T, status int, body string, capture func([]byte)) *model {
-	t.Helper()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if capture != nil {
-			b, _ := io.ReadAll(r.Body)
-			capture(b)
-		}
-		w.WriteHeader(status)
-		w.Write([]byte(body))
-	}))
-	t.Cleanup(srv.Close)
-	m := compactCmdModel()
-	m.agent = agent.New(testBackend(srv.URL, "k"), "kimi-k3-fast", 100, "sys")
-	return m
-}
-
-func TestGoalFromContextPrompt(t *testing.T) {
-	call := models.ToolCall{}
-	call.Function.Name = "bash"
-	call.Function.Arguments = `{"cmd":"go test ./..."}`
-	tail := []models.Message{
-		{Role: "user", Content: "make the tests green"},
-		{Role: "assistant", Content: "I'll fix the flaky test and run go test.", ToolCalls: []models.ToolCall{call}},
-	}
-	p := agent.BuildGoalFromContextPrompt(tail)
-	for _, want := range []string{"make the tests green", "flaky test", "assistant called bash(", "ONLY the goal"} {
-		if !strings.Contains(p, want) {
-			t.Fatalf("prompt missing %q:\n%s", want, p)
-		}
-	}
-
-	// window selection: system excluded; n caps the tail, short history wins
-	msgs := []models.Message{
-		{Role: "system", Content: "sys"},
-		{Role: "user", Content: "old"},
-		{Role: "assistant", Content: "older"},
-		{Role: "user", Content: "recent ask"},
-		{Role: "assistant", Content: "recent reply"},
-	}
-	got, err := agent.GoalFromContextMessages(msgs, 2)
-	if err != nil || len(got) != 2 || got[0].Content != "recent ask" || got[1].Content != "recent reply" {
-		t.Fatalf("window: %v %v", got, err)
-	}
-	// n larger than the history clamps to everything after the system prompt
-	got, err = agent.GoalFromContextMessages(msgs, 50)
-	if err != nil || len(got) != 4 || got[0].Content != "old" {
-		t.Fatalf("clamped window: %v %v", got, err)
-	}
-	// n <= 0 means the default window
-	got, err = agent.GoalFromContextMessages(msgs, 0)
-	if err != nil || len(got) != 4 {
-		t.Fatalf("default window: %v %v", got, err)
-	}
-	if _, err := agent.GoalFromContextMessages(msgs[:2], 8); err == nil {
-		t.Fatal("two conversation messages required")
-	}
-}
-
-func TestGoalFromContextSetsGoal(t *testing.T) {
-	m := goalFromContextModel(t, 200, `{"choices":[{"message":{"content":"fix the flaky test and verify with go test"}}]}`)
-	m.agent.Messages = []models.Message{
-		{Role: "system", Content: "sys"},
-		{Role: "user", Content: "tests are flaky"},
-		{Role: "assistant", Content: "I'll fix them."},
-	}
-	m.command("/goal-from-context") // headless: runs the formulation inline
-	if m.goal != "fix the flaky test and verify with go test" {
-		t.Fatalf("goal: %q", m.goal)
-	}
-	if m.busy {
-		t.Fatal("busy must clear when the inline formulation returns")
-	}
-	// the transcript must say how many messages were distilled
-	found := false
-	for _, b := range m.blocks {
-		if strings.Contains(b.text, "formulating goal from the last 2 messages") {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatalf("expected the message count in the note, blocks: %v", m.blocks)
-	}
-}
-
-func TestGoalFromContextWindowArg(t *testing.T) {
-	var req []byte
-	m := goalFromContextModelCapture(t, 200,
-		`{"choices":[{"message":{"content":"the goal"}}]}`, func(b []byte) { req = b })
-	m.agent.Messages = []models.Message{
-		{Role: "system", Content: "sys"},
-		{Role: "user", Content: "ancient context"},
-		{Role: "assistant", Content: "ancient reply"},
-		{Role: "user", Content: "recent ask"},
-		{Role: "assistant", Content: "recent reply"},
-	}
-	m.command("/goal-from-context 2")
-	if m.goal != "the goal" {
-		t.Fatalf("goal: %q", m.goal)
-	}
-	// the formulation prompt must contain only the last 2 messages
-	body := string(req)
-	if !strings.Contains(body, "recent ask") || strings.Contains(body, "ancient context") {
-		t.Fatalf("window not honored in the request:\n%s", body)
-	}
-	// and the note reports the distilled window
-	found := false
-	for _, b := range m.blocks {
-		if strings.Contains(b.text, "formulating goal from the last 2 messages") {
-			found = true
-		}
-	}
-	if !found {
-		t.Fatalf("expected the message count in the note, blocks: %v", m.blocks)
-	}
-}
-
-func TestGoalFromContextMaxTokens(t *testing.T) {
-	var req struct {
-		MaxTokens int `json:"max_tokens"`
-	}
-	m := goalFromContextModelCapture(t, 200,
-		`{"choices":[{"message":{"content":"the goal"}}]}`,
-		func(b []byte) { json.Unmarshal(b, &req) })
-	m.agent.Messages = []models.Message{
-		{Role: "system", Content: "sys"},
-		{Role: "user", Content: "u"},
-		{Role: "assistant", Content: "a"},
-	}
-	m.command("/goal-from-context")
-	if req.MaxTokens != 8192 {
-		t.Fatalf("the formulation call must allow detailed goals, max_tokens=%d", req.MaxTokens)
-	}
-}
-
-func TestGoalFromContextBadCount(t *testing.T) {
-	m := goalFromContextModel(t, 200, `{"choices":[{"message":{"content":"x"}}]}`)
-	m.agent.Messages = []models.Message{
-		{Role: "system", Content: "sys"},
-		{Role: "user", Content: "u"},
-		{Role: "assistant", Content: "a"},
-	}
-	for _, cmd := range []string{"/goal-from-context nope", "/goal-from-context 1"} {
-		m.command(cmd)
-		if m.busy {
-			t.Fatalf("%s: no formulation call should start", cmd)
-		}
-		if out := lastBlock(m); !strings.Contains(out, "usage: /goal-from-context") {
-			t.Fatalf("%s: expected a usage note, got %q", cmd, out)
-		}
-	}
-}
-
-func TestGoalFromContextErrorLeavesGoalUntouched(t *testing.T) {
-	m := goalFromContextModel(t, 500, `{"error":"boom"}`)
-	m.agent.Messages = []models.Message{
-		{Role: "system", Content: "sys"},
-		{Role: "user", Content: "tests are flaky"},
-		{Role: "assistant", Content: "I'll fix them."},
-	}
-	m.command("/goal-from-context")
-	if m.goal != "" {
-		t.Fatalf("failed formulation must not set a goal, got %q", m.goal)
-	}
-	if m.busy {
-		t.Fatal("busy must clear after a failed formulation")
-	}
-	if out := lastBlock(m); !strings.Contains(out, "goal-from-context failed") {
-		t.Fatalf("expected a failure note, got %q", out)
-	}
-}
-
-func TestGoalFromContextNeedsHistory(t *testing.T) {
-	m := goalFromContextModel(t, 200, `{"choices":[{"message":{"content":"x"}}]}`)
-	m.agent.Messages = []models.Message{{Role: "system", Content: "sys"}}
-	m.command("/goal-from-context")
-	if m.busy {
-		t.Fatal("no formulation call should start without history")
-	}
-	if out := lastBlock(m); !strings.Contains(out, "not enough context") {
-		t.Fatalf("expected a needs-history note, got %q", out)
-	}
-}
-
-// The live-path message handler: on failure it clears busy/cancel itself and
-// must NOT submit (no trailing turnDoneMsg, so a paused goal's loop cannot
-// re-engage); on success it sets the goal and hands busy to the new turn.
 func TestGoalFromContextMsgHandler(t *testing.T) {
-	m := goalFromContextModel(t, 200, `{"choices":[{"message":{"content":"x"}}]}`)
+	m := compactCmdModel()
 	m.busy = true
 	m.cancel = func() {}
-	m.goal = "paused old goal"
-	m.goalRounds = 20 // exhausted
+	oldGoal := agent.NewGoal("paused old goal")
+	oldGoal.Rounds = 20
+	oldGoal.Status = agent.GoalStatusPaused
+	m.applyGoalRecord(oldGoal)
 	tm, cmd := m.Update(goalFromContextMsg{err: errors.New("boom")})
 	m = tm.(*model)
 	if cmd != nil {
@@ -1532,8 +1261,8 @@ func TestGoalFromContextMsgHandler(t *testing.T) {
 	if m.busy || m.cancel != nil {
 		t.Fatal("the msg handler must clear busy/cancel on failure")
 	}
-	if m.goal != "paused old goal" {
-		t.Fatalf("old goal must survive untouched, got %q", m.goal)
+	if m.goalRecord == nil || m.goalRecord.Objective != "paused old goal" {
+		t.Fatalf("old goal must survive untouched, got %+v", m.goalRecord)
 	}
 	if out := lastBlock(m); !strings.Contains(out, "goal-from-context failed") {
 		t.Fatalf("expected a failure note, got %q", out)
@@ -1550,10 +1279,22 @@ func TestGoalFromContextMsgHandler(t *testing.T) {
 	// success: goal trimmed, set, and submitted — busy stays owned by the
 	// new turn. The submit's turn goroutine p.Sends on a nil prog, so it
 	// must run to completion (or fail) without touching the assertions.
-	m2 := goalFromContextModel(t, 200, `{"choices":[{"message":{"content":"x"}}]}`)
+	m2 := compactCmdModel()
+	serverConn, clientConn := net.Pipe()
+	defer serverConn.Close()
+	defer clientConn.Close()
+	go func() {
+		dec := workerwire.NewDecoder(serverConn)
+		for {
+			if _, err := dec.Read(); err != nil {
+				return
+			}
+		}
+	}()
+	m2.workerClient = workerwire.NewClient(clientConn, "test")
 	m2.busy = true
 	m2.cancel = func() {}
-	m2.agent.Messages = []models.Message{{Role: "system", Content: "sys"}}
+	m2.messages = []models.Message{{Role: "system", Content: "sys"}}
 	tm2, cmd2 := m2.Update(goalFromContextMsg{goal: "  ship it  "})
 	m2 = tm2.(*model)
 	if cmd2 == nil {
@@ -1562,8 +1303,8 @@ func TestGoalFromContextMsgHandler(t *testing.T) {
 	if !m2.busy {
 		t.Fatal("busy must stay set — it belongs to the submitted turn now")
 	}
-	if m2.goal != "ship it" {
-		t.Fatalf("goal should be trimmed and set, got %q", m2.goal)
+	if m2.currentGoal() != "ship it" {
+		t.Fatalf("goal should be trimmed and set, got %q", m2.currentGoal())
 	}
 	found := false
 	for _, b := range m2.blocks {
@@ -1577,8 +1318,8 @@ func TestGoalFromContextMsgHandler(t *testing.T) {
 }
 
 func TestGoalFromContextBusyRefuses(t *testing.T) {
-	m := goalFromContextModel(t, 200, `{"choices":[{"message":{"content":"x"}}]}`)
-	m.agent.Messages = []models.Message{
+	m := compactCmdModel()
+	m.messages = []models.Message{
 		{Role: "system", Content: "sys"},
 		{Role: "user", Content: "a"},
 		{Role: "assistant", Content: "b"},
@@ -1588,98 +1329,8 @@ func TestGoalFromContextBusyRefuses(t *testing.T) {
 	if out := lastBlock(m); !strings.Contains(out, "busy") {
 		t.Fatalf("expected a busy note, got %q", out)
 	}
-	if m.goal != "" {
+	if m.currentGoal() != "" {
 		t.Fatal("busy refusal must not touch the goal")
-	}
-}
-
-// The feature end-to-end: remember writes a markdown bullet to
-// ~/.ghg/memory.md, the next turn's system prompt injects it, /memory lists
-// it, and deleting by number stops the injection.
-func TestMemoryEndToEnd(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("GHG_HOME", home)
-
-	m := compactCmdModel()
-
-	// 1. the model remembers a fact (installation scope)
-	callTool := func(name, args string) string {
-		t.Helper()
-		for _, tool := range m.agent.Tools {
-			if tool.Def.Function.Name == name {
-				out, err := tool.Run(t.Context(), []byte(args))
-				if err != nil {
-					return "Error: " + err.Error()
-				}
-				return out
-			}
-		}
-		t.Fatal(name + " not registered")
-		return ""
-	}
-	if out := callTool("remember", `{"text":"user prefers pnpm over npm"}`); strings.HasPrefix(out, "Error:") {
-		t.Fatal(out)
-	}
-
-	// 2. it's a plain markdown bullet in ~/.ghg/memory.md
-	data, err := os.ReadFile(filepath.Join(home, "memory.md"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(data) != "- [ ] user prefers pnpm over npm\n" {
-		t.Fatalf("memory.md:\n%s", data)
-	}
-
-	// 3. the next turn injects it into the system prompt
-	m.prepareTurn("hello")
-	sys := m.agent.Messages[0].Content
-	if !strings.Contains(sys, "user prefers pnpm over npm") || !strings.Contains(sys, "<memory>") {
-		t.Fatalf("memory not injected into the system prompt:\n%s", sys)
-	}
-
-	// 4. /memory lists it
-	m.memoryCommand(nil)
-	var listed bool
-	for _, b := range m.blocks {
-		r := ansi.Strip(b.render(m.width))
-		if strings.Contains(r, "installation") && strings.Contains(r, "user prefers pnpm") {
-			listed = true
-		}
-	}
-	if !listed {
-		t.Fatal("/memory should list the installation entry")
-	}
-
-	// 5. delete it by number without leaving the TUI; injection stops
-	m.memoryCommand([]string{"1"})
-	data, _ = os.ReadFile(filepath.Join(home, "memory.md"))
-	if !strings.Contains(string(data), "- [x] user prefers pnpm") {
-		t.Fatalf("entry should be struck, not deleted:\n%s", data)
-	}
-	m.prepareTurn("hello again")
-	if strings.Contains(m.agent.Messages[0].Content, "pnpm") {
-		t.Fatal("struck entries must stop being injected")
-	}
-}
-
-// Session-scoped memory lives under sessions/<id>.memory.md and only appears
-// while that session is active.
-func TestSessionMemoryScope(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("GHG_HOME", home)
-
-	m := compactCmdModel()
-	m.agent.SetSessionID("sess1")
-	if err := memory.Session("sess1").Remember("this repo uses ./scripts/ship.sh to deploy"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(filepath.Join(home, "sessions", "sess1.memory.md")); err != nil {
-		t.Fatal("session memory should live under sessions/")
-	}
-	m.sessionID = "sess1"
-	m.prepareTurn("hi")
-	if !strings.Contains(m.agent.Messages[0].Content, "ship.sh") {
-		t.Fatal("session memory should inject while the session is active")
 	}
 }
 
@@ -1696,7 +1347,7 @@ func TestBottomStatusControlsCycleModelAndMode(t *testing.T) {
 		m.cfg.Models[name] = config.Model{Providers: []string{"inference"}}
 	}
 	m.modelName = "tiny-model"
-	m.agent.Role = config.RoleTiny
+	m.role = config.RoleTiny
 
 	clickModel := func() {
 		t, _ := m.Update(tea.MouseMsg{
@@ -1708,20 +1359,20 @@ func TestBottomStatusControlsCycleModelAndMode(t *testing.T) {
 	}
 	_ = m.View()
 	clickModel()
-	if m.settings != nil || m.uiMode() != uiModeExecute || m.agent.Role != config.RoleSmart || m.modelName != "smart-model" {
-		t.Fatalf("model click should select smart without changing execute mode, got %q/%q/%q", m.uiMode(), m.agent.Role, m.modelName)
+	if m.settings != nil || m.uiMode() != uiModeExecute || m.role != config.RoleSmart || m.modelName != "smart-model" {
+		t.Fatalf("model click should select smart without changing execute mode, got %q/%q/%q", m.uiMode(), m.role, m.modelName)
 	}
 	clickModel()
-	if m.agent.Role != config.RoleDefault || m.modelName != "default-model" || m.uiMode() != uiModeExecute {
-		t.Fatalf("model click should select default without changing execute mode, got %q/%q/%q", m.uiMode(), m.agent.Role, m.modelName)
+	if m.role != config.RoleDefault || m.modelName != "default-model" || m.uiMode() != uiModeExecute {
+		t.Fatalf("model click should select default without changing execute mode, got %q/%q/%q", m.uiMode(), m.role, m.modelName)
 	}
 	clickModel()
-	if m.agent.Role != config.RoleFast || m.modelName != "fast-model" {
-		t.Fatalf("model click should select fast, got %q/%q", m.agent.Role, m.modelName)
+	if m.role != config.RoleFast || m.modelName != "fast-model" {
+		t.Fatalf("model click should select fast, got %q/%q", m.role, m.modelName)
 	}
 	clickModel()
-	if m.agent.Role != config.RoleTiny || m.modelName != "tiny-model" {
-		t.Fatalf("model click should select tiny, got %q/%q", m.agent.Role, m.modelName)
+	if m.role != config.RoleTiny || m.modelName != "tiny-model" {
+		t.Fatalf("model click should select tiny, got %q/%q", m.role, m.modelName)
 	}
 
 	clickMode := func() {
@@ -1733,34 +1384,34 @@ func TestBottomStatusControlsCycleModelAndMode(t *testing.T) {
 		_ = m.View()
 	}
 	clickMode()
-	if m.settings != nil || m.uiMode() != uiModePlan || m.agent.Role != config.RoleTiny {
-		t.Fatalf("mode click should cycle execute → plan without changing role, got %q/%q", m.uiMode(), m.agent.Role)
+	if m.settings != nil || m.uiMode() != uiModePlan || m.role != config.RoleTiny {
+		t.Fatalf("mode click should cycle execute → plan without changing role, got %q/%q", m.uiMode(), m.role)
 	}
 	clickModel()
-	if m.uiMode() != uiModePlan || m.agent.Role != config.RoleSmart || m.modelName != "smart-model" {
-		t.Fatalf("model click should work in plan mode, got %q/%q/%q", m.uiMode(), m.agent.Role, m.modelName)
+	if m.uiMode() != uiModePlan || m.role != config.RoleSmart || m.modelName != "smart-model" {
+		t.Fatalf("model click should work in plan mode, got %q/%q/%q", m.uiMode(), m.role, m.modelName)
 	}
 	clickMode()
-	if m.uiMode() != uiModeExecute || m.agent.Role != config.RoleSmart || m.modelName != "smart-model" {
-		t.Fatalf("second mode click should wrap plan → execute without changing role, got %q/%q/%q", m.uiMode(), m.agent.Role, m.modelName)
+	if m.uiMode() != uiModeExecute || m.role != config.RoleSmart || m.modelName != "smart-model" {
+		t.Fatalf("second mode click should wrap plan → execute without changing role, got %q/%q/%q", m.uiMode(), m.role, m.modelName)
 	}
 }
 
 func TestModeSelectionPreservesModel(t *testing.T) {
 	m := compactCmdModel()
-	origRole := m.agent.Role
+	origRole := m.role
 	origModel := m.modelName
 	if err := m.setMode(uiModePlan); err != nil {
 		t.Fatal(err)
 	}
-	if m.uiMode() != uiModePlan || m.agent.Role != origRole || m.modelName != origModel {
-		t.Fatalf("plan mode should preserve model and role, got mode %q role %q", m.uiMode(), m.agent.Role)
+	if m.uiMode() != uiModePlan || m.role != origRole || m.modelName != origModel {
+		t.Fatalf("plan mode should preserve model and role, got mode %q role %q", m.uiMode(), m.role)
 	}
 	if err := m.setMode(uiModeExecute); err != nil {
 		t.Fatal(err)
 	}
-	if m.uiMode() != uiModeExecute || m.agent.Role != origRole || m.modelName != origModel {
-		t.Fatalf("execute mode should preserve model and role, got mode %q role %q", m.uiMode(), m.agent.Role)
+	if m.uiMode() != uiModeExecute || m.role != origRole || m.modelName != origModel {
+		t.Fatalf("execute mode should preserve model and role, got mode %q role %q", m.uiMode(), m.role)
 	}
 }
 
@@ -1787,7 +1438,7 @@ func TestBottomModeClickCyclesWithoutOpeningPalette(t *testing.T) {
 func TestBottomStatusEffortIsSeparateAndClickable(t *testing.T) {
 	m := compactCmdModel()
 	m.width, m.height = 100, 30
-	m.agent.Effort = "high"
+	m.effort = "high"
 	_ = m.View()
 	if got := m.statusView(); !strings.Contains(got, "│ kimi-k3-fast │ (high) │ execute │") {
 		t.Fatalf("status should render effort as a separate segment: %q", got)
@@ -1798,8 +1449,8 @@ func TestBottomStatusEffortIsSeparateAndClickable(t *testing.T) {
 		X: m.statusEffortX + m.statusEffortW/2, Y: statusInfoRow(m.height),
 	})
 	m = tm.(*model)
-	if m.settings != nil || m.agent.Effort != "" || m.uiMode() != uiModeExecute {
-		t.Fatalf("effort click should cycle high → off without opening a selector or changing mode: %q/%q", m.agent.Effort, m.uiMode())
+	if m.settings != nil || m.effort != "" || m.uiMode() != uiModeExecute {
+		t.Fatalf("effort click should cycle high → off without opening a selector or changing mode: %q/%q", m.effort, m.uiMode())
 	}
 
 	_ = m.View()
@@ -1808,8 +1459,8 @@ func TestBottomStatusEffortIsSeparateAndClickable(t *testing.T) {
 		X: m.statusEffortX + m.statusEffortW/2, Y: statusInfoRow(m.height),
 	})
 	m = tm.(*model)
-	if m.agent.Effort != "low" {
-		t.Fatalf("effort click should cycle off → low, got %q", m.agent.Effort)
+	if m.effort != "low" {
+		t.Fatalf("effort click should cycle off → low, got %q", m.effort)
 	}
 }
 
@@ -1884,7 +1535,6 @@ func TestPaletteMouseClicksActivateRootAndPanelRows(t *testing.T) {
 func modelCmdModel() *model {
 	m := &model{
 		input: newInput(),
-		agent: &agent.Agent{},
 		cfg: &config.Config{
 			DefaultModel: "kimi-k3-fast",
 			Providers:    map[string]config.Provider{"inference": {BaseURL: "https://x", APIKey: "k"}},
@@ -1976,277 +1626,6 @@ func TestModelArgEnterNeverNewlines(t *testing.T) {
 	if m.input.Value() == "/model glm" {
 		t.Fatalf("enter should have accepted the completion, still %q", m.input.Value())
 	}
-}
-
-type planTestBackend struct {
-	mu     sync.Mutex
-	stream chan models.Request
-	done   chan struct{}
-}
-
-func (b *planTestBackend) Stream(_ context.Context, req models.Request, sink models.EventSink) (models.Message, models.Usage, error) {
-	if b.stream != nil {
-		b.stream <- req
-	}
-	if sink.OnText != nil {
-		sink.OnText("plan text\n<proposed_plan>\n# Plan: ship it\n1. write code\n2. run tests\n</proposed_plan>")
-	}
-	if b.done != nil {
-		b.done <- struct{}{}
-	}
-	return models.Message{Role: "assistant", Content: "plan text\n<proposed_plan>\n# Plan: ship it\n1. write code\n2. run tests\n</proposed_plan>"}, models.Usage{}, nil
-}
-
-func (b *planTestBackend) Complete(_ context.Context, req models.Request) (models.Message, models.Usage, error) {
-	return models.Message{Role: "assistant", Content: "done"}, models.Usage{}, nil
-}
-
-func TestPlanThenExecuteConversational(t *testing.T) {
-	b := &planTestBackend{
-		stream: make(chan models.Request, 2),
-		done:   make(chan struct{}),
-	}
-	m := &model{
-		agent: agent.New(b, "model", 100, "sys"),
-		input: newInput(),
-	}
-
-	// 1. /plan switches to plan mode and submits goal
-	m.command("/plan ship it")
-	if m.uiMode() != uiModePlan {
-		t.Fatalf("expected mode plan, got %q", m.uiMode())
-	}
-	if !m.agent.PlanMode {
-		t.Fatal("expected agent.PlanMode to be true")
-	}
-	<-b.done
-	for i := 0; i < 100 && len(m.agent.MessagesSnapshot()) < 3; i++ {
-		time.Sleep(2 * time.Millisecond)
-	}
-
-	// Simulate turn completion
-	finalMsg := "Here is the plan:\n<proposed_plan>\n# Plan: ship it\n1. write code\n2. run tests\n</proposed_plan>"
-	m.Update(turnDoneMsg{final: finalMsg})
-
-	if m.proposedPlanMD == "" || !strings.Contains(m.proposedPlanMD, "# Plan: ship it") {
-		t.Fatalf("expected proposedPlanMD to contain plan, got: %q", m.proposedPlanMD)
-	}
-
-	// 2. /execute switches to execute mode and submits approved plan
-	m.command("/execute")
-	if m.uiMode() != uiModeExecute {
-		t.Fatalf("expected mode execute, got %q", m.uiMode())
-	}
-	if m.agent.PlanMode {
-		t.Fatal("expected agent.PlanMode to be false after /execute")
-	}
-	<-b.done
-	for i := 0; i < 100 && len(m.agent.MessagesSnapshot()) < 5; i++ {
-		time.Sleep(2 * time.Millisecond)
-	}
-}
-
-func TestExecuteWithoutPlanFails(t *testing.T) {
-	m := &model{
-		agent: agent.New(&planTestBackend{}, "model", 100, "sys"),
-		input: newInput(),
-	}
-
-	m.command("/execute")
-	var foundErr bool
-	for _, blk := range m.blocks {
-		if strings.Contains(blk.text, "no plan to execute") {
-			foundErr = true
-			break
-		}
-	}
-	if !foundErr {
-		t.Fatalf("expected 'no plan to execute' error, got blocks: %+v", m.blocks)
-	}
-}
-
-func TestPlanCommandPreservesModel(t *testing.T) {
-	b := &planTestBackend{}
-	m := &model{
-		agent:     agent.New(b, "custom-model", 100, "sys"),
-		modelName: "custom-model",
-		provName:  "custom-prov",
-		input:     newInput(),
-	}
-	m.agent.Role = config.RoleFast
-
-	m.planCommand("/plan")
-	if m.modelName != "custom-model" || m.provName != "custom-prov" || m.agent.Role != config.RoleFast {
-		t.Fatalf("bare /plan changed model or role: %q/%q/%q", m.modelName, m.provName, m.agent.Role)
-	}
-	if m.uiMode() != uiModePlan || !m.agent.PlanMode {
-		t.Fatalf("expected plan mode, got uiMode=%q planMode=%v", m.uiMode(), m.agent.PlanMode)
-	}
-}
-
-func TestBuildAgentUsesModelRoutesAndModelAPIOverride(t *testing.T) {
-	t.Setenv("GHG_HOME", t.TempDir())
-	profiles := routeTestProfiles(t)
-	cfg := &config.Config{
-		Providers: map[string]config.Provider{
-			"route-test": {
-				Profile: "route-test",
-				APIKey:  "test-key",
-			},
-		},
-		Models: map[string]config.Model{
-			"anthropic-model": {Providers: []string{"route-test"}, ID: "minimax-m3", Context: 1000},
-			"responses-model": {Providers: []string{"route-test"}, ID: "grok-4.6", Context: 1000},
-			"override-model":  {Providers: []string{"route-test"}, ID: "minimax-m3", API: string(models.ProtocolOpenAIChatCompletions), Context: 1000},
-		},
-		Roles: map[string]config.RoleConfig{
-			config.RoleDefault: {Model: "override-model", Provider: "route-test"},
-			config.RoleSmart:   {Model: "anthropic-model", Provider: "route-test"},
-			config.RoleFast:    {Model: "override-model", Provider: "route-test"},
-			config.RoleTiny:    {Model: "anthropic-model", Provider: "route-test"},
-		},
-	}
-
-	ag, _, _, err := agent.NewConfigured(agent.BuildOptions{
-		Config: cfg, Profiles: profiles, Model: "anthropic-model", Role: config.RoleDefault, SystemPrompt: "system",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := ag.Backend.(*models.AnthropicClient); !ok {
-		t.Fatalf("route-matched model backend = %T, want *models.AnthropicClient", ag.Backend)
-	}
-
-	ag, _, _, err = agent.NewConfigured(agent.BuildOptions{
-		Config: cfg, Profiles: profiles, Model: "override-model", Role: config.RoleDefault, SystemPrompt: "system",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := ag.Backend.(*models.Client); !ok {
-		t.Fatalf("model API override backend = %T, want *models.Client", ag.Backend)
-	}
-
-	ag, _, _, err = agent.NewConfigured(agent.BuildOptions{
-		Config: cfg, Profiles: profiles, Model: "responses-model", Role: config.RoleDefault, SystemPrompt: "system",
-	})
-	if err != nil {
-		t.Fatalf("Responses route should build: %v", err)
-	}
-	if _, ok := ag.Backend.(*models.OpenAIResponsesClient); !ok {
-		t.Fatalf("Responses route backend = %T, want *models.OpenAIResponsesClient", ag.Backend)
-	}
-}
-
-func TestBuildAgentForRoleUsesRoleRoute(t *testing.T) {
-	profiles := routeTestProfiles(t)
-	cfg := &config.Config{
-		Providers: map[string]config.Provider{
-			"route-test": {Profile: "route-test", APIKey: "test-key"},
-		},
-		Models: map[string]config.Model{
-			"default-model": {Providers: []string{"route-test"}, ID: "minimax-m3", Context: 1000},
-			"smart-model":   {Providers: []string{"route-test"}, ID: "minimax-m3", Context: 1000},
-			"fast-model":    {Providers: []string{"route-test"}, ID: "qwen3-coder", Context: 1000},
-			"tiny-model":    {Providers: []string{"route-test"}, ID: "minimax-m3", Context: 1000},
-		},
-		Roles: map[string]config.RoleConfig{
-			config.RoleDefault: {Model: "default-model", Provider: "route-test"},
-			config.RoleSmart:   {Model: "smart-model", Provider: "route-test"},
-			config.RoleFast:    {Model: "fast-model", Provider: "route-test"},
-			config.RoleTiny:    {Model: "tiny-model", Provider: "route-test"},
-		},
-	}
-
-	for _, tc := range []struct {
-		role, model string
-		wantType    any
-	}{
-		{config.RoleSmart, "smart-model", (*models.AnthropicClient)(nil)},
-		{config.RoleFast, "fast-model", (*models.Client)(nil)},
-		{config.RoleTiny, "tiny-model", (*models.AnthropicClient)(nil)},
-	} {
-		ag, model, prov, err := agent.NewConfiguredForRole(cfg, profiles, tc.role, "system", false)
-		if err != nil {
-			t.Fatalf("%s: %v", tc.role, err)
-		}
-		if model != tc.model || prov != "route-test" || ag.Role != tc.role {
-			t.Fatalf("%s route = %q @ %q, agent role %q", tc.role, model, prov, ag.Role)
-		}
-		switch tc.wantType.(type) {
-		case *models.AnthropicClient:
-			if _, ok := ag.Backend.(*models.AnthropicClient); !ok {
-				t.Fatalf("%s backend = %T, want Anthropic", tc.role, ag.Backend)
-			}
-		case *models.Client:
-			if _, ok := ag.Backend.(*models.Client); !ok {
-				t.Fatalf("%s backend = %T, want OpenAI", tc.role, ag.Backend)
-			}
-		}
-	}
-}
-
-func TestBuildAgentUsesModelsDevContextFallback(t *testing.T) {
-	t.Setenv("GHG_HOME", t.TempDir())
-	if err := config.SaveModelsDev(config.ModelsDevCache{
-		Providers: map[string]map[string]int{"route-test": {"minimax-m3": 131072}},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	profiles := routeTestProfiles(t)
-	cfg := &config.Config{
-		Providers: map[string]config.Provider{
-			"route-test": {Profile: "route-test", APIKey: "test-key"},
-		},
-		Models: map[string]config.Model{
-			"metadata-model": {Providers: []string{"route-test"}, ID: "minimax-m3"},
-		},
-	}
-
-	ag, _, _, err := agent.NewConfigured(agent.BuildOptions{
-		Config: cfg, Profiles: profiles, Model: "metadata-model", Role: config.RoleDefault, SystemPrompt: "system",
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if ag.ContextLimit != 131072 {
-		t.Fatalf("models.dev context = %d, want 131072", ag.ContextLimit)
-	}
-}
-
-func routeTestProfiles(t *testing.T) models.Profiles {
-	t.Helper()
-	dir := t.TempDir()
-	data := `schema: 1
-id: route-test
-display_name: Route Test
-protocol: openai-chat-completions
-base_url: http://127.0.0.1:9999/v1
-auth:
-  kind: bearer
-  header: Authorization
-  env_var: ROUTE_TEST_KEY
-routes:
-  - models: ["minimax-*"]
-    protocol: anthropic-messages
-    auth:
-      kind: header
-      header: x-api-key
-    default_headers:
-      anthropic-version: "2023-06-01"
-  - models: ["grok-*"]
-    protocol: openai-responses
-catalog:
-  kind: none
-`
-	if err := os.WriteFile(filepath.Join(dir, "route-test.yaml"), []byte(data), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	profiles, err := models.Load(models.LoadOptions{UserDir: dir})
-	if err != nil {
-		t.Fatal(err)
-	}
-	return profiles
 }
 
 func (m *model) dispatches(name string) bool {
@@ -2520,21 +1899,6 @@ func TestReportIsBusySafe(t *testing.T) {
 	}
 }
 
-type reviewTestBackend struct {
-	done chan struct{}
-}
-
-func (b *reviewTestBackend) Stream(_ context.Context, _ models.Request, _ models.EventSink) (models.Message, models.Usage, error) {
-	if b.done != nil {
-		b.done <- struct{}{}
-	}
-	return models.Message{Role: "assistant", Content: `{"summary":"looks great","verdict":"approve","findings":[]}`}, models.Usage{}, nil
-}
-
-func (b *reviewTestBackend) Complete(_ context.Context, _ models.Request) (models.Message, models.Usage, error) {
-	return models.Message{Role: "assistant", Content: "done"}, models.Usage{}, nil
-}
-
 func TestReviewWithoutTargetShowsUsage(t *testing.T) {
 	m := compactCmdModel()
 	m.command("/review")
@@ -2550,91 +1914,6 @@ func TestReviewWithoutTargetShowsUsage(t *testing.T) {
 	}
 }
 
-func TestReviewOneShotLifecycle(t *testing.T) {
-	b := &reviewTestBackend{done: make(chan struct{})}
-	m := &model{
-		agent: agent.New(b, "test-model", 100, "sys"),
-		input: newInput(),
-		mode:  uiModeExecute,
-	}
-	m.agent.Role = config.RoleFast
-
-	// 1. Submit /review
-	m.command("/review internal/tui")
-	if !m.reviewing {
-		t.Fatal("expected m.reviewing to be true")
-	}
-	if !m.agent.ReviewMode {
-		t.Fatal("expected agent.ReviewMode to be true")
-	}
-	if m.agent.PlanMode {
-		t.Fatal("expected agent.PlanMode to be false")
-	}
-	if m.agent.Role != config.RoleFast {
-		t.Fatalf("expected role to remain fast, got %q", m.agent.Role)
-	}
-	<-b.done
-	for i := 0; i < 100 && len(m.agent.MessagesSnapshot()) < 3; i++ {
-		time.Sleep(2 * time.Millisecond)
-	}
-
-	// 2. Complete turn with valid review JSON
-	reviewJSON := `{"summary":"verified clean","verdict":"approve","findings":[]}`
-	m.Update(turnDoneMsg{final: reviewJSON})
-
-	if m.reviewing {
-		t.Fatal("expected m.reviewing to be false after completion")
-	}
-	if m.agent.ReviewMode {
-		t.Fatal("expected agent.ReviewMode to be false after completion")
-	}
-	if m.uiMode() != uiModeExecute {
-		t.Fatalf("expected uiMode to remain execute, got %q", m.uiMode())
-	}
-	if m.agent.Role != config.RoleFast {
-		t.Fatalf("expected role to be restored to fast, got %q", m.agent.Role)
-	}
-
-	// 3. Transcript contains rendered findings
-	var renderedFound bool
-	for _, blk := range m.blocks {
-		if strings.Contains(blk.text, "verified clean") {
-			renderedFound = true
-			break
-		}
-	}
-	if !renderedFound {
-		t.Fatalf("expected rendered review in blocks, got: %+v", m.blocks)
-	}
-}
-
-func TestReviewPreservesCustomModel(t *testing.T) {
-	b := &reviewTestBackend{done: make(chan struct{})}
-	m := &model{
-		agent:     agent.New(b, "custom-model", 100, "sys"),
-		modelName: "custom-model",
-		provName:  "custom-prov",
-		input:     newInput(),
-		mode:      uiModePlan,
-	}
-	m.agent.Role = config.RoleDefault
-
-	m.command("/review target")
-	if m.modelName != "custom-model" || m.provName != "custom-prov" || m.agent.Role != config.RoleDefault {
-		t.Fatalf("expected custom model to be preserved during review, got %q/%q/%q", m.modelName, m.provName, m.agent.Role)
-	}
-	<-b.done
-	for i := 0; i < 100 && len(m.agent.MessagesSnapshot()) < 3; i++ {
-		time.Sleep(2 * time.Millisecond)
-	}
-	m.Update(turnDoneMsg{final: `{"summary":"clean","verdict":"approve","findings":[]}`})
-	if m.modelName != "custom-model" || m.provName != "custom-prov" || m.agent.Role != config.RoleDefault {
-		t.Fatalf("expected custom model to be preserved after review, got %q/%q/%q", m.modelName, m.provName, m.agent.Role)
-	}
-}
-
-// Scheduled tasks persist in the session store and survive a reload — the
-// durability half of the wakeup channel.
 func TestSchedulePersistence(t *testing.T) {
 	t.Setenv("GHG_HOME", t.TempDir())
 	st, err := session.Open(filepath.Join(t.TempDir(), "s.db"))
@@ -2646,12 +1925,11 @@ func TestSchedulePersistence(t *testing.T) {
 	m := compactCmdModel()
 	m.store = st
 
-	// /schedule needs a session row; persist() creates one when a turn exists
-	m.agent.Messages = append(m.agent.Messages, models.Message{Role: "user", Content: "q", Authored: true})
-	m.persist()
-	if m.sessionID == "" {
-		t.Fatal("persist should create the session")
+	id, err := st.Create(cwd(), m.modelName, m.provName)
+	if err != nil {
+		t.Fatal(err)
 	}
+	m.sessionID = id
 
 	m.scheduleCommand([]string{"@every", "10m", "check the deploy status"})
 	m.scheduleCommand([]string{"@at", time.Now().Add(time.Hour).UTC().Format(time.RFC3339), "one-shot reminder"})
@@ -2695,7 +1973,7 @@ func TestStartupReportSkillsAndWarnings(t *testing.T) {
 	os.Chdir(dir)
 	defer os.Chdir(wd)
 
-	m := tasksModel("http://unused")
+	m := compactCmdModel()
 	m.startupReport()
 	if len(m.blocks) == 0 {
 		t.Fatal("no report rendered")
@@ -2719,22 +1997,6 @@ func TestStartupReportSkillsAndWarnings(t *testing.T) {
 	}
 }
 
-// TestStartupReportMCP: ready/failed/disabled servers render with the right
-// glyphs in one line.
-func TestStartupReportMCP(t *testing.T) {
-	m := tasksModel("http://unused")
-	disabled := false
-	m.mcpMgr = mcp.NewManager(map[string]mcp.ServerConfig{
-		"off":     {Command: []string{"true"}, Enabled: &disabled},
-		"invalid": {},
-	})
-	m.startupReport()
-	out := m.blocks[0].text
-	if !strings.Contains(out, "MCP servers:") || !strings.Contains(out, "○ off") || !strings.Contains(out, "✗ invalid") {
-		t.Errorf("bad mcp line:\n%s", out)
-	}
-}
-
 // TestStartupReportSilent: nothing loaded, nothing said.
 func TestStartupReportSilent(t *testing.T) {
 	dir := t.TempDir()
@@ -2743,7 +2005,7 @@ func TestStartupReportSilent(t *testing.T) {
 	defer os.Chdir(wd)
 	t.Setenv("HOME", t.TempDir()) // no ~/.ghg/skills either
 
-	m := tasksModel("http://unused")
+	m := compactCmdModel()
 	m.startupReport()
 	if len(m.blocks) != 0 {
 		t.Errorf("expected silence, got %q", m.blocks[0].text)
@@ -2753,201 +2015,20 @@ func TestStartupReportSilent(t *testing.T) {
 func shellModel() *model {
 	m := &model{
 		input: newInput(),
-		agent: &agent.Agent{},
 	}
 	m.width = 80
 	m.input.SetWidth(m.width - 2)
 	return m
 }
 
-func TestRunShellAppendsToolBlockAndMessage(t *testing.T) {
-	m := shellModel()
-	m.runShell("!echo hello")
-
-	b := m.blocks[len(m.blocks)-1]
-	if b.kind != blockTool {
-		t.Fatalf("output should be a tool block, got kind %d", b.kind)
-	}
-	if !strings.Contains(b.text, "hello") {
-		t.Fatalf("output should contain the command's stdout: %q", b.text)
-	}
-
-	if len(m.agent.Messages) != 1 {
-		t.Fatalf("expected one conversation message, got %d", len(m.agent.Messages))
-	}
-	msg := m.agent.Messages[0]
-	if msg.Role != "user" || msg.Authored {
-		t.Fatalf("message should be a non-authored user message: %+v", msg)
-	}
-	if !strings.HasPrefix(msg.Content, "$ echo hello") {
-		t.Fatalf("message should lead with the command: %q", msg.Content)
-	}
-	if !strings.Contains(msg.Content, "hello") {
-		t.Fatalf("message should carry the output: %q", msg.Content)
-	}
-}
-
 func TestRunShellEmptyIsANote(t *testing.T) {
 	m := shellModel()
 	m.runShell("!")
-	if len(m.agent.Messages) != 0 {
-		t.Fatalf("bare ! should not touch the conversation: %v", m.agent.Messages)
+	if len(m.messages) != 0 {
+		t.Fatalf("bare ! should not touch the conversation: %v", m.messages)
 	}
 	if b := lastBlock(m); !strings.Contains(b, "! <command>") {
 		t.Fatalf("bare ! should print a usage note: %q", b)
-	}
-}
-
-func TestRunShellFailingCommand(t *testing.T) {
-	m := shellModel()
-	m.runShell("!echo oops >&2; exit 3")
-	b := lastBlock(m)
-	if !strings.Contains(b, "oops") || !strings.Contains(b, "exit") {
-		t.Fatalf("stderr and exit status should be captured: %q", b)
-	}
-}
-
-func TestRunShellTruncatesHugeOutput(t *testing.T) {
-	m := shellModel()
-	m.runShell("!seq 1 200000")
-	if b := lastBlock(m); !strings.Contains(b, "truncated") {
-		t.Fatalf("huge output should carry a truncation marker (len %d)", len(b))
-	}
-}
-
-func TestRunShellWhileBusySteers(t *testing.T) {
-	// mid-turn the turn goroutine owns Messages, so the output is steered
-	// (mutex-guarded) for injection at the next loop boundary instead of a
-	// racy direct append
-	m := shellModel()
-	m.busy = true
-	m.runShell("!echo mid-turn")
-	if !m.busy {
-		t.Fatal("runShell must not clear busy")
-	}
-	if len(m.agent.Messages) != 0 {
-		t.Fatalf("mid-turn output must steer, not append: %v", m.agent.Messages)
-	}
-	// drainPending is unexported, but Turn would see it — pin via a turn on a
-	// nil client being overkill; instead confirm the transcript got the block
-	if b := lastBlock(m); !strings.Contains(b, "mid-turn") {
-		t.Fatalf("the output block should still land in the transcript: %q", b)
-	}
-}
-
-func TestEnterWhileBusyRunsShellEscape(t *testing.T) {
-	m := busyQueueModel()
-	m.input.SetValue("!echo hi")
-	m = press(t, m, tea.KeyMsg{Type: tea.KeyEnter})
-	if len(m.queue) != 0 {
-		t.Fatalf("! should run now, not queue: %v", m.queue)
-	}
-	if len(m.agent.Messages) != 0 {
-		t.Fatalf("busy output steers into the running turn, not append: %v", m.agent.Messages)
-	}
-	if b := lastBlock(m); !strings.Contains(b, "hi") {
-		t.Fatalf("the output block should land: %q", b)
-	}
-	if m.hist[len(m.hist)-1] != "!echo hi" {
-		t.Fatalf("the escape should be in history: %v", m.hist)
-	}
-}
-
-func TestEnterIdleRunsShellEscape(t *testing.T) {
-	m := shellModel()
-	m.input.SetValue("!echo hi")
-	m = press(t, m, tea.KeyMsg{Type: tea.KeyEnter})
-	if m.busy {
-		t.Fatal("! must not start a turn")
-	}
-	if len(m.agent.Messages) != 1 {
-		t.Fatalf("the shell message should land: %d", len(m.agent.Messages))
-	}
-}
-
-func TestQueueDrainExecutesShellEscape(t *testing.T) {
-	m := busyQueueModel("!echo drained")
-	m = press(t, m, tea.KeyMsg{Type: tea.KeyUp}) // exercise queueSel reset
-	tm, _ := m.Update(turnDoneMsg{})
-	m = tm.(*model)
-	if len(m.queue) != 0 {
-		t.Fatalf("the drained ! line should execute, not resubmit: %v", m.queue)
-	}
-	if m.queueSel != -1 {
-		t.Fatalf("queueSel should reset, got %d", m.queueSel)
-	}
-	// busy just cleared, so the drained escape appends idle-style
-	if len(m.agent.Messages) != 1 || !strings.Contains(m.agent.Messages[0].Content, "drained") {
-		t.Fatalf("the shell message should land: %+v", m.agent.Messages)
-	}
-	// the queued line was already rendered in the queue view; draining must
-	// not re-echo it as ❯ !echo drained
-	for _, b := range m.blocks {
-		if strings.Contains(b.text, "❯ !echo drained") {
-			t.Fatal("drained escapes should not re-echo the command line")
-		}
-	}
-}
-
-func TestCdAndPwd(t *testing.T) {
-	orig, err := os.Getwd()
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Chdir(orig) })
-
-	m := shellModel()
-	m.command("/pwd")
-	if b := lastBlock(m); !strings.Contains(b, orig) {
-		t.Fatalf("/pwd should print the cwd: %q", b)
-	}
-
-	// macOS: t.TempDir lives under /var, a symlink to /private/var — Getwd
-	// resolves it, the literal dir doesn't.
-	dir, err := filepath.EvalSymlinks(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	m.command("/cd " + dir)
-	if wd, _ := os.Getwd(); wd != dir {
-		t.Fatalf("/cd should chdir: got %q", wd)
-	}
-	if b := lastBlock(m); !strings.Contains(b, dir) {
-		t.Fatalf("/cd should confirm the new cwd: %q", b)
-	}
-
-	// bare /cd prints
-	m.command("/cd")
-	if b := lastBlock(m); !strings.Contains(b, dir) {
-		t.Fatalf("bare /cd should print the cwd: %q", b)
-	}
-
-	// bad dir errors without moving
-	m.command("/cd /definitely/not/a/dir")
-	if b := lastBlock(m); !strings.Contains(b, "/cd:") {
-		t.Fatalf("/cd should report the error: %q", b)
-	}
-	if wd, _ := os.Getwd(); wd != dir {
-		t.Fatalf("failed /cd should not move: got %q", wd)
-	}
-}
-
-func TestCdTilde(t *testing.T) {
-	orig, err := os.Getwd()
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.Chdir(orig) })
-	home, err := filepath.EvalSymlinks(t.TempDir())
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("HOME", home)
-
-	m := shellModel()
-	m.command("/cd ~")
-	if wd, _ := os.Getwd(); wd != home {
-		t.Fatalf("/cd ~ should land in $HOME: got %q", wd)
 	}
 }
 
@@ -2965,8 +2046,8 @@ func TestBangWhitespaceOnlyIsANote(t *testing.T) {
 	m := shellModel()
 	m.input.SetValue("!   ")
 	m = press(t, m, tea.KeyMsg{Type: tea.KeyEnter})
-	if len(m.agent.Messages) != 0 {
-		t.Fatalf("whitespace-only ! should be the usage note: %v", m.agent.Messages)
+	if len(m.messages) != 0 {
+		t.Fatalf("whitespace-only ! should be the usage note: %v", m.messages)
 	}
 }
 
@@ -2978,133 +2059,14 @@ func TestBangNotAtStartQueuesAsMessage(t *testing.T) {
 	if len(m.queue) != 1 || m.queue[0] != "say ! loudly" {
 		t.Fatalf("mid-string ! must queue as a plain message: %v", m.queue)
 	}
-	if len(m.agent.Messages) != 0 {
+	if len(m.messages) != 0 {
 		t.Fatal("mid-string ! must not trigger the shell escape")
 	}
 }
 
 // multiline command via ctrl+j
-func TestRunShellMultilineCommand(t *testing.T) {
-	m := shellModel()
-	m.runShell("!echo a\necho b")
-	if len(m.agent.Messages) != 1 || !strings.Contains(m.agent.Messages[0].Content, "b") {
-		t.Fatalf("multiline command should run through bash -c: %+v", m.agent.Messages)
-	}
-}
-
-func TestDoctorFreshSession(t *testing.T) {
-	m := tasksModel("http://unused")
-	m.sysPrompt = "You are an expert coding assistant operating inside ghg. "
-	disabled := false
-	m.mcpMgr = mcp.NewManager(map[string]mcp.ServerConfig{
-		"off":     {Command: []string{"true"}, Enabled: &disabled},
-		"invalid": {},
-	})
-	out := m.doctorReport()
-	for _, want := range []string{
-		"context audit", "system prompt (base)", "skills (", "tool schemas (",
-		"mcp: off", "disabled", "mcp: invalid", "TOTAL injected", "Trim:",
-	} {
-		if !strings.Contains(out, want) {
-			t.Errorf("missing %q in:\n%s", want, out)
-		}
-	}
-}
-
-func TestDoctorCommandWired(t *testing.T) {
-	m := tasksModel("http://unused")
-	m.command("/context-doctor")
-	if len(m.blocks) == 0 || !strings.Contains(m.blocks[len(m.blocks)-1].text, "context audit") {
-		t.Fatalf("/context-doctor produced no report: %+v", m.blocks)
-	}
-	before := len(m.blocks)
-	m.command("/doctor")
-	if !strings.Contains(m.blocks[len(m.blocks)-1].text, "unknown command") {
-		t.Error("/doctor should not exist as a shorthand")
-	}
-	_ = before
-}
-
-func TestDoctorSkillSources(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	proj := t.TempDir()
-	t.Chdir(proj)
-
-	writeSkill := func(dir, name, desc string) {
-		t.Helper()
-		sd := filepath.Join(dir, name)
-		if err := os.MkdirAll(sd, 0o755); err != nil {
-			t.Fatal(err)
-		}
-		body := "---\nname: " + name + "\ndescription: " + desc + "\n---\n"
-		if err := os.WriteFile(filepath.Join(sd, "SKILL.md"), []byte(body), 0o600); err != nil {
-			t.Fatal(err)
-		}
-	}
-	writeSkill(filepath.Join(proj, ".agents", "skills"), "proj-skill", "from the project")
-	writeSkill(filepath.Join(home, ".ghg", "skills"), "user-skill", "from the user dir")
-
-	m := tasksModel("http://unused")
-	m.skillScan = func() []skills.Skill { return skills.Scan(skills.DefaultDirs()...) }
-	out := m.doctorReport()
-	if !strings.Contains(out, "proj-skill") || !strings.Contains(out, "user-skill") {
-		t.Fatalf("both skills should be named:\n%s", out)
-	}
-	if !strings.Contains(out, "proj-skill ~") || !strings.Contains(out, "(./.agents/skills)") {
-		t.Errorf("project skill should point at ./.agents/skills:\n%s", out)
-	}
-	if !strings.Contains(out, "(~/.ghg/skills)") {
-		t.Errorf("user skill should point at ~/.ghg/skills:\n%s", out)
-	}
-}
-
-func TestDoctorProjectInstructions(t *testing.T) {
-	home := t.TempDir()
-	root := t.TempDir()
-	t.Setenv("GHG_HOME", home)
-	t.Chdir(root)
-	if err := config.Trust(root); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(root, "AGENTS.md"), []byte("run task check\n"), 0o644); err != nil {
-		t.Fatal(err)
-	}
-	m := tasksModel("http://unused")
-	m.sysPrompt = "base\n\n" + config.ProjectInstructions(root, true)
-	out := m.doctorReport()
-	if !strings.Contains(out, "project instructions (AGENTS.md)") || !strings.Contains(out, "trusted project") {
-		t.Fatalf("trusted project instructions should be audited:\n%s", out)
-	}
-
-	other := t.TempDir()
-	t.Chdir(other)
-	m.sysPrompt = "base"
-	out = m.doctorReport()
-	if strings.Contains(out, "project instructions (AGENTS.md)") {
-		t.Fatalf("untrusted project instructions should be absent:\n%s", out)
-	}
-}
-
-func TestShortSkillsDir(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	wd := t.TempDir()
-	t.Chdir(wd)
-	cases := map[string]string{
-		filepath.Join(home, ".ghg", "skills"):                      "~/.ghg/skills",
-		filepath.Join(wd, ".agents", "skills"):                     "./.agents/skills",
-		filepath.Join(string(filepath.Separator), "opt", "skills"): "/opt/skills",
-	}
-	for dir, want := range cases {
-		if got := shortSkillsDir(dir); got != want {
-			t.Errorf("shortSkillsDir(%q) = %q, want %q", dir, got, want)
-		}
-	}
-}
-
-func TestTok(t *testing.T) {
-	if tok(350) != "350" || tok(4848) != "4.8k" {
-		t.Errorf("tok: %q %q", tok(350), tok(4848))
+func TestFmtTokIncludesMillions(t *testing.T) {
+	if fmtTok(350) != "350" || fmtTok(4848) != "4.8k" || fmtTok(1_500_000) != "1.5M" {
+		t.Errorf("fmtTok: %q %q %q", fmtTok(350), fmtTok(4848), fmtTok(1_500_000))
 	}
 }

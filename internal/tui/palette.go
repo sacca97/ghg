@@ -10,10 +10,9 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/x/ansi"
 
+	"github.com/sacca97/ghg/internal/agent"
 	"github.com/sacca97/ghg/internal/auth"
 	"github.com/sacca97/ghg/internal/config"
-	"github.com/sacca97/ghg/internal/goal"
-	"github.com/sacca97/ghg/internal/mcp"
 	"github.com/sacca97/ghg/internal/models"
 )
 
@@ -147,10 +146,10 @@ func (m *model) paletteItems() []paletteItem {
 			panel:   func(m *model) *ppanel { return m.modePanel(false) }},
 		{title: "Reasoning effort", category: "Agent",
 			dynDesc: func(m *model) string {
-				if m.agent == nil {
+				if m.modelName == "" {
 					return "configure a provider first"
 				}
-				return "thinking level for " + m.agent.Model
+				return "thinking level for " + m.modelName
 			},
 			dynHint: func(m *model) string { return "/effort " + slashHint(m, "/effort") },
 			panel: func(m *model) *ppanel {
@@ -284,14 +283,15 @@ func (m *model) paletteItems() []paletteItem {
 			stepFwd:  func(m *model) { m.setCompactPct(m.compactPct() + 10) }},
 		{title: "Goal", category: "Session",
 			dynDesc: func(m *model) string {
-				if m.goal == "" {
+				if g := m.currentGoal(); g == "" {
 					return fmt.Sprintf("keep working until the goal is met (max %d rounds)", m.goalMaxRounds())
+				} else {
+					return truncLine(g, 40)
 				}
-				return truncLine(m.goal, 40)
 			},
 			dynHint: func(m *model) string { return "/goal " + slashHint(m, "/goal") },
 			panel: func(m *model) *ppanel {
-				pp := &ppanel{kind: panelGoal, title: "Goal", prepare: m.goal}
+				pp := &ppanel{kind: panelGoal, title: "Goal", prepare: m.currentGoal()}
 				return pp
 			}},
 		{title: "Thinking timer", category: "Display",
@@ -848,17 +848,13 @@ func (m *model) previewModel(it modelItem) {
 	if it.model == m.modelName && it.provider == m.provName {
 		return
 	}
-	if m.workerOnly {
-		route, err := resolveDisplayRoute(m.cfg, m.profiles, it.model, it.provider, config.RoleDefault)
-		if err == nil {
-			m.modelName, m.provName, m.modelID = route.ModelName, route.ProviderName, route.APIID
-			m.protocol, m.role, m.contextLimit = route.Protocol, route.Role, route.ContextLimit
-			m.effort = m.maxEffort()
-			m.modelSlotW = m.statusModelSlotWidth()
-		}
-		return
+	route, err := resolveDisplayRoute(m.cfg, m.profiles, it.model, it.provider, config.RoleDefault)
+	if err == nil {
+		m.modelName, m.provName, m.modelID = route.ModelName, route.ProviderName, route.APIID
+		m.protocol, m.role, m.contextLimit = route.Protocol, route.Role, route.ContextLimit
+		m.effort = m.maxEffort()
+		m.modelSlotW = m.statusModelSlotWidth()
 	}
-	_ = m.rebuildAgent(it.model, it.provider, config.RoleDefault, true)
 }
 
 // commitGoal applies the goal panel's text: set, clear (empty), or resume.
@@ -866,11 +862,10 @@ func (m *model) previewModel(it modelItem) {
 // edited goal starts at round 0 (mirrors /goal resume vs /goal <text>).
 func (m *model) commitGoal(pp *ppanel) {
 	objective := strings.TrimSpace(pp.prepare)
-	if objective == m.goal {
+	if objective == m.currentGoal() {
 		if objective != "" && !m.busy {
-			m.goalRounds = 0
 			m.append(dimStyle.Render("◎ resuming goal: " + objective))
-			m.submitGoal(goal.ContinuePrompt(objective))
+			m.submitGoal(agent.ContinuePrompt(objective))
 		}
 		return
 	}
@@ -1065,23 +1060,22 @@ func paletteState(m *model, it paletteItem) string {
 	case "Thinking timer":
 		return dimStyle.Render("  [" + onOff(m.showThinking) + "]")
 	case "Goal":
-		if m.goal != "" {
+		if m.currentGoal() != "" {
 			return dimStyle.Render("  [on]")
 		}
 	case "Compaction level":
 		return dimStyle.Render(fmt.Sprintf("  [%d%%]", m.compactPct()))
 	case "MCP servers":
-		if m.mcpMgr == nil {
-			return ""
-		}
-		ready, total := 0, 0
-		for _, st := range m.mcpMgr.Statuses() {
-			total++
-			if st.Status == mcp.StatusReady {
-				ready++
+		if len(m.workerMCPStatuses) > 0 {
+			ready, total := 0, len(m.workerMCPStatuses)
+			for _, st := range m.workerMCPStatuses {
+				if st.State == "ready" {
+					ready++
+				}
 			}
+			return dimStyle.Render(fmt.Sprintf("  [%d/%d ready]", ready, total))
 		}
-		return dimStyle.Render(fmt.Sprintf("  [%d/%d ready]", ready, total))
+		return ""
 	}
 	return ""
 }

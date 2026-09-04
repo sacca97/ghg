@@ -198,6 +198,7 @@ func matchTier(f, q string) int {
 		return 0
 	}
 	lf := strings.ToLower(f)
+	q = strings.ToLower(q)
 	base := lf[strings.LastIndexByte(lf, '/')+1:]
 	if strings.Contains(base, q) {
 		return 0

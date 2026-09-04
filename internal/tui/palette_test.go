@@ -1,12 +1,14 @@
 package tui
 
 import (
+	"net"
 	"strings"
 	"testing"
 
 	tea "github.com/charmbracelet/bubbletea"
 
 	"github.com/sacca97/ghg/internal/config"
+	workerwire "github.com/sacca97/ghg/internal/worker"
 )
 
 func TestPaletteOpensAndClosesOnEsc(t *testing.T) {
@@ -167,13 +169,13 @@ func TestPaletteArrowsStepEffortInPlace(t *testing.T) {
 	if m.settings == nil {
 		t.Fatal("→ must keep the settings open")
 	}
-	if m.agent.Effort != "low" {
-		t.Fatalf("→ should step off → low, got %q", m.agent.Effort)
+	if m.effort != "low" {
+		t.Fatalf("→ should step off → low, got %q", m.effort)
 	}
 	tm, _ = m.paletteKey(tea.KeyMsg{Type: tea.KeyLeft})
 	m = tm.(*model)
-	if m.agent.Effort != "" {
-		t.Fatalf("← should step back to off, got %q", m.agent.Effort)
+	if m.effort != "" {
+		t.Fatalf("← should step back to off, got %q", m.effort)
 	}
 }
 
@@ -232,7 +234,7 @@ func TestPalettePanelPushPop(t *testing.T) {
 	if pp == nil || pp.kind != panelEffort {
 		t.Fatal("enter should push the effort panel")
 	}
-	if pp.levels[pp.lidx] != m.agent.Effort {
+	if pp.levels[pp.lidx] != m.effort {
 		t.Fatalf("panel should start on the current level, got %q", pp.levels[pp.lidx])
 	}
 	// filter input is paused inside a panel: typing runes does nothing
@@ -265,8 +267,8 @@ func TestPaletteEffortPanelApplies(t *testing.T) {
 	m = tm.(*model)
 	tm, _ = m.paletteKey(tea.KeyMsg{Type: tea.KeyEnter})
 	m = tm.(*model)
-	if m.agent.Effort != "medium" {
-		t.Fatalf("enter should apply the highlighted level, got %q", m.agent.Effort)
+	if m.effort != "medium" {
+		t.Fatalf("enter should apply the highlighted level, got %q", m.effort)
 	}
 	if m.settings.top() != nil {
 		t.Fatal("enter should pop the panel after applying")
@@ -321,8 +323,19 @@ func TestPaletteModelRolePanelSelectsRoute(t *testing.T) {
 // The goal panel edits the goal inline; enter applies and starts working.
 func TestPaletteGoalPanelSetsGoal(t *testing.T) {
 	m := compactCmdModel()
-	// commitGoal submits the first turn; give the goroutine a program to send
-	// to (offline — messages just drain into its queue)
+	serverConn, clientConn := net.Pipe()
+	defer serverConn.Close()
+	defer clientConn.Close()
+	go func() {
+		dec := workerwire.NewDecoder(serverConn)
+		for {
+			if _, err := dec.Read(); err != nil {
+				return
+			}
+		}
+	}()
+	m.workerClient = workerwire.NewClient(clientConn, "test")
+	// commitGoal submits the first turn through the worker projection.
 	m.prog = tea.NewProgram(m, tea.WithoutRenderer())
 	defer m.prog.Kill()
 	m.openPalette()
@@ -339,8 +352,8 @@ func TestPaletteGoalPanelSetsGoal(t *testing.T) {
 	}
 	tm, _ = m.paletteKey(tea.KeyMsg{Type: tea.KeyEnter})
 	m = tm.(*model)
-	if m.goal != "ship it" {
-		t.Fatalf("enter should set the goal, got %q", m.goal)
+	if m.currentGoal() != "ship it" {
+		t.Fatalf("enter should set the goal, got %q", m.currentGoal())
 	}
 	if !m.busy {
 		t.Fatal("setting a goal should start the first turn")
@@ -399,8 +412,8 @@ func TestPaletteCompactPanelDefaultRowRestores(t *testing.T) {
 	}
 	tm, _ := m.paletteKey(tea.KeyMsg{Type: tea.KeyEnter})
 	m = tm.(*model)
-	if m.compactModel != "" || m.agent.CompactModel != config.DefaultCompactModel {
-		t.Fatalf("the default row should restore the built-in default: %q / %q", m.compactModel, m.agent.CompactModel)
+	if m.compactModel != "" {
+		t.Fatalf("the default row should restore the built-in default: %q", m.compactModel)
 	}
 	// enter popped the panel — and since it was opened directly (not drilled
 	// into from the root list), the whole settings closed with it
@@ -412,7 +425,7 @@ func TestPaletteCompactPanelDefaultRowRestores(t *testing.T) {
 // The Compaction level row steps the threshold ±10% in place and shows it.
 func TestPaletteCompactionLevelSteps(t *testing.T) {
 	m := compactCmdModel()
-	m.agent.CompactThreshold = config.CompactThreshold(m.cfg) // default 40%
+	m.cfg.CompactPct = 40 // default 40%
 	m.openPalette()
 	var it *paletteItem
 	for i := range m.settings.items {
@@ -428,13 +441,13 @@ func TestPaletteCompactionLevelSteps(t *testing.T) {
 		t.Fatal("Compaction level should be ←/→ steppable")
 	}
 	it.stepFwd(m)
-	if m.agent.CompactThreshold != 0.5 {
-		t.Fatalf("→ should step to 50%%, got %v", m.agent.CompactThreshold)
+	if m.compactPct() != 50 {
+		t.Fatalf("→ should step to 50%%, got %v", m.compactPct())
 	}
 	it.stepBack(m)
 	it.stepBack(m)
-	if m.agent.CompactThreshold != 0.3 {
-		t.Fatalf("← ← should step to 30%%, got %v", m.agent.CompactThreshold)
+	if m.compactPct() != 30 {
+		t.Fatalf("← ← should step to 30%%, got %v", m.compactPct())
 	}
 	if state := paletteState(m, *it); !strings.Contains(state, "30%") {
 		t.Fatalf("the row badge should show the live level, got %q", state)

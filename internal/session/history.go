@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/sacca97/ghg/internal/models"
 )
@@ -58,13 +59,33 @@ func historyIndexText(msg models.Message) string {
 
 func boundedHistoryText(value string, limit int) string {
 	value = strings.TrimSpace(value)
+	return truncateHistory(value, limit)
+}
+
+func truncateHistory(value string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
 	if len(value) <= limit {
 		return value
 	}
-	if limit < 2 {
-		return value[:limit]
+	const suffix = "…"
+	if limit < len(suffix) {
+		return value[:utf8Prefix(value, limit)]
 	}
-	return value[:limit-1] + "…"
+	return value[:utf8Prefix(value, limit-len(suffix))] + suffix
+}
+
+func utf8Prefix(value string, limit int) int {
+	end := 0
+	for end < len(value) {
+		_, size := utf8.DecodeRuneInString(value[end:])
+		if end+size > limit {
+			break
+		}
+		end += size
+	}
+	return end
 }
 
 // backfillHistoryFTS rebuilds the derived index once for databases created
@@ -188,7 +209,13 @@ func (s *Store) SearchHistory(ctx context.Context, sessionID, query, role string
 		if ctx.Err() != nil {
 			return nil, ctx.Err()
 		}
-		return nil, ErrInvalidHistoryQuery
+		message := strings.ToLower(err.Error())
+		if strings.Contains(message, "fts5: syntax error") ||
+			strings.Contains(message, "unterminated string") ||
+			strings.Contains(message, "fts5: parser stack overflow") {
+			return nil, ErrInvalidHistoryQuery
+		}
+		return nil, err
 	}
 	defer func() { _ = rows.Close() }()
 	var hits []HistoryHit

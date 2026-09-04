@@ -2,7 +2,6 @@ package tui
 
 import (
 	"encoding/json"
-	"github.com/sacca97/ghg/internal/agent"
 	"github.com/sacca97/ghg/internal/config"
 	"github.com/sacca97/ghg/internal/models"
 	"github.com/sacca97/ghg/internal/search"
@@ -125,6 +124,9 @@ func TestFuzzyFiles(t *testing.T) {
 	hits := fuzzyFiles("roadmap", 8)
 	if len(hits) != 2 || hits[0] != "docs/roadmap.md" {
 		t.Fatalf("roadmap: %v", hits)
+	}
+	if hits = fuzzyFiles("ROADMAP", 8); len(hits) != 2 {
+		t.Fatalf("case-insensitive roadmap: %v", hits)
 	}
 	// base-name substring beats full-path match
 	hits = fuzzyFiles("main", 8)
@@ -292,11 +294,10 @@ func TestPrepareTurnReloadsSkillsEveryTurn(t *testing.T) {
 	os.WriteFile(filepath.Join(dir, ".agents/skills/demo/SKILL.md"),
 		[]byte("---\nname: demo\ndescription: live demo skill\n---\n"), 0o644)
 
-	m := &model{agent: agent.New(testBackend("http://unused", "k"), "m", 1, "overwritten"), sysPrompt: "BASE"}
+	m := &model{sysPrompt: "BASE"}
 	out, _ := m.prepareTurn("use $demo now")
-	sys := m.agent.Messages[0].Content
-	if !strings.HasPrefix(sys, "BASE") || !strings.Contains(sys, "<name>demo</name>") || !strings.Contains(sys, "<description>live demo skill</description>") {
-		t.Fatalf("system prompt: %q", sys)
+	if m.skillsLoaded != 1 || m.skillsCache[0].Name != "demo" {
+		t.Fatalf("skills were not refreshed: %+v", m.skillsCache)
 	}
 	if !strings.Contains(out, "invoked skill(s): demo") {
 		t.Fatalf("expansion: %q", out)
@@ -307,8 +308,8 @@ func TestPrepareTurnReloadsSkillsEveryTurn(t *testing.T) {
 	os.WriteFile(filepath.Join(dir, ".agents/skills/fresh/SKILL.md"),
 		[]byte("---\nname: fresh\ndescription: added mid-session\n---\n"), 0o644)
 	m.prepareTurn("hello")
-	if !strings.Contains(m.agent.Messages[0].Content, "<name>fresh</name>") {
-		t.Fatalf("new skill not picked up: %q", m.agent.Messages[0].Content)
+	if m.skillsLoaded != 2 || m.skillsCache[1].Name != "fresh" {
+		t.Fatalf("new skill not picked up: %+v", m.skillsCache)
 	}
 }
 
@@ -369,10 +370,7 @@ func TestMessageMultimodalRoundTrip(t *testing.T) {
 // input_modalities entry wins over config; config's vision flag is the default.
 func TestSupportsVisionGate(t *testing.T) {
 	newModel := func(visionCfg bool, catalog *config.Catalog) *model {
-		ag := agent.New(testBackend("http://unused", "k"), "m", 1, "sys")
-		ag.Model = "some-model"
 		m := &model{
-			agent:     ag,
 			modelName: "some-model",
 			provName:  "inference",
 			cfg:       &config.Config{Models: map[string]config.Model{"some-model": {Vision: visionCfg}}},
@@ -418,10 +416,7 @@ func TestPrepareTurnVisionGate(t *testing.T) {
 		t.Fatal(err)
 	}
 	build := func(vision bool) *model {
-		ag := agent.New(testBackend("http://unused", "k"), "m", 1, "sys")
-		ag.Model = "m"
 		return &model{
-			agent:     ag,
 			modelName: "m",
 			provName:  "p",
 			cfg:       &config.Config{Models: map[string]config.Model{"m": {Vision: vision}}},

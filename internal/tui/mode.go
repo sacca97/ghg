@@ -98,11 +98,6 @@ func (m *model) activeRoleLabel() string {
 			return m.role
 		}
 	}
-	if m.agent != nil && !m.workerOnly {
-		if slices.Contains(modelRoleLabels, m.agent.Role) {
-			return m.agent.Role
-		}
-	}
 	return config.RoleDefault
 }
 
@@ -113,13 +108,8 @@ func (m *model) setMode(mode string) error {
 	if mode != uiModePlan && mode != uiModeExecute {
 		return fmt.Errorf("unknown mode %q (want plan or execute)", mode)
 	}
-	if m.agent != nil && !m.workerOnly {
-		m.agent.PlanMode = (mode == uiModePlan)
-	}
 	m.mode = mode
-	if m.workerOnly {
-		m.syncWorkerConfiguration(false)
-	}
+	m.syncWorkerConfiguration(false)
 	return nil
 }
 
@@ -127,29 +117,9 @@ func (m *model) setMode(mode string) error {
 // cumulative usage. Unlike /model, this is an execution detail and does not
 // rewrite the user's configured default route.
 func (m *model) switchRole(role string) error {
-	if m.workerOnly {
-		target, err := m.roleRoute(role)
-		if err != nil {
-			return err
-		}
-		return m.activateRoute(target.Model, target.Provider, role)
-	}
-	if m.agent == nil {
-		return fmt.Errorf("no agent configured")
-	}
-	if m.agent.Role == role {
-		return nil
-	}
-	if m.cfg == nil {
-		m.agent.Role = role
-		return nil
-	}
-	target, err := m.cfg.ResolveRole(role)
+	target, err := m.roleRoute(role)
 	if err != nil {
 		return err
-	}
-	if target.Model == "" {
-		return fmt.Errorf("role %q has no configured agent", role)
 	}
 	return m.activateRoute(target.Model, target.Provider, role)
 }
@@ -158,35 +128,18 @@ func (m *model) switchRole(role string) error {
 // conversation and session-local state. It deliberately does not rewrite the
 // configured default route: choosing a role model edits that role only.
 func (m *model) activateRoute(modelName, providerName, role string) error {
-	if m.workerOnly {
-		if m.workerClient != nil && m.workerLiveWork {
-			return errors.New("worker is busy; change the model after this work finishes")
-		}
-		route, err := resolveDisplayRoute(m.cfg, m.profiles, modelName, providerName, role)
-		if err != nil {
-			return err
-		}
-		m.modelName, m.provName, m.modelID = route.ModelName, route.ProviderName, route.APIID
-		m.protocol, m.role, m.contextLimit = route.Protocol, role, route.ContextLimit
-		m.effort = m.maxEffort()
-		m.modelSlotW = m.statusModelSlotWidth()
-		m.syncWorkerConfiguration(true)
-		return nil
-	}
-	if m.cfg == nil {
-		if m.agent == nil {
-			return fmt.Errorf("no agent configured")
-		}
-		m.agent.Role = role
-		m.agent.PlanMode = (m.uiMode() == uiModePlan)
-		return nil
-	}
 	if m.workerClient != nil && m.workerLiveWork {
 		return errors.New("worker is busy; change the model after this work finishes")
 	}
-	if err := m.rebuildAgent(modelName, providerName, role, false); err != nil {
+	route, err := resolveDisplayRoute(m.cfg, m.profiles, modelName, providerName, role)
+	if err != nil {
 		return err
 	}
+	m.modelName, m.provName, m.modelID = route.ModelName, route.ProviderName, route.APIID
+	m.protocol, m.role, m.contextLimit = route.Protocol, role, route.ContextLimit
+	m.effort = m.maxEffort()
+	m.modelSlotW = m.statusModelSlotWidth()
+	m.syncWorkerConfiguration(true)
 	return nil
 }
 
@@ -341,13 +294,7 @@ var effortCands = []cand{
 }
 
 func (m *model) currentEffort() string {
-	if m.workerOnly {
-		return m.effort
-	}
-	if m.agent == nil {
-		return ""
-	}
-	return m.agent.Effort
+	return m.effort
 }
 
 // effortsFor returns the cycle of effort levels available for the current
@@ -440,24 +387,10 @@ func effortCandsFor(levels []string) []cand {
 // fetch completes).
 func (m *model) updateCatalogs(cats map[string]config.Catalog) {
 	m.catalogs = cats
-	if m.workerOnly {
-		m.contextLimit = m.contextLimitFor(m.provName, m.currentModelID())
-		if !slices.Contains(m.effortsFor(), m.effort) {
-			m.resetEffort("")
-			m.append(dimStyle.Render("⚡ effort reset to off: not supported by " + m.modelName))
-		}
-		return
-	}
-	if m.agent == nil {
-		return
-	}
-	m.agent.ReasoningToggle = m.reasoningToggleFor(m.provName, m.agent.Model)
-	if n := m.contextLimitFor(m.provName, m.agent.Model); n != m.agent.ContextLimit {
-		m.agent.ContextLimit = n // /models is the source of truth
-	}
-	if !slices.Contains(m.effortsFor(), m.agent.Effort) {
+	m.contextLimit = m.contextLimitFor(m.provName, m.currentModelID())
+	if !slices.Contains(m.effortsFor(), m.effort) {
 		m.resetEffort("")
-		m.append(dimStyle.Render("⚡ effort reset to off: not supported by " + m.agent.Model))
+		m.append(dimStyle.Render("⚡ effort reset to off: not supported by " + m.modelName))
 	}
 }
 
@@ -468,55 +401,19 @@ func (m *model) updateCatalogs(cats map[string]config.Catalog) {
 // level) use resetEffort instead so a quiet reconciliation never rewrites
 // the user's chosen global default.
 func (m *model) setEffort(lv string) {
-	if m.workerOnly {
-		if m.workerClient != nil && m.workerLiveWork {
-			m.append(dimStyle.Render("(worker is busy — change reasoning after this work finishes)"))
-			return
-		}
-		m.effort = lv
-		m.cfg.DefaultEffort = lv
-		_ = m.saveConfig()
-		if m.store != nil && m.sessionID != "" {
-			_ = m.store.SetEffort(m.sessionID, lv)
-		}
-		m.syncWorkerConfiguration(true)
-		return
-	}
-	if m.agent == nil {
-		return
-	}
 	if m.workerClient != nil && m.workerLiveWork {
 		m.append(dimStyle.Render("(worker is busy — change reasoning after this work finishes)"))
 		return
 	}
-	m.agent.Effort = lv
+	m.effort = lv
 	m.cfg.DefaultEffort = lv
 	_ = m.saveConfig()
-	if m.store != nil && m.sessionID != "" {
-		_ = m.store.SetEffort(m.sessionID, lv) // best-effort; persist() re-stamps
-	}
 	m.syncWorkerConfiguration(true)
 }
 
 // resetEffort applies a level without touching the global default.
 func (m *model) resetEffort(lv string) {
-	if m.workerOnly {
-		m.effort = lv
-		if m.store != nil && m.sessionID != "" {
-			_ = m.store.SetEffort(m.sessionID, lv)
-		}
-		if !m.workerLiveWork {
-			m.syncWorkerConfiguration(true)
-		}
-		return
-	}
-	if m.agent == nil {
-		return
-	}
-	m.agent.Effort = lv
-	if m.store != nil && m.sessionID != "" {
-		_ = m.store.SetEffort(m.sessionID, lv)
-	}
+	m.effort = lv
 	if !m.workerLiveWork {
 		m.syncWorkerConfiguration(true)
 	}

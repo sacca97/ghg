@@ -15,6 +15,7 @@ import (
 	"github.com/sacca97/ghg/internal/lsp"
 	"github.com/sacca97/ghg/internal/models"
 	"github.com/sacca97/ghg/internal/session"
+	"github.com/sacca97/ghg/internal/tools"
 	workerwire "github.com/sacca97/ghg/internal/worker"
 )
 
@@ -318,5 +319,144 @@ func TestWorkerPlanTurnAndSnapshot(t *testing.T) {
 	}
 	if !strings.Contains(payload["markdown"], "# Step 1") {
 		t.Fatalf("expected markdown to contain '# Step 1', got %q", payload["markdown"])
+	}
+}
+
+func TestWorkerForkAndRenameCommands(t *testing.T) {
+	dir := t.TempDir()
+	st, err := session.Open(filepath.Join(dir, "s.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	sessionID, err := st.Create("/tmp", "m", "p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	b := &workerTestBackend{}
+	ag := agent.New(b, "m", 100, "sys")
+	ag.Messages = []models.Message{
+		{Role: "system", Content: "sys"},
+		{Role: "user", Content: "q1", Authored: true},
+		{Role: "assistant", Content: "a1"},
+	}
+
+	w := &workerProcessState{
+		sessionID: sessionID,
+		store:     st,
+		ag:        ag,
+		state:     workerwire.StateIdle,
+	}
+
+	// 1. Test Rename
+	renamePayload, _ := json.Marshal(workerwire.RenameRequest{Title: "renamed session"})
+	renameRes, err := w.Command(context.Background(), workerwire.Command{
+		Name:    workerwire.CommandRename,
+		Payload: renamePayload,
+	})
+	if err != nil {
+		t.Fatalf("rename command failed: %v", err)
+	}
+	var renameResult workerwire.RenameResult
+	if err := json.Unmarshal(renameRes.Payload, &renameResult); err != nil {
+		t.Fatal(err)
+	}
+	if renameResult.Title != "renamed session" {
+		t.Fatalf("rename result title = %q, want 'renamed session'", renameResult.Title)
+	}
+	meta, _, err := st.Load(sessionID)
+	if err != nil || meta.Title != "renamed session" {
+		t.Fatalf("stored title = %q, want 'renamed session'", meta.Title)
+	}
+
+	// 2. Test Fork
+	forkPayload, _ := json.Marshal(workerwire.ForkRequest{Cut: 2, Title: "forked session"})
+	forkRes, err := w.Command(context.Background(), workerwire.Command{
+		Name:    workerwire.CommandFork,
+		Payload: forkPayload,
+	})
+	if err != nil {
+		t.Fatalf("fork command failed: %v", err)
+	}
+	var forkResult workerwire.ForkResult
+	if err := json.Unmarshal(forkRes.Payload, &forkResult); err != nil {
+		t.Fatal(err)
+	}
+	if forkResult.Title != "forked session" || forkResult.NewSessionID == "" || forkResult.OldSessionID != sessionID {
+		t.Fatalf("fork result = %+v", forkResult)
+	}
+	forkedMeta, forkedMsgs, err := st.Load(forkResult.NewSessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if forkedMeta.Title != "forked session" || len(forkedMsgs) != 3 {
+		t.Fatalf("forked session meta = %+v, msgs = %d", forkedMeta, len(forkedMsgs))
+	}
+}
+
+func TestWorkerHumanGateAndPermRules(t *testing.T) {
+	t.Setenv("GHG_HOME", t.TempDir())
+	perms := tools.LoadPermRules()
+	w := &workerProcessState{
+		perms:   perms,
+		pending: make(map[string]*workerApprovalFlight),
+	}
+
+	req := tools.GateRequest{Tool: "bash", Command: "git status", Rule: "git status"}
+	if perms.CoveredBy(req) {
+		t.Fatal("initially should not be covered")
+	}
+
+	// 1. Uncovered command: humanGate starts flight in background
+	answered := make(chan struct{})
+	go func() {
+		dec, _ := w.humanGate(req)
+		if dec != tools.GateAllowAlways {
+			t.Errorf("expected GateAllowAlways, got %v", dec)
+		}
+		close(answered)
+	}()
+
+	// Wait for pending flight
+	var id string
+	for i := 0; i < 50; i++ {
+		time.Sleep(10 * time.Millisecond)
+		w.mu.Lock()
+		for pendingID := range w.pending {
+			id = pendingID
+			break
+		}
+		w.mu.Unlock()
+		if id != "" {
+			break
+		}
+	}
+	if id == "" {
+		t.Fatal("expected pending approval flight")
+	}
+
+	// 2. Answer allow_always
+	ok := w.answerApproval(workerApprovalAnswer{ID: id, Decision: "allow_always"})
+	if !ok {
+		t.Fatal("answerApproval returned false")
+	}
+	<-answered
+
+	// 3. PermRules now covers git status
+	if !perms.CoveredBy(req) {
+		t.Fatal("expected perms to cover git status now")
+	}
+
+	// 4. Calling humanGate again should return immediately without pending flight
+	dec, redirect := w.humanGate(req)
+	if dec != tools.GateAllowOnce || redirect != "" {
+		t.Fatalf("expected GateAllowOnce, got %v redirect=%q", dec, redirect)
+	}
+	w.mu.Lock()
+	pendingLen := len(w.pending)
+	w.mu.Unlock()
+	if pendingLen != 0 {
+		t.Fatalf("expected 0 pending flights, got %d", pendingLen)
 	}
 }

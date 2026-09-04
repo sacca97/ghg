@@ -75,20 +75,32 @@ func (r *Registry) BindSession(ctx context.Context, sessionID string) error {
 		if strings.HasPrefix(key, "\x00") {
 			copyRecord := record
 			copyRecord.SessionID = sessionID
-			r.records[sessionKey(sessionID, record.ID)] = copyRecord
-			delete(r.records, key)
 			pending = append(pending, copyRecord)
 		}
 	}
 	r.mu.Unlock()
-	if store == nil {
-		return nil
-	}
-	for _, record := range pending {
-		if err := store.SaveObservation(ctx, sessionID, record); err != nil {
-			return err
+	if store != nil {
+		for _, record := range pending {
+			if err := store.SaveObservation(ctx, sessionID, record); err != nil {
+				return err
+			}
 		}
 	}
+	r.mu.Lock()
+	for _, record := range pending {
+		key := sessionKey("", record.ID)
+		current, ok := r.records[key]
+		if !ok {
+			continue
+		}
+		current.SessionID = sessionID
+		r.records[sessionKey(sessionID, current.ID)] = current
+		delete(r.records, key)
+	}
+	if store != nil {
+		r.evictOldest(sessionID)
+	}
+	r.mu.Unlock()
 	return nil
 }
 
@@ -111,12 +123,19 @@ func (r *Registry) Save(ctx context.Context, sessionID string, record Record) er
 	}
 	record.SessionID = sessionID
 	r.mu.Lock()
-	r.records[sessionKey(sessionID, record.ID)] = record
 	store := r.persistent
 	r.mu.Unlock()
 	if store != nil && strings.TrimSpace(sessionID) != "" {
-		return store.SaveObservation(ctx, sessionID, record)
+		if err := store.SaveObservation(ctx, sessionID, record); err != nil {
+			return err
+		}
 	}
+	r.mu.Lock()
+	r.records[sessionKey(sessionID, record.ID)] = record
+	if store != nil && strings.TrimSpace(sessionID) != "" {
+		r.evictOldest(sessionID)
+	}
+	r.mu.Unlock()
 	return nil
 }
 
@@ -141,8 +160,35 @@ func (r *Registry) Load(ctx context.Context, sessionID, id string) (Record, erro
 	}
 	r.mu.Lock()
 	r.records[sessionKey(sessionID, id)] = record
+	r.evictOldest(sessionID)
 	r.mu.Unlock()
 	return record, nil
+}
+
+// ponytail: 128 live records bound memory; older observations reload from storage.
+const maxLiveObservationsPerSession = 128
+
+func (r *Registry) evictOldest(sessionID string) {
+	prefix := sessionID + "\x00"
+	for {
+		count := 0
+		oldestKey := ""
+		var oldest time.Time
+		for key, record := range r.records {
+			if !strings.HasPrefix(key, prefix) {
+				continue
+			}
+			count++
+			if oldestKey == "" || record.CreatedAt.Before(oldest) || (record.CreatedAt.Equal(oldest) && key < oldestKey) {
+				oldestKey = key
+				oldest = record.CreatedAt
+			}
+		}
+		if count <= maxLiveObservationsPerSession || oldestKey == "" {
+			return
+		}
+		delete(r.records, oldestKey)
+	}
 }
 
 // FindLatest returns the most recent observation matching path and exact line span.

@@ -175,7 +175,7 @@ func TestDeleteFrom(t *testing.T) {
 
 	// rewind to before msgs[3] ("q2"): seq == conversation index, so
 	// DeleteFrom(3) drops q2 (seq 3) and a2 (seq 4); q1/a1 survive
-	if err := st.DeleteFrom(id, 3); err != nil {
+	if err := st.DeleteFrom(id, 3, nil); err != nil {
 		t.Fatal(err)
 	}
 	_, msgs, err := st.Load(id)
@@ -183,17 +183,62 @@ func TestDeleteFrom(t *testing.T) {
 		t.Fatalf("after rewind: %v %+v", err, msgs)
 	}
 	// a middle cut keeps the full prefix — seq is NOT re-based after deletes
-	if err := st.DeleteFrom(id, 2); err != nil {
+	if err := st.DeleteFrom(id, 2, nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, msgs, _ = st.Load(id); len(msgs) != 1 || msgs[0].Content != "q1" {
 		t.Fatalf("middle cut: %+v", msgs)
 	}
 	// re-deleting at the same point is a no-op
-	if err := st.DeleteFrom(id, 2); err != nil {
+	if err := st.DeleteFrom(id, 2, nil); err != nil {
 		t.Fatal(err)
 	}
 	if _, msgs, _ = st.Load(id); len(msgs) != 1 {
 		t.Fatalf("re-delete changed rows: %d", len(msgs))
+	}
+}
+
+func TestDeleteFromAfterCompactionUsesRawSequence(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "s.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	id, err := st.Create(t.TempDir(), "m", "p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := []models.Message{
+		{Role: "system", Content: "sys"},
+		{Role: "user", Content: "q1"},
+		{Role: "assistant", Content: "a1"},
+		{Role: "user", Content: "q2"},
+		{Role: "assistant", Content: "a2"},
+		{Role: "user", Content: "q3"},
+		{Role: "assistant", Content: "a3"},
+	}
+	if err := st.Save(id, 0, raw, "m", "p"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RecordCompaction(id, 4, "q1 and q2"); err != nil {
+		t.Fatal(err)
+	}
+	_, view, err := st.Load(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.DeleteFrom(id, 3, view); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(st.RawMessages(id)); got != 5 {
+		t.Fatalf("raw messages after rewind = %d, want 5", got)
+	}
+	_, view, err = st.Load(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(view) != 3 || view[2].Content != "a2" {
+		t.Fatalf("compacted view after rewind = %+v, want summary plus a2", view)
 	}
 }

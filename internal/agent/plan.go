@@ -123,7 +123,11 @@ End your response with a Markdown implementation plan in a single, exact block:
 
 A response without that block is valid only when actively gathering necessary initial evidence or asking clarifying questions. Only emit <proposed_plan> once, as your final answer.`
 
-// planSafeTools is the read-only allowlist Plan mode exposes. Enforcement
+const askModePrompt = `You are answering the user's question in a read-only mode. Answer the question directly; it may be about the repository or a general subject, and infer which from the question.
+
+If the question concerns the repository, inspect only the files and evidence needed to answer accurately. You have read-only tools: read, grep, glob, lsp, find_files, output_list, output_read, history_search, and history_read. You cannot write or edit files, run shell commands, spawn tasks, update goals, or otherwise mutate anything. Do not propose an implementation plan unless the user explicitly asks for one.`
+
+// planSafeTools is the read-only allowlist shared by Plan and Ask modes. Enforcement
 // happens when building "available", not only through prompting, so mutating
 // and side-effecting tools are structurally unreachable in Plan mode. MCP tools
 // are intentionally excluded because ghg cannot prove they are read-only.
@@ -139,7 +143,7 @@ var planSafeTools = map[string]bool{
 	"history_read":   true,
 }
 
-// planTools returns the Plan-mode read-only tool allowlist. It intentionally
+// planTools returns the read-only tool allowlist. It intentionally
 // does not include the MCP set (unproven read-only) or any mutating built-in.
 func (a *Agent) planTools() []tools.Tool {
 	a.toolsMu.Lock()

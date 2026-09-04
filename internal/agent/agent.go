@@ -119,6 +119,10 @@ type Agent struct {
 	// mode that terminates upon successful review submission.
 	ReviewMode bool
 
+	// AskMode restricts one turn to read-only tools and injects a direct
+	// question-answering prompt.
+	AskMode bool
+
 	mu        sync.Mutex
 	pending   []pendingSteer // steered user messages awaiting injection
 	compacted bool           // a compaction already happened this turn — don't retry-loop
@@ -633,6 +637,13 @@ func (a *Agent) MessagesSnapshot() []models.Message {
 	return append([]models.Message(nil), a.Messages...)
 }
 
+// MessageCount returns the current conversation length without copying it.
+func (a *Agent) MessageCount() int {
+	a.msgsMu.Lock()
+	defer a.msgsMu.Unlock()
+	return len(a.Messages)
+}
+
 // SetSystemPrompt replaces the session's system prompt between turns. The
 // worker attach path refreshes it with the current skills and project
 // instructions without exposing the message slice to another goroutine.
@@ -834,7 +845,7 @@ func (a *Agent) TurnWithImagesAndGoal(ctx context.Context, input string, parts [
 }
 
 func (a *Agent) readOnlyCollaborationMode() bool {
-	return a.PlanMode || a.ReviewMode
+	return a.PlanMode || a.ReviewMode || a.AskMode
 }
 
 func (a *Agent) collaborationPrompt() string {
@@ -843,6 +854,9 @@ func (a *Agent) collaborationPrompt() string {
 	}
 	if a.PlanMode {
 		return planModePrompt
+	}
+	if a.AskMode {
+		return askModePrompt
 	}
 	return ""
 }
@@ -924,7 +938,7 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 	reviewTarget := msg.Content
 
 	var planBudget *rolloutBudget
-	if a.readOnlyCollaborationMode() && authored {
+	if (a.PlanMode || a.ReviewMode) && authored {
 		planBudget = newPlanRolloutBudget()
 	}
 	readGuard := newReadCoverageTracker()
@@ -944,7 +958,7 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 			turnTools = append(turnTools, submitReviewTool())
 		}
 	}
-	if activeGoal != nil {
+	if activeGoal != nil && !a.readOnlyCollaborationMode() {
 		turnTools = append(turnTools, GoalTool(*activeGoal))
 	}
 	turnDefs := tools.Defs(turnTools)

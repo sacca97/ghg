@@ -2,20 +2,22 @@ package tui
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/x/ansi"
-	"github.com/sacca97/ghg/internal/agent"
-	"github.com/sacca97/ghg/internal/models"
-	"github.com/sacca97/ghg/internal/session"
-	workerwire "github.com/sacca97/ghg/internal/worker"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
+
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
+	"github.com/sacca97/ghg/internal/models"
+	"github.com/sacca97/ghg/internal/session"
+	workerwire "github.com/sacca97/ghg/internal/worker"
 )
 
 // The rendered screen must be artifact-free: no bare/empty SGR escapes
@@ -203,13 +205,12 @@ func forkModel(t *testing.T) *model {
 	t.Cleanup(func() { st.Close() })
 	m := &model{
 		input:    newInput(),
-		agent:    &agent.Agent{},
 		store:    st,
 		queueSel: -1,
 	}
 	m.width = 80
 	m.input.SetWidth(m.width - 2)
-	m.agent.Messages = []models.Message{
+	m.messages = []models.Message{
 		{Role: "system", Content: "sys"},
 		{Role: "user", Content: "q1", Authored: true},
 		{Role: "assistant", Content: "a1"},
@@ -221,8 +222,7 @@ func forkModel(t *testing.T) *model {
 		t.Fatal(err)
 	}
 	m.sessionID = id
-	m.saved = len(m.agent.Messages)
-	if err := st.Save(id, 1, m.agent.Messages, "m", "p"); err != nil {
+	if err := st.Save(id, 1, m.messages, "m", "p"); err != nil {
 		t.Fatal(err)
 	}
 	m.rebuildTranscript()
@@ -231,147 +231,6 @@ func forkModel(t *testing.T) *model {
 
 func tailBlock(m *model) string { return m.blocks[len(m.blocks)-1].text }
 
-func TestForkWithArg(t *testing.T) {
-	m := forkModel(t)
-	m.command("/fork experiment")
-
-	if m.sessionID == "" || strings.Contains(tailBlock(m), "fork failed") {
-		t.Fatalf("fork failed: %q", tailBlock(m))
-	}
-	meta, msgs, err := m.store.Load(m.sessionID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if meta.Title != "experiment" || len(msgs) != 4 { // the full conversation
-		t.Fatalf("fork: %+v (%d msgs)", meta, len(msgs))
-	}
-	if !strings.Contains(tailBlock(m), "⑂ forked") {
-		t.Fatalf("confirmation: %q", tailBlock(m))
-	}
-	// the original session survives untouched under /resume
-	recent, err := m.store.Recent(10)
-	if err != nil || len(recent) != 2 {
-		t.Fatalf("recent: %v %+v", err, recent)
-	}
-}
-
-func TestForkBareOpensNamePrompt(t *testing.T) {
-	m := forkModel(t)
-	m.command("/fork")
-
-	if m.namePrompt == nil || m.input.Value() != "q1 (fork #1)" {
-		t.Fatalf("prompt: %+v input=%q", m.namePrompt, m.input.Value())
-	}
-	press(t, m, tea.KeyMsg{Type: tea.KeyEnter}) // accept the suggestion
-	meta, _, err := m.store.Load(m.sessionID)
-	if err != nil || meta.Title != "q1 (fork #1)" {
-		t.Fatalf("fork title: %+v %v", meta, err)
-	}
-	// a second bare fork unwraps the suffix and suggests #2 off the base
-	m.command("/fork")
-	if m.input.Value() != "q1 (fork #2)" {
-		t.Fatalf("suggestion: %q", m.input.Value())
-	}
-	// esc cancels without forking
-	press(t, m, esc(m))
-	if m.namePrompt != nil {
-		t.Fatal("esc should cancel the prompt")
-	}
-	if recent, _ := m.store.Recent(10); len(recent) != 2 {
-		t.Fatalf("cancelled fork created a session: %+v", recent)
-	}
-}
-
-func TestForkFromRewindPicker(t *testing.T) {
-	m := forkModel(t)
-	press(t, m, esc(m))
-	press(t, m, esc(m)) // open rewind picker, selection on "q2"
-	press(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'f'}})
-
-	if m.rew != nil || m.namePrompt == nil {
-		t.Fatalf("f should swap picker for name prompt: rew=%v np=%v", m.rew, m.namePrompt)
-	}
-	m.input.SetValue("at-q2")
-	press(t, m, tea.KeyMsg{Type: tea.KeyEnter})
-
-	meta, msgs, err := m.store.Load(m.sessionID)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if meta.Title != "at-q2" {
-		t.Fatalf("title: %+v", meta)
-	}
-	// forked at q2: the copy keeps the selected message (q1, a1, q2);
-	// rewinding instead would drop q2
-	if len(msgs) != 3 || msgs[2].Content != "q2" {
-		t.Fatalf("prefix: %+v", msgs)
-	}
-	if len(m.agent.Messages) != 4 {
-		t.Fatalf("live messages: %+v", m.agent.Messages)
-	}
-}
-
-func TestForkWhileRewoundIntoFuture(t *testing.T) {
-	// rewind to before q1, then fork from the picker at the future q2 entry:
-	// the clipped tail up to the cut comes along
-	m := forkModel(t)
-	press(t, m, esc(m))
-	press(t, m, esc(m))
-	press(t, m, tea.KeyMsg{Type: tea.KeyUp}) // select q1
-	press(t, m, tea.KeyMsg{Type: tea.KeyEnter})
-	m.input.Reset()
-	if len(m.agent.Messages) != 1 || len(m.future) != 4 {
-		t.Fatalf("rewound: msgs=%d future=%d", len(m.agent.Messages), len(m.future))
-	}
-
-	press(t, m, esc(m))
-	press(t, m, esc(m)) // reopen: both entries are future
-	if len(m.rew.entries) != 2 {
-		t.Fatalf("entries: %+v", m.rew.entries)
-	}
-	// sel 0 = newest = q2 (cut = 1+2 = 3); fork through it
-	press(t, m, tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'f'}})
-	m.input.SetValue("redo-fork")
-	press(t, m, tea.KeyMsg{Type: tea.KeyEnter})
-
-	if len(m.agent.Messages) != 4 || m.agent.Messages[3].Content != "q2" {
-		t.Fatalf("fork through future: %+v", m.agent.Messages)
-	}
-	_, msgs, err := m.store.Load(m.sessionID)
-	if err != nil || len(msgs) != 3 {
-		t.Fatalf("stored: %v %+v", err, msgs)
-	}
-	// fork consumes the redo stack — the new session starts at the picked
-	// point with no forward tail
-	if len(m.future) != 0 {
-		t.Fatalf("remaining future: %+v", m.future)
-	}
-}
-
-func TestRename(t *testing.T) {
-	m := forkModel(t)
-	m.command("/rename better-name")
-	meta, _, err := m.store.Load(m.sessionID)
-	if err != nil || meta.Title != "better-name" {
-		t.Fatalf("rename: %+v %v", meta, err)
-	}
-
-	// bare rename prompts prefilled with the current title
-	m.command("/rename")
-	if m.namePrompt == nil || m.input.Value() != "better-name" {
-		t.Fatalf("prompt: %q", m.input.Value())
-	}
-	m.input.SetValue("final-name")
-	press(t, m, tea.KeyMsg{Type: tea.KeyEnter})
-	meta, _, _ = m.store.Load(m.sessionID)
-	if meta.Title != "final-name" {
-		t.Fatalf("prompt rename: %+v", meta)
-	}
-}
-
-// Resuming an interrupted session tells the user exactly what the model was
-// told: each dangling tool call renders as an inline "interrupted" row under
-// its call, plus one summary note at the resume boundary.
 func TestResumeShowsInterruptedToolCalls(t *testing.T) {
 	m := compactCmdModel()
 	st, err := session.Open(filepath.Join(t.TempDir(), "s.db"))
@@ -625,8 +484,7 @@ func TestPickerDeleteCurrentSessionResetsState(t *testing.T) {
 	m := compactCmdModel()
 	m.store = st
 	m.sessionID = id
-	m.saved = 2
-	m.agent.Messages = append(m.agent.Messages, models.Message{Role: "user", Content: "hi"})
+	m.messages = append(m.messages, models.Message{Role: "user", Content: "hi"})
 
 	m.openPicker()
 	m.pickerKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
@@ -635,11 +493,8 @@ func TestPickerDeleteCurrentSessionResetsState(t *testing.T) {
 	if m.sessionID != "" {
 		t.Fatalf("sessionID should be empty, got %q", m.sessionID)
 	}
-	if m.saved != 1 {
-		t.Fatalf("saved should be 1 (skip system prompt), got %d", m.saved)
-	}
-	if len(m.agent.Messages) != 1 {
-		t.Fatalf("agent messages should only retain system prompt, got %d", len(m.agent.Messages))
+	if len(m.messages) != 1 {
+		t.Fatalf("agent messages should only retain system prompt, got %d", len(m.messages))
 	}
 }
 
@@ -655,19 +510,17 @@ func rewindModel(t *testing.T, msgs ...models.Message) *model {
 	t.Cleanup(func() { st.Close() })
 	m := &model{
 		input:    newInput(),
-		agent:    &agent.Agent{},
 		store:    st,
 		queueSel: -1,
 	}
 	m.width = 80
 	m.input.SetWidth(m.width - 2)
-	m.agent.Messages = append([]models.Message{{Role: "system", Content: "sys"}}, msgs...)
+	m.messages = append([]models.Message{{Role: "system", Content: "sys"}}, msgs...)
 	m.vp.SetContent("x")
 	// persisted as if turns had run
-	if err := st.Save(m.sessionIDC(t), 1, m.agent.Messages, "m", "p"); err != nil {
+	if err := st.Save(m.sessionIDC(t), 1, m.messages, "m", "p"); err != nil {
 		t.Fatal(err)
 	}
-	m.saved = len(m.agent.Messages)
 	m.rebuildTranscript()
 	return m
 }
@@ -753,8 +606,8 @@ func TestBusyEscWithDraftClearsInputNotAgent(t *testing.T) {
 		t.Fatal("clearing a draft must not open the rewind picker")
 	}
 	// chat history untouched: agent messages are exactly what we seeded
-	if len(m.agent.Messages) != 2 { // system + q1
-		t.Fatalf("chat history must be untouched, got %d messages", len(m.agent.Messages))
+	if len(m.messages) != 2 { // system + q1
+		t.Fatalf("chat history must be untouched, got %d messages", len(m.messages))
 	}
 }
 
@@ -914,50 +767,6 @@ func TestRewindPickerShowsTimestamps(t *testing.T) {
 	}
 }
 
-func TestRewindTruncatesAndRestoresInput(t *testing.T) {
-	m := rewindModel(t,
-		models.Message{Role: "user", Content: "q1", Authored: true},
-		models.Message{Role: "assistant", Content: "a1"},
-		models.Message{Role: "user", Content: "q2", Authored: true},
-		models.Message{Role: "assistant", Content: "a2"},
-	)
-	press(t, m, esc(m))
-	press(t, m, esc(m))
-	press(t, m, tea.KeyMsg{Type: tea.KeyUp}) // sel starts on the latest (q2); ↑ moves to q1
-	press(t, m, tea.KeyMsg{Type: tea.KeyEnter})
-
-	// rewound to just before q1: only the system prompt survives
-	if len(m.agent.Messages) != 1 {
-		t.Fatalf("messages after rewind: %+v", m.agent.Messages)
-	}
-	if m.input.Value() != "q1" {
-		t.Fatalf("input should restore the rewound message, got %q", m.input.Value())
-	}
-	if len(m.future) != 4 { // q1..a2 clipped
-		t.Fatalf("redo stack: %+v", m.future)
-	}
-	if m.saved != 1 {
-		t.Fatalf("saved=%d", m.saved)
-	}
-	// DB rows at/after the cut are gone
-	_, stored, err := m.store.Load(m.sessionID)
-	if err != nil || len(stored) != 0 {
-		t.Fatalf("stored after rewind: %v %+v", err, stored)
-	}
-	// transcript rebuilt: no message blocks remain
-	var texts []string
-	for _, b := range m.blocks {
-		texts = append(texts, b.text)
-	}
-	joined := strings.Join(texts, "\n")
-	if strings.Contains(joined, "q1") || strings.Contains(joined, "q2") {
-		t.Fatalf("blocks: %q", joined)
-	}
-}
-
-// After a rewind, resubmitting records the replaced message's text as
-// RewoundFrom — rewind provenance survives on the new message (and in the
-// store) even though the redo stack is discarded.
 func TestResubmitAfterRewindStampsRewoundFrom(t *testing.T) {
 	m := rewindModel(t,
 		models.Message{Role: "user", Content: "q1", Authored: true},
@@ -965,10 +774,11 @@ func TestResubmitAfterRewindStampsRewoundFrom(t *testing.T) {
 		models.Message{Role: "user", Content: "q2 original", Authored: true},
 		models.Message{Role: "assistant", Content: "a2"},
 	)
-	// rewind to before q2: q2/a2 become the redo stack
-	m.applyRewind(3)
-	if len(m.future) != 2 || len(m.agent.Messages) != 3 {
-		t.Fatalf("after rewind: msgs=%d future=%d", len(m.agent.Messages), len(m.future))
+	// simulate rewind to before q2: q2/a2 become the redo stack
+	m.future = append(slices.Clone(m.messages[3:]), m.future...)
+	m.messages = m.messages[:3]
+	if len(m.future) != 2 || len(m.messages) != 3 {
+		t.Fatalf("after rewind: msgs=%d future=%d", len(m.messages), len(m.future))
 	}
 
 	// the submitTurn logic: capture the replaced text, then discard the future
@@ -986,10 +796,10 @@ func TestResubmitAfterRewindStampsRewoundFrom(t *testing.T) {
 	}
 	m.discardFuture()
 	// the resubmitted message is stamped (what submitTurn does post-turn)
-	m.agent.Messages = append(m.agent.Messages, models.Message{
+	m.messages = append(m.messages, models.Message{
 		Role: "user", Content: "q2 edited", Authored: true, RewoundFrom: rewoundFrom,
 	})
-	got := m.agent.Messages[len(m.agent.Messages)-1]
+	got := m.messages[len(m.messages)-1]
 	if got.RewoundFrom != "q2 original" {
 		t.Fatalf("resubmitted message should carry RewoundFrom, got %q", got.RewoundFrom)
 	}
@@ -998,103 +808,18 @@ func TestResubmitAfterRewindStampsRewoundFrom(t *testing.T) {
 	}
 }
 
-func TestRewindForwardTravel(t *testing.T) {
-	m := rewindModel(t,
-		models.Message{Role: "user", Content: "q1", Authored: true},
-		models.Message{Role: "assistant", Content: "a1"},
-		models.Message{Role: "user", Content: "q2", Authored: true},
-		models.Message{Role: "assistant", Content: "a2"},
-	)
-	press(t, m, esc(m))
-	press(t, m, esc(m))
-	press(t, m, tea.KeyMsg{Type: tea.KeyUp}) // q2 → q1, rewind to just before it
-	press(t, m, tea.KeyMsg{Type: tea.KeyEnter})
-	m.input.Reset()
-	if len(m.agent.Messages) != 1 || len(m.future) != 4 {
-		t.Fatalf("after rewind: msgs=%d future=%d", len(m.agent.Messages), len(m.future))
-	}
-
-	// reopen: both clipped user messages appear as dimmed future entries
-	press(t, m, esc(m))
-	press(t, m, esc(m))
-	if len(m.rew.entries) != 2 || !m.rew.entries[0].future || !m.rew.entries[1].future {
-		t.Fatalf("entries: %+v", m.rew.entries)
-	}
-	// sel 0 is q2 (the newest future entry): enter goes forward to just before it
-	press(t, m, tea.KeyMsg{Type: tea.KeyEnter})
-
-	// forward to just before q2: q1/a1 restored, q2/a2 still clipped
-	if len(m.agent.Messages) != 3 || len(m.future) != 2 || m.future[0].Content != "q2" {
-		t.Fatalf("forward: msgs=%d future=%+v", len(m.agent.Messages), m.future)
-	}
-	// the restored rows are persisted again
-	if _, stored, _ := m.store.Load(m.sessionID); len(stored) != 2 {
-		t.Fatalf("stored after forward: %+v", stored)
-	}
-	// forward travel does not clobber the input
-	if m.input.Value() != "" {
-		t.Fatalf("input: %q", m.input.Value())
-	}
-}
-
-func TestRewindNeverCutsToolCallPairs(t *testing.T) {
-	// entries sit at user messages; tool results always travel with their
-	// assistant message, so no cut can orphan a tool result from its call
-	m := rewindModel(t,
-		models.Message{Role: "user", Content: "q1", Authored: true},
-		models.Message{Role: "assistant", ToolCalls: []models.ToolCall{{ID: "c1"}}},
-		models.Message{Role: "tool", ToolCallID: "c1", Content: "out"},
-		models.Message{Role: "assistant", Content: "a1"},
-		models.Message{Role: "user", Content: "q2", Authored: true},
-	)
-	press(t, m, esc(m))
-	press(t, m, esc(m))
-	press(t, m, tea.KeyMsg{Type: tea.KeyUp}) // q1
-	press(t, m, tea.KeyMsg{Type: tea.KeyEnter})
-	if len(m.agent.Messages) != 1 { // only the system prompt survives
-		t.Fatalf("messages: %+v", m.agent.Messages)
-	}
-	if _, stored, _ := m.store.Load(m.sessionID); len(stored) != 0 {
-		t.Fatalf("stored: %+v", stored)
-	}
-}
-
 func TestRewindCancelLeavesConversation(t *testing.T) {
 	m := rewindModel(t,
 		models.Message{Role: "user", Content: "q1", Authored: true},
 		models.Message{Role: "assistant", Content: "a1"},
 	)
-	before := len(m.agent.Messages)
+	before := len(m.messages)
 	press(t, m, esc(m))
 	press(t, m, esc(m))
 	press(t, m, tea.KeyMsg{Type: tea.KeyUp})
 	press(t, m, esc(m)) // cancel
-	if m.rew != nil || len(m.agent.Messages) != before || len(m.future) != 0 {
+	if m.rew != nil || len(m.messages) != before || len(m.future) != 0 {
 		t.Fatal("cancel must not touch the conversation")
-	}
-}
-
-func TestPartialRewindKeepsPrefixInDB(t *testing.T) {
-	// rewind to a middle cut: the retained prefix must survive in the DB
-	// exactly (seq == conversation index; a cut at 3 keeps seq 1 and 2)
-	m := rewindModel(t,
-		models.Message{Role: "user", Content: "q1", Authored: true},
-		models.Message{Role: "assistant", Content: "a1"},
-		models.Message{Role: "user", Content: "q2", Authored: true},
-		models.Message{Role: "assistant", Content: "a2"},
-		models.Message{Role: "user", Content: "q3", Authored: true},
-	)
-	press(t, m, esc(m))
-	press(t, m, esc(m))
-	press(t, m, tea.KeyMsg{Type: tea.KeyUp}) // sel starts on q3 (latest); ↑ moves to q2
-	press(t, m, tea.KeyMsg{Type: tea.KeyEnter})
-
-	if len(m.agent.Messages) != 3 { // sys, q1, a1
-		t.Fatalf("messages: %+v", m.agent.Messages)
-	}
-	_, stored, err := m.store.Load(m.sessionID)
-	if err != nil || len(stored) != 2 || stored[0].Content != "q1" || stored[1].Content != "a1" {
-		t.Fatalf("stored prefix: %v %+v", err, stored)
 	}
 }
 
@@ -1125,142 +850,194 @@ func TestNamePromptPreservesDraft(t *testing.T) {
 	}
 }
 
-func TestResumeAfterRewindMatches(t *testing.T) {
-	m := rewindModel(t,
-		models.Message{Role: "user", Content: "q1", Authored: true},
-		models.Message{Role: "assistant", Content: "a1"},
-		models.Message{Role: "user", Content: "q2", Authored: true},
-	)
-	press(t, m, esc(m))
-	press(t, m, esc(m))
-	press(t, m, tea.KeyMsg{Type: tea.KeyUp})
-	press(t, m, tea.KeyMsg{Type: tea.KeyEnter}) // rewind to before q1
-
-	// a fresh load of the session sees exactly the rewound history (nothing)
-	_, stored, err := m.store.Load(m.sessionID)
-	if err != nil || len(stored) != 0 {
-		t.Fatalf("resumed history: %v %+v", err, stored)
-	}
-}
-
-// Workspace rewind: a turn's file changes are captured as a git snapshot, and
-// rewinding the conversation past that turn restores the files too — while
-// untracked files the user made are left alone and the rollback is recorded.
-func TestWorkspaceRewind(t *testing.T) {
-	repo := t.TempDir()
-	git(t, repo, "init", "-q")
-	git(t, repo, "config", "user.email", "t@t")
-	git(t, repo, "config", "user.name", "t")
-	os.WriteFile(filepath.Join(repo, "a.txt"), []byte("base\n"), 0o644)
-	git(t, repo, "add", "-A")
-	git(t, repo, "commit", "-qm", "base")
-	t.Chdir(repo) // cwd() is process-global; snapshot/restore run here
-
-	m := compactCmdModel()
-	st, err := session.Open(filepath.Join(t.TempDir(), "s.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { st.Close() })
-	m.store = st
-	m.sessionID, _ = st.Create(repo, m.modelName, m.provName)
-
-	// a turn starts: snapshot the pre-turn workspace, then the agent edits a
-	// tracked file mid-turn
-	m.snapshots = map[int]string{}
-	snap := session.SnapshotWorkspace(repo)
-	if snap == "" {
-		t.Fatal("a clean tree still snapshots (as HEAD) — the point is pre-turn state")
-	}
-	if !session.WorkspaceClean(repo) {
-		t.Fatal("tree should be clean before the turn")
-	}
-	os.WriteFile(filepath.Join(repo, "a.txt"), []byte("agent edit\n"), 0o644)
-	if session.WorkspaceClean(repo) {
-		t.Fatal("tree should be dirty after the agent's edit")
-	}
-	// turn ends dirty → the snapshot is kept, keyed by the turn's start index
-	m.snapshots[3] = snap
-	if err := st.SetSnapshot(m.sessionID, 3, snap); err != nil {
-		t.Fatal(err)
-	}
-	os.WriteFile(filepath.Join(repo, "mine.txt"), []byte("keep me\n"), 0o644)
-
-	// conversation rewind past the turn: messages 0..2 survive, cut at 3
-	m.agent.Messages = append(m.agent.Messages,
-		models.Message{Role: "system"},
-		models.Message{Role: "user", Content: "q1", Authored: true},
-		models.Message{Role: "assistant", Content: "a1"},
-		models.Message{Role: "user", Content: "do the edit", Authored: true},
-		models.Message{Role: "assistant", Content: "done"},
-	)
-	m.rebuildTranscript()
-	m.applyRewind(3)
-
-	body, _ := os.ReadFile(filepath.Join(repo, "a.txt"))
-	if string(body) != "base\n" {
-		t.Fatalf("tracked file not restored: %q", body)
-	}
-	if _, err := os.Stat(filepath.Join(repo, "mine.txt")); err != nil {
-		t.Fatal("untracked user file must survive a workspace rewind")
-	}
-	if got := st.Snapshots(m.sessionID); len(got) != 0 {
-		t.Fatalf("consumed snapshot rows should be trimmed, got %v", got)
-	}
-
-	// the transcript shows the rollback
-	var sawNote bool
-	for _, b := range m.blocks {
-		if strings.Contains(ansi.Strip(b.render(m.width)), "workspace rewound") {
-			sawNote = true
-		}
-	}
-	if !sawNote {
-		t.Fatal("transcript should record the workspace rewind")
-	}
-}
-
-// A turn that changed nothing leaves no snapshot, and a rewind without any
-// snapshot restores nothing and notes nothing.
-func TestWorkspaceRewindNoSnapshot(t *testing.T) {
-	repo := t.TempDir()
-	git(t, repo, "init", "-q")
-	git(t, repo, "config", "user.email", "t@t")
-	git(t, repo, "config", "user.name", "t")
-	os.WriteFile(filepath.Join(repo, "a.txt"), []byte("base\n"), 0o644)
-	git(t, repo, "add", "-A")
-	git(t, repo, "commit", "-qm", "base")
-	t.Chdir(repo)
-
-	m := compactCmdModel()
-	m.snapshots = map[int]string{}
-	m.agent.Messages = append(m.agent.Messages,
-		models.Message{Role: "system"},
-		models.Message{Role: "user", Content: "q1", Authored: true},
-		models.Message{Role: "assistant", Content: "a1"},
-	)
-	m.rebuildTranscript()
-	blocksBefore := len(m.blocks)
-	m.applyRewind(1)
-	for _, b := range m.blocks {
-		if strings.Contains(ansi.Strip(b.render(m.width)), "workspace rewound") {
-			t.Fatal("no snapshot, no rewind note")
-		}
-	}
-	if len(m.blocks) >= blocksBefore {
-		t.Fatal("rewind should still clip the transcript")
-	}
-	body, _ := os.ReadFile(filepath.Join(repo, "a.txt"))
-	if string(body) != "base\n" {
-		t.Fatalf("file should be untouched: %q", body)
-	}
-}
-
 func git(t *testing.T, dir string, args ...string) {
 	t.Helper()
 	cmd := exec.Command("git", args...)
 	cmd.Dir = dir
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+	}
+}
+
+func TestWorkerForkAndRenameAcks(t *testing.T) {
+	st, err := session.Open(filepath.Join(t.TempDir(), "s.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	origID, err := st.Create("/tmp", "m", "p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	forkID, err := st.Create("/tmp", "m", "p")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	m := compactCmdModel()
+	m.store = st
+	m.sessionID = origID
+	// 1. Deliver rename ack
+	renamePayload, _ := json.Marshal(workerwire.RenameResult{
+		SessionID: origID,
+		Title:     "fresh title",
+	})
+	m.handleWorkerFrame(workerwire.Frame{
+		Type:      workerwire.TypeAck,
+		RequestID: "rename-123",
+		Payload:   renamePayload,
+	})
+	if !strings.Contains(tailBlock(m), "fresh title") {
+		t.Fatalf("confirmation: %q", tailBlock(m))
+	}
+
+	// 2. Deliver fork ack
+	forkPayload, _ := json.Marshal(workerwire.ForkResult{
+		NewSessionID: forkID,
+		OldSessionID: origID,
+		Title:        "fork title",
+		OldTitle:     "orig title",
+	})
+	m.handleWorkerFrame(workerwire.Frame{
+		Type:      workerwire.TypeAck,
+		RequestID: "fork-123",
+		Payload:   forkPayload,
+	})
+	if m.sessionID != forkID {
+		t.Fatalf("sessionID = %q, want %q", m.sessionID, forkID)
+	}
+	if !strings.Contains(tailBlock(m), "⑂ forked") {
+		t.Fatalf("confirmation: %q", tailBlock(m))
+	}
+}
+
+func TestResumeRestoresProposedPlan(t *testing.T) {
+	st, err := session.Open(filepath.Join(t.TempDir(), "s.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	id, err := st.Create("/tmp", "m", "p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	planJSON, _ := json.Marshal(map[string]string{"markdown": "# My Saved Plan\n\n1. Do this"})
+	err = st.SaveWorkflowResult(context.Background(), session.WorkflowResultRecord{
+		ResultID:   "plan-1",
+		SessionID:  id,
+		Kind:       "plan",
+		Version:    2,
+		Payload:    string(planJSON),
+		MessageSeq: 1,
+		CreatedAt:  time.Now().UTC(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	m := compactCmdModel()
+	m.store = st
+	if err := m.resumeDisplay(id); err != nil {
+		t.Fatal(err)
+	}
+	if m.proposedPlanMD != "# My Saved Plan\n\n1. Do this" {
+		t.Fatalf("proposedPlanMD = %q, want plan markdown", m.proposedPlanMD)
+	}
+}
+
+func TestWorkerTurnSubmissionAndDoneVerticalSlice(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	defer serverConn.Close()
+	defer clientConn.Close()
+
+	m := compactCmdModel()
+	m.sessionID = "test-session-slice"
+	client := workerwire.NewClient(clientConn, "test-session-slice")
+	m.workerClient = client
+
+	readFrame := make(chan workerwire.Frame, 1)
+	readErr := make(chan error, 1)
+	go func() {
+		decoder := workerwire.NewDecoder(serverConn)
+		f, err := decoder.Read()
+		if err != nil {
+			readErr <- err
+			return
+		}
+		readFrame <- f
+	}()
+
+	// 1. Submit turn via TUI
+	m.submitTurn("explain the algorithm", true)
+
+	if !m.busy {
+		t.Fatal("expected model to be busy during turn")
+	}
+
+	// 2. Read command frame on serverConn
+	var frame workerwire.Frame
+	select {
+	case frame = <-readFrame:
+	case err := <-readErr:
+		t.Fatalf("failed to read turn command: %v", err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for turn command frame")
+	}
+	if frame.Type != workerwire.TypeCommand {
+		t.Fatalf("frame type = %q, want %q", frame.Type, workerwire.TypeCommand)
+	}
+	var cmdReq workerwire.CommandRequest
+	if err := json.Unmarshal(frame.Payload, &cmdReq); err != nil {
+		t.Fatal(err)
+	}
+	if cmdReq.Name != workerwire.CommandInput {
+		t.Fatalf("command = %q, want %q", cmdReq.Name, workerwire.CommandInput)
+	}
+	var input workerwire.Input
+	if err := json.Unmarshal(cmdReq.Payload, &input); err != nil {
+		t.Fatal(err)
+	}
+	if input.Input != "explain the algorithm" || !input.Authored {
+		t.Fatalf("input = %+v", input)
+	}
+
+	// 3. Worker emits turn_done event
+	turnResultData, _ := json.Marshal(workerwire.TurnResult{
+		Final:         "Here is the explanation.",
+		Usage:         models.Usage{PromptTokens: 10, CompletionTokens: 5},
+		ContextTokens: 15,
+		At:            input.At,
+		Clean:         true,
+	})
+	cmd := m.workerEvent(workerEvent{Kind: "turn_done", Data: turnResultData})
+	if cmd == nil {
+		t.Fatal("expected command from turn_done")
+	}
+	doneMsg := cmd()
+	m.handleTurnDone(doneMsg.(turnDoneMsg))
+
+	if m.busy {
+		t.Fatal("model should not be busy after turn done")
+	}
+	if m.usage.PromptTokens != 10 || m.usage.CompletionTokens != 5 {
+		t.Fatalf("usage = %+v, want prompt=10 completion=5", m.usage)
+	}
+	if m.workerContextTokens != 15 {
+		t.Fatalf("contextTokens = %d, want 15", m.workerContextTokens)
+	}
+
+	// 4. Test plan delivery in turn_done
+	turnWithPlan, _ := json.Marshal(workerwire.TurnResult{
+		Final: "Here is the plan.",
+		Plan:  "# Step 1\n\nRun the test",
+	})
+	cmdPlan := m.workerEvent(workerEvent{Kind: "turn_done", Data: turnWithPlan})
+	donePlanMsg := cmdPlan()
+	m.mode = uiModePlan
+	m.handleTurnDone(donePlanMsg.(turnDoneMsg))
+	if m.proposedPlanMD != "# Step 1\n\nRun the test" {
+		t.Fatalf("proposedPlanMD = %q, want plan", m.proposedPlanMD)
 	}
 }

@@ -83,6 +83,33 @@ func (u GoalUpdate) Validate(currentID string) error {
 	return nil
 }
 
+// ApplyUpdate validates and applies one model-authored goal checkpoint, and
+// reports whether the record changed. Progress and blocker notes are truncated
+// to MaxNoteBytes so model-authored data cannot bloat the goal ledger.
+func ApplyUpdate(record *GoalRecord, update GoalUpdate) (bool, error) {
+	if record == nil {
+		return false, fmt.Errorf("goal record is nil")
+	}
+	if err := update.Validate(record.ID); err != nil {
+		return false, err
+	}
+	if record.Status == update.Status && record.Progress == update.Progress && record.Blocker == update.Blocker {
+		return true, nil
+	}
+	record.Status = update.Status
+	record.Progress = truncateNote(update.Progress)
+	record.Blocker = truncateNote(update.Blocker)
+	return true, nil
+}
+
+func truncateNote(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) <= MaxNoteBytes {
+		return value
+	}
+	return value[:MaxNoteBytes]
+}
+
 const GoalToolName = "update_goal"
 
 // GoalContextBlock renders the active goal for one model request.
@@ -197,6 +224,13 @@ func BuildGoalFromContextPrompt(tail []models.Message) string {
 	WriteTranscript(&b, tail)
 	b.WriteString("\n---\n\nWrite the goal now.")
 	return b.String()
+}
+
+// ContinuePrompt re-opens the active goal for another turn.
+func ContinuePrompt(objective string) string {
+	return fmt.Sprintf(`[goal continuation] Continue working on the active objective: %s
+
+Inspect and verify the remaining work. Use the request-scoped goal context as the source of truth. Call update_goal with status active and a concise progress note when you have made meaningful progress; call it with status blocked only for a genuine blocker; call it with status complete only after verification. A prose claim alone never completes the goal.`, objective)
 }
 
 // WriteTranscript renders bounded message data for a model-authored summary.

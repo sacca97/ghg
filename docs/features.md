@@ -519,7 +519,8 @@ guarded, and a successful auth builds the first agent in place. Headless
   building is pure (`agent.BuildGoalFromContextPrompt` over the window from
   `agent.GoalFromContextMessages`); the TUI command mirrors `/compact`'s
   goroutine + `goalFromContextMsg` pattern, refusing while busy and running
-  inline when headless. Tests: `goal_test.go` (`TestGoalFromContext*`).
+  inline when headless. Tests: `internal/agent/goal_test.go` (`TestGoalFromContextPrompt`)
+  and `internal/tui/commands_test.go` (`TestGoalFromContextMsgHandler*`).
 - **`/plan [goal]` / `/execute [plan]`** are an explicit two-step workflow. `/plan`
   enters persistent read-only Plan mode on the `smart` role, where ordinary turns
   can inspect the repository and either continue conversationally or finish with a
@@ -529,6 +530,8 @@ guarded, and a successful auth builds the first agent in place. Headless
   settings is bounded to the terminal height and scrolls with
   ↑/↓ or the mouse wheel. The bottom status box's separate `(effort)` control
   cycles through off and the available effort levels.
+- **`/ask <question>`** answers directly. It can investigate repository questions
+  with read-only tools, but cannot edit files, run commands, spawn tasks, or mutate state.
 - The bottom status box keeps the active model/provider, a separate `(effort)` indicator,
   and `plan`/`execute` mode visible. Clicking the model cycles the routes already
   selected for the `smart`/`plan`, `default`, `fast`, and `tiny` roles without changing

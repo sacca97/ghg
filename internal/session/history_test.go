@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/sacca97/ghg/internal/models"
 )
@@ -103,6 +104,20 @@ func TestHistorySearchRejectsMalformedQuery(t *testing.T) {
 	_, err = st.SearchHistory(context.Background(), id, `"`, "", nil, 10)
 	if !errors.Is(err, ErrInvalidHistoryQuery) || strings.Contains(err.Error(), "sqlite") {
 		t.Fatalf("malformed query error = %v", err)
+	}
+	if _, err := st.db.Exec(`DROP TABLE history_fts`); err != nil {
+		t.Fatal(err)
+	}
+	_, err = st.SearchHistory(context.Background(), id, "valid", "", nil, 10)
+	if errors.Is(err, ErrInvalidHistoryQuery) || !strings.Contains(err.Error(), "history_fts") {
+		t.Fatalf("operational history error = %v", err)
+	}
+}
+
+func TestHistoryIndexTruncationKeepsUTF8AndByteBound(t *testing.T) {
+	got := boundedHistoryText("ééé", 5)
+	if !utf8.ValidString(got) || len(got) > 5 {
+		t.Fatalf("truncated history = %q, valid=%v, bytes=%d", got, utf8.ValidString(got), len(got))
 	}
 }
 

@@ -1,6 +1,7 @@
 package session
 
 import (
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -336,6 +337,42 @@ func TestStoreEdgeCases(t *testing.T) {
 	st.db.Exec(`UPDATE messages SET content='{bad' WHERE session_id=?`, id1)
 	if _, _, err := st.Load(id1); err == nil {
 		t.Fatal("expected corrupt-row error")
+	}
+}
+
+func TestDeleteSessionDropsSnapshotRefs(t *testing.T) {
+	repo := t.TempDir()
+	cmd := exec.Command("git", "-C", repo, "init", "-q")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v: %s", err, out)
+	}
+	cmd = exec.Command("git", "-C", repo, "-c", "user.name=ghg", "-c", "user.email=ghg@example.com", "commit", "--allow-empty", "-m", "init")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git commit: %v: %s", err, out)
+	}
+	ref := "test-snapshot"
+	cmd = exec.Command("git", "-C", repo, "update-ref", "refs/ghg/snapshots/"+ref, "HEAD")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git snapshot ref: %v: %s", err, out)
+	}
+
+	st, err := Open(filepath.Join(t.TempDir(), "s.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	id, err := st.Create(repo, "m", "p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetSnapshot(id, 1, ref); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.DeleteSession(id); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("git", "-C", repo, "show-ref", "--verify", "--quiet", "refs/ghg/snapshots/"+ref).CombinedOutput(); err == nil {
+		t.Fatalf("snapshot ref still exists: %s", out)
 	}
 }
 

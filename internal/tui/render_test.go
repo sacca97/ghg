@@ -4,22 +4,22 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
-	"github.com/charmbracelet/x/ansi"
-	"github.com/sacca97/ghg/internal/agent"
-	"github.com/sacca97/ghg/internal/config"
-	"github.com/sacca97/ghg/internal/models"
-	"github.com/sacca97/ghg/internal/tools"
-	workerwire "github.com/sacca97/ghg/internal/worker"
+	"io"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 	"unicode/utf8"
+
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
+	"github.com/sacca97/ghg/internal/config"
+	"github.com/sacca97/ghg/internal/models"
+	"github.com/sacca97/ghg/internal/tools"
+	workerwire "github.com/sacca97/ghg/internal/worker"
 )
 
 // A degenerate WindowSizeMsg (1–4 cols, which a tmux/PTY handshake can emit
@@ -83,11 +83,11 @@ func frameModel() *model {
 	m.queueSel = -1
 	m.width, m.height = 100, 30
 	for i := range 80 {
-		m.agent.Messages = append(m.agent.Messages,
+		m.messages = append(m.messages,
 			models.Message{Role: "user", Content: fmt.Sprintf("question %d", i)},
 			models.Message{Role: "assistant", Content: fmt.Sprintf("answer %d padded out a bit", i)})
 	}
-	m.seedTranscript(m.agent.Messages, 0)
+	m.seedTranscript(m.messages, 0)
 	return m
 }
 
@@ -267,11 +267,10 @@ func TestFmtTok(t *testing.T) {
 // reserved for the app identity and loaded-skill count.
 func TestHeaderKeepsContextInStatus(t *testing.T) {
 	m := compactCmdModel()
-	m.agent = agent.New(testBackend("https://x", "k"), "kimi-k3-fast", 100, "sys")
-	m.agent.ContextLimit = 100000
+	m.contextLimit = 100000
 	m.follow = true
-	m.agent.AddUsage(models.Usage{PromptTokens: 12345, CompletionTokens: 678})
-	m.agent.AddUsage(models.Usage{ // cached tokens accumulate through the details struct
+	m.usage.Add(models.Usage{PromptTokens: 12345, CompletionTokens: 678})
+	m.usage.Add(models.Usage{ // cached tokens accumulate through the details struct
 		PromptTokens: 1,
 		PromptTokensDetails: &struct {
 			CachedTokens int `json:"cached_tokens"`
@@ -301,7 +300,7 @@ func TestHeaderKeepsContextInStatus(t *testing.T) {
 func TestHeaderContainsOnlyAppAndSkillCount(t *testing.T) {
 	m := compactCmdModel()
 	m.skillsLoaded = 33
-	m.goal = "finish the release"
+	m.setGoal("finish the release")
 	m.follow = false
 	m.width = 120
 
@@ -1027,7 +1026,6 @@ func TestResumedToolCallNotTruncated(t *testing.T) {
 // statusModel builds a model with an agent so statusView has data.
 func statusModel() *model {
 	m := newGrowModel()
-	m.agent = &agent.Agent{}
 	return m
 }
 
@@ -1038,12 +1036,12 @@ func TestStatusLineAlwaysShown(t *testing.T) {
 	m.width = 120
 	m.modelName = "kimi-k3-fast"
 	m.provName = "inference"
-	m.agent.Effort = "high"
-	m.agent.ContextLimit = 128000
-	m.agent.Messages = []models.Message{{Role: "system", Content: "system prompt"}}
+	m.effort = "high"
+	m.contextLimit = 128000
+	m.messages = []models.Message{{Role: "system", Content: "system prompt"}}
 
 	v := m.View()
-	for _, want := range []string{"kimi-k3-fast", "(high)", "execute", "inference", "ctx 8/128.0k"} {
+	for _, want := range []string{"kimi-k3-fast", "(high)", "execute", "inference", "ctx 0/128.0k"} {
 		if !strings.Contains(v, want) {
 			t.Errorf("status box should show %q\n--- view tail ---\n%s", want, tailLines(v, 8))
 		}
@@ -1058,8 +1056,9 @@ func TestStatusLineAlwaysShown(t *testing.T) {
 
 func TestContextStatusUsesLatestReportedRequest(t *testing.T) {
 	m := statusModel()
-	m.agent.ContextLimit = 128000
-	m.agent.Messages = []models.Message{
+	m.contextLimit = 128000
+	m.workerContextTokens = 340
+	m.messages = []models.Message{
 		{Role: "system", Content: strings.Repeat("x", 40000)},
 		{Role: "assistant", Content: "first", Usage: &models.Usage{PromptTokens: 100, CompletionTokens: 20}},
 		{Role: "user", Content: "next"},
@@ -1071,12 +1070,12 @@ func TestContextStatusUsesLatestReportedRequest(t *testing.T) {
 	}
 }
 
-func TestContextStatusEstimatesActiveTokensWithoutReportedResponse(t *testing.T) {
+func TestContextStatusStartsAtZeroWithoutReportedResponse(t *testing.T) {
 	m := statusModel()
-	m.agent.ContextLimit = 128000
-	m.agent.Messages = []models.Message{{Role: "system", Content: strings.Repeat("x", 40000)}}
+	m.contextLimit = 128000
+	m.messages = []models.Message{{Role: "system", Content: strings.Repeat("x", 40000)}}
 
-	if got, want := m.contextStatus(), "ctx 10.0k/128.0k"; got != want {
+	if got, want := m.contextStatus(), "ctx 0/128.0k"; got != want {
 		t.Fatalf("context status = %q, want %q", got, want)
 	}
 }
@@ -1184,7 +1183,7 @@ func TestStatusModelSlotStaysFixedAcrossRoleChanges(t *testing.T) {
 	m.cfg.Models[long] = config.Model{Providers: []string{"inference"}}
 
 	m.modelName = short
-	m.agent.Role = config.RoleDefault
+	m.role = config.RoleDefault
 	_ = m.View()
 	effortX, modeX, modelW := m.statusEffortX, m.statusModeX, m.statusModelW
 	if modelW != len(long) {
@@ -1192,7 +1191,7 @@ func TestStatusModelSlotStaysFixedAcrossRoleChanges(t *testing.T) {
 	}
 
 	m.modelName = long
-	m.agent.Role = config.RoleSmart
+	m.role = config.RoleSmart
 	_ = m.View()
 	if m.statusEffortX != effortX || m.statusModeX != modeX || m.statusModelW != modelW {
 		t.Fatalf("following status controls moved with the model: short=(%d,%d,%d), long=(%d,%d,%d)", effortX, modeX, modelW, m.statusEffortX, m.statusModeX, m.statusModelW)
@@ -1218,7 +1217,7 @@ func TestStatusLineOmitsTokenUsage(t *testing.T) {
 	u.PromptTokensDetails = &struct {
 		CachedTokens int `json:"cached_tokens"`
 	}{CachedTokens: 4000}
-	m.agent.AddUsage(u)
+	m.usage.Add(u)
 
 	got := m.statusView()
 	if strings.ContainsAny(got, "↓↑") || strings.Contains(got, "tok") {
@@ -1233,7 +1232,7 @@ func TestBusyStatsLeavesTokenUsageToStatus(t *testing.T) {
 	m := statusModel()
 	m.turnStart = time.Unix(100, 0)
 	m.now = func() time.Time { return time.Unix(101, 0) }
-	m.agent.AddUsage(models.Usage{PromptTokens: 12000, CompletionTokens: 800})
+	m.usage.Add(models.Usage{PromptTokens: 12000, CompletionTokens: 800})
 
 	got := m.busyStats()
 	if strings.Contains(got, "tok") || strings.Contains(got, "%") || strings.Contains(got, "12.0k") {
@@ -1315,7 +1314,7 @@ func TestStatusLineShowsCost(t *testing.T) {
 	m := statusModel()
 	m.modelName = "m"
 	m.provName = "p"
-	m.agent.Model = "priced"
+	m.modelName = "priced"
 	m.catalogs = map[string]config.Catalog{
 		"p": {Models: []config.ModelInfoLite{{ID: "priced", InPrice: 1e-6, OutPrice: 5e-6, CacheReadPrice: 1e-7}}},
 	}
@@ -1323,7 +1322,7 @@ func TestStatusLineShowsCost(t *testing.T) {
 	u.PromptTokensDetails = &struct {
 		CachedTokens int `json:"cached_tokens"`
 	}{CachedTokens: 8000}
-	m.agent.AddUsage(u)
+	m.usage.Add(u)
 
 	// (10k-8k)*1e-6 + 8k*1e-7 + 1k*5e-6 = 0.0078
 	if got := m.statusView(); !strings.Contains(got, "$0.0078") {
@@ -1335,11 +1334,11 @@ func TestStatusLineHidesCostWithoutPricing(t *testing.T) {
 	m := statusModel()
 	m.modelName = "m"
 	m.provName = "p"
-	m.agent.Model = "unpriced"
+	m.modelName = "unpriced"
 	m.catalogs = map[string]config.Catalog{
 		"p": {Models: []config.ModelInfoLite{{ID: "unpriced"}}},
 	}
-	m.agent.AddUsage(models.Usage{PromptTokens: 10000, CompletionTokens: 1000})
+	m.usage.Add(models.Usage{PromptTokens: 10000, CompletionTokens: 1000})
 
 	if got := m.statusView(); strings.Contains(got, "$") {
 		t.Errorf("unpriced model should hide cost: %q", got)
@@ -1365,18 +1364,19 @@ func TestFmtCost(t *testing.T) {
 // distinct (kimi-k3-fast bills higher than kimi-k3) with nothing hardcoded:
 // rates come from the provider's response body alone.
 func TestSessionCostUsesFetchedPricing(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{"data":[
-			{"id":"kimi-k3","pricing":{"prompt":"0.000003","completion":"0.000015","input_cache_read":"0.0000003"}},
-			{"id":"kimi-k3-fast","pricing":{"prompt":"0.0000045","completion":"0.0000225","input_cache_read":"0.00000045"}}
-		]}`))
-	}))
-	defer srv.Close()
-
+	// Injected transport instead of httptest: the pipeline is exercised from the
+	// response body down, and no test should need a bound TCP listener.
+	canned := `{"data":[
+		{"id":"kimi-k3","pricing":{"prompt":"0.000003","completion":"0.000015","input_cache_read":"0.0000003"}},
+		{"id":"kimi-k3-fast","pricing":{"prompt":"0.0000045","completion":"0.0000225","input_cache_read":"0.00000045"}}
+	]}`
+	httpOpts := models.BackendOptions{APIKey: "k", HTTP: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(canned))}, nil
+	})}}
 	backend, err := models.NewBackend(models.Resolved{
-		BaseURL:  srv.URL,
+		BaseURL:  "https://provider.invalid/v1",
 		Protocol: models.ProtocolOpenAIChatCompletions,
-	}, models.BackendOptions{APIKey: "k"})
+	}, httpOpts)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1398,14 +1398,14 @@ func TestSessionCostUsesFetchedPricing(t *testing.T) {
 	u.PromptTokensDetails = &struct {
 		CachedTokens int `json:"cached_tokens"`
 	}{CachedTokens: 20700}
-	m.agent.AddUsage(u)
+	m.usage.Add(u)
 
-	m.agent.Model = "kimi-k3-fast"
+	m.modelName = "kimi-k3-fast"
 	fast, ok := m.sessionCost()
 	if !ok {
 		t.Fatal("fast variant should be priced")
 	}
-	m.agent.Model = "kimi-k3"
+	m.modelName = "kimi-k3"
 	std, ok := m.sessionCost()
 	if !ok {
 		t.Fatal("standard variant should be priced")
@@ -1419,14 +1419,19 @@ func TestSessionCostUsesFetchedPricing(t *testing.T) {
 	}
 }
 
+// roundTripFunc serves a canned response without a listener, so HTTP-dependent
+// tests stay runnable in sandboxes that deny loopback binds.
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }
+
 func TestWorkerSnapshotContextTokensOverridesStaleShadowAgent(t *testing.T) {
 	m := statusModel()
-	m.agent.ContextLimit = 128000
+	m.contextLimit = 128000
 	// Shadow agent has ~10k tokens worth of text
-	m.agent.Messages = []models.Message{{Role: "system", Content: strings.Repeat("x", 40000)}}
+	m.messages = []models.Message{{Role: "system", Content: strings.Repeat("x", 40000)}}
 
-	// Direct execution would say 10.0k
-	if got, want := m.contextStatus(), "ctx 10.0k/128.0k"; got != want {
+	if got, want := m.contextStatus(), "ctx 0/128.0k"; got != want {
 		t.Fatalf("pre-worker context status = %q, want %q", got, want)
 	}
 
@@ -1445,7 +1450,7 @@ func TestWorkerSnapshotContextTokensOverridesStaleShadowAgent(t *testing.T) {
 
 func TestWorkerUsageAndCompactionSynchronizeContextTokens(t *testing.T) {
 	m := statusModel()
-	m.agent.ContextLimit = 128000
+	m.contextLimit = 128000
 	m.workerState = "running"
 	m.workerContextTokens = 1000
 
@@ -1545,6 +1550,144 @@ func TestToolCollapsedDiffCapped(t *testing.T) {
 	lines := strings.Split(strings.TrimSpace(out), "\n")
 	if len(lines) > 20 {
 		t.Fatalf("collapsed preview should remain capped, got %d lines", len(lines))
+	}
+}
+
+func (m *model) viewportPlain() []string {
+	return strings.Split(ansi.Strip(m.vp.View()), "\n")
+}
+
+// A long tool call remains visible in the viewport across resizes.
+func TestToolCallFullyVisibleInViewportAcrossResize(t *testing.T) {
+	m := compactCmdModel()
+	tm, _ := m.Update(mkWinSize(46, 30))
+	m = tm.(*model)
+
+	cmd := `{"command":"cd /home/user/project && git log --oneline --graph --decorate=full --all | head -50"}`
+	tm, _ = m.Update(toolStartMsg{name: "bash", args: cmd})
+	m = tm.(*model)
+
+	assertFullyVisible := func(width int) {
+		t.Helper()
+		lines := m.viewportPlain()
+		joined := strings.Join(strings.Fields(strings.Join(lines, " ")), " ")
+		if strings.Contains(joined, "…") {
+			t.Fatalf("viewport at %d cols contains an ellipsis:\n%s", width, strings.Join(lines, "\n"))
+		}
+		compact := strings.Map(func(r rune) rune {
+			if r == ' ' || r == '\t' || r == '\n' {
+				return -1
+			}
+			return r
+		}, joined)
+		want := strings.ReplaceAll(cmd, " ", "")
+		if !strings.Contains(compact, want) {
+			t.Errorf("viewport at %d cols lost command bytes:\nwant fragment of %q\ngot %q", width, want, compact)
+		}
+		for _, l := range lines {
+			if w := ansi.StringWidth(l); w > width {
+				t.Errorf("viewport line at %d cols is %d wide: %q", width, w, l)
+			}
+		}
+	}
+
+	assertFullyVisible(46)
+
+	tm, _ = m.Update(mkWinSize(30, 30))
+	m = tm.(*model)
+	assertFullyVisible(30)
+
+	tm, _ = m.Update(mkWinSize(120, 30))
+	m = tm.(*model)
+	assertFullyVisible(120)
+}
+
+// A tool result collapses to a preview, expands fully, and reflows on resize.
+func TestToolResultFullyVisibleWhenExpanded(t *testing.T) {
+	m := compactCmdModel()
+	tm, _ := m.Update(mkWinSize(46, 40))
+	m = tm.(*model)
+
+	var sb strings.Builder
+	for i := 1; i <= 12; i++ {
+		sb.WriteString("output row " + strings.Repeat("x", i) + "\n")
+	}
+	m.appendRaw(blockTool, sb.String())
+	m.refreshVP()
+
+	joined := strings.Join(m.viewportPlain(), "\n")
+	if !strings.Contains(joined, "… +7 lines") {
+		t.Fatalf("collapsed view should announce hidden lines, got:\n%s", joined)
+	}
+	if strings.Contains(joined, "output row "+strings.Repeat("x", 12)) {
+		t.Fatal("collapsed view must not show the last row")
+	}
+
+	tm, _ = m.key(tea.KeyMsg{Type: tea.KeyCtrlE})
+	m = tm.(*model)
+	joined = strings.Join(m.viewportPlain(), "\n")
+	for i := 1; i <= 12; i++ {
+		row := "output row " + strings.Repeat("x", i)
+		if !strings.Contains(joined, row) {
+			t.Errorf("expanded viewport missing %q", row)
+		}
+	}
+	if strings.Contains(joined, "… +") {
+		t.Errorf("expanded viewport still hides lines:\n%s", joined)
+	}
+
+	tm, _ = m.Update(mkWinSize(28, 40))
+	m = tm.(*model)
+	for _, l := range m.viewportPlain() {
+		if w := ansi.StringWidth(l); w > 28 {
+			t.Errorf("expanded line exceeds 28 cols (%d): %q", w, l)
+		}
+	}
+}
+
+// benchTranscript builds a realistic resumed conversation: n exchanges, each
+// with a user message, an assistant answer, and a tool call.
+func benchTranscript(n int) []models.Message {
+	msgs := make([]models.Message, 0, n*3)
+	for i := 0; i < n; i++ {
+		msgs = append(msgs,
+			models.Message{Role: "user", Content: fmt.Sprintf("question %d: how do I do the thing?", i)},
+			models.Message{Role: "assistant", Content: strings.Repeat("Here is **some** `answer` with text. ", 20)},
+			func() models.Message {
+				var tc models.ToolCall
+				tc.Function.Name = "bash"
+				tc.Function.Arguments = fmt.Sprintf(`{"command":"ls %d"}`, i)
+				return models.Message{Role: "assistant", ToolCalls: []models.ToolCall{tc}}
+			}(),
+		)
+	}
+	return msgs
+}
+
+// BenchmarkSeedTranscript measures the rendering cost of a large resumed
+// transcript. Cached block renders keep this to one transcript rebuild.
+func BenchmarkSeedTranscript(b *testing.B) {
+	msgs := benchTranscript(200)
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		m := compactCmdModel()
+		m.Update(mkWinSize(120, 40))
+		m.seedTranscript(msgs, 1)
+	}
+}
+
+// BenchmarkAppendStream measures the live streaming append path. The live
+// program defers the transcript rebuild to layout, so each append is O(1).
+func BenchmarkAppendStream(b *testing.B) {
+	m := compactCmdModel()
+	m.Update(mkWinSize(120, 40))
+	m.seedTranscript(benchTranscript(200), 1)
+	m.prog = tea.NewProgram(m, tea.WithoutRenderer())
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		m.append(fmt.Sprintf("streamed line %d", i))
 	}
 }
 

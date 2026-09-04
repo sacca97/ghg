@@ -1,7 +1,6 @@
 package tui
 
 import (
-	"context"
 	"fmt"
 	"maps"
 	"sort"
@@ -10,8 +9,8 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/sacca97/ghg/internal/agent"
-	"github.com/sacca97/ghg/internal/goal"
-	"github.com/sacca97/ghg/internal/models"
+	"github.com/sacca97/ghg/internal/lsp"
+	"github.com/sacca97/ghg/internal/mcp"
 	workerwire "github.com/sacca97/ghg/internal/worker"
 )
 
@@ -27,6 +26,7 @@ type registryEntry struct {
 // registry lists every user-facing slash command.
 var registry = []registryEntry{
 	{Name: "/auth", Hint: "[provider] [key] — connect any profile (bare lists profiles; provider-only opens a masked prompt; also: ghg auth <provider>)", Category: "Agent"},
+	{Name: "/ask", Hint: "<question> — answer directly; repository questions may be investigated read-only", Category: "Agent", Immediate: true},
 	{Name: "/cd", Hint: "[dir] — change working directory (bare prints it)", Category: "Session"},
 	{Name: "/clear", Hint: "— reset conversation", Category: "Session", Immediate: true},
 	{Name: "/compact", Hint: "[model] [provider]|off — compact now, or pick the compaction model (off restores the default); retry undoes the last compaction, log lists them; compaction level: ctrl+p › Compaction level", Category: "Session", Immediate: true},
@@ -53,7 +53,7 @@ var registry = []registryEntry{
 	{Name: "/schedule", Hint: "@every 10m|<@at time> <prompt> — schedule a wakeup turn; list | cancel <n>", Category: "Session"},
 	{Name: "/tasks", Hint: "[id] — background subagents: focus the dock, or open one subagent's live view", Keybind: "ctrl+t", Category: "Session", Immediate: true},
 	{Name: "/execute", Hint: "[plan] — execute the latest proposal or supplied plan with the fast model", Category: "Agent", Immediate: true},
-	{Name: "!cmd", Hint: "— run a shell command locally; output lands in the transcript and the conversation", Category: "App"},
+	{Name: "!cmd", Hint: "— run a shell command in the worker; output lands in the transcript and conversation", Category: "App"},
 }
 
 // slashRegistry returns the registry entries that name a slash command,
@@ -127,7 +127,7 @@ func busyCmd(text string) bool {
 	switch fields[0] {
 	case "/help", "/effort", "/tasks", "/cd", "/pwd", "/report", "/detach":
 		return true
-	case "/plan", "/execute", "/review": // handled immediately so a slash command is not sent as chat text
+	case "/ask", "/plan", "/execute", "/review": // handled immediately so a slash command is not sent as chat text
 		return true
 	case "/auth": // must run now even while busy: an inline key queued as a chat message would be sent to the model
 		return true
@@ -178,7 +178,7 @@ func (m *model) command(text string) (tea.Model, tea.Cmd) {
 	case "/me":
 		return m, m.openMe()
 	case "/compact":
-		if len(fields) == 1 && (m.workerClient != nil || m.workerOnly) {
+		if len(fields) == 1 {
 			if m.busy {
 				m.append(dimStyle.Render("(busy — /compact after this turn)"))
 				return m, nil
@@ -225,29 +225,16 @@ func (m *model) command(text string) (tea.Model, tea.Cmd) {
 		if !m.requireAgent() {
 			return m, nil
 		}
-		if m.store != nil && m.sessionID == "" {
-			m.ensureSession()
+		if m.workerClient == nil && !m.ensureWorker() {
+			m.append(errStyle.Render("compact failed: worker unavailable: " + m.workerStartError))
+			return m, nil
 		}
 		m.busy = true
 		m.append(dimStyle.Render("◎ compacting…"))
-		p := m.prog
-		ag := m.agent // capture the current conversation for the summary call
-		ctx, cancel := context.WithCancel(context.Background())
-		m.cancel = cancel
-		go func() {
-			took := len(ag.Messages)
-			var summary string
-			err := ag.ManualCompact(ctx, agent.Events{
-				OnCompactionReady: func(messages []models.Message, summary string, cutoff int) error {
-					return m.store.PersistCompaction(m.sessionID, m.saved, messages, m.modelName, m.provName, summary, cutoff)
-				},
-				OnCompacted: func(s string, _ int) { summary = s },
-			})
-			if p != nil { // nil in headless tests; compaction still ran
-				p.Send(compactMsg{took: took - len(ag.Messages), kept: len(ag.Messages), summary: summary, err: err})
-				p.Send(turnDoneMsg{}) // clear busy state
-			}
-		}()
+		if err := m.workerClient.Send(workerwire.CommandCompact, workerRequestID("compact"), nil); err != nil {
+			m.busy = false
+			m.append(errStyle.Render("compact failed: " + err.Error()))
+		}
 		return m, m.spin.Tick
 	case "/mcp":
 		return m.mcpCommand(fields)
@@ -308,84 +295,24 @@ func (m *model) command(text string) (tea.Model, tea.Cmd) {
 			}
 			window = n
 		}
-		if m.workerOnly {
-			if m.workerClient == nil && !m.ensureWorker() {
-				m.append(errStyle.Render("goal-from-context: worker unavailable: " + m.workerStartError))
-				return m, nil
-			}
-			m.busy = true
-			m.turnStart = m.nowFn()
-			m.append(dimStyle.Render(fmt.Sprintf("◎ formulating goal from the last %d messages…", window)))
-			requestID := workerRequestID("goal-from-context")
-			m.cancel = func() {
-				if m.workerClient != nil {
-					_ = m.workerClient.Send(workerwire.CommandCancel, requestID+"-cancel", nil)
-				}
-			}
-			if err := m.workerClient.Send(workerwire.CommandGoalFromContext, requestID, workerwire.GoalFromContextRequest{Window: window}); err != nil {
-				m.busy = false
-				m.cancel = nil
-				m.append(errStyle.Render("goal-from-context failed: " + err.Error()))
-			}
-			return m, m.spin.Tick
-		}
-		tail, err := agent.GoalFromContextMessages(m.agent.Messages, window)
-		if err != nil {
-			m.append(errStyle.Render(err.Error()))
+		if m.workerClient == nil && !m.ensureWorker() {
+			m.append(errStyle.Render("goal-from-context: worker unavailable: " + m.workerStartError))
 			return m, nil
 		}
-		// one non-streaming call on the CURRENT model (the compact-model
-		// override is deliberately ignored) distills the tail into a goal
 		m.busy = true
-		m.append(dimStyle.Render(fmt.Sprintf("◎ formulating goal from the last %d messages…", len(tail))))
-		p := m.prog
-		// ag may drift from m.agent if the user /model-switches mid-formulation:
-		// usage lands on the old agent, the goal submits on the new one. The
-		// call itself is safe (Complete touches no Agent state, AddUsage is
-		// mutex-protected) and the window is seconds — not worth a guard.
-		ag := m.agent
-		ctx, cancel := context.WithCancel(context.Background())
-		m.cancel = cancel
-		prompt := agent.BuildGoalFromContextPrompt(tail)
-		formulate := func() (string, error) {
-			reasoningEffort, reasoningEnabled := ag.ReasoningRequest()
-			message, usage, err := ag.CompleteWithRoute(ctx, ag.Backend, ag.Role, ag.Provider, ag.Protocol, models.Request{
-				Model:            ag.Model,
-				MaxTokens:        8192,
-				Messages:         []models.Message{{Role: "user", Content: prompt}},
-				ReasoningEffort:  reasoningEffort,
-				ReasoningEnabled: reasoningEnabled,
-			}, agent.Events{})
-			ag.AddUsage(usage) // the formulation call is session spend too
-			return message.TextContent(), err
+		m.turnStart = m.nowFn()
+		m.append(dimStyle.Render(fmt.Sprintf("◎ formulating goal from the last %d messages…", window)))
+		requestID := workerRequestID("goal-from-context")
+		m.cancel = func() {
+			if m.workerClient != nil {
+				_ = m.workerClient.Send(workerwire.CommandCancel, requestID+"-cancel", nil)
+			}
 		}
-		if p == nil {
-			// headless (tests): run inline on the caller's goroutine — with
-			// no program to pump messages the Update handler can't run, so
-			// apply the same notes/goal here; the goal loop itself never
-			// starts without a running program
-			goal, err := formulate()
+		if err := m.workerClient.Send(workerwire.CommandGoalFromContext, requestID, workerwire.GoalFromContextRequest{Window: window}); err != nil {
 			m.busy = false
 			m.cancel = nil
-			switch {
-			case err != nil && err != context.Canceled:
-				m.append(errStyle.Render("goal-from-context failed: " + err.Error()))
-			case err == nil && strings.TrimSpace(goal) == "":
-				m.append(errStyle.Render("goal-from-context: model returned an empty goal"))
-			case err == nil:
-				m.setGoal(strings.TrimSpace(goal))
-				m.append(dimStyle.Render("◎ goal set: " + m.goal))
-			}
-			return m, nil
+			m.append(errStyle.Render("goal-from-context failed: " + err.Error()))
 		}
-		go func() {
-			goal, err := formulate()
-			// the msg handler owns busy/cancel: on success it submits (busy
-			// belongs to the new turn), on failure it clears them directly —
-			// a turnDoneMsg{} here would either cancel-proof the fresh turn
-			// (success) or re-engage a paused goal's loop (failure)
-			p.Send(goalFromContextMsg{goal: goal, err: err})
-		}()
 		return m, m.spin.Tick
 	case "/plan":
 		return m.planCommand(text)
@@ -426,7 +353,7 @@ func (m *model) command(text string) (tea.Model, tea.Cmd) {
 				break
 			}
 			record, _ := m.goalRecordForSession()
-			return m.submitGoal(goal.ContinuePrompt(record.Objective))
+			return m.submitGoal(agent.ContinuePrompt(record.Objective))
 		default:
 			if !m.requireAgent() {
 				break
@@ -466,23 +393,22 @@ func (m *model) command(text string) (tea.Model, tea.Cmd) {
 		}
 		m.openPicker()
 	case "/context-doctor":
-		if m.workerOnly {
-			if m.workerClient == nil && !m.ensureWorker() {
-				m.append(errStyle.Render("context doctor: worker unavailable: " + m.workerStartError))
-				return m, nil
-			}
-			if err := m.workerClient.Send(workerwire.CommandContextDoctor, workerRequestID("doctor"), nil); err != nil {
-				m.append(errStyle.Render("context doctor failed: " + err.Error()))
-			}
+		if m.workerClient == nil && !m.ensureWorker() {
+			m.append(errStyle.Render("context doctor: worker unavailable: " + m.workerStartError))
 			return m, nil
 		}
-		m.append(m.doctorReport())
+		if err := m.workerClient.Send(workerwire.CommandContextDoctor, workerRequestID("doctor"), nil); err != nil {
+			m.append(errStyle.Render("context doctor failed: " + err.Error()))
+		}
+		return m, nil
 	case "/report":
 		m.append(m.reportBlock())
 	case "/help":
 		m.append(dimStyle.Render(helpText()))
 	case "/auth":
 		m.authCommand(fields[1:])
+	case "/ask":
+		return m.askCommand(text)
 	case "/model":
 		if len(fields) < 2 {
 			m.openModelPicker()
@@ -529,16 +455,156 @@ func (m *model) degradedProviderNote() string {
 // requireAgent keeps agent-dependent commands harmless during the cold TUI
 // state. The note is deliberately the same onboarding hint shown at startup.
 func (m *model) requireAgent() bool {
-	if m.workerOnly {
-		if m.modelName != "" && m.provName != "" {
-			return true
-		}
-		m.append(m.degradedProviderNote())
-		return false
-	}
-	if m.agent != nil {
+	if m.modelName != "" && m.provName != "" {
 		return true
 	}
 	m.append(m.degradedProviderNote())
 	return false
+}
+
+// lspCommand handles "/lsp" — requests status from the worker.
+func (m *model) lspCommand(fields []string) (tea.Model, tea.Cmd) {
+	if m.workerClient == nil && !m.ensureWorker() {
+		m.append(errStyle.Render("LSP status failed: worker unavailable: " + m.workerStartError))
+		return m, nil
+	}
+	if err := m.workerClient.Send(workerwire.CommandLSPStatus, workerRequestID("lsp"), nil); err != nil {
+		m.append(errStyle.Render("LSP status failed: " + err.Error()))
+	}
+	return m, nil
+}
+
+func (m *model) renderLSPStatuses(servers []lsp.Status) {
+	if len(servers) == 0 {
+		m.append(dimStyle.Render("no LSP servers"))
+		return
+	}
+	var b strings.Builder
+	b.WriteString("LSP servers:\n")
+	for _, s := range servers {
+		icon := "○"
+		detail := "idle — starts on first matching file"
+		switch s.State {
+		case "connected":
+			icon = "●"
+			detail = "connected"
+			if s.Root != "" {
+				detail += " (root: " + s.Root + ")"
+			}
+		case "failed":
+			icon = "✗"
+			detail = s.Err
+		}
+		line := fmt.Sprintf("  %s %-16s %s", icon, s.Name, detail)
+		switch s.State {
+		case "failed":
+			b.WriteString(errStyle.Render(line) + "\n")
+		case "not started":
+			b.WriteString(dimStyle.Render(line) + "\n")
+		default:
+			b.WriteString(line + "\n")
+		}
+	}
+	m.append(strings.TrimRight(b.String(), "\n"))
+}
+
+func workerLSPStatuses(statuses []workerwire.LSPStatus) []lsp.Status {
+	converted := make([]lsp.Status, len(statuses))
+	for i, status := range statuses {
+		converted[i] = lsp.Status{Name: status.Name, Root: status.Root, State: status.State, Err: status.Error}
+	}
+	return converted
+}
+
+// mcpCommand handles "/mcp [name] [reconnect|enable|disable]".
+func (m *model) mcpCommand(fields []string) (tea.Model, tea.Cmd) {
+	if m.workerClient == nil && !m.ensureWorker() {
+		m.append(errStyle.Render("MCP command failed: worker unavailable: " + m.workerStartError))
+		return m, nil
+	}
+	if len(fields) == 1 {
+		if err := m.workerClient.Send(workerwire.CommandMCPStatus, workerRequestID("mcp"), nil); err != nil {
+			m.append(errStyle.Render("MCP status failed: " + err.Error()))
+		}
+		return m, nil
+	}
+	name := fields[1]
+	action := workerwire.CommandMCPReconnect
+	if len(fields) > 2 {
+		switch fields[2] {
+		case "reconnect":
+			action = workerwire.CommandMCPReconnect
+		case "enable":
+			action = workerwire.CommandMCPEnable
+		case "disable":
+			action = workerwire.CommandMCPDisable
+		default:
+			m.append(errStyle.Render("usage: /mcp [name] [reconnect|enable|disable]"))
+			return m, nil
+		}
+	}
+	if err := m.workerClient.Send(action, workerRequestID("mcp"), workerwire.MCPRequest{Name: name}); err != nil {
+		m.append(errStyle.Render("MCP command failed: " + err.Error()))
+	}
+	return m, nil
+}
+
+func renderMCPStatuses(servers []mcp.Server) string {
+	if len(servers) == 0 {
+		return dimStyle.Render("no MCP servers")
+	}
+	var b strings.Builder
+	b.WriteString("MCP servers:\n")
+	for _, s := range servers {
+		icon := "◌"
+		detail := ""
+		switch s.Status {
+		case mcp.StatusReady:
+			icon = "●"
+			detail = fmt.Sprintf("%d tools", s.Tools)
+		case mcp.StatusFailed:
+			icon = "✗"
+			detail = s.Err
+			if s.Source != "" {
+				detail += " (" + s.Source + ")"
+			}
+		case mcp.StatusDisabled:
+			icon = "○"
+			detail = "disabled"
+			if s.Note != "" {
+				detail = "disabled — " + s.Note
+			}
+		case mcp.StatusConnecting:
+			icon = "◌"
+			detail = "connecting…"
+		}
+		line := fmt.Sprintf("  %s %-20s %s", icon, s.Name, detail)
+		switch s.Status {
+		case mcp.StatusReady:
+			b.WriteString(line + "\n")
+		case mcp.StatusFailed:
+			b.WriteString(errStyle.Render(line) + "\n")
+		default:
+			b.WriteString(dimStyle.Render(line) + "\n")
+		}
+	}
+	return strings.TrimRight(b.String(), "\n")
+}
+
+func renderWorkerMCPStatuses(statuses []workerwire.MCPStatus) string {
+	servers := make([]mcp.Server, len(statuses))
+	for i, status := range statuses {
+		servers[i] = mcp.Server{Name: status.Name, Note: status.Note, Err: status.Error, Tools: status.Tools, Source: status.Source}
+		switch status.State {
+		case "ready":
+			servers[i].Status = mcp.StatusReady
+		case "failed":
+			servers[i].Status = mcp.StatusFailed
+		case "disabled":
+			servers[i].Status = mcp.StatusDisabled
+		default:
+			servers[i].Status = mcp.StatusConnecting
+		}
+	}
+	return renderMCPStatuses(servers)
 }

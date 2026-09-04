@@ -3,20 +3,35 @@ package tui
 import (
 	"context"
 	"errors"
-	"fmt"
-	tea "github.com/charmbracelet/bubbletea"
-	"github.com/charmbracelet/lipgloss"
-	"github.com/charmbracelet/x/ansi"
-	"github.com/sacca97/ghg/internal/agent"
-	"github.com/sacca97/ghg/internal/config"
-	"github.com/sacca97/ghg/internal/models"
 	"io"
-	"net/http"
 	"os"
 	"strings"
 	"testing"
 	"time"
+
+	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
+	"github.com/sacca97/ghg/internal/models"
 )
+
+func TestInteractiveDoneUsesToolPreview(t *testing.T) {
+	m := &model{input: newInput()}
+	m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
+	m.iactive = &interactive{}
+	m.Update(interactiveDoneMsg{output: "summary\n```diff\n--- file\n+++ file\n-old\n+new\n```"})
+
+	if m.iactive != nil || len(m.blocks) != 1 {
+		t.Fatalf("interactive command should settle into one transcript block: active=%v blocks=%d", m.iactive != nil, len(m.blocks))
+	}
+	got := ansi.Strip(m.blocks[0].text)
+	if strings.Contains(got, "```diff") || strings.Contains(got, "--- file") || strings.Contains(got, "+++ file") {
+		t.Fatalf("interactive preview should use the shared diff preview: %q", got)
+	}
+	if !strings.Contains(got, "-old") || !strings.Contains(got, "+new") {
+		t.Fatalf("interactive preview should retain diff lines: %q", got)
+	}
+}
 
 // Same ctrl+j regression but with a populated transcript (the resume case):
 // the viewport has content, so layout computes a non-trivial height and the
@@ -24,7 +39,7 @@ import (
 func TestCtrlJFirstLineVisibleWithTranscript(t *testing.T) {
 	m := compactCmdModel()
 	m.queueSel = -1
-	m.agent.Messages = append(m.agent.Messages,
+	m.messages = append(m.messages,
 		models.Message{Role: "user", Content: "earlier question", Authored: true},
 		models.Message{Role: "assistant", Content: "earlier answer with several lines\nof content\nright here"},
 	)
@@ -98,10 +113,10 @@ func TestCtrlKClear(t *testing.T) {
 	m := compactCmdModel()
 	m.Update(mkWinSize(80, 30))
 	m.appendRaw(blockText, "hello world")
-	if got := len(m.agent.Messages); got != 1 {
-		t.Fatalf("expected just the system prompt, got %d messages", got)
+	if got := len(m.messages); got != 0 {
+		t.Fatalf("append should not create a conversation message, got %d", got)
 	}
-	m.agent.Messages = append(m.agent.Messages,
+	m.messages = append(m.messages,
 		models.Message{Role: "user", Content: "hi", Authored: true})
 
 	// a draft in the input box must survive — ctrl+k clears the CHAT
@@ -110,15 +125,20 @@ func TestCtrlKClear(t *testing.T) {
 	tm, _ := m.key(tea.KeyMsg{Type: tea.KeyCtrlK})
 	m = tm.(*model)
 
-	if got := len(m.agent.Messages); got != 1 {
+	if got := len(m.messages); got != 1 {
 		t.Fatalf("ctrl+k should reset messages to the system prompt, got %d", got)
 	}
-	// the old transcript blocks are gone; only the cleared notice remains
+	// the old transcript is gone and the cleared notice remains
 	if m.msgBlock != nil {
 		t.Fatal("ctrl+k should drop the pending message block")
 	}
-	if len(m.blocks) != 1 || !strings.Contains(ansi.Strip(m.blocks[0].render(m.width)), "(conversation cleared)") {
-		t.Fatalf("expected only the cleared notice block, got %d blocks", len(m.blocks))
+	for _, block := range m.blocks {
+		if strings.Contains(block.text, "hello world") {
+			t.Fatalf("cleared transcript still contains old content: %q", block.text)
+		}
+	}
+	if !strings.Contains(lastBlock(m), "(conversation cleared)") {
+		t.Fatalf("missing cleared notice, got %d blocks", len(m.blocks))
 	}
 	if m.sessionID != "" {
 		t.Fatalf("ctrl+k should detach the session, got %q", m.sessionID)
@@ -350,7 +370,6 @@ func wrapString(width int) string {
 func busyQueueModel(queue ...string) *model {
 	m := &model{
 		input:    newInput(),
-		agent:    &agent.Agent{},
 		busy:     true,
 		queue:    queue,
 		queueSel: -1,
@@ -464,7 +483,7 @@ func TestBusyCmdAllowList(t *testing.T) {
 	runs := []string{
 		"/help", "/effort", "/effort high",
 		"/tasks", "/tasks abc123", "/goal", "/goal clear", "/goal rounds 5",
-		"/cd", "/cd /tmp", "/pwd",
+		"/cd", "/cd /tmp", "/pwd", "/ask what is this?",
 	}
 	for _, c := range runs {
 		if !busyCmd(c) {
@@ -485,16 +504,17 @@ func TestBusyCmdAllowList(t *testing.T) {
 
 func TestEnterWhileBusyRunsSettingsCommand(t *testing.T) {
 	t.Setenv("HOME", t.TempDir()) // keep cfg.Save() away from the real config
-	m := busyQueueModel()
-	m.cfg = &config.Config{}
+	m := compactCmdModel()
+	m.busy = true
+	_, m.cancel = context.WithCancel(context.Background())
 	m.input.SetValue("/effort high")
 	m = press(t, m, tea.KeyMsg{Type: tea.KeyEnter})
 
 	if len(m.queue) != 0 {
 		t.Fatalf("/effort should run now, not queue: %v", m.queue)
 	}
-	if m.agent.Effort != "high" {
-		t.Fatalf("effort should have changed to high, got %q", m.agent.Effort)
+	if m.effort != "high" {
+		t.Fatalf("effort should have changed to high, got %q", m.effort)
 	}
 	for _, b := range m.blocks {
 		if strings.Contains(b.text, "⚡ effort:") {
@@ -533,11 +553,11 @@ func TestEnterWhileBusyQueuesGoalSubmits(t *testing.T) {
 
 func TestEnterWhileBusyRunsGoalSettings(t *testing.T) {
 	m := busyQueueModel()
-	m.goal = "old goal"
+	m.setGoal("old goal")
 	m.input.SetValue("/goal clear")
 	m = press(t, m, tea.KeyMsg{Type: tea.KeyEnter})
-	if m.goal != "" {
-		t.Fatalf("/goal clear should run now, goal=%q", m.goal)
+	if m.currentGoal() != "" {
+		t.Fatalf("/goal clear should run now, goal=%q", m.currentGoal())
 	}
 	if len(m.queue) != 0 {
 		t.Fatalf("/goal clear should not queue: %v", m.queue)
@@ -545,7 +565,7 @@ func TestEnterWhileBusyRunsGoalSettings(t *testing.T) {
 }
 
 func TestEscInterruptsMidResponse(t *testing.T) {
-	m := &model{input: newInput(), agent: &agent.Agent{}, busy: true}
+	m := &model{input: newInput(), busy: true}
 	m.width = 80
 	m.input.SetWidth(78)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -559,7 +579,7 @@ func TestEscInterruptsMidResponse(t *testing.T) {
 }
 
 func TestEscDoesNotInterruptWhenIdle(t *testing.T) {
-	m := &model{input: newInput(), agent: &agent.Agent{}, busy: false}
+	m := &model{input: newInput(), busy: false}
 	m.width = 80
 	m.input.SetWidth(78)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -572,130 +592,15 @@ func TestEscDoesNotInterruptWhenIdle(t *testing.T) {
 	}
 }
 
-// stubLLM answers chat completions with an immediate empty SSE stream so a
-// drained queue can submit without touching the network.
-func stubLLM() models.Backend {
-	backend, err := models.NewBackend(models.Resolved{
-		BaseURL:  "http://stub",
-		Protocol: models.ProtocolOpenAIChatCompletions,
-	}, models.BackendOptions{
-		HTTP: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
-			return &http.Response{
-				StatusCode: http.StatusOK,
-				Header:     http.Header{"Content-Type": {"text/event-stream"}},
-				Body:       io.NopCloser(strings.NewReader("data: [DONE]\n\n")),
-			}, nil
-		})},
-	})
-	if err != nil {
-		panic(err)
-	}
-	return backend
-}
-
-type roundTripFunc func(*http.Request) (*http.Response, error)
-
-func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
-
 // TestEmptyEnterSteerDrainsQueue proves the reported regression end to end:
 // queue a message while busy, empty-enter to steer (cancels the turn), then
 // the turn ends with the wrapped cancellation error an http client actually
 // returns ("Post ...: context canceled"). The queue must still drain — the
 // queued message submits as the next turn.
-func TestEmptyEnterSteerDrainsQueue(t *testing.T) {
-	m := busyQueueModel()
-	m.agent.Backend = stubLLM()
-	m.agent.Messages = []models.Message{{Role: "system", Content: "sys"}}
-
-	// first enter while busy: the typed message queues
-	m.input.SetValue("thanks we're all done")
-	m = press(t, m, tea.KeyMsg{Type: tea.KeyEnter})
-	if len(m.queue) != 1 || m.queue[0] != "thanks we're all done" {
-		t.Fatalf("typed text should queue while busy: %v", m.queue)
-	}
-
-	// second enter on the empty input: force-steer cancels the in-flight turn
-	m = press(t, m, tea.KeyMsg{Type: tea.KeyEnter})
-
-	// the canceled http request reports a *url.Error wrapping context.Canceled,
-	// not the sentinel itself
-	wrapped := fmt.Errorf("Post %q: %w", "https://api.example/v1/chat/completions", context.Canceled)
-	tm, _ := m.Update(turnDoneMsg{err: wrapped})
-	m = tm.(*model)
-
-	if len(m.queue) != 0 {
-		t.Fatalf("the canceled turn should drain the queue, still queued: %v", m.queue)
-	}
-	if !m.busy {
-		t.Fatal("the queued message should have submitted as the next turn (busy)")
-	}
-	if !hasUserMsg(t, m, "thanks we're all done") {
-		t.Fatalf("the queued message should be submitted to the model, got %+v", m.agent.Messages)
-	}
-}
-
-// hasUserMsg reports whether the conversation holds the given user message.
-// submitTurn appends it from a goroutine, so read via the agent's published
-// snapshot (never the live slice) and poll briefly rather than assert on the
-// first read.
-func hasUserMsg(t *testing.T, m *model, content string) bool {
-	t.Helper()
-	for range 100 {
-		for _, msg := range m.agent.MessagesSnapshot() {
-			if msg.Role == "user" && msg.Content == content {
-				return true
-			}
-		}
-		time.Sleep(time.Millisecond)
-	}
-	return false
-}
-
-// TestEmptyEnterSteerDrainsQueueOnSentinel covers the unwrapped sentinel too
-// (agent.go's post-tool `return ctx.Err()` path).
-func TestEmptyEnterSteerDrainsQueueOnSentinel(t *testing.T) {
-	m := busyQueueModel()
-	m.agent.Backend = stubLLM()
-	m.agent.Messages = []models.Message{{Role: "system", Content: "sys"}}
-	m.queue = []string{"follow up"}
-
-	tm, _ := m.Update(turnDoneMsg{err: context.Canceled})
-	m = tm.(*model)
-
-	if len(m.queue) != 0 {
-		t.Fatalf("the canceled turn should drain the queue, still queued: %v", m.queue)
-	}
-	if !m.busy {
-		t.Fatal("the queued message should have submitted as the next turn (busy)")
-	}
-}
-
-// TestEmptyEnterIdleDrainsStuckQueue is the recovery path for the stuck state
-// the bug left sessions in: idle with a stranded queue, empty enter does
-// nothing. It must submit the head of the queue.
-func TestEmptyEnterIdleDrainsStuckQueue(t *testing.T) {
-	m := busyQueueModel("stranded")
-	m.busy = false // idle — the turn already ended without draining
-	m.agent.Backend = stubLLM()
-	m.agent.Messages = []models.Message{{Role: "system", Content: "sys"}}
-
-	m = press(t, m, tea.KeyMsg{Type: tea.KeyEnter})
-
-	if len(m.queue) != 0 {
-		t.Fatalf("empty enter while idle should drain the stuck queue: %v", m.queue)
-	}
-	if !m.busy {
-		t.Fatal("the stranded message should have submitted (busy)")
-	}
-	if !hasUserMsg(t, m, "stranded") {
-		t.Fatalf("the stranded message should be submitted, got %+v", m.agent.Messages)
-	}
-}
-
 func TestQueueViewShowsSelection(t *testing.T) {
 	m := busyQueueModel("first", "second")
 	m.queueSel = 1
-	m.agent.Model = "m"
+	m.modelName = "m"
 	m.provName = "p"
 	view := m.View()
 	if !strings.Contains(view, "del to remove") {
@@ -735,7 +640,6 @@ func TestQueueRendersOneLineEach(t *testing.T) {
 func idleModel() *model {
 	m := &model{
 		input: newInput(),
-		agent: &agent.Agent{},
 	}
 	m.width = 80
 	m.input.SetWidth(m.width - 2)
