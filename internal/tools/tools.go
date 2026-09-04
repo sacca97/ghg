@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"github.com/sacca97/ghg/internal/models"
+	"github.com/sacca97/ghg/internal/tools/bashrun"
 )
 
 // Tool is a named executable tool with a JSON schema.
@@ -31,7 +32,69 @@ func resultTool(def models.Tool, run func(context.Context, json.RawMessage) (Too
 
 // All returns the built-in tool set.
 func All() []Tool {
-	return []Tool{bashTool(), readTool(), writeTool(), editTool(), grepTool(), globTool(), findFilesTool(), lspTool(), lspRenameTool()}
+	return []Tool{bashTool(), readTool(), writeTool(), editTool(), grepTool(), structuralSearchTool(), globTool(), findFilesTool(), lspTool(), lspRenameTool()}
+}
+
+// CapabilityReporter lets an optional runtime service report deterministic
+// preflight failures without making the tools package depend on its concrete
+// implementation.
+type CapabilityReporter interface {
+	CapabilityStatus() (bool, []string)
+}
+
+// FilterAvailable removes tools whose deterministic runtime prerequisites are
+// known to be missing before a model request is built. A nil runtime keeps
+// lightweight/unit callers compatible; configured production agents always
+// attach a runtime before their first turn.
+func FilterAvailable(ts []Tool, runtime *ToolRuntime) ([]Tool, []string) {
+	if runtime == nil {
+		return ts, nil
+	}
+
+	needBash := false
+	needLSP := false
+	for _, tool := range ts {
+		switch tool.Def.Function.Name {
+		case "bash":
+			needBash = true
+		case "lsp", "lsp_rename":
+			needLSP = true
+		}
+	}
+
+	missing := make(map[string]string)
+	var notices []string
+	if needBash && !bashrun.Available() {
+		missing["bash"] = "bash unavailable: the selected shell is not on PATH"
+	}
+	if needLSP {
+		lspAvailable := runtime.LanguageService != nil
+		lspNotices := []string(nil)
+		if reporter, ok := runtime.LanguageService.(CapabilityReporter); ok {
+			lspAvailable, lspNotices = reporter.CapabilityStatus()
+		}
+		if len(lspNotices) > 0 {
+			notices = append(notices, lspNotices...)
+		}
+		if !lspAvailable {
+			missing["lsp"] = "lsp unavailable: no configured language server is runnable"
+			missing["lsp_rename"] = missing["lsp"]
+			if len(lspNotices) == 0 {
+				notices = append(notices, missing["lsp"])
+			}
+		}
+	}
+	if len(missing) == 0 {
+		return ts, notices
+	}
+	out := make([]Tool, 0, len(ts)-len(missing))
+	for _, tool := range ts {
+		if _, unavailable := missing[tool.Def.Function.Name]; unavailable {
+			continue
+		}
+		out = append(out, tool)
+	}
+	return out, notices
 }
 
 // Defs returns the models.Tool definitions for a tool set.
