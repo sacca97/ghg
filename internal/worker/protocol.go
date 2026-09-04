@@ -31,6 +31,7 @@ const (
 
 const (
 	EventPlanDelta = "plan_delta"
+	EventShellDone = "shell_done"
 )
 
 const (
@@ -52,6 +53,7 @@ const (
 	CommandCompactRetry    = "compact_retry"
 	CommandGoal            = "goal"
 	CommandGoalFromContext = "goal_from_context"
+	CommandShell           = "shell"
 	// CommandChdir retargets the worker process at the TUI's new working
 	// directory: the worker owns the tools and sandbox, so a TUI-side chdir
 	// alone would leave it reading and editing the original workspace.
@@ -60,6 +62,8 @@ const (
 	// worker-owned conversation (or steers the running turn) — the `!` shell
 	// escape output has to reach the model that actually answers next.
 	CommandAppend = "append"
+	CommandFork   = "fork"
+	CommandRename = "rename"
 )
 
 var (
@@ -256,7 +260,7 @@ func knownCommand(name string) bool {
 		CommandStop, CommandPing, CommandLSPStatus, CommandMCPStatus,
 		CommandMCPReconnect, CommandMCPEnable, CommandMCPDisable, CommandContextDoctor, CommandRewind,
 		CommandCompactRetry, CommandGoal, CommandGoalFromContext,
-		CommandChdir, CommandAppend:
+		CommandChdir, CommandAppend, CommandShell, CommandFork, CommandRename:
 		return true
 	default:
 		return false
