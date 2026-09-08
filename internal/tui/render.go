@@ -580,7 +580,10 @@ func mdRenderer(width int) *glamour.TermRenderer {
 		return nil
 	}
 	if len(mdRenderers) >= 8 {
-		clear(mdRenderers)
+		for cachedWidth := range mdRenderers {
+			delete(mdRenderers, cachedWidth)
+			break
+		}
 	}
 	mdRenderers[width] = r
 	return r

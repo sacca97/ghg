@@ -54,14 +54,6 @@ func NewOutputStoreWithLimit(root string, maxBytes int64) (*OutputStore, error) 
 	return &OutputStore{root: abs, maxSize: maxBytes}, nil
 }
 
-func NewTempOutputStore(limits ...int64) (*OutputStore, error) {
-	limit := DefaultMaxBytes
-	if len(limits) > 0 {
-		limit = limits[0]
-	}
-	return NewTempOutputStoreWithLimit(limit)
-}
-
 func NewTempOutputStoreWithLimit(maxBytes int64) (*OutputStore, error) {
 	root, err := os.MkdirTemp("/tmp", "ghg-outputs-")
 	if err != nil {
@@ -91,9 +83,6 @@ func (s *OutputStore) Put(ctx context.Context, data []byte, originalBytes int64,
 		return models.OutputRef{}, err
 	}
 	if originalBytes < int64(len(data)) {
-		originalBytes = int64(len(data))
-	}
-	if originalBytes <= 0 {
 		originalBytes = int64(len(data))
 	}
 	if int64(len(data)) > s.maxSize {
@@ -284,6 +273,9 @@ func (s *OutputStore) GarbageCollect(ctx context.Context, referenced map[string]
 		}
 		total -= candidate.size
 		removed++
+		// ponytail: shard directories are cosmetic; Remove is a no-op while a
+		// referenced or not-yet-collected payload still occupies the shard.
+		_ = os.Remove(filepath.Dir(candidate.path))
 	}
 	return removed, nil
 }

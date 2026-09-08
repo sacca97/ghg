@@ -250,45 +250,6 @@ func (m *model) scheduleList() {
 	m.append(b.String())
 }
 
-// compactCommand handles "/compact <args…>": off restores the built-in
-// default compaction model, "<model> [provider]" selects one (persisted).
-func (m *model) compactCommand(args []string) {
-	if len(args) == 0 {
-		return
-	}
-	if !m.requireAgent() {
-		return
-	}
-	compactModel, compactProv, _, err := m.parseCompactTarget(args)
-	if err != nil {
-		m.append(errStyle.Render(err.Error()))
-		return
-	}
-	m.compactModel, m.compactProv = compactModel, compactProv
-	m.cfg.CompactModel, m.cfg.CompactProvider = m.compactModel, m.compactProv
-	_ = m.saveConfig()
-	if m.workerClient != nil {
-		_ = m.workerClient.Send(workerwire.CommandConfigure, workerRequestID("configure"), workerwire.ConfigureRequest{
-			Model: m.modelName, Provider: m.provName, Role: m.currentRole(),
-			Effort: m.currentEffort(), UpdateEffort: false, Mode: m.uiMode(),
-			CompactModel: m.compactModel, CompactProvider: m.compactProv, UpdateCompact: true,
-		})
-	}
-}
-
-func (m *model) parseCompactTarget(args []string) (model, provider string, off bool, err error) {
-	if args[0] == "off" {
-		return "", "", true, nil
-	}
-	if _, ok := m.cfg.Models[args[0]]; !ok {
-		return "", "", false, fmt.Errorf("unknown model %s", args[0])
-	}
-	if len(args) > 1 {
-		provider = args[1]
-	}
-	return args[0], provider, false, nil
-}
-
 // compactPct returns the live threshold percent (the default when unset).
 // cfg.CompactPct is the authoritative value; the agent's float is derived.
 func (m *model) compactPct() int {
@@ -399,7 +360,11 @@ func (m *model) exportRecord(kind string) (session.WorkflowResultRecord, bool, e
 		if len(msgs) == 0 {
 			return session.WorkflowResultRecord{}, false, nil
 		}
-		rawPayload, _ := json.Marshal(msgs)
+		var payload any = msgs
+		if len(m.reviewProgressHistory) > 0 {
+			payload = export.ChatPayload{Messages: msgs, ReviewProgress: slices.Clone(m.reviewProgressHistory)}
+		}
+		rawPayload, _ := json.Marshal(payload)
 		return newExportRecord("chat", m.sessionID, "chat", 1, string(rawPayload)), true, nil
 	}
 	if kind == "message" {

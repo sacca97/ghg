@@ -10,18 +10,43 @@ import (
 	"github.com/sacca97/ghg/internal/models"
 )
 
-// Fork copies stored rows through uptoSeq into a new session.
-func (s *Store) Fork(srcID string, uptoSeq int, title string) (string, error) {
+// Fork copies stored rows through a prompt-view cutoff into a new session.
+// before is the complete source prompt view; compacted sessions need it to
+// translate the view cutoff to raw-log coordinates.
+func (s *Store) Fork(srcID string, uptoSeq int, title string, before []models.Message) (string, error) {
+	viewCutoff := uptoSeq
+	rawCutoff := uptoSeq
+	events, err := s.latestCompaction(srcID)
+	if err != nil {
+		return "", err
+	}
+	if viewCutoff > 0 && len(events) > 0 {
+		rawCutoff, err = s.translatedRawCutoff(srcID, viewCutoff, before, events)
+		if err != nil {
+			return "", err
+		}
+	}
 	newID := NewSessionID()
 	tx, err := s.db.Begin()
 	if err != nil {
 		return "", err
 	}
 	defer func() { _ = tx.Rollback() }()
-	if _, err := tx.Exec(`INSERT INTO sessions (id, created_at, updated_at, cwd, model, provider, title, goal, forked_from, fork_seq, effort)
-		SELECT ?, ?, ?, cwd, model, provider, ?, goal, ?, ?, effort FROM sessions WHERE id=?`,
-		newID, now(), now(), title, srcID, uptoSeq, srcID); err != nil {
+	result, err := tx.Exec(`INSERT INTO sessions
+		(id, created_at, updated_at, cwd, model, provider, title, goal, forked_from,
+		 fork_seq, tags, pinned, effort, usage_in, usage_cached, usage_out, todos)
+		SELECT ?, ?, ?, cwd, model, provider, ?, goal, ?, ?, tags, pinned, effort,
+		 usage_in, usage_cached, usage_out, todos FROM sessions WHERE id=?`,
+		newID, now(), now(), title, srcID, viewCutoff, srcID)
+	if err != nil {
 		return "", err
+	}
+	inserted, err := result.RowsAffected()
+	if err != nil {
+		return "", err
+	}
+	if inserted != 1 {
+		return "", fmt.Errorf("source session %q does not exist", srcID)
 	}
 	if _, err := tx.Exec(`INSERT INTO goals
 		(session_id, goal_id, objective, status, rounds, usage_in, usage_cached,
@@ -39,18 +64,18 @@ func (s *Store) Fork(srcID string, uptoSeq int, title string) (string, error) {
 		FROM goal_checkpoints WHERE session_id=?`, newID, srcID); err != nil {
 		return "", err
 	}
-	if uptoSeq > 0 {
+	if viewCutoff > 0 {
 		if _, err := tx.Exec(`INSERT INTO messages (session_id, seq, role, content)
 			SELECT ?, seq, role, content FROM messages WHERE session_id=? AND seq <= ?`,
-			newID, srcID, uptoSeq); err != nil {
+			newID, srcID, rawCutoff); err != nil {
 			return "", err
 		}
 		if _, err := tx.Exec(`INSERT INTO history_fts (session_id, seq, role, content)
 			SELECT ?, seq, role, content FROM history_fts WHERE session_id=? AND seq <= ?`,
-			newID, srcID, uptoSeq); err != nil {
+			newID, srcID, rawCutoff); err != nil {
 			return "", err
 		}
-		outputIDs, err := outputIDsInMessages(tx, srcID, uptoSeq)
+		outputIDs, err := outputIDsInMessages(tx, srcID, rawCutoff)
 		if err != nil {
 			return "", err
 		}
@@ -60,7 +85,7 @@ func (s *Store) Fork(srcID string, uptoSeq int, title string) (string, error) {
 			SELECT ?, message_seq, id, tool_call_id, tool_name, media_type,
 			 original_bytes, stored_bytes, hash, path, complete, metadata, created_at
 			FROM artifacts WHERE session_id=? AND (message_seq <= ?`
-		args := []any{newID, srcID, uptoSeq}
+		args := []any{newID, srcID, rawCutoff}
 		if len(outputIDs) > 0 {
 			placeholders := make([]string, len(outputIDs))
 			for i, id := range outputIDs {
@@ -75,13 +100,13 @@ func (s *Store) Fork(srcID string, uptoSeq int, title string) (string, error) {
 		}
 		if _, err := tx.Exec(`INSERT INTO compactions (session_id, seq, cutoff, summary, created_at)
 			SELECT ?, seq, cutoff, summary, created_at FROM compactions
-			WHERE session_id=? AND cutoff<=?`, newID, srcID, uptoSeq); err != nil {
+			WHERE session_id=? AND cutoff<=?`, newID, srcID, rawCutoff); err != nil {
 			return "", err
 		}
 		if _, err := tx.Exec(`INSERT INTO workflow_results
 			(session_id, result_id, kind, version, payload, role, provider, model, message_seq, created_at)
 			SELECT ?, result_id, kind, version, payload, role, provider, model, message_seq, created_at
-			FROM workflow_results WHERE session_id=? AND message_seq<=?`, newID, srcID, uptoSeq); err != nil {
+			FROM workflow_results WHERE session_id=? AND message_seq<=?`, newID, srcID, viewCutoff); err != nil {
 			return "", err
 		}
 	}
@@ -111,15 +136,6 @@ func outputIDsInMessages(tx *sql.Tx, sessionID string, uptoSeq int) ([]string, e
 		}
 	}
 	return ids, rows.Err()
-}
-
-func (s *Store) ForksOf(id string) ([]Meta, error) {
-	rows, err := s.db.Query(`SELECT `+sessionMetaColumns+`
-		FROM sessions WHERE forked_from=? ORDER BY updated_at DESC`, id)
-	if err != nil {
-		return nil, err
-	}
-	return scanMetas(rows)
 }
 
 // ForkTitle derives the next non-nested fork title.

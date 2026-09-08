@@ -13,6 +13,7 @@ import (
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
 	"github.com/sacca97/ghg/internal/models"
+	workerwire "github.com/sacca97/ghg/internal/worker"
 )
 
 func TestInteractiveDoneUsesToolPreview(t *testing.T) {
@@ -30,6 +31,19 @@ func TestInteractiveDoneUsesToolPreview(t *testing.T) {
 	}
 	if !strings.Contains(got, "-old") || !strings.Contains(got, "+new") {
 		t.Fatalf("interactive preview should retain diff lines: %q", got)
+	}
+}
+
+func TestAttachedToolRowClosesOnCompletion(t *testing.T) {
+	m := compactCmdModel()
+	m.busy = true
+	m.applyWorkerSnapshot(workerwire.Snapshot{State: workerwire.StateRunning, ActiveTool: "read"})
+	if len(m.blocks) == 0 || !m.blocks[len(m.blocks)-1].toolRunning {
+		t.Fatal("expected an attached running tool row")
+	}
+	m.Update(toolEndMsg{id: "real-tool-id", name: "read"})
+	if m.blocks[len(m.blocks)-1].toolRunning {
+		t.Fatal("attached tool row stayed running after its completion")
 	}
 }
 
@@ -152,7 +166,7 @@ func TestCtrlKClear(t *testing.T) {
 }
 
 // TestMain is a safety net: several TUI code paths persist through
-// config.Save() (setEffort, switchModel, compactCommand). Without
+// config.Save() (setEffort, switchModel). Without
 // isolation those writes land in the REAL ~/.ghg/config.json — this exact
 // bug corrupted the config twice. Point the whole test binary at a scratch
 // GHG_HOME so even a future test that forgets t.Setenv cannot clobber the

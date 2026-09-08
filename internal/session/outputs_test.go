@@ -62,7 +62,7 @@ func TestOutputMetadataRoundTripForkAndRewind(t *testing.T) {
 		t.Fatalf("loaded output message = %+v", loaded)
 	}
 
-	forkID, err := st.Fork(id, 2, "fork")
+	forkID, err := st.Fork(id, 2, "fork", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -105,6 +105,37 @@ func TestListOutputsIsBoundedAndSessionScoped(t *testing.T) {
 	}
 	if _, err := st.LookupOutput(context.Background(), first, "sha256:"+strings.Repeat("b", 64)); err == nil {
 		t.Fatal("lookup must not cross sessions")
+	}
+}
+
+func TestListOutputsEscapesLikeWildcards(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "s.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	id, err := st.Create("/tmp", "m", "p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	msgs := make([]models.Message, 0, 2)
+	for i, metadata := range []string{"literal%marker", "literalXmarker"} {
+		ref := models.OutputRef{
+			ID:   "sha256:" + strings.Repeat(string(rune('a'+i)), 64),
+			Hash: strings.Repeat(string(rune('a'+i)), 64), Metadata: map[string]string{"label": metadata},
+			OriginalBytes: 1, StoredBytes: 1, Complete: true,
+		}
+		msgs = append(msgs, models.Message{Role: "tool", Content: "x", ToolCallID: string(rune('a' + i)), Output: &ref})
+	}
+	if err := st.Save(id, 0, msgs, "m", "p"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.ListOutputs(context.Background(), id, OutputFilter{Query: "%"}, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Metadata["label"] != "literal%marker" {
+		t.Fatalf("wildcard query matched %+v", got)
 	}
 }
 
@@ -168,7 +199,19 @@ func TestCompactionViewWithoutSystemAppendsToRawTail(t *testing.T) {
 		t.Fatalf("view after raw-tail append = %+v", view)
 	}
 
-	forkID, err := st.Fork(id, 8, "fork")
+	partialID, err := st.Fork(id, 5, "partial", agentView)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, partialView, err := st.Load(partialID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(partialView) != 5 || partialView[4].Content != "q4" {
+		t.Fatalf("compacted partial fork = %+v, want q4 as its last message", partialView)
+	}
+
+	forkID, err := st.Fork(id, 8, "fork", agentView)
 	if err != nil {
 		t.Fatal(err)
 	}

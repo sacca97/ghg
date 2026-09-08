@@ -87,17 +87,6 @@ func ValidGoalStatus(s GoalStatus) bool {
 	}
 }
 
-func (s GoalStatus) Terminal() bool { return s == GoalStatusComplete }
-
-func (s GoalStatus) Resumable() bool {
-	switch s {
-	case GoalStatusPaused, GoalStatusBlocked, GoalStatusUsageLimited, GoalStatusBudgetLimited:
-		return true
-	default:
-		return false
-	}
-}
-
 // GoalCheckpoint is one append-only snapshot of a goal's lifecycle and
 // accounting. The current state is available through LoadGoal; checkpoints
 // make progress and blockers inspectable after resume or a process failure.
@@ -118,12 +107,13 @@ type GoalCheckpoint struct {
 // old sessions.goal column remains a compatibility mirror; new code reads the
 // structured ledger first.
 func migrateLegacyGoals(db *sql.DB) error {
+	stamp := formatGoalTime(time.Now())
 	_, err := db.Exec(`INSERT OR IGNORE INTO goals
 		(session_id, goal_id, objective, status, rounds, usage_in, usage_cached,
 		 usage_out, progress, blocker, created_at, updated_at)
 		SELECT id, 'legacy-' || id, TRIM(goal), ?, 0, 0, 0, 0, '', '',
-		CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
-		FROM sessions WHERE TRIM(goal) <> ''`, GoalStatusActive)
+		?, ?
+		FROM sessions WHERE TRIM(goal) <> ''`, GoalStatusActive, stamp, stamp)
 	if err != nil {
 		return fmt.Errorf("migrate legacy goals: %w", err)
 	}
@@ -134,34 +124,54 @@ func migrateLegacyGoals(db *sql.DB) error {
 // goal is not an error; callers use the boolean to distinguish a fresh
 // session from a database failure.
 func (s *Store) LoadGoal(sessionID string) (GoalRecord, bool, error) {
-	var record GoalRecord
-	var status, created, updated string
-	err := s.db.QueryRowContext(context.Background(), `SELECT goal_id, objective,
+	rows, err := s.db.QueryContext(context.Background(), `SELECT goal_id, objective,
 		status, rounds, usage_in, usage_cached, usage_out, progress, blocker,
-		created_at, updated_at FROM goals WHERE session_id=?
-		ORDER BY updated_at DESC, created_at DESC, goal_id DESC LIMIT 1`, sessionID).
-		Scan(&record.ID, &record.Objective, &status, &record.Rounds,
+		created_at, updated_at FROM goals WHERE session_id=?`, sessionID)
+	if err != nil {
+		return GoalRecord{}, false, fmt.Errorf("load goal %s: %w", sessionID, err)
+	}
+	defer func() { _ = rows.Close() }()
+	var best GoalRecord
+	found := false
+	for rows.Next() {
+		var record GoalRecord
+		var status, created, updated string
+		if err := rows.Scan(&record.ID, &record.Objective, &status, &record.Rounds,
 			&record.PromptTokens, &record.CachedTokens, &record.CompletionTokens,
-			&record.Progress, &record.Blocker, &created, &updated)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return GoalRecord{}, false, nil
+			&record.Progress, &record.Blocker, &created, &updated); err != nil {
+			return GoalRecord{}, false, fmt.Errorf("load goal %s: %w", sessionID, err)
 		}
+		record.Status = GoalStatus(status)
+		record.CreatedAt, err = parseGoalTime(created)
+		if err != nil {
+			return GoalRecord{}, false, fmt.Errorf("load goal %s created_at: %w", sessionID, err)
+		}
+		record.UpdatedAt, err = parseGoalTime(updated)
+		if err != nil {
+			return GoalRecord{}, false, fmt.Errorf("load goal %s updated_at: %w", sessionID, err)
+		}
+		if err := record.Validate(); err != nil {
+			return GoalRecord{}, false, fmt.Errorf("load goal %s: %w", sessionID, err)
+		}
+		if !found || newerGoal(record, best) {
+			best = record
+			found = true
+		}
+	}
+	if err := rows.Err(); err != nil {
 		return GoalRecord{}, false, fmt.Errorf("load goal %s: %w", sessionID, err)
 	}
-	record.Status = GoalStatus(status)
-	record.CreatedAt, err = parseGoalTime(created)
-	if err != nil {
-		return GoalRecord{}, false, fmt.Errorf("load goal %s created_at: %w", sessionID, err)
+	return best, found, nil
+}
+
+func newerGoal(candidate, current GoalRecord) bool {
+	if !candidate.UpdatedAt.Equal(current.UpdatedAt) {
+		return candidate.UpdatedAt.After(current.UpdatedAt)
 	}
-	record.UpdatedAt, err = parseGoalTime(updated)
-	if err != nil {
-		return GoalRecord{}, false, fmt.Errorf("load goal %s updated_at: %w", sessionID, err)
+	if !candidate.CreatedAt.Equal(current.CreatedAt) {
+		return candidate.CreatedAt.After(current.CreatedAt)
 	}
-	if err := record.Validate(); err != nil {
-		return GoalRecord{}, false, fmt.Errorf("load goal %s: %w", sessionID, err)
-	}
-	return record, true, nil
+	return candidate.ID > current.ID
 }
 
 // SaveGoal writes the current goal state without adding a checkpoint. It is

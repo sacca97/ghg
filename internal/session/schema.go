@@ -56,9 +56,10 @@ CREATE TABLE IF NOT EXISTS tasks (
 	PRIMARY KEY (session_id, task_id)
 );
 -- Workspace snapshots: one git stash ref per turn (keyed by the conversation
--- index the turn started at), so a conversation rewind can also restore the
--- files that turn changed. Same seq semantics as messages, so DeleteFrom
--- trims both together.
+-- view index the turn started at), so a conversation rewind can also restore
+-- tracked files that turn changed. Untracked files are outside the snapshot
+-- contract. Unlike messages, this index is not raw-log sequence after
+-- compaction; DeleteFrom trims it in view coordinates.
 CREATE TABLE IF NOT EXISTS snapshots (
 	session_id TEXT NOT NULL REFERENCES sessions(id),
 	seq        INTEGER NOT NULL,
@@ -175,11 +176,10 @@ CREATE TABLE IF NOT EXISTS workflow_results (
 CREATE INDEX IF NOT EXISTS workflow_results_session_kind ON workflow_results(session_id, kind, created_at DESC);
 `
 
-// extraColumns are added idempotently after the base schema: SQLite's
-// ADD COLUMN errors if the column already exists, so each is guarded by an
-// information check in migrate(). New per-session bookkeeping lands here, not
-// in the CREATE above (which only runs on a fresh DB).
-var extraColumns = []struct{ name, def string }{
+// sessionColumns are added idempotently for databases created before the
+// current schema. Fresh databases already have these columns in schema.
+var sessionColumns = []struct{ name, def string }{
+	{"goal", "goal TEXT NOT NULL DEFAULT ''"},
 	{"forked_from", "forked_from TEXT NOT NULL DEFAULT ''"},     // source session id
 	{"fork_seq", "fork_seq INTEGER NOT NULL DEFAULT 0"},         // branch point in the source
 	{"tags", "tags TEXT NOT NULL DEFAULT ''"},                   // comma-separated labels
@@ -191,20 +191,57 @@ var extraColumns = []struct{ name, def string }{
 	{"todos", "todos TEXT NOT NULL DEFAULT ''"},                 // todowrite plan JSON ([]agent.Todo)
 }
 
+var artifactColumns = []struct{ name, def string }{
+	{"metadata", "metadata TEXT NOT NULL DEFAULT ''"},
+}
+
+func addMissingColumns(db *sql.DB, table string, columns []struct{ name, def string }) error {
+	rows, err := db.Query(`PRAGMA table_info(` + table + `)`)
+	if err != nil {
+		return fmt.Errorf("read %s columns: %w", table, err)
+	}
+
+	existing := make(map[string]struct{})
+	for rows.Next() {
+		var (
+			cid, notnull, pk int
+			name, columnType string
+			defaultValue     sql.NullString
+		)
+		if err := rows.Scan(&cid, &name, &columnType, &notnull, &defaultValue, &pk); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("read %s columns: %w", table, err)
+		}
+		existing[name] = struct{}{}
+	}
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("read %s columns: %w", table, err)
+	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("read %s columns: %w", table, err)
+	}
+
+	for _, column := range columns {
+		if _, ok := existing[column.name]; ok {
+			continue
+		}
+		if _, err := db.Exec(`ALTER TABLE ` + table + ` ADD COLUMN ` + column.def); err != nil {
+			return fmt.Errorf("add %s.%s: %w", table, column.name, err)
+		}
+	}
+	return nil
+}
+
 func applySchema(db *sql.DB) error {
 	if _, err := db.Exec(schema); err != nil {
 		return err
 	}
-	// migrate pre-goal databases; duplicate-column errors are expected
-	_, _ = db.Exec(`ALTER TABLE sessions ADD COLUMN goal TEXT NOT NULL DEFAULT ''`)
-	// later per-session bookkeeping (fork linkage, tags, pinned); the same
-	// duplicate-column-tolerant migration as goal
-	for _, c := range extraColumns {
-		_, _ = db.Exec(`ALTER TABLE sessions ADD COLUMN ` + c.def)
+	if err := addMissingColumns(db, "sessions", sessionColumns); err != nil {
+		return err
 	}
-	// Keep databases created by the initial Phase 1 slice readable when output
-	// metadata is added.
-	_, _ = db.Exec(`ALTER TABLE artifacts ADD COLUMN metadata TEXT NOT NULL DEFAULT ''`)
+	if err := addMissingColumns(db, "artifacts", artifactColumns); err != nil {
+		return err
+	}
 	if err := migrateLegacyGoals(db); err != nil {
 		return err
 	}

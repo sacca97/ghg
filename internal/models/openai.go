@@ -641,11 +641,14 @@ func (c *Client) stream(ctx context.Context, req Request, sink EventSink) (Messa
 		return Message{}, Usage{}, err
 	}
 	var last error
-	for attempt := 1; attempt <= c.attempts(); attempt++ {
+	configuredAttempts := c.attempts()
+	limit := configuredAttempts
+	for attempt := 1; attempt <= limit; attempt++ {
 		emitted := false // true once any visible delta reached the caller
+		textEmitted := false
 		wrapText, wrapThink := sink.OnText, sink.OnThink
 		if sink.OnText != nil {
-			wrapText = func(s string) { emitted = true; sink.OnText(s) }
+			wrapText = func(s string) { emitted = true; textEmitted = true; sink.OnText(s) }
 		}
 		if sink.OnThink != nil {
 			wrapThink = func(s string) { emitted = true; sink.OnThink(s) }
@@ -655,13 +658,21 @@ func (c *Client) stream(ctx context.Context, req Request, sink EventSink) (Messa
 			return msg, usage, nil
 		}
 		last = err
-		// Retry only transient failures the caller hasn't seen output from.
-		if emitted || !retryable(err) || attempt == c.attempts() {
+		// Retry transient failures before answer text. A GOAWAY after reasoning
+		// is also safe: no answer or tool call has completed yet.
+		replayReasoning := isHTTP2GoAway(err) && !textEmitted
+		if (emitted && !replayReasoning) || !retryable(err) {
 			break
+		}
+		if attempt == limit {
+			limit = extendRetryLimit(configuredAttempts, limit, attempt, err)
+			if attempt == limit {
+				break
+			}
 		}
 		delay := backoff(attempt)
 		if sink.OnRetry != nil {
-			sink.OnRetry(RetryEvent{Attempt: attempt, Max: c.attempts(), Delay: delay, Err: err})
+			sink.OnRetry(RetryEvent{Attempt: attempt, Max: limit, Delay: delay, Err: err})
 		}
 		if serr := sleep(ctx, delay); serr != nil {
 			return Message{}, Usage{}, serr
@@ -791,7 +802,9 @@ func (c *Client) complete(ctx context.Context, req Request, sink EventSink) (Mes
 		return Message{}, Usage{}, err
 	}
 	var last error
-	for attempt := 1; attempt <= c.attempts(); attempt++ {
+	configuredAttempts := c.attempts()
+	limit := configuredAttempts
+	for attempt := 1; attempt <= limit; attempt++ {
 		var msg Message
 		var usage Usage
 		msg, usage, err = c.completeOnce(ctx, body)
@@ -799,12 +812,18 @@ func (c *Client) complete(ctx context.Context, req Request, sink EventSink) (Mes
 			return msg, usage, nil
 		}
 		last = err
-		if !retryable(err) || attempt == c.attempts() {
+		if !retryable(err) {
 			break
+		}
+		if attempt == limit {
+			limit = extendRetryLimit(configuredAttempts, limit, attempt, err)
+			if attempt == limit {
+				break
+			}
 		}
 		delay := backoff(attempt)
 		if sink.OnRetry != nil {
-			sink.OnRetry(RetryEvent{Attempt: attempt, Max: c.attempts(), Delay: delay, Err: err})
+			sink.OnRetry(RetryEvent{Attempt: attempt, Max: limit, Delay: delay, Err: err})
 		}
 		if serr := sleep(ctx, delay); serr != nil {
 			return Message{}, Usage{}, serr

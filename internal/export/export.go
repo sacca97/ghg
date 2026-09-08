@@ -27,6 +27,14 @@ const (
 	FormatJSON     = "json"
 )
 
+// ChatPayload keeps the conversation export backward-compatible with the
+// original []Message payload while allowing transient review diagnostics to
+// travel alongside it.
+type ChatPayload struct {
+	Messages       []models.Message       `json:"messages"`
+	ReviewProgress []agent.ReviewProgress `json:"review_progress,omitempty"`
+}
+
 // DefaultExportFilename derives a sanitized default file name for export.
 func DefaultExportFilename(kind string, t time.Time, format string) string {
 	if t.IsZero() {
@@ -130,6 +138,12 @@ func RenderReviewMarkdown(r agent.Review) string {
 
 // RenderChat formats a session conversation into clean Markdown / text.
 func RenderChat(sessionID string, msgs []models.Message) string {
+	return RenderChatWithProgress(sessionID, msgs, nil)
+}
+
+// RenderChatWithProgress formats a conversation and optional transient review
+// progress for human inspection.
+func RenderChatWithProgress(sessionID string, msgs []models.Message, progress []agent.ReviewProgress) string {
 	var b strings.Builder
 	if sessionID != "" {
 		b.WriteString("# Conversation: " + sessionID + "\n\n")
@@ -169,7 +183,30 @@ func RenderChat(sessionID string, msgs []models.Message) string {
 			b.WriteString("### " + roleName + "\n\n" + strings.TrimSpace(m.Content) + "\n\n")
 		}
 	}
+	if len(progress) > 0 {
+		b.WriteString("## Review progress\n\n```json\n")
+		for _, event := range progress {
+			data, err := json.Marshal(event)
+			if err == nil {
+				b.Write(data)
+				b.WriteByte('\n')
+			}
+		}
+		b.WriteString("```\n\n")
+	}
 	return strings.TrimRight(b.String(), "\n") + "\n"
+}
+
+func parseChatPayload(payload string) (ChatPayload, error) {
+	var messages []models.Message
+	if err := json.Unmarshal([]byte(payload), &messages); err == nil {
+		return ChatPayload{Messages: messages}, nil
+	}
+	var chat ChatPayload
+	if err := json.Unmarshal([]byte(payload), &chat); err != nil {
+		return ChatPayload{}, err
+	}
+	return chat, nil
 }
 
 // RenderResult renders a persisted workflow result record to the requested format.
@@ -222,11 +259,11 @@ func RenderResult(record session.WorkflowResultRecord, format string) ([]byte, e
 			}
 			return []byte(strings.TrimRight(record.Payload, "\n") + "\n"), nil
 		case "chat", "log", "transcript":
-			var msgs []models.Message
-			if err := json.Unmarshal([]byte(record.Payload), &msgs); err != nil {
+			chat, err := parseChatPayload(record.Payload)
+			if err != nil {
 				return nil, fmt.Errorf("parse chat payload: %w", err)
 			}
-			return []byte(RenderChat(record.SessionID, msgs)), nil
+			return []byte(RenderChatWithProgress(record.SessionID, chat.Messages, chat.ReviewProgress)), nil
 		default:
 			return nil, fmt.Errorf("%w: %q", ErrUnsupportedKind, record.Kind)
 		}

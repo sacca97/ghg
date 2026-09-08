@@ -26,8 +26,12 @@ func NewConfigured(opts BuildOptions) (*Agent, string, string, error) {
 	cfg := opts.Config
 	route, err := cfg.Resolve(opts.Model, opts.Provider)
 	if err != nil {
-		if opts.AllowMissingCredentials && len(cfg.Providers) == 0 && opts.Model == "" && opts.Provider == "" {
-			return nil, cfg.DefaultModel, cfg.DefaultProvider, nil
+		if opts.AllowMissingCredentials && opts.Model == "" && cfg.DefaultModel == "" {
+			provider := opts.Provider
+			if provider == "" {
+				provider = cfg.DefaultProvider
+			}
+			return nil, "", provider, nil
 		}
 		return nil, "", "", err
 	}
@@ -74,14 +78,12 @@ func NewConfigured(opts BuildOptions) (*Agent, string, string, error) {
 	if contextLimit <= 0 {
 		contextLimit = config.LoadModelsDev().ContextLength(route.APIID, modelProviderIDs(resolved, providerName)...)
 	}
-	maxOut := 0
+	maxOut := route.Model.MaxOut
 	if hasCatalog {
-		maxOut = cat.MaxCompletionTokens(route.APIID)
+		if n := cat.MaxCompletionTokens(route.APIID); n > 0 && (maxOut <= 0 || n < maxOut) {
+			maxOut = n
+		}
 	}
-	if maxOut <= 0 {
-		maxOut = contextLimit
-	}
-
 	backend, err := auth.NewBackend(resolved, key, route.Model.API, cfg.MaxRetries)
 	if err != nil {
 		return nil, "", "", err

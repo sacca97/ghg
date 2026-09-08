@@ -399,12 +399,16 @@ func (c *OpenAIResponsesClient) stream(ctx context.Context, req Request, sink Ev
 	}
 
 	var last error
-	for attempt := 1; attempt <= c.attempts(); attempt++ {
+	configuredAttempts := c.attempts()
+	limit := configuredAttempts
+	for attempt := 1; attempt <= limit; attempt++ {
 		emitted := false
+		textEmitted := false
 		wrapText, wrapThink := sink.OnText, sink.OnThink
 		if sink.OnText != nil {
 			wrapText = func(delta string) {
 				emitted = true
+				textEmitted = true
 				sink.OnText(delta)
 			}
 		}
@@ -419,12 +423,19 @@ func (c *OpenAIResponsesClient) stream(ctx context.Context, req Request, sink Ev
 			return msg, usage, nil
 		}
 		last = err
-		if emitted || !retryable(err) || attempt == c.attempts() {
+		replayReasoning := isHTTP2GoAway(err) && !textEmitted
+		if (emitted && !replayReasoning) || !retryable(err) {
 			break
+		}
+		if attempt == limit {
+			limit = extendRetryLimit(configuredAttempts, limit, attempt, err)
+			if attempt == limit {
+				break
+			}
 		}
 		delay := backoff(attempt)
 		if sink.OnRetry != nil {
-			sink.OnRetry(RetryEvent{Attempt: attempt, Max: c.attempts(), Delay: delay, Err: err})
+			sink.OnRetry(RetryEvent{Attempt: attempt, Max: limit, Delay: delay, Err: err})
 		}
 		if err := sleep(ctx, delay); err != nil {
 			return Message{}, Usage{}, err
@@ -478,18 +489,26 @@ func (c *OpenAIResponsesClient) complete(ctx context.Context, req Request, sink 
 	}
 
 	var last error
-	for attempt := 1; attempt <= c.attempts(); attempt++ {
+	configuredAttempts := c.attempts()
+	limit := configuredAttempts
+	for attempt := 1; attempt <= limit; attempt++ {
 		msg, usage, err := c.completeOnce(ctx, body)
 		if err == nil {
 			return msg, usage, nil
 		}
 		last = err
-		if !retryable(err) || attempt == c.attempts() {
+		if !retryable(err) {
 			break
+		}
+		if attempt == limit {
+			limit = extendRetryLimit(configuredAttempts, limit, attempt, err)
+			if attempt == limit {
+				break
+			}
 		}
 		delay := backoff(attempt)
 		if sink.OnRetry != nil {
-			sink.OnRetry(RetryEvent{Attempt: attempt, Max: c.attempts(), Delay: delay, Err: err})
+			sink.OnRetry(RetryEvent{Attempt: attempt, Max: limit, Delay: delay, Err: err})
 		}
 		if err := sleep(ctx, delay); err != nil {
 			return Message{}, Usage{}, err

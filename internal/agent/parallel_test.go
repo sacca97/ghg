@@ -551,9 +551,9 @@ func TestBackgroundTaskSubscribersSeeLiveStream(t *testing.T) {
 // FanIn forwards each fired callback to every source that implements it,
 // leaving callbacks absent from all inputs nil.
 func TestFanIn(t *testing.T) {
-	var a, b, usage atomic.Int32
+	var a, b, usage, progress atomic.Int32
 	ev := FanIn(
-		Events{OnText: func(string) { a.Add(1) }, OnUsage: func(models.Usage) { usage.Add(1) }},
+		Events{OnText: func(string) { a.Add(1) }, OnUsage: func(models.Usage) { usage.Add(1) }, OnReviewProgress: func(ReviewProgress) { progress.Add(1) }},
 		Events{OnText: func(string) { b.Add(1) }},
 	)
 	if ev.OnThink != nil {
@@ -561,8 +561,9 @@ func TestFanIn(t *testing.T) {
 	}
 	ev.OnText("x")
 	ev.OnUsage(models.Usage{})
-	if a.Load() != 1 || b.Load() != 1 || usage.Load() != 1 {
-		t.Fatalf("fan-in miscounted: a=%d b=%d usage=%d", a.Load(), b.Load(), usage.Load())
+	ev.OnReviewProgress(ReviewProgress{Phase: "inventory"})
+	if a.Load() != 1 || b.Load() != 1 || usage.Load() != 1 || progress.Load() != 1 {
+		t.Fatalf("fan-in miscounted: a=%d b=%d usage=%d progress=%d", a.Load(), b.Load(), usage.Load(), progress.Load())
 	}
 }
 

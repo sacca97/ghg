@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"maps"
 	"net/url"
 	"os"
 	"path"
@@ -162,6 +163,18 @@ type runtimeState struct {
 	approval map[string]*approvalFlight
 }
 
+var childEnvAllowed = map[string]struct{}{
+	"PATH": {}, "HOME": {}, "SHELL": {}, "TERM": {},
+	"TERM_PROGRAM": {}, "COLORTERM": {}, "TMPDIR": {},
+	"TMP": {}, "TEMP": {}, "USER": {}, "LOGNAME": {},
+	"LANG": {}, "NO_COLOR": {}, "CI": {}, "GOCACHE": {},
+	"GOMODCACHE": {}, "GOPATH": {}, "GOROOT": {},
+	"GOTOOLCHAIN": {}, "GOPROXY": {}, "GOSUMDB": {},
+	"GONOSUMDB": {}, "GOPRIVATE": {}, "XDG_CACHE_HOME": {},
+	"XDG_CONFIG_HOME": {}, "XDG_DATA_HOME": {}, "CARGO_HOME": {},
+	"RUSTUP_HOME": {}, "NPM_CONFIG_CACHE": {}, "BUN_INSTALL": {},
+}
+
 type approvalFlight struct {
 	done     chan struct{}
 	decision GateDecision
@@ -189,22 +202,11 @@ func (r *ToolRuntime) Child() *ToolRuntime {
 	child := *r
 	child.SecretNames = slices.Clone(r.SecretNames)
 	child.PostEditHooks = clonePostEditHooks(r.PostEditHooks)
-	child.envOverrides = mapsClone(r.envOverrides)
+	child.envOverrides = maps.Clone(r.envOverrides)
 	if child.state == nil {
 		child.state = &runtimeState{approval: make(map[string]*approvalFlight)}
 	}
 	return &child
-}
-
-func mapsClone(in map[string]string) map[string]string {
-	if in == nil {
-		return nil
-	}
-	out := make(map[string]string, len(in))
-	for key, value := range in {
-		out[key] = value
-	}
-	return out
 }
 
 // WithPolicy returns a call-scoped child runtime using the supplied policy.
@@ -321,10 +323,6 @@ func SearchHintsFor(ctx context.Context) SearchHints {
 	return hints
 }
 
-func searchHintsFor(ctx context.Context) SearchHints {
-	return SearchHintsFor(ctx)
-}
-
 // WrapCommand exposes the same OS boundary to non-Bash subprocesses such as
 // search's short git-status hint and future hooks.
 func (r *ToolRuntime) WrapCommand(spec sandbox.CommandSpec) (sandbox.WrappedCommand, error) {
@@ -348,25 +346,14 @@ func AuthorizePath(ctx context.Context, name string, access sandbox.Access, allo
 // configured local MCP server; Bash/LSP callers pass nil and therefore never
 // receive provider keys or secret-resolver inputs from ghg's process.
 func (r *ToolRuntime) ChildEnv(explicit map[string]string) []string {
-	allowed := map[string]bool{
-		"PATH": true, "HOME": true, "SHELL": true, "TERM": true,
-		"TERM_PROGRAM": true, "COLORTERM": true, "TMPDIR": true,
-		"TMP": true, "TEMP": true, "USER": true, "LOGNAME": true,
-		"LANG": true, "NO_COLOR": true, "CI": true, "GOCACHE": true,
-		"GOMODCACHE": true, "GOPATH": true, "GOROOT": true,
-		"GOTOOLCHAIN": true, "GOPROXY": true, "GOSUMDB": true,
-		"GONOSUMDB": true, "GOPRIVATE": true, "XDG_CACHE_HOME": true,
-		"XDG_CONFIG_HOME": true, "XDG_DATA_HOME": true, "CARGO_HOME": true,
-		"RUSTUP_HOME": true, "NPM_CONFIG_CACHE": true, "BUN_INSTALL": true,
-	}
-	values := make(map[string]string)
+	values := make(map[string]string, len(childEnvAllowed)+len(explicit))
 	for _, pair := range os.Environ() {
-		key, _, ok := strings.Cut(pair, "=")
+		key, value, ok := strings.Cut(pair, "=")
 		if !ok {
 			continue
 		}
-		if allowed[key] || strings.HasPrefix(key, "LC_") {
-			values[key] = pair[strings.IndexByte(pair, '=')+1:]
+		if _, allowed := childEnvAllowed[key]; allowed || strings.HasPrefix(key, "LC_") {
+			values[key] = value
 		}
 	}
 	for key, value := range explicit {
@@ -551,7 +538,10 @@ func (r *ToolRuntime) reviewOrHuman(ctx context.Context, request ApprovalRequest
 	if r.state == nil {
 		return r.reviewOrHumanOnce(ctx, request, allowAutoReview)
 	}
-	key := request.Fingerprint + "\x00" + fmt.Sprint(allowAutoReview)
+	key := request.Fingerprint
+	if allowAutoReview {
+		key += "|auto"
+	}
 	r.state.mu.Lock()
 	if r.state.approval == nil {
 		r.state.approval = make(map[string]*approvalFlight)
@@ -637,7 +627,7 @@ func (r *ToolRuntime) audit(audit ExecutionAudit) {
 	}
 	audit = r.redactAudit(audit)
 	if r.state == nil {
-		r.state = &runtimeState{approval: make(map[string]*approvalFlight)}
+		return
 	}
 	r.state.mu.Lock()
 	if len(r.state.audits) >= 32 {

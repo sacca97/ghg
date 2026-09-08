@@ -51,7 +51,7 @@ func (s *Store) LookupOutput(ctx context.Context, sessionID, id string) (OutputM
 	row := s.db.QueryRowContext(ctx, `SELECT session_id, message_seq, id, tool_call_id,
 		tool_name, media_type, original_bytes, stored_bytes, hash, path, complete, metadata, created_at
 		FROM artifacts WHERE session_id=? AND id=?
-		ORDER BY created_at DESC, message_seq DESC, tool_call_id LIMIT 1`, sessionID, id)
+		ORDER BY created_at DESC, message_seq DESC, tool_call_id, rowid DESC LIMIT 1`, sessionID, id)
 	return scanOutput(row)
 }
 
@@ -78,8 +78,8 @@ func (s *Store) ListOutputs(ctx context.Context, sessionID string, filter Output
 		args = append(args, filter.ToolCallID)
 	}
 	if filter.Query != "" {
-		like := "%" + filter.Query + "%"
-		query += ` AND (id LIKE ? OR tool_call_id LIKE ? OR tool_name LIKE ? OR media_type LIKE ? OR metadata LIKE ?)`
+		like := "%" + likeEscape(filter.Query) + "%"
+		query += ` AND (id LIKE ? ESCAPE '\' OR tool_call_id LIKE ? ESCAPE '\' OR tool_name LIKE ? ESCAPE '\' OR media_type LIKE ? ESCAPE '\' OR metadata LIKE ? ESCAPE '\')`
 		args = append(args, like, like, like, like, like)
 	}
 	if !filter.Since.IsZero() {

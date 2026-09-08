@@ -13,6 +13,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/sacca97/ghg/internal/agent"
 	"github.com/sacca97/ghg/internal/auth"
 	"github.com/sacca97/ghg/internal/config"
@@ -270,7 +271,7 @@ func TestBuildAgentWithProfilesOptionalDegradesOnlyForMissingCredentials(t *test
 	if err != nil {
 		t.Fatalf("missing key should be a degraded start: %v", err)
 	}
-	if ag != nil || modelName != cfg.DefaultModel || providerName != "inference" {
+	if ag != nil || modelName != "" || providerName != cfg.DefaultProvider {
 		t.Fatalf("unexpected degraded route: agent=%v model=%q provider=%q", ag, modelName, providerName)
 	}
 
@@ -303,7 +304,7 @@ func TestColdTUICommandsRemainSafeAndActionable(t *testing.T) {
 	m.width, m.height = 80, 24
 
 	note := m.degradedProviderNote()
-	if note != "No provider has been configured — run /auth" {
+	if note != "No model has been configured — choose one with /model" {
 		t.Fatalf("degraded note should be short and actionable: %q", note)
 	}
 	m.startupReport()
@@ -351,7 +352,7 @@ func TestColdTUICommandsRemainSafeAndActionable(t *testing.T) {
 	if m.busy {
 		t.Fatal("cold submission must not set busy")
 	}
-	if !strings.Contains(m.transcriptText(), "No provider has been configured — run /auth") {
+	if !strings.Contains(m.transcriptText(), "No model has been configured — choose one with /model") {
 		t.Fatalf("cold submission should repeat the onboarding note:\n%s", m.transcriptText())
 	}
 	if _, cmd := m.Update(tea.WindowSizeMsg{Width: 80, Height: 24}); cmd != nil {
@@ -364,10 +365,9 @@ func TestColdTUICommandsRemainSafeAndActionable(t *testing.T) {
 	}
 }
 
-func TestAuthResultPromotesColdTUIToFirstAgent(t *testing.T) {
+func TestAuthResultColdStartStillRequiresModelSelection(t *testing.T) {
 	m := authTestModel(t)
 	m.modelName = m.cfg.DefaultModel
-	m.provName = "inference"
 	resolved := authResolved(t, m, "generic-openai")
 
 	m.applyAuthResult(authResultMsg{
@@ -376,11 +376,11 @@ func TestAuthResultPromotesColdTUIToFirstAgent(t *testing.T) {
 		key:       "sk-first-agent",
 		validated: true,
 	})
-	if m.provName != "generic-openai" || m.modelName != m.cfg.DefaultModel {
-		t.Fatalf("first agent should use the authenticated route: %q @ %q", m.modelName, m.provName)
+	if m.modelName != "" || m.provName != "" {
+		t.Fatalf("first auth must not select a model automatically: %q @ %q", m.modelName, m.provName)
 	}
-	if m.cfg.DefaultProvider != "generic-openai" {
-		t.Fatalf("first auth should make the selected provider the next-start route, got %q", m.cfg.DefaultProvider)
+	if !strings.Contains(m.transcriptText(), "choose a model with /model") {
+		t.Fatalf("first auth should explain how to select a model:\n%s", m.transcriptText())
 	}
 }
 
@@ -528,7 +528,7 @@ func TestApplyOAuthResultReportsDiscoveryFailure(t *testing.T) {
 }
 
 func compactCmdModel() *model {
-	// NOTE: any test that drives setEffort/switchModel/compactCommand writes
+	// NOTE: any test that drives setEffort/switchModel writes
 	// through cfg.Save(); TestMain points GHG_HOME at a scratch dir so
 	// those writes can never reach the real ~/.ghg/config.json.
 	m := &model{
@@ -540,8 +540,6 @@ func compactCmdModel() *model {
 			Models: map[string]config.Model{
 				"kimi-k3-fast": {Providers: []string{"inference"}},
 				"glm-5.2-fast": {Providers: []string{"inference"}},
-				// the built-in compaction default, routable on inference
-				config.DefaultCompactModel: {Providers: []string{"inference"}},
 			},
 		},
 		modelName: "kimi-k3-fast",
@@ -599,47 +597,10 @@ func TestAskCommandSendsReadOnlyWorkerTurn(t *testing.T) {
 	}
 }
 
-// Regression guard for the config corruption bug: running a persistence
-// command from a test must write under the isolated GHG_HOME, never the
-// user's real ~/.ghg.
-func TestCompactCommandNeverTouchesRealHome(t *testing.T) {
+func TestCompactCommandRejectsModelSelection(t *testing.T) {
 	m := compactCmdModel()
-	m.compactCommand([]string{"glm-5.2-fast"}) // triggers cfg.Save()
-	dir := os.Getenv("GHG_HOME")
-	if dir == "" || dir == filepath.Join(os.Getenv("HOME"), ".ghg") {
-		t.Fatalf("tests must run with an isolated GHG_HOME, got %q", dir)
-	}
-	if _, err := os.Stat(filepath.Join(dir, "config.json")); err != nil {
-		t.Fatalf("expected the save to land under GHG_HOME: %v", err)
-	}
-}
-
-func TestCompactCommandSelectsModel(t *testing.T) {
-	m := compactCmdModel()
-	blocks := len(m.blocks)
-	m.compactCommand([]string{"glm-5.2-fast"})
-	if m.compactModel != "glm-5.2-fast" || m.compactProv != "" {
-		t.Fatalf("compact model state: %q @ %q", m.compactModel, m.compactProv)
-	}
-	if m.cfg.CompactModel != "glm-5.2-fast" {
-		t.Fatalf("config should persist the pick, got %q", m.cfg.CompactModel)
-	}
-	m.compactCommand([]string{"off"})
-	if m.compactModel != "" {
-		t.Fatalf("off should restore the default compaction model: %q", m.compactModel)
-	}
-	if len(m.blocks) != blocks {
-		t.Fatalf("successful compaction model changes should not append routine notes, got %v", m.blocks)
-	}
-}
-
-func TestCompactCommandRejectsUnknownModel(t *testing.T) {
-	m := compactCmdModel()
-	m.compactCommand([]string{"nope"})
-	if m.compactModel != "" {
-		t.Fatal("unknown model must not become the compaction model")
-	}
-	if !strings.Contains(m.blocks[len(m.blocks)-1].text, "unknown model") {
+	m.command("/compact meta/muse-spark-1.3-contributor")
+	if !strings.Contains(m.blocks[len(m.blocks)-1].text, "does not accept a model") {
 		t.Fatalf("expected an error note, got %v", m.blocks)
 	}
 }
@@ -1600,6 +1561,22 @@ func TestModelPaletteEnterOpensPicker(t *testing.T) {
 	if len(pp.list) != 4 || pp.list[1] != "smart" {
 		t.Fatalf("model-role panel should list default, smart, fast, tiny: %+v", pp.list)
 	}
+	m.cfg.Roles = map[string]config.RoleConfig{
+		config.RoleDefault: {Model: "kimi-k3-fast", Provider: "inference"},
+		config.RoleSmart:   {Model: "glm-5.2-fast", Provider: "inference"},
+		config.RoleFast:    {Model: "kimi-k3-fast", Provider: "inference"},
+		config.RoleTiny:    {Model: "glm-5.2-fast", Provider: "inference"},
+	}
+	rows, _, _ := m.panelContent(pp)
+	view := ansi.Strip(strings.Join(rows, "\n"))
+	for _, want := range []string{"default  — kimi-k3-fast", "smart  — glm-5.2-fast", "fast  — kimi-k3-fast", "tiny  — glm-5.2-fast"} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("model-role panel should show configured role models, missing %q in %q", want, view)
+		}
+	}
+	if strings.Contains(view, "(current)") {
+		t.Fatalf("model-role panel should not add a redundant current marker: %q", view)
+	}
 	tm, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
 	m = tm.(*model)
 	if pp := m.settings.top(); pp == nil || pp.kind != panelModel {
@@ -1684,7 +1661,7 @@ func TestPaletteListsRegistryCommands(t *testing.T) {
 		}
 		hint := it.dynHint(m)
 		if !strings.HasPrefix(hint, "/") || strings.ContainsAny(hint, " ·<") {
-			continue // keybind-only or usage-form hints ("/model · tab", "/compact <model>")
+			continue // keybind-only or usage-form hints ("/model · tab")
 		}
 		e := registryFind(hint)
 		if e == nil {

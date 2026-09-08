@@ -32,7 +32,7 @@ type Model struct {
 	// and the value shown for providers that don't report one.
 	Context int `json:"context,omitempty"`
 	// MaxOut caps OUTPUT tokens (the max_tokens request param). 0 uses the
-	// provider's max_completion_tokens when advertised, else a sane default.
+	// provider default when no output limit is advertised.
 	MaxOut int `json:"maxOut,omitempty"`
 	// MaxTokens is the legacy field name for Context (it was misnamed: it held
 	// the context window, not an output cap). Read on load for back-compat.

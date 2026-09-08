@@ -10,11 +10,13 @@ type Events struct {
 	OnToolOutput     func(id, output string)          // accumulated output while a tool call runs
 	OnToolEnd        func(id, name, result string)    // a tool call finished
 	OnSteer          func(text string)                // a steered message was injected
+	OnNotice         func(text string)                // a transient status message for the user
 	OnCompact        func(took, kept int)             // context was auto-compacted (messages removed/kept)
 	OnCompacted      func(summary string, cutoff int) // a durable compaction completed
 	OnUsage          func(u models.Usage)             // a request reported its token usage
 	OnRetry          func(ev models.RetryEvent)       // a transient request failure is being retried
 	OnGoalUpdate     func(GoalUpdate)                 // structured active-goal checkpoint
+	OnReviewProgress func(ReviewProgress)             // scope-aware ReviewMode budget state
 	OnToolTelemetry  func(ToolTelemetry)              // bounded-output accounting for one tool call
 	OnModelCallStart func(ModelCallStart)
 	OnPromptView     func(PromptView)
@@ -98,7 +100,7 @@ type PromptView struct {
 func FanIn(evs ...Events) Events {
 	var out Events
 	var hasText, hasThink, hasToolStart, hasToolOutput, hasToolEnd, hasTelemetry, hasSteer bool
-	var hasCompact, hasCompacted, hasCompactionReady, hasUsage, hasGoalUpdate bool
+	var hasCompact, hasCompacted, hasCompactionReady, hasUsage, hasGoalUpdate, hasNotice, hasReviewProgress bool
 	var hasModelCallStart, hasPromptView, hasModelCallEnd, hasPlanDelta, hasRetry bool
 
 	for _, e := range evs {
@@ -123,6 +125,9 @@ func FanIn(evs ...Events) Events {
 		if e.OnSteer != nil {
 			hasSteer = true
 		}
+		if e.OnNotice != nil {
+			hasNotice = true
+		}
 		if e.OnCompact != nil {
 			hasCompact = true
 		}
@@ -140,6 +145,9 @@ func FanIn(evs ...Events) Events {
 		}
 		if e.OnGoalUpdate != nil {
 			hasGoalUpdate = true
+		}
+		if e.OnReviewProgress != nil {
+			hasReviewProgress = true
 		}
 		if e.OnModelCallStart != nil {
 			hasModelCallStart = true
@@ -218,6 +226,15 @@ func FanIn(evs ...Events) Events {
 			}
 		}
 	}
+	if hasNotice {
+		out.OnNotice = func(text string) {
+			for _, e := range evs {
+				if e.OnNotice != nil {
+					e.OnNotice(text)
+				}
+			}
+		}
+	}
 	if hasCompact {
 		out.OnCompact = func(took, kept int) {
 			for _, e := range evs {
@@ -271,6 +288,15 @@ func FanIn(evs ...Events) Events {
 			for _, e := range evs {
 				if e.OnGoalUpdate != nil {
 					e.OnGoalUpdate(update)
+				}
+			}
+		}
+	}
+	if hasReviewProgress {
+		out.OnReviewProgress = func(progress ReviewProgress) {
+			for _, e := range evs {
+				if e.OnReviewProgress != nil {
+					e.OnReviewProgress(progress)
 				}
 			}
 		}

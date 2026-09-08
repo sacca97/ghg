@@ -91,6 +91,68 @@ func (m *model) attachWorkerClient(client *workerwire.Client, runtimeFile worker
 	return generation
 }
 
+type workerStartSpec struct {
+	sessionID string
+	sysPrompt string
+	modelName string
+	provName  string
+	role      string
+	effort    string
+	mode      string
+	cwd       string
+	cautious  bool
+	sandbox   string
+	network   string
+	approval  string
+}
+
+func (m *model) workerStartSpec(cautious bool) workerStartSpec {
+	if m.sessionID == "" {
+		m.sessionID = session.NewSessionID()
+	}
+	spec := workerStartSpec{
+		sessionID: m.sessionID,
+		sysPrompt: m.sysPrompt,
+		modelName: m.modelName,
+		provName:  m.provName,
+		role:      m.currentRole(),
+		effort:    m.currentEffort(),
+		mode:      m.uiMode(),
+		cwd:       m.workingDirectory(),
+		cautious:  cautious,
+	}
+	if m.cfg != nil && m.cfg.Execution != nil {
+		spec.sandbox = m.cfg.Execution.Sandbox
+		spec.network = m.cfg.Execution.Network
+		spec.approval = m.cfg.Execution.Approval
+	}
+	return spec
+}
+
+func (m *model) startWorkerCmd() tea.Cmd {
+	if m.workerClient != nil || m.workerStarting || m.store == nil || m.prog == nil || m.modelName == "" || m.provName == "" {
+		return nil
+	}
+	m.workerStarting = true
+	spec := m.workerStartSpec(m.cautious)
+	return func() tea.Msg {
+		result := startWorkerProcess(spec)
+		result.sessionID = spec.sessionID
+		return result
+	}
+}
+
+func (m *model) ensureWorkerAction(action func() tea.Cmd) (tea.Model, tea.Cmd) {
+	if m.workerClient != nil {
+		return m, action()
+	}
+	if m.prog == nil || m.store == nil {
+		return m, nil
+	}
+	m.pendingWorkerAction = action
+	return m, m.startWorkerCmd()
+}
+
 func (m *model) startWorkerProcess(cautious bool) error {
 	if m.store == nil {
 		return errors.New("worker requires a session store")
@@ -98,74 +160,76 @@ func (m *model) startWorkerProcess(cautious bool) error {
 	if m.modelName == "" || m.provName == "" {
 		return errors.New(m.degradedProviderNote())
 	}
-	if m.sessionID == "" {
-		m.sessionID = session.NewSessionID()
+	result := startWorkerProcess(m.workerStartSpec(cautious))
+	if result.err != nil {
+		return result.err
 	}
+	m.workerProcess = result.process
+	generation := m.attachWorkerClient(result.client, result.runtime)
+	if result.process != nil {
+		m.monitorWorker(result.process, result.runtime, generation)
+	}
+	return nil
+}
+
+func startWorkerProcess(spec workerStartSpec) workerStartedMsg {
 	dir, err := config.Dir()
 	if err != nil {
-		return err
+		return workerStartedMsg{err: err}
 	}
-	runtimeFile, err := workerwire.NewRuntime(dir, m.sessionID)
+	runtimeFile, err := workerwire.NewRuntime(dir, spec.sessionID)
 	if err != nil {
-		return err
+		return workerStartedMsg{err: err}
 	}
-	// A detached worker already owns this session (resume after /detach, or
-	// --resume while one still runs). Attach to it instead of launching a
-	// competitor: the launch would fail its lifetime lock, the monitor would
-	// see the failed process and close the valid client, and the live worker
-	// would read that as an unacknowledged disconnect and cancel its work.
+	// A detached worker already owns this session, so attach instead of
+	// launching a competing process.
 	if runtimeFile.Live() {
-		client, cerr := m.connectWorker(runtimeFile)
-		if cerr != nil {
-			return cerr
-		}
-		m.attachWorkerClient(client, runtimeFile)
-		return nil
+		client, err := connectWorker(runtimeFile)
+		return workerStartedMsg{client: client, runtime: runtimeFile, err: err}
 	}
-	if err := runtimeFile.WritePrompt(m.sysPrompt); err != nil {
-		return err
+	if err := runtimeFile.WritePrompt(spec.sysPrompt); err != nil {
+		return workerStartedMsg{err: err}
 	}
 	workerEnv := map[string]string{
 		"GHG_INTERNAL_WORKER": "1",
-		workerSessionEnv:      m.sessionID,
+		workerSessionEnv:      spec.sessionID,
 		workerBaseEnv:         dir,
-		// Captured at launch, which now happens lazily on the first
-		// worker-backed turn — after any /cd the user made.
-		workerCWDEnv:      mustWorkingDirectory(),
-		workerModelEnv:    m.modelName,
-		workerProviderEnv: m.provName,
-		workerRoleEnv:     m.currentRole(),
-		workerEffortEnv:   m.currentEffort(),
-		workerModeEnv:     m.uiMode(),
-		workerCautiousEnv: strconv.FormatBool(cautious),
+		workerCWDEnv:          spec.cwd,
+		workerModelEnv:        spec.modelName,
+		workerProviderEnv:     spec.provName,
+		workerRoleEnv:         spec.role,
+		workerEffortEnv:       spec.effort,
+		workerModeEnv:         spec.mode,
+		workerCautiousEnv:     strconv.FormatBool(spec.cautious),
 	}
-	if m.cfg != nil && m.cfg.Execution != nil {
-		workerEnv[workerSandboxEnv] = m.cfg.Execution.Sandbox
-		workerEnv[workerNetworkEnv] = m.cfg.Execution.Network
-		workerEnv[workerApprovalEnv] = m.cfg.Execution.Approval
+	if spec.sandbox != "" {
+		workerEnv[workerSandboxEnv] = spec.sandbox
+	}
+	if spec.network != "" {
+		workerEnv[workerNetworkEnv] = spec.network
+	}
+	if spec.approval != "" {
+		workerEnv[workerApprovalEnv] = spec.approval
 	}
 	proc, err := workerwire.Launch(context.Background(), os.Args[0], workerEnv)
 	if err != nil {
 		_ = runtimeFile.RemovePrompt()
-		return err
+		return workerStartedMsg{err: err}
 	}
-	client, err := m.connectWorker(runtimeFile)
+	client, err := connectWorker(runtimeFile)
 	if err != nil {
 		_ = proc.Stop()
 		waitProcess(proc, time.Second)
 		_ = runtimeFile.RemovePrompt()
-		return err
+		return workerStartedMsg{err: err}
 	}
-	m.workerProcess = proc
-	generation := m.attachWorkerClient(client, runtimeFile)
-	m.monitorWorker(proc, runtimeFile, generation)
-	return nil
+	return workerStartedMsg{client: client, process: proc, runtime: runtimeFile}
 }
 
 // connectWorker dials the session socket until the worker serves it (bounded
 // by 5s — enough for a fresh process to reach Serve, short enough that a dead
 // endpoint fails fast).
-func (m *model) connectWorker(runtimeFile workerwire.Runtime) (*workerwire.Client, error) {
+func connectWorker(runtimeFile workerwire.Runtime) (*workerwire.Client, error) {
 	var client *workerwire.Client
 	var err error
 	deadline := time.Now().Add(5 * time.Second)
@@ -191,7 +255,7 @@ func (m *model) attachWorkerProcess(sessionID string) error {
 	if err != nil {
 		return err
 	}
-	client, err := m.connectWorker(runtimeFile)
+	client, err := connectWorker(runtimeFile)
 	if err != nil {
 		return fmt.Errorf("attach worker: %w", err)
 	}
@@ -222,14 +286,25 @@ func (m *model) ensureWorker() bool {
 	if m.workerClient != nil || m.workerStartFailed || m.prog == nil || m.store == nil {
 		return m.workerClient != nil
 	}
-	if err := m.startWorkerProcess(m.cautious); err != nil {
+	if m.workerStarting {
+		m.workerStartError = "worker is still starting"
+		return false
+	}
+	if m.modelName == "" || m.provName == "" {
+		err := errors.New(m.degradedProviderNote())
 		m.workerStartFailed = true
 		m.workerStartError = err.Error()
 		config.LogEvent("worker.start", err.Error())
 		return false
 	}
-	m.workerStartError = ""
-	return true
+	// Live sessions must never perform worker I/O from Update. Normal startup
+	// returns this command from Init; this fallback covers a later restart.
+	if cmd := m.startWorkerCmd(); cmd != nil {
+		p := m.prog
+		go func() { sendProg(p, cmd()) }()
+		m.workerStartError = "worker is starting"
+	}
+	return false
 }
 
 func (m *model) beginWorkerTransition() error {
@@ -258,6 +333,13 @@ func (m *model) syncWorkerConfiguration(updateEffort bool) {
 func mustWorkingDirectory() string {
 	wd, _ := os.Getwd()
 	return wd
+}
+
+func (m *model) workingDirectory() string {
+	if m.workingDir != "" {
+		return m.workingDir
+	}
+	return mustWorkingDirectory()
 }
 
 func (m *model) pumpWorker(client *workerwire.Client, generation uint64) {
@@ -433,7 +515,7 @@ func (m *model) handleWorkerFrame(frame workerwire.Frame) (tea.Model, tea.Cmd) {
 				if err := os.Chdir(result.CWD); err != nil {
 					m.append(errStyle.Render("/cd: controller: " + err.Error()))
 				} else {
-					m.shortCWD = shortCWD()
+					m.workingDir, m.shortCWD = result.CWD, shortCWD()
 					m.append(dimStyle.Render("→ " + result.CWD))
 				}
 			}
@@ -443,11 +525,17 @@ func (m *model) handleWorkerFrame(frame workerwire.Frame) (tea.Model, tea.Cmd) {
 			var result workerwire.ForkResult
 			if err := json.Unmarshal(frame.Payload, &result); err == nil && result.NewSessionID != "" {
 				m.stopWorker()
-				if err := m.resumeDisplay(result.NewSessionID); err != nil {
-					m.append(errStyle.Render("fork resume failed: " + err.Error()))
-				} else {
-					m.append(dimStyle.Render(fmt.Sprintf("⑂ forked %q → %q (%s) — the original is under /resume", result.OldTitle, result.Title, result.NewSessionID)))
+				m.forkNotice = fmt.Sprintf("⑂ forked %q → %q (%s) — the original is under /resume", result.OldTitle, result.Title, result.NewSessionID)
+				if m.prog == nil {
+					if err := m.resumeDisplay(result.NewSessionID); err != nil {
+						m.append(errStyle.Render("fork resume failed: " + err.Error()))
+					} else {
+						m.append(dimStyle.Render(m.forkNotice))
+					}
+					m.forkNotice = ""
+					return m, nil
 				}
+				return m, m.resumeCmd(result.NewSessionID)
 			}
 		}
 		if strings.HasPrefix(frame.RequestID, "rename-") {
@@ -498,7 +586,6 @@ func (m *model) applyWorkerSnapshot(snapshot workerwire.Snapshot) {
 	m.modelName = snapshot.ModelName
 	m.provName = snapshot.Provider
 	m.role = snapshot.Role
-	m.protocol = snapshot.Protocol
 	m.effort = snapshot.Effort
 	if len(snapshot.Messages) > 0 {
 		m.setMessages(snapshot.Messages)
@@ -557,7 +644,7 @@ func (m *model) workerEvent(event workerEvent) tea.Cmd {
 			if m.modelName == "" {
 				m.modelName = value.Model
 			}
-			m.role, m.protocol = value.Role, value.Protocol
+			m.role = value.Role
 			if value.UpdateEffort {
 				m.effort = value.Effort
 			}
@@ -578,7 +665,7 @@ func (m *model) workerEvent(event workerEvent) tea.Cmd {
 		}
 		return nil
 	case "task":
-		search.InvalidateFileIndex(mustWorkingDirectory())
+		search.InvalidateFileIndex(m.workingDirectory())
 		if value, ok := decodeEvent[workerwire.TaskState](event.Data); ok {
 			if m.workerTasks == nil {
 				m.workerTasks = make(map[string]workerwire.TaskState)
@@ -606,13 +693,24 @@ func (m *model) workerEvent(event workerEvent) tea.Cmd {
 			return func() tea.Msg { return planDeltaMsg(value) }
 		}
 	case workerwire.EventShellDone:
-		search.InvalidateFileIndex(mustWorkingDirectory())
+		search.InvalidateFileIndex(m.workingDirectory())
 		if value, ok := decodeEvent[workerwire.ShellResult](event.Data); ok {
 			return func() tea.Msg { return shellDoneMsg{cmd: value.Command, out: value.Output} }
 		}
 	case "steer":
 		if value, ok := decodeEvent[string](event.Data); ok {
 			return func() tea.Msg { return steeredMsg(value) }
+		}
+	case "notice":
+		if value, ok := decodeEvent[string](event.Data); ok {
+			return func() tea.Msg { return noticeMsg(value) }
+		}
+	case "review_progress":
+		var envelope struct {
+			Progress agent.ReviewProgress `json:"progress"`
+		}
+		if err := json.Unmarshal(event.Data, &envelope); err == nil {
+			return func() tea.Msg { return reviewProgressMsg{progress: envelope.Progress} }
 		}
 	case "tool_start":
 		if value, ok := decodeEvent[workerToolStartEvent](event.Data); ok {
@@ -628,7 +726,7 @@ func (m *model) workerEvent(event workerEvent) tea.Cmd {
 			if total := value.PromptTokens + value.CompletionTokens; total > 0 {
 				m.workerContextTokens = total
 			}
-			return func() tea.Msg { return usageMsg(value) }
+			return nil
 		}
 	case "goal_update":
 		if value, ok := decodeEvent[agent.GoalUpdate](event.Data); ok {
@@ -652,8 +750,8 @@ func (m *model) workerEvent(event workerEvent) tea.Cmd {
 			}
 			var record *agent.GoalRecord
 			if value.Goal != nil {
-				copy := *value.Goal
-				record = &copy
+				goalCopy := *value.Goal
+				record = &goalCopy
 			}
 			goalText := ""
 			if record != nil {
@@ -688,7 +786,7 @@ func (m *model) workerEvent(event workerEvent) tea.Cmd {
 			}
 		}
 	case "turn_done":
-		search.InvalidateFileIndex(mustWorkingDirectory())
+		search.InvalidateFileIndex(m.workingDirectory())
 		if value, ok := decodeEvent[workerwire.TurnResult](event.Data); ok {
 			err := workerError(value.Error)
 			if len(value.Messages) > 0 {
@@ -711,22 +809,18 @@ func (m *model) workerEvent(event workerEvent) tea.Cmd {
 			if value.Role != "" {
 				m.role = value.Role
 			}
-			if value.Protocol != "" {
-				m.protocol = value.Protocol
-			}
 			if value.Effort != "" || m.effort != "" {
 				m.effort = value.Effort
 			}
 			var goal *agent.GoalRecord
 			if value.Goal != nil {
-				copy := *value.Goal
-				goal = &copy
+				goalCopy := *value.Goal
+				goal = &goalCopy
 			}
 			return func() tea.Msg {
 				return turnDoneMsg{
-					final: value.Final, err: err, at: value.At, snap: value.Snap,
-					clean: value.Clean, plan: value.Plan, review: value.Review, reviewMarkdown: value.ReviewMarkdown,
-					goal: goal, goalContinue: value.GoalContinue, goalUsage: value.Usage,
+					final: value.Final, err: err, plan: value.Plan, reviewMarkdown: value.ReviewMarkdown,
+					goal: goal, goalContinue: value.GoalContinue,
 				}
 			}
 		}

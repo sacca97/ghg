@@ -411,6 +411,13 @@ func TestPasteCollapseOptIn(t *testing.T) {
 	}
 }
 
+func TestEditedPastePlaceholderStillPreservesPaste(t *testing.T) {
+	got := restoreCollapsedPaste("[Pasted ~3 lines] (edited)", "line1\nline2\nline3")
+	if !strings.Contains(got, "line1\nline2\nline3") {
+		t.Fatalf("edited placeholder lost pasted content: %q", got)
+	}
+}
+
 // A short paste (1-2 lines) never collapses, even when the option is on.
 func TestPasteCollapseShortPasteIgnored(t *testing.T) {
 	on := true

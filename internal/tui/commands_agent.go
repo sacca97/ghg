@@ -233,7 +233,7 @@ func (m *model) applyAuthResult(res authResultMsg) {
 		return
 	}
 	m.modelName, m.provName, m.modelID = route.ModelName, route.ProviderName, route.APIID
-	m.protocol, m.role, m.contextLimit = route.Protocol, route.Role, route.ContextLimit
+	m.role, m.contextLimit = route.Role, route.ContextLimit
 	m.effort = m.maxEffort()
 	m.modelSlotW = m.statusModelSlotWidth()
 	if m.workerClient != nil {
@@ -396,8 +396,8 @@ func (m *model) currentGoal() string {
 }
 
 func (m *model) applyGoalRecord(record agent.GoalRecord) {
-	copy := record
-	m.goalRecord = &copy
+	goalCopy := record
+	m.goalRecord = &goalCopy
 }
 
 func (m *model) goalRecordForSession() (agent.GoalRecord, bool) {

@@ -53,6 +53,7 @@ type block struct {
 	toolID      string
 	toolRunning bool
 	toolFailed  bool
+	streaming   bool
 	// y0/y1 are the block's line range in the last rendered content (set by
 	// refreshVP); used to map a mouse click to the block under it.
 	y0, y1 int
@@ -81,6 +82,9 @@ func (b *block) renderAt(width int) string {
 func (b block) render(width int) string {
 	switch b.kind {
 	case blockAssistant:
+		if b.streaming {
+			return wrap(botStyle.Render("● ")+b.text, width)
+		}
 		return renderMarkdownBlock("●", b.text, width)
 	case blockPlan:
 		return renderMarkdownBlock("◎", b.text, width)
@@ -147,10 +151,8 @@ func (b *block) toggle() bool {
 
 // append adds finalized blocks to the transcript, separating blocks with a
 // blank line so consecutive messages and tool calls breathe.
-func (m *model) append(blocks ...string) {
-	for _, s := range blocks {
-		m.appendRaw(blockText, s)
-	}
+func (m *model) append(s string) {
+	m.appendRaw(blockText, s)
 }
 
 // appendAssistant appends raw assistant markdown; rendering happens in
@@ -173,10 +175,10 @@ func (m *model) appendRaw(kind blockKind, text string) {
 
 // refreshVP rebuilds the viewport content, bottom-anchored: short transcripts
 // are padded from the top so messages grow upward from the input. Block
-// renders are cached per width (renderAt), so a rebuild is an O(transcript)
-// join of cached strings; the expensive glamour markdown render only happens
-// for blocks that are new, mutated, or hit by a width change. This is what
-// keeps resume and streaming appends near-linear.
+// renders are cached per width (renderAt), so the expensive glamour markdown
+// render only happens for blocks that are new, mutated, or hit by a width
+// change. The viewport still needs its complete content string after an
+// append, but avoids reparsing unchanged markdown.
 func (m *model) refreshVP() {
 	if m.width == 0 {
 		return // tea hasn't started (resume path): the first WindowSizeMsg renders once at the real width
@@ -188,8 +190,12 @@ func (m *model) refreshVP() {
 	// is unreadable either way — render at the floor instead.
 	width := max(m.width, minRenderWidth)
 	var b strings.Builder
-	if n := len(m.blocks); n > 0 {
-		b.Grow(n * 24)
+	if len(m.blocks) > 0 {
+		n := 0
+		for _, block := range m.blocks {
+			n += len(block.rendered) + 2
+		}
+		b.Grow(n)
 	}
 	line := 0
 	for i := range m.blocks {
@@ -294,6 +300,12 @@ func fmtCost(d float64) string {
 // layout gives the viewport whatever height the chrome doesn't need,
 // growing the input box with its content so the whole prompt stays visible.
 func (m *model) layout() {
+	m.frameViewsValid = false
+	m.frameCurrent = ""
+	m.frameThinking = ""
+	m.frameInteractive = ""
+	m.framePermission = ""
+	m.frameRewind = ""
 	m.growInput()
 	// Rows View() spends outside the viewport, counted against m.height. Get
 	// this wrong and the frame overflows the terminal: a too-tall frame makes
@@ -316,19 +328,24 @@ func (m *model) layout() {
 		chrome += 2 // blank line above the spinner + the spinner line itself
 	}
 	if m.current != "" {
-		chrome += lipgloss.Height(m.currentView()) + 1 // + its blank separator
+		m.frameCurrent = m.currentView()
+		chrome += lipgloss.Height(m.frameCurrent) + 1 // + its blank separator
 	}
 	if !m.thinkStart.IsZero() && m.showThinking {
-		chrome += lipgloss.Height(m.thinkView()) + 1
+		m.frameThinking = m.thinkView()
+		chrome += lipgloss.Height(m.frameThinking) + 1
 	}
 	if m.iactive != nil {
-		chrome += lipgloss.Height(m.interactiveView()) + 1
+		m.frameInteractive = m.interactiveView()
+		chrome += lipgloss.Height(m.frameInteractive) + 1
 	}
 	if m.permDialog != nil {
-		chrome += lipgloss.Height(m.permView()) + 1
+		m.framePermission = m.permView()
+		chrome += lipgloss.Height(m.framePermission) + 1
 	}
 	if m.rew != nil {
-		chrome += lipgloss.Height(m.rewindView()) + 1
+		m.frameRewind = m.rewindView()
+		chrome += lipgloss.Height(m.frameRewind) + 1
 	}
 	if m.menu != nil {
 		chrome += min(len(m.menu.cands), menuRows) + 1
@@ -340,15 +357,16 @@ func (m *model) layout() {
 		m.refreshTaskVP() // the task pane owns the free area; size it to fit
 	}
 	m.dockRows = 0
-	if dock := m.tasksDock(); dock != "" { // lipgloss.Height("") is 1, not 0
+	m.dockSkip = 0
+	m.dockView = m.tasksDock()
+	if dock := m.dockView; dock != "" { // lipgloss.Height("") is 1, not 0
 		m.dockRows = lipgloss.Height(dock)
 		// clicking computes task rows from the strip's top; a focused dock's
 		// hint row isn't a task — skip it
-		m.dockSkip = 0
 		if m.tasksFocus {
 			m.dockSkip++
 		}
-		chrome += m.dockRows + 1 // strip + the blank line above the input
+		chrome += m.dockRows
 	}
 	// Floor the viewport width too: a degenerate m.width (1–4 cols) would set
 	// the viewport to 1 col and re-slice the transcript into a one-char strip,
@@ -358,6 +376,7 @@ func (m *model) layout() {
 		m.vp.Width, m.vp.Height = w, h
 		m.refreshVP()
 	}
+	m.frameViewsValid = true
 }
 
 // dockTop returns the screen row of the first TASK row in the dock: the dock
@@ -365,7 +384,7 @@ func (m *model) layout() {
 // dockSkip non-task rows (the focused hint) sit on top of the task rows.
 // layout() keeps both in sync with what View renders.
 func (m *model) dockTop() int {
-	return m.height - 2 - m.input.Height() - m.dockRows + m.dockSkip
+	return m.height - statusBoxRows - 1 - m.input.Height() - m.dockRows + m.dockSkip
 }
 
 // busyStats renders the busy line's elapsed time. Token totals belong only in
@@ -380,6 +399,47 @@ func (m *model) busyStats() string {
 	}
 	elapsed := d.Round(time.Second)
 	return fmt.Sprintf(" %d:%02d", int(elapsed.Minutes()), int(elapsed.Seconds())%60)
+}
+
+func formatReviewLOC(lines int) string {
+	if lines < 1000 {
+		return fmt.Sprintf("%d", lines)
+	}
+	return fmt.Sprintf("%.1fk", float64(lines)/1000)
+}
+
+func renderReviewScope(progress agent.ReviewProgress) string {
+	if progress.Inventory == nil {
+		return "◎ review scope"
+	}
+	focus := strings.Join(progress.Focus, ", ")
+	if focus == "" {
+		focus = "(largest production files)"
+	}
+	return fmt.Sprintf("◎ review scope\n  %d production · %d tests · %s LOC · %d large files\n  budget: %d exploration rounds · hard limit: %d\n  focus: %s", progress.Inventory.ProductionFiles, progress.Inventory.TestFiles, formatReviewLOC(progress.Inventory.ProductionLOC), len(progress.Inventory.LargeFiles), progress.Allocation, progress.HardLimit, focus)
+}
+
+func renderReviewExtension(progress agent.ReviewProgress) string {
+	reason := strings.TrimSpace(progress.Reason)
+	if reason == "" {
+		reason = "unresolved review evidence"
+	}
+	return fmt.Sprintf("◎ review budget extended · %d → %d · hard limit %d\n  reason: %s", progress.FromAllocation, progress.ToAllocation, progress.HardLimit, reason)
+}
+
+func (m *model) reviewBusyHint() string {
+	if !m.reviewing || m.reviewProgress == nil {
+		return ""
+	}
+	p := m.reviewProgress
+	switch p.Phase {
+	case "final_evidence":
+		return " review · final evidence batch"
+	case "exploration_closed":
+		return " review · synthesizing"
+	default:
+		return fmt.Sprintf(" review · exploration %d/%d · hard limit %d", p.CurrentRound, p.Allocation, p.HardLimit)
+	}
 }
 
 // contextLimitFor returns the context window for a model id on a models.
@@ -481,8 +541,10 @@ func (m *model) tasksView() string {
 // message re-renders as one markdown document on resize.
 func (m *model) appendAssistant(s string) {
 	if m.inMsg && len(m.blocks) > 0 && m.blocks[len(m.blocks)-1].kind == blockAssistant {
-		m.blocks[len(m.blocks)-1].text += "\n\n" + s // same message: merge
-		m.blocks[len(m.blocks)-1].stale = true
+		b := &m.blocks[len(m.blocks)-1]
+		b.text += "\n\n" + s // same message: merge
+		b.streaming = m.busy
+		b.stale = true
 		m.transcriptDirty = true
 		if m.prog == nil {
 			m.refreshVP()
@@ -490,6 +552,9 @@ func (m *model) appendAssistant(s string) {
 		return
 	}
 	m.appendAssistantBlock(s)
+	if m.busy {
+		m.blocks[len(m.blocks)-1].streaming = true
+	}
 	m.inMsg = true
 }
 
@@ -588,6 +653,11 @@ func (m *model) flushCurrent() {
 	if cur != "" {
 		m.appendAssistant(cur)
 	}
+	if len(m.blocks) > 0 && m.blocks[len(m.blocks)-1].kind == blockAssistant && m.blocks[len(m.blocks)-1].streaming {
+		m.blocks[len(m.blocks)-1].streaming = false
+		m.blocks[len(m.blocks)-1].stale = true
+		m.transcriptDirty = true
+	}
 	m.inMsg = false
 }
 
@@ -599,6 +669,41 @@ func (m *model) currentView() string {
 		s = botStyle.Render("● ") + s
 	}
 	return wrap(s, m.width) // streamed mid-flight: plain text; markdown renders on flush
+}
+
+func (m *model) frameCurrentView() string {
+	if m.frameViewsValid {
+		return m.frameCurrent
+	}
+	return m.currentView()
+}
+
+func (m *model) frameThinkingView() string {
+	if m.frameViewsValid {
+		return m.frameThinking
+	}
+	return m.thinkView()
+}
+
+func (m *model) frameInteractiveView() string {
+	if m.frameViewsValid {
+		return m.frameInteractive
+	}
+	return m.interactiveView()
+}
+
+func (m *model) framePermissionView() string {
+	if m.frameViewsValid {
+		return m.framePermission
+	}
+	return m.permView()
+}
+
+func (m *model) frameRewindView() string {
+	if m.frameViewsValid {
+		return m.frameRewind
+	}
+	return m.rewindView()
 }
 
 func (m *model) View() string {
@@ -622,19 +727,22 @@ func (m *model) View() string {
 	}
 	b.WriteString(m.viewportView() + "\n")
 	if !m.thinkStart.IsZero() && m.showThinking {
-		b.WriteString("\n" + m.thinkView() + "\n")
+		b.WriteString("\n" + m.frameThinkingView() + "\n")
 	}
 	if m.current != "" {
-		b.WriteString("\n" + m.currentView() + "\n")
+		b.WriteString("\n" + m.frameCurrentView() + "\n")
 	}
 	if m.iactive != nil {
-		b.WriteString("\n" + m.interactiveView() + "\n")
+		b.WriteString("\n" + m.frameInteractiveView() + "\n")
 	}
 	if m.permDialog != nil {
-		b.WriteString("\n" + m.permView() + "\n")
+		b.WriteString("\n" + m.framePermissionView() + "\n")
 	}
 	if m.busy {
 		hint := " thinking… (enter queues · /effort run now · esc interrupts · ctrl+c ctrl+c interrupts)"
+		if reviewHint := m.reviewBusyHint(); reviewHint != "" {
+			hint = reviewHint
+		}
 		if m.iactive != nil {
 			hint = " bash (interactive) — type to respond · ctrl+c ctrl+c to cancel"
 		} else if m.interrupt1 {
@@ -660,11 +768,15 @@ func (m *model) View() string {
 	}
 	b.WriteString(m.inputRule() + "\n")
 	// the persistent background-subagent strip sits just above the input box
-	if dock := m.tasksDock(); dock != "" {
+	dock := m.dockView
+	if dock == "" && len(m.dockTasks()) > 0 {
+		dock = m.tasksDock()
+	}
+	if dock != "" {
 		b.WriteString(dock + "\n")
 	}
 	if m.rew != nil {
-		b.WriteString(m.rewindView() + "\n\n")
+		b.WriteString(m.frameRewindView() + "\n\n")
 	}
 	if m.iactive == nil {
 		if m.namePrompt != nil {

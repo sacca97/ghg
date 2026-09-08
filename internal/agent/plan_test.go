@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -178,6 +181,102 @@ func TestAskModeAnswersWithReadOnlyTools(t *testing.T) {
 	}
 }
 
+func TestReadOnlyModesCloseAfterFinalEvidenceBatch(t *testing.T) {
+	reviewArgs := `{"summary":"all clean","verdict":"approve","findings":[]}`
+	cases := []struct {
+		name       string
+		configure  func(*Agent)
+		final      models.Message
+		wantTools  []string
+		wantResult string
+	}{
+		{
+			name:       "plan",
+			configure:  func(ag *Agent) { ag.PlanMode = true },
+			final:      models.Message{Role: "assistant", Content: "<proposed_plan>done</proposed_plan>"},
+			wantResult: "<proposed_plan>done</proposed_plan>",
+		},
+		{
+			name:      "review",
+			configure: func(ag *Agent) { ag.ReviewMode = true },
+			final: models.Message{Role: "assistant", ToolCalls: []models.ToolCall{{
+				ID: "submit", Type: "function", Function: struct {
+					Name      string `json:"name"`
+					Arguments string `json:"arguments"`
+				}{Name: "submit_review", Arguments: reviewArgs},
+			}}},
+			wantTools:  []string{"submit_review"},
+			wantResult: reviewArgs,
+		},
+		{
+			name:       "ask",
+			configure:  func(ag *Agent) { ag.AskMode = true },
+			final:      models.Message{Role: "assistant", Content: "answer"},
+			wantResult: "answer",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			responses := readOnlyCheckpointResponses(tc.final)
+			wantCalls := 12
+			if tc.name == "review" {
+				// ReviewMode has its own scope-aware boundary coordinator; this
+				// table only checks the immediate terminal handoff for that mode.
+				responses = []models.Message{tc.final}
+				wantCalls = 1
+			}
+			backend := &checkpointBackend{responses: responses}
+			ag := New(backend, "model", 100, "system")
+			tc.configure(ag)
+			ag.Tools = []tools.Tool{
+				{Def: models.NewTool("read", "read", `{"type":"object"}`), Run: func(context.Context, json.RawMessage) (string, error) { return "ok", nil }},
+				{Def: models.NewTool("grep", "grep", `{"type":"object"}`), Run: func(context.Context, json.RawMessage) (string, error) { return "ok", nil }},
+				{Def: models.NewTool("write", "write", `{"type":"object"}`), Run: func(context.Context, json.RawMessage) (string, error) { return "ok", nil }},
+			}
+			got, err := ag.TurnAuthored(context.Background(), "inspect", Events{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got != tc.wantResult {
+				t.Fatalf("result = %q, want %q", got, tc.wantResult)
+			}
+			if len(backend.requests) != wantCalls {
+				t.Fatalf("model calls = %d, want %d", len(backend.requests), wantCalls)
+			}
+			if tc.name == "review" {
+				if len(backend.requests[0].Tools) != 3 || backend.requests[0].Tools[0].Function.Name != "read" || backend.requests[0].Tools[1].Function.Name != "grep" || backend.requests[0].Tools[2].Function.Name != "submit_review" {
+					t.Fatalf("review tools = %+v, want read, grep, submit_review", backend.requests[0].Tools)
+				}
+				return
+			}
+			if !requestContains(backend.requests[10], `<exploration_checkpoint level="1">`) {
+				t.Fatal("final evidence request lacks the checkpoint reminder")
+			}
+			gotTools := make([]string, 0, len(backend.requests[11].Tools))
+			for _, tool := range backend.requests[11].Tools {
+				gotTools = append(gotTools, tool.Function.Name)
+			}
+			if len(gotTools) != len(tc.wantTools) || (len(gotTools) > 0 && !reflect.DeepEqual(gotTools, tc.wantTools)) {
+				t.Fatalf("synthesis tools = %v, want %v", gotTools, tc.wantTools)
+			}
+		})
+	}
+}
+
+func readOnlyCheckpointResponses(final models.Message) []models.Message {
+	read := func(id string, n int) models.ToolCall {
+		return models.ToolCall{ID: id, Type: "function", Function: struct {
+			Name      string `json:"name"`
+			Arguments string `json:"arguments"`
+		}{Name: "read", Arguments: fmt.Sprintf(`{"path":"file-%d.go"}`, n)}}
+	}
+	responses := make([]models.Message, 0, 12)
+	for i := 0; i < 11; i++ {
+		responses = append(responses, models.Message{Role: "assistant", ToolCalls: []models.ToolCall{read(fmt.Sprintf("read-%d", i), i)}})
+	}
+	return append(responses, final)
+}
+
 func TestRolloutBudgetWeightedUsageAndThresholds(t *testing.T) {
 	budget := newPlanRolloutBudget()
 	if budget.Remaining() != defaultPlanBudgetLimit {
@@ -240,7 +339,7 @@ func TestAssembleRequestMessagesStablePrefix(t *testing.T) {
 		{Role: "tool", Content: "tool result", ToolCallID: "tc-1"},
 	}
 
-	assembled := ag.assembleRequestMessages(history, "todo block", "", "<rollout_budget>reminder</rollout_budget>", "", "")
+	assembled := ag.assembleRequestMessages(history, "todo block", "", "<rollout_budget>reminder</rollout_budget>", "", "", "")
 	if len(assembled) != 7 {
 		t.Fatalf("expected 7 messages, got %d", len(assembled))
 	}
@@ -250,11 +349,29 @@ func TestAssembleRequestMessagesStablePrefix(t *testing.T) {
 	if assembled[1].Content != planModePrompt {
 		t.Fatalf("idx 1: %q, want planModePrompt", assembled[1].Content)
 	}
-	if assembled[2].Content != "<rollout_budget>reminder</rollout_budget>" {
-		t.Fatalf("idx 2: %q, want budget reminder", assembled[2].Content)
+	if assembled[5].Content != "<rollout_budget>reminder</rollout_budget>" {
+		t.Fatalf("idx 5: %q, want budget reminder", assembled[5].Content)
 	}
-	if assembled[3].Content != "user prompt" || assembled[4].Content != "assistant thought" || assembled[5].Content != "tool result" || assembled[6].Content != "todo block" {
+	if assembled[2].Content != "user prompt" || assembled[3].Content != "assistant thought" || assembled[4].Content != "tool result" || assembled[6].Content != "todo block" {
 		t.Fatalf("unexpected assembled messages: %+v", assembled)
+	}
+}
+
+func TestPlanTaggedScopePromptListsResolvedFiles(t *testing.T) {
+	workspace := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(workspace, "internal", "search"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workspace, "internal", "search", "state.go"), []byte("package search\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Chdir(workspace)
+
+	ag := New(nil, "model", 100, "system")
+	target := "inspect [note: the user tagged " + filepath.Join(workspace, "internal", "search") + " — contents are not inlined]"
+	got := planTaggedScopePrompt(ag, target)
+	if !strings.Contains(got, "<tagged_scope>") || !strings.Contains(got, "internal/search/state.go") {
+		t.Fatalf("tagged scope prompt = %q", got)
 	}
 }
 

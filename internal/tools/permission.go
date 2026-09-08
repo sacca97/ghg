@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"unicode"
@@ -71,7 +72,13 @@ func CommandRule(command string) string {
 	for n := len(tokens); n > 0; n-- {
 		prefix := strings.Join(tokens[:n], " ")
 		if a, ok := arity[prefix]; ok {
-			return strings.Join(tokens[:min(a, len(tokens))], " ")
+			end := min(a, len(tokens))
+			for _, token := range tokens[:end] {
+				if strings.HasPrefix(token, "-") && token != "-" {
+					return normalizeShellText(command)
+				}
+			}
+			return strings.Join(tokens[:end], " ")
 		}
 	}
 	return tokens[0] // unknown command: the binary is the rule
@@ -92,14 +99,14 @@ func SegmentShell(command string) ([]CommandSegment, error) {
 	var quote byte
 	for i := 0; i < len(command); i++ {
 		c := command[i]
-		if c == '\\' {
-			i++
-			continue
-		}
 		if quote != 0 {
 			if c == quote {
 				quote = 0
 			}
+			continue
+		}
+		if c == '\\' {
+			i++
 			continue
 		}
 		switch c {
@@ -1071,6 +1078,7 @@ func (r *PermRules) AllowAlways(tool, rule string) {
 	for k := range r.rules {
 		list = append(list, k)
 	}
-	r.mu.Unlock()
+	slices.Sort(list)
 	_ = config.WriteJSON("permissions.json", list)
+	r.mu.Unlock()
 }

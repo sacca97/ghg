@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/sacca97/ghg/internal/tools/bashrun"
 )
 
 func run(t *testing.T, name, args string) string {
@@ -87,6 +89,57 @@ func TestReadUsesBoundedDefaultLimit(t *testing.T) {
 	}
 	if result.Metadata["observation_end"] != "250" || result.Metadata["observation_next_offset"] != "251" {
 		t.Fatalf("default read metadata = %+v", result.Metadata)
+	}
+}
+
+func TestReadBatchesIndependentRanges(t *testing.T) {
+	dir := t.TempDir()
+	first := filepath.Join(dir, "first.go")
+	second := filepath.Join(dir, "second.go")
+	if err := os.WriteFile(first, []byte("package first\nfirst body\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(second, []byte("package second\nsecond body\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	args := map[string]any{"ranges": []map[string]any{
+		{"path": first, "offset": 1, "limit": 2},
+		{"path": second, "offset": 1, "limit": 2},
+	}}
+	raw, err := json.Marshal(args)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := ExecuteResult(context.Background(), All(), "read", raw)
+	if result.ExitCode != 0 || result.Metadata["observation_count"] != "2" {
+		t.Fatalf("batched read = %+v", result)
+	}
+	var observations []struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal([]byte(result.Metadata["observations"]), &observations); err != nil {
+		t.Fatal(err)
+	}
+	if len(observations) != 2 || observations[0].ID == "" || observations[1].ID == "" || observations[0].ID == observations[1].ID {
+		t.Fatalf("batched observations = %+v", observations)
+	}
+	if firstAt, secondAt := strings.Index(result.Preview, filepath.ToSlash(first)), strings.Index(result.Preview, filepath.ToSlash(second)); firstAt < 0 || secondAt < 0 || firstAt >= secondAt {
+		t.Fatalf("batched read order = %q", result.Preview)
+	}
+}
+
+func TestReadBatchKeepsSuccessfulSiblingsWhenOneRangeFails(t *testing.T) {
+	dir := t.TempDir()
+	first := writeSearchFile(t, dir, "first.go", "package first\n")
+	second := writeSearchFile(t, dir, "second.go", "package second\n")
+	missing := filepath.Join(dir, "missing.go")
+	args := fmt.Sprintf(`{"ranges":[{"path":%q},{"path":%q},{"path":%q}]}`, first, missing, second)
+	result := ExecuteResult(context.Background(), All(), "read", json.RawMessage(args))
+	if result.ExitCode != 0 || result.Metadata["observation_count"] != "2" {
+		t.Fatalf("mixed batched read = %+v", result)
+	}
+	if !strings.Contains(result.Preview, first) || !strings.Contains(result.Preview, second) || !strings.Contains(result.Preview, "range 2") {
+		t.Fatalf("mixed batched read hid a sibling or failure: %q", result.Preview)
 	}
 }
 
@@ -202,10 +255,10 @@ type mockInteractiveRunner struct {
 	gotCommand string
 	gotTimeout time.Duration
 	gotKeys    <-chan []byte
-	returnThis string
+	returnThis bashrun.Result
 }
 
-func (m *mockInteractiveRunner) Run(_ context.Context, command string, timeout time.Duration, keys <-chan []byte) string {
+func (m *mockInteractiveRunner) Run(_ context.Context, command string, timeout time.Duration, keys <-chan []byte) bashrun.Result {
 	m.gotCommand = command
 	m.gotTimeout = timeout
 	m.gotKeys = keys
@@ -217,12 +270,20 @@ func (m *mockInteractiveRunner) Run(_ context.Context, command string, timeout t
 // and returns whatever the runner returns. It also confirms the hook is
 // consulted only when interactive is true.
 func TestBashToolInteractiveHook(t *testing.T) {
-	mock := &mockInteractiveRunner{returnThis: "PASSWORD_ACCEPTED\n(exit: 0)"}
+	output := "PASSWORD_ACCEPTED\n(exit: 0)"
+	mock := &mockInteractiveRunner{returnThis: bashrun.Result{
+		Output:        output,
+		OriginalBytes: int64(len(output)),
+		Complete:      false,
+	}}
 	ctx := WithRuntime(context.Background(), &ToolRuntime{InteractiveRunner: mock})
 
-	out := Execute(ctx, All(), "bash", json.RawMessage(`{"command":"sudo apt install -y sl","interactive":true,"timeout":20}`))
-	if out != "PASSWORD_ACCEPTED\n(exit: 0)" {
-		t.Fatalf("interactive bash should return runner output verbatim: %q", out)
+	result := ExecuteResult(ctx, All(), "bash", json.RawMessage(`{"command":"sudo apt install -y sl","interactive":true,"timeout":20}`))
+	if result.Preview != output {
+		t.Fatalf("interactive bash should return runner output verbatim: %q", result.Preview)
+	}
+	if result.Complete {
+		t.Fatal("interactive bash should preserve incomplete runner metadata")
 	}
 	if mock.gotCommand != "sudo apt install -y sl" {
 		t.Fatalf("runner got wrong command: %q", mock.gotCommand)
@@ -236,7 +297,7 @@ func TestBashToolInteractiveHook(t *testing.T) {
 
 	// interactive:false must NOT call the runner even when it's installed
 	mock.gotCommand = ""
-	out = Execute(ctx, All(), "bash", json.RawMessage(`{"command":"echo nohook"}`))
+	out := Execute(ctx, All(), "bash", json.RawMessage(`{"command":"echo nohook"}`))
 	if mock.gotCommand != "" {
 		t.Fatalf("non-interactive call should not reach the runner: %q", mock.gotCommand)
 	}

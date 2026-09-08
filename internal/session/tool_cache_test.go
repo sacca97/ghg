@@ -47,3 +47,33 @@ func TestSearchAndObservationStateRoundTrip(t *testing.T) {
 		t.Fatal("snapshot crossed session boundary")
 	}
 }
+
+func TestDeleteFromClearsBranchSpecificToolState(t *testing.T) {
+	store, err := Open(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	sessionID, err := store.Create(t.TempDir(), "model", "provider")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	record := observation.Record{ID: "obs-1", Path: "/tmp/main.go", Content: "stale"}
+	if err := store.SaveObservation(ctx, sessionID, record); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := search.Snapshot{ID: "grep-1", Kind: "grep", Complete: true}
+	if err := store.SaveSearchSnapshot(ctx, sessionID, snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.DeleteFrom(sessionID, 1, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.LoadObservation(ctx, sessionID, record.ID); err == nil {
+		t.Fatal("rewind retained an observation from the discarded branch")
+	}
+	if _, err := store.LoadSearchSnapshot(ctx, sessionID, snapshot.ID); err == nil {
+		t.Fatal("rewind retained a search cursor from the discarded branch")
+	}
+}

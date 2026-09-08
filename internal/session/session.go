@@ -27,8 +27,8 @@ type Meta struct {
 	Goal        string
 	ForkedFrom  string   // source session id when created by /fork ("" = root)
 	ForkSeq     int      // conversation index the fork branched at
-	Tags        []string // freeform labels, for filtering /resume
-	Pinned      bool     // pinned sessions sort first and survive cleanup
+	Tags        []string // freeform labels for caller-side filtering
+	Pinned      bool     // pinned sessions sort first in Recent
 	Effort      string   // reasoning effort for this session ("" = use the global default)
 	UsageIn     int      // cumulative input tokens across the session's API calls
 	UsageCached int      // of UsageIn, tokens served from the provider's prompt cache
@@ -45,22 +45,19 @@ type Store struct {
 
 // Open opens (creating if needed) the sessions database at path.
 func Open(path string) (*Store, error) {
-	dsn := path
-	if !strings.Contains(dsn, "?") {
-		dsn += "?_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=temp_store(MEMORY)"
-	}
-	db, err := sql.Open("sqlite", dsn)
+	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		return nil, err
 	}
 	db.SetMaxOpenConns(1)
 	for _, pragma := range []string{
 		"PRAGMA busy_timeout=5000",
-		"PRAGMA journal_mode=WAL",   // faster commits, no read/write blocking
+		"PRAGMA journal_mode=WAL",   // faster commits
 		"PRAGMA synchronous=NORMAL", // safe in WAL; skips per-commit fsync
 		"PRAGMA temp_store=MEMORY",
 	} {
 		if _, err := db.Exec(pragma); err != nil {
+			_ = db.Close()
 			return nil, err
 		}
 	}
@@ -139,7 +136,7 @@ func now() string { return time.Now().UTC().Format(time.RFC3339) }
 
 // NewSessionID returns an id suitable for a session and worker runtime.
 func NewSessionID() string {
-	b := make([]byte, 4)
+	b := make([]byte, 8)
 	if _, err := rand.Read(b); err == nil {
 		return hex.EncodeToString(b)
 	}
@@ -321,7 +318,7 @@ func (s *Store) DeleteSession(id string) error {
 	}
 	for _, ref := range refs {
 		if cwd != "" {
-			DropSnapshot(cwd, ref)
+			s.DropSnapshotIfUnreferenced(cwd, ref)
 		}
 	}
 	return nil
@@ -329,7 +326,18 @@ func (s *Store) DeleteSession(id string) error {
 
 // Load resolves idOrPrefix to a session and returns its metadata and messages.
 func (s *Store) Load(idOrPrefix string) (Meta, []models.Message, error) {
-	rows, err := s.db.Query(`SELECT `+sessionMetaColumns+` FROM sessions WHERE id LIKE ?||'%' LIMIT 3`, idOrPrefix)
+	query := `SELECT ` + sessionMetaColumns + ` FROM sessions WHERE id=?`
+	args := []any{idOrPrefix}
+	if idOrPrefix == "" {
+		query = `SELECT ` + sessionMetaColumns + ` FROM sessions`
+		args = nil
+	} else if upper, ok := nextPrefix(idOrPrefix); ok {
+		query += ` OR (id>=? AND id<?)`
+		args = append(args, idOrPrefix, upper)
+	}
+	query += ` ORDER BY CASE WHEN id=? THEN 0 ELSE 1 END, id LIMIT 3`
+	args = append(args, idOrPrefix)
+	rows, err := s.db.Query(query, args...)
 	if err != nil {
 		return Meta{}, nil, err
 	}
@@ -337,14 +345,23 @@ func (s *Store) Load(idOrPrefix string) (Meta, []models.Message, error) {
 	if err != nil {
 		return Meta{}, nil, err
 	}
-	switch len(metas) {
-	case 0:
-		return Meta{}, nil, fmt.Errorf("no session matching %q", idOrPrefix)
-	case 1:
-	default:
-		return Meta{}, nil, fmt.Errorf("session id %q is ambiguous", idOrPrefix)
+	var meta Meta
+	for _, candidate := range metas {
+		if candidate.ID == idOrPrefix {
+			meta = candidate
+			break
+		}
 	}
-	meta := metas[0]
+	if meta.ID == "" {
+		switch len(metas) {
+		case 0:
+			return Meta{}, nil, fmt.Errorf("no session matching %q", idOrPrefix)
+		case 1:
+			meta = metas[0]
+		default:
+			return Meta{}, nil, fmt.Errorf("session id %q is ambiguous", idOrPrefix)
+		}
+	}
 
 	// pre-size the slice: a long session is hundreds of rows; the COUNT is
 	// one index scan and avoids O(log n) reallocs while scanning
@@ -372,11 +389,23 @@ func (s *Store) Load(idOrPrefix string) (Meta, []models.Message, error) {
 	return meta, answerDanglingToolCalls(applyCompactionRows(s.db, meta.ID, stored)), mrows.Err()
 }
 
+func nextPrefix(prefix string) (string, bool) {
+	bytes := []byte(prefix)
+	for i := len(bytes) - 1; i >= 0; i-- {
+		if bytes[i] == 0xff {
+			continue
+		}
+		bytes[i]++
+		return string(bytes[:i+1]), true
+	}
+	return "", false
+}
+
 // Recent returns up to n sessions, newest first.
 func (s *Store) Recent(n int) ([]Meta, error) {
 	rows, err := s.db.Query(`SELECT `+sessionMetaColumns+` FROM sessions
 		WHERE EXISTS (SELECT 1 FROM messages WHERE session_id = sessions.id)
-		ORDER BY updated_at DESC LIMIT ?`, n)
+		ORDER BY pinned DESC, updated_at DESC, rowid DESC LIMIT ?`, n)
 	if err != nil {
 		return nil, err
 	}
@@ -412,10 +441,18 @@ func (s *Store) MostRecentForCWD(cwd string) (Meta, error) {
 // they're injected by ghg, not written by the user. Those carry Authored=false
 // and are skipped; only Authored=true messages come back.
 func (s *Store) UserHistory(limit int) ([]string, error) {
-	rows, err := s.db.Query(`SELECT m.content FROM messages m
+	query := `SELECT m.content FROM messages m
 		JOIN sessions s ON s.id = m.session_id
 		WHERE m.role='user'
-		ORDER BY s.updated_at DESC, m.seq DESC`)
+		  AND json_valid(m.content)
+		  AND json_extract(m.content, '$.authored') = 1
+		ORDER BY s.updated_at DESC, m.seq DESC`
+	args := []any(nil)
+	if limit > 0 {
+		query += ` LIMIT ?`
+		args = append(args, limit)
+	}
+	rows, err := s.db.Query(query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -467,19 +504,48 @@ func (s *Store) LastExchange(id string) (user, assistant string) {
 }
 
 // DeleteFrom drops the stored tail at a conversation-view boundary, plus
-// snapshots and workflow results for those turns. Compacted sessions map the
-// view boundary back to raw message sequence numbers before deleting.
+// branch-specific snapshots, workflow results, and tool state. Compacted
+// sessions map the view boundary back to raw message sequence numbers first.
 func (s *Store) DeleteFrom(id string, from int, before []models.Message) error {
 	rawFrom := from
-	events := s.Compactions(id)
+	events, err := s.latestCompaction(id)
+	if err != nil {
+		return err
+	}
 	if len(events) > 0 {
-		rawFrom = s.RawCutoff(id, from, before)
+		rawFrom, err = s.translatedRawCutoff(id, from, before, events)
+		if err != nil {
+			return err
+		}
 	}
 	tx, err := s.db.Begin()
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	var cwd string
+	if err := tx.QueryRow(`SELECT cwd FROM sessions WHERE id=?`, id).Scan(&cwd); err != nil && err != sql.ErrNoRows {
+		return err
+	}
+	rows, err := tx.Query(`SELECT ref FROM snapshots WHERE session_id=? AND seq>=?`, id, from)
+	if err != nil {
+		return err
+	}
+	var refs []string
+	for rows.Next() {
+		var ref string
+		if err := rows.Scan(&ref); err != nil {
+			_ = rows.Close()
+			return err
+		}
+		refs = append(refs, ref)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
 	if _, err := tx.Exec(`DELETE FROM messages WHERE session_id=? AND seq>=?`, id, rawFrom); err != nil {
 		return err
 	}
@@ -495,12 +561,24 @@ func (s *Store) DeleteFrom(id string, from int, before []models.Message) error {
 	if _, err := tx.Exec(`DELETE FROM workflow_results WHERE session_id=? AND message_seq>=?`, id, from); err != nil {
 		return err
 	}
+	if _, err := tx.Exec(`DELETE FROM observations WHERE session_id=?`, id); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`DELETE FROM search_snapshots WHERE session_id=?`, id); err != nil {
+		return err
+	}
 	if len(events) > 0 && rawFrom < events[len(events)-1].Cutoff {
-		if _, err := tx.Exec(`DELETE FROM compactions WHERE session_id=?`, id); err != nil {
+		if _, err := tx.Exec(`DELETE FROM compactions WHERE session_id=? AND cutoff>?`, id, rawFrom); err != nil {
 			return err
 		}
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	for _, ref := range refs {
+		s.DropSnapshotIfUnreferenced(cwd, ref)
+	}
+	return nil
 }
 
 // SetTitle retitles a session (/rename).
@@ -515,7 +593,7 @@ func (s *Store) SetTags(id string, tags []string) error {
 	return err
 }
 
-// SetPinned marks a session pinned (sorts first in /resume, kept by cleanup).
+// SetPinned marks a session pinned (sorts first in Recent).
 func (s *Store) SetPinned(id string, pinned bool) error {
 	v := 0
 	if pinned {
@@ -545,11 +623,4 @@ func scanMetas(rows *sql.Rows) ([]Meta, error) {
 		out = append(out, m)
 	}
 	return out, rows.Err()
-}
-
-func truncate(s string, n int) string {
-	if len(s) > n {
-		return s[:n-1] + "…"
-	}
-	return s
 }

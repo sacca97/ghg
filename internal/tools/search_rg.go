@@ -2,6 +2,7 @@ package tools
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -9,20 +10,22 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/sacca97/ghg/internal/sandbox"
-	"github.com/sacca97/ghg/internal/search"
 )
 
-var rgPathLookedUp bool
-var rgBinaryPath string
+var rgPath = sync.OnceValue(func() string {
+	path, err := exec.LookPath("rg")
+	if err != nil {
+		return ""
+	}
+	return path
+})
 
 func rgAvailable() (string, bool) {
-	if !rgPathLookedUp {
-		rgBinaryPath, _ = exec.LookPath("rg")
-		rgPathLookedUp = true
-	}
-	return rgBinaryPath, rgBinaryPath != ""
+	path := rgPath()
+	return path, path != ""
 }
 
 type rgMatchEvent struct {
@@ -38,7 +41,7 @@ type rgMatchEvent struct {
 	} `json:"data"`
 }
 
-func grepSnapshotRG(ctx context.Context, args grepArgs, scope *searchScope, out *searchCollector) error {
+func grepSnapshotRG(ctx context.Context, args grepArgs, scope *searchScope, matcher *grepMatcher, out *searchCollector) error {
 	bin, ok := rgAvailable()
 	if !ok {
 		return errors.New("rg not available")
@@ -61,11 +64,7 @@ func grepSnapshotRG(ctx context.Context, args grepArgs, scope *searchScope, out 
 		cmdArgs = append(cmdArgs, "--fixed-strings")
 	}
 
-	patterns := append([]string(nil), args.Patterns...)
-	if len(patterns) == 0 && args.Pattern != "" {
-		patterns = []string{args.Pattern}
-	}
-	for _, p := range patterns {
+	for _, p := range matcher.patterns {
 		cmdArgs = append(cmdArgs, "-e", p)
 	}
 
@@ -112,6 +111,11 @@ func grepSnapshotRG(ctx context.Context, args grepArgs, scope *searchScope, out 
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("rg start: %w", err)
 	}
+	stop := func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+	}
 
 	scanner := bufio.NewScanner(stdout)
 	scanner.Buffer(make([]byte, 64<<10), 1<<20)
@@ -119,7 +123,7 @@ func grepSnapshotRG(ctx context.Context, args grepArgs, scope *searchScope, out 
 	var scanErr error
 	for scanner.Scan() {
 		lineBytes := scanner.Bytes()
-		if len(lineBytes) == 0 || lineBytes[0] != '{' {
+		if !bytes.HasPrefix(lineBytes, []byte(`{"type":"match"`)) {
 			continue
 		}
 		var ev rgMatchEvent
@@ -137,33 +141,39 @@ func grepSnapshotRG(ctx context.Context, args grepArgs, scope *searchScope, out 
 		}
 		display = filepath.ToSlash(display)
 
-		text := strings.TrimSuffix(ev.Data.Lines.Text, "\n")
-		text = strings.TrimSuffix(text, "\r")
-		if len(text) > maxMatchLineBytes {
-			text = text[:maxMatchLineBytes] + "… [line truncated]"
-		}
+		matchText := strings.TrimSuffix(ev.Data.Lines.Text, "\n")
+		matchText = strings.TrimSuffix(matchText, "\r")
+		text := truncateMatchText(matchText, false)
 
-		if addErr := out.add(ctx, search.Item{
-			Path: display,
-			Line: ev.Data.LineNumber,
-			Text: text,
-		}); addErr != nil {
-			if errors.Is(addErr, errSearchLimit) {
-				_ = cmd.Process.Kill()
-				_ = cmd.Wait()
-				return nil
-			}
+		patterns := singlePatternMatch
+		if len(matcher.regexes) > 1 {
+			patterns = matcher.matches([]byte(matchText))
+		}
+		if addErr := appendGrepMatches(ctx, out, display, ev.Data.LineNumber, text, matcher, patterns); addErr != nil {
+			stop()
 			scanErr = addErr
+		}
+		if scanErr != nil {
 			break
 		}
 	}
 
 	if err := scanner.Err(); err != nil && scanErr == nil {
 		scanErr = err
+		stop()
 	}
 
 	waitErr := cmd.Wait()
 	if scanErr != nil {
+		if errors.Is(scanErr, errSearchLimit) {
+			return nil
+		}
+		if errors.Is(scanErr, context.Canceled) || errors.Is(scanErr, context.DeadlineExceeded) {
+			return scanErr
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
 		return scanErr
 	}
 	if waitErr != nil {

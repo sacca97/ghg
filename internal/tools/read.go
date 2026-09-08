@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/sacca97/ghg/internal/models"
 	"github.com/sacca97/ghg/internal/observation"
@@ -16,61 +17,212 @@ import (
 )
 
 const (
-	defaultReadLines   = 250
-	maxReadLines       = 1000
-	maxReadBytes       = 16 << 10
-	maxReadLineBytes   = 1 << 20
-	maxObservationPath = 4 << 10
-	readHeaderBudget   = 128
+	defaultReadLines     = 250
+	maxReadLines         = 1000
+	maxReadBytes         = 16 << 10
+	maxReadLineBytes     = 1 << 20
+	maxObservationPath   = 4 << 10
+	readHeaderBudget     = 128
+	maxReadRanges        = 32
+	maxBatchReadBytes    = 32 << 10
+	maxReadWorkers       = 4
+	maxBatchFailureBytes = 512
 )
+
+type readRangeArgs struct {
+	Path   string `json:"path"`
+	Offset int    `json:"offset"`
+	Limit  int    `json:"limit"`
+}
+
+type readArgs struct {
+	readRangeArgs
+	Ranges []readRangeArgs `json:"ranges"`
+}
+
+type pendingObservedRead struct {
+	result    ToolResult
+	record    observation.Record
+	canonical string
+	duplicate bool
+}
 
 func readTool() Tool {
 	return resultTool(models.NewTool("read",
-		"Read a bounded range of complete lines and issue an observation id for later range-authorized edits. Use offset/limit to continue.",
-		`{"type":"object","properties":{"path":{"type":"string","description":"Path to the file"},"offset":{"type":"number","description":"1-based line to start from (default 1)"},"limit":{"type":"number","description":"Max complete lines to return (default 250, maximum 1000)"}},"required":["path"]}`),
+		"Read one or more bounded ranges of complete lines and issue observation ids for later range-authorized edits. Prefer the ranges form for every request, including one range; use the legacy path/offset/limit form only for compatibility. Use offset/limit to continue a file.",
+		fmt.Sprintf(`{"type":"object","properties":{"path":{"type":"string","description":"Legacy single-file form; prefer ranges even for one file"},"offset":{"type":"number","description":"1-based line to start from (default 1)"},"limit":{"type":"number","description":"Max complete lines to return (default 250, maximum 1000)"},"ranges":{"type":"array","minItems":1,"maxItems":%d,"description":"Preferred form: independent ranges returned in request order; use a one-element array for one range","items":{"type":"object","properties":{"path":{"type":"string","description":"Path to the file"},"offset":{"type":"number","description":"1-based line to start from (default 1)"},"limit":{"type":"number","description":"Max complete lines to return (default 250, maximum 1000)"}},"required":["path"]}}},"oneOf":[{"required":["ranges"],"not":{"required":["path"]}},{"required":["path"],"not":{"required":["ranges"]}}]}`, maxReadRanges)),
 		runReadResult)
 }
 
 func runReadResult(ctx context.Context, args json.RawMessage) (ToolResult, error) {
-	var a struct {
-		Path   string `json:"path"`
-		Offset int    `json:"offset"`
-		Limit  int    `json:"limit"`
-	}
+	var a readArgs
 	if err := json.Unmarshal(args, &a); err != nil {
 		return ToolResult{}, err
 	}
-	return runObservedRead(ctx, a)
+	if a.Ranges != nil {
+		if strings.TrimSpace(a.Path) != "" {
+			return ToolResult{}, fmt.Errorf("read cannot mix path with ranges")
+		}
+		if len(a.Ranges) == 0 {
+			return ToolResult{}, fmt.Errorf("read ranges cannot be empty")
+		}
+		if len(a.Ranges) > maxReadRanges {
+			return ToolResult{}, fmt.Errorf("read supports at most %d ranges", maxReadRanges)
+		}
+		return runObservedReadBatch(ctx, a.Ranges)
+	}
+	return runObservedRead(ctx, a.readRangeArgs)
 }
 
-func runObservedRead(ctx context.Context, args struct {
-	Path   string `json:"path"`
-	Offset int    `json:"offset"`
-	Limit  int    `json:"limit"`
-}) (ToolResult, error) {
+func runObservedRead(ctx context.Context, args readRangeArgs) (ToolResult, error) {
 	if err := ctx.Err(); err != nil {
 		return ToolResult{}, err
 	}
 	if strings.TrimSpace(args.Path) == "" {
 		return ToolResult{}, fmt.Errorf("path is required")
 	}
-
-	canonical, err := authorizedObservationPath(ctx, args.Path, sandbox.AccessRead, false)
+	pending, err := prepareObservedRead(ctx, args)
 	if err != nil {
 		return ToolResult{}, err
+	}
+	if err := persistObservedRead(ctx, pending); err != nil {
+		return ToolResult{}, err
+	}
+	return pending.result, nil
+}
+
+func prepareObservedRead(ctx context.Context, args readRangeArgs) (pendingObservedRead, error) {
+	canonical, err := authorizedObservationPath(ctx, args.Path, sandbox.AccessRead, false)
+	if err != nil {
+		return pendingObservedRead{}, err
 	}
 	f, err := os.Open(canonical)
 	if err != nil {
-		return ToolResult{}, err
+		return pendingObservedRead{}, err
 	}
 	defer func() { _ = f.Close() }()
 
-	return readObservedContent(ctx, canonical, args.Path, f, args.Offset, args.Limit)
+	return prepareObservedContent(ctx, canonical, args.Path, f, args.Offset, args.Limit)
+}
+
+func runObservedReadBatch(ctx context.Context, ranges []readRangeArgs) (ToolResult, error) {
+	if err := ctx.Err(); err != nil {
+		return ToolResult{}, err
+	}
+	type outcome struct {
+		read pendingObservedRead
+		err  error
+	}
+	outcomes := make([]outcome, len(ranges))
+	jobs := make(chan int)
+	workers := min(len(ranges), maxReadWorkers)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for index := range jobs {
+				read, err := prepareObservedRead(ctx, ranges[index])
+				outcomes[index] = outcome{read: read, err: err}
+			}
+		}()
+	}
+	for index := range ranges {
+		select {
+		case jobs <- index:
+		case <-ctx.Done():
+			close(jobs)
+			wg.Wait()
+			return ToolResult{}, ctx.Err()
+		}
+	}
+	close(jobs)
+	wg.Wait()
+	if err := ctx.Err(); err != nil {
+		return ToolResult{}, err
+	}
+
+	var output strings.Builder
+	selected := 0
+	complete := true
+	observations := make([]map[string]any, 0, len(ranges))
+	failureCount := 0
+	for _, outcome := range outcomes {
+		if outcome.err != nil {
+			failureCount++
+		}
+	}
+	contentBudget := maxBatchReadBytes - failureCount*maxBatchFailureBytes
+	appendFailure := func(index int, message string) {
+		complete = false
+		path := strings.NewReplacer("\n", " ", "\r", " ").Replace(ranges[index].Path)
+		message = strings.NewReplacer("\n", " ", "\r", " ").Replace(message)
+		note := fmt.Sprintf("[range %d path=%s error=%s]\n", index+1, path, message)
+		if len(note) > maxBatchFailureBytes {
+			note = note[:maxBatchFailureBytes-len("...\n")] + "...\n"
+		}
+		if output.Len()+len(note) <= maxBatchReadBytes {
+			output.WriteString(note)
+		}
+	}
+	for index, outcome := range outcomes {
+		if outcome.err != nil {
+			appendFailure(index, outcome.err.Error())
+			continue
+		}
+		if !outcome.read.record.Complete {
+			complete = false
+		}
+		text := outcome.read.result.Preview
+		if output.Len()+len(text) > contentBudget {
+			appendFailure(index, fmt.Sprintf("omitted because the combined result exceeds the %d-byte content limit", contentBudget))
+			continue
+		}
+		if err := persistObservedRead(ctx, outcome.read); err != nil {
+			appendFailure(index, err.Error())
+			continue
+		}
+		output.WriteString(text)
+		selected++
+		observations = append(observations, map[string]any{
+			"id":          outcome.read.record.ID,
+			"path":        outcome.read.record.Path,
+			"start_line":  outcome.read.record.StartLine,
+			"end_line":    outcome.read.record.EndLine,
+			"next_offset": outcome.read.record.NextOffset,
+			"complete":    outcome.read.record.Complete,
+		})
+	}
+	raw := output.String()
+	result := TextResultWithSize(raw, raw, int64(len(raw)), complete, 0)
+	if selected == 0 {
+		result.ExitCode = 1
+	}
+	encoded, err := json.Marshal(observations)
+	if err != nil {
+		return ToolResult{}, fmt.Errorf("encode read observations: %w", err)
+	}
+	result.Metadata = map[string]string{
+		"observations":      string(encoded),
+		"observation_count": fmt.Sprint(selected),
+	}
+	return MarkUntrusted(result, "read"), nil
 }
 
 func readObservedContent(ctx context.Context, canonical, display string, r io.Reader, offset, limit int) (ToolResult, error) {
-	if err := ctx.Err(); err != nil {
+	pending, err := prepareObservedContent(ctx, canonical, display, r, offset, limit)
+	if err != nil {
 		return ToolResult{}, err
+	}
+	if err := persistObservedRead(ctx, pending); err != nil {
+		return ToolResult{}, err
+	}
+	return pending.result, nil
+}
+
+func prepareObservedContent(ctx context.Context, canonical, display string, r io.Reader, offset, limit int) (pendingObservedRead, error) {
+	if err := ctx.Err(); err != nil {
+		return pendingObservedRead{}, err
 	}
 	start := offset
 	if start <= 0 {
@@ -88,7 +240,7 @@ func readObservedContent(ctx context.Context, canonical, display string, r io.Re
 	var content strings.Builder
 	payloadBudget := maxReadBytes - len(canonical) - readHeaderBudget
 	if payloadBudget <= 0 {
-		return ToolResult{}, fmt.Errorf("read path leaves no room within the %d-byte output budget", maxReadBytes)
+		return pendingObservedRead{}, fmt.Errorf("read path leaves no room within the %d-byte output budget", maxReadBytes)
 	}
 	lineNo := 0
 	selected := 0
@@ -96,11 +248,11 @@ func readObservedContent(ctx context.Context, canonical, display string, r io.Re
 	limitedByBytes := false
 	for {
 		if err := ctx.Err(); err != nil {
-			return ToolResult{}, err
+			return pendingObservedRead{}, err
 		}
 		line, eof, err := readCompleteLine(reader, maxReadLineBytes)
 		if err != nil {
-			return ToolResult{}, fmt.Errorf("read %s: %w", display, err)
+			return pendingObservedRead{}, fmt.Errorf("read %s: %w", display, err)
 		}
 		if line == nil && eof {
 			break
@@ -119,7 +271,7 @@ func readObservedContent(ctx context.Context, canonical, display string, r io.Re
 		numberedLine := fmt.Sprintf("%d\t", lineNo)
 		if numbered.Len()+len(numberedLine)+len(line) > payloadBudget {
 			if selected == 0 {
-				return ToolResult{}, fmt.Errorf("read line %d exceeds the %d-byte read budget; request a narrower range or use a dedicated tool", lineNo, maxReadBytes)
+				return pendingObservedRead{}, fmt.Errorf("read line %d exceeds the %d-byte read budget; request a narrower range or use a dedicated tool", lineNo, maxReadBytes)
 			}
 			limitedByBytes = true
 			nextOffset = lineNo
@@ -138,7 +290,7 @@ func readObservedContent(ctx context.Context, canonical, display string, r io.Re
 		}
 	}
 	if lineNo < start || selected == 0 {
-		return ToolResult{}, fmt.Errorf("offset %d past end of file (%d lines)", offset, lineNo)
+		return pendingObservedRead{}, fmt.Errorf("offset %d past end of file (%d lines)", offset, lineNo)
 	}
 	if nextOffset > 0 && !limitedByBytes && selected < limit {
 		nextOffset = 0
@@ -163,7 +315,7 @@ func readObservedContent(ctx context.Context, canonical, display string, r io.Re
 	header := fmt.Sprintf("[observation %s path=%s lines=%d-%d next_offset=%d]\n", id, filepath.ToSlash(canonical), start, start+selected-1, nextOffset)
 	raw := header + numbered.String()
 	if len(raw) > maxObservationPath+maxReadBytes {
-		return ToolResult{}, fmt.Errorf("read result exceeded its bounded output budget")
+		return pendingObservedRead{}, fmt.Errorf("read result exceeded its bounded output budget")
 	}
 	record := observation.Record{
 		ID:          id,
@@ -175,14 +327,6 @@ func readObservedContent(ctx context.Context, canonical, display string, r io.Re
 		Content:     content.String(),
 		Complete:    !limitedByBytes,
 	}
-	if store != nil && !isDuplicate {
-		if err := store.Save(ctx, sessionID, record); err != nil {
-			return ToolResult{}, fmt.Errorf("persist read observation: %w", err)
-		}
-	}
-	if runtime := RuntimeFromContext(ctx); runtime != nil && runtime.LanguageService != nil {
-		runtime.LanguageService.Warm(ctx, canonical)
-	}
 	result := TextResultWithSize(raw, raw, int64(len(raw)), true, 0)
 	result.Metadata = map[string]string{
 		"observation_id":          id,
@@ -192,7 +336,25 @@ func readObservedContent(ctx context.Context, canonical, display string, r io.Re
 		"observation_next_offset": fmt.Sprint(record.NextOffset),
 		"observation_complete":    fmt.Sprint(record.Complete),
 	}
-	return MarkUntrusted(result, "read"), nil
+	return pendingObservedRead{
+		result:    MarkUntrusted(result, "read"),
+		record:    record,
+		canonical: canonical,
+		duplicate: isDuplicate,
+	}, nil
+}
+
+func persistObservedRead(ctx context.Context, pending pendingObservedRead) error {
+	sessionID, store := observationContextFor(ctx)
+	if store != nil && !pending.duplicate {
+		if err := store.Save(ctx, sessionID, pending.record); err != nil {
+			return fmt.Errorf("persist read observation: %w", err)
+		}
+	}
+	if runtime := RuntimeFromContext(ctx); runtime != nil && runtime.LanguageService != nil {
+		runtime.LanguageService.Warm(ctx, pending.canonical)
+	}
+	return nil
 }
 
 func canonicalObservationPath(name string) (string, error) {

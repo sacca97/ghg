@@ -126,6 +126,14 @@ type namePrompt struct {
 	onOK  func(string)
 }
 
+func restoreCollapsedPaste(text, paste string) string {
+	placeholder := strings.TrimSpace(fmt.Sprintf("[Pasted ~%d lines]", strings.Count(paste, "\n")+1))
+	if replaced := strings.Replace(text, placeholder, strings.TrimSpace(paste), 1); replaced != text {
+		return replaced
+	}
+	return strings.TrimSpace(text) + "\n" + strings.TrimSpace(paste)
+}
+
 func (m *model) openNamePrompt(label, value string, onOK func(string)) {
 	m.namePrompt = &namePrompt{label: label, draft: m.input.Value(), onOK: onOK}
 	m.input.SetValue(value)
@@ -184,10 +192,15 @@ func (m *model) inputContentHeight() int {
 	if contentWidth < 1 {
 		contentWidth = 1
 	}
+	value := m.input.Value()
+	if value == m.inputMeasuredValue && contentWidth == m.inputMeasuredWidth {
+		return m.inputMeasuredHeight
+	}
 	h := 0
-	for _, line := range strings.Split(m.input.Value(), "\n") {
+	for _, line := range strings.Split(value, "\n") {
 		h += max(1, (lipgloss.Width(line)+contentWidth-1)/contentWidth)
 	}
+	m.inputMeasuredValue, m.inputMeasuredWidth, m.inputMeasuredHeight = value, contentWidth, h
 	return h
 }
 
@@ -311,7 +324,7 @@ func (m *model) key(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.tasksFocus = !m.tasksFocus
-		m.clampTaskSel(-1)
+		m.clampTaskSel()
 		return m, nil
 	case tea.KeyCtrlD:
 		return m.command("/detach")
@@ -487,8 +500,7 @@ func (m *model) key(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		// while busy with a queue and an empty input, ↑ selects queued messages
-		if m.busy && len(m.queue) > 0 && m.input.Value() == "" &&
-			(msg.Type == tea.KeyUp || msg.Type == tea.KeyShiftTab) {
+		if m.busy && len(m.queue) > 0 && m.input.Value() == "" && msg.Type == tea.KeyUp {
 			if m.queueSel < 0 {
 				m.queueSel = len(m.queue) - 1 // start at the newest
 			} else if m.queueSel > 0 {
@@ -585,7 +597,7 @@ func (m *model) key(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		text := strings.TrimSpace(m.input.Value())
 		// a collapsed paste swaps its real text back in at submit
 		if m.pasteBuf != "" {
-			text = strings.Replace(text, strings.TrimSpace(fmt.Sprintf("[Pasted ~%d lines]", strings.Count(m.pasteBuf, "\n")+1)), strings.TrimSpace(m.pasteBuf), 1)
+			text = restoreCollapsedPaste(text, m.pasteBuf)
 			m.pasteBuf = ""
 		}
 		if m.busy {

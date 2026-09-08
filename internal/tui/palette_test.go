@@ -298,8 +298,8 @@ func TestPaletteModelRolePanelSelectsRoute(t *testing.T) {
 	tm, _ = m.paletteKey(tea.KeyMsg{Type: tea.KeyEnter}) // open default's models
 	m = tm.(*model)
 	pp = m.settings.top()
-	if pp == nil || pp.kind != panelModel || len(pp.items) != 3 {
-		t.Fatalf("default model panel should list three keyed routes: %+v", pp)
+	if pp == nil || pp.kind != panelModel || len(pp.items) != 2 {
+		t.Fatalf("default model panel should list two keyed routes: %+v", pp)
 	}
 	modelBefore := m.modelName
 	tm, _ = m.paletteKey(tea.KeyMsg{Type: tea.KeyUp}) // choose glm without previewing
@@ -360,65 +360,6 @@ func TestPaletteGoalPanelSetsGoal(t *testing.T) {
 	}
 	if m.settings.top() != nil {
 		t.Fatal("enter should pop the goal panel")
-	}
-}
-
-// The compaction-model panel applies on ←/→ without closing.
-func TestPaletteCompactPanelAppliesInPlace(t *testing.T) {
-	m := compactCmdModel()
-	m.openPalette()
-	var tm tea.Model
-	for m.settings.items[m.settings.idx].title != "Compaction model" {
-		tm, _ = m.paletteKey(tea.KeyMsg{Type: tea.KeyDown})
-		m = tm.(*model)
-	}
-	tm, _ = m.paletteKey(tea.KeyMsg{Type: tea.KeyEnter}) // push compact panel
-	m = tm.(*model)
-	pp := m.settings.top()
-	if pp == nil || pp.kind != panelCompact {
-		t.Fatal("enter should push the compaction panel")
-	}
-	if pp.midx != 0 { // no override configured → the default row selected
-		t.Fatalf("should start on the default row, got %d", pp.midx)
-	}
-	tm, _ = m.paletteKey(tea.KeyMsg{Type: tea.KeyDown})
-	m = tm.(*model)
-	tm, _ = m.paletteKey(tea.KeyMsg{Type: tea.KeyRight}) // apply in place
-	m = tm.(*model)
-	if m.compactModel == "" {
-		t.Fatal("→ should apply the highlighted model")
-	}
-	if m.settings.top() == nil {
-		t.Fatal("→ must keep the panel open")
-	}
-}
-
-// The panel's first row restores the built-in default (""), not "current
-// model": picking a model then selecting the default row resets the override.
-func TestPaletteCompactPanelDefaultRowRestores(t *testing.T) {
-	m := compactCmdModel()
-	m.compactCommand([]string{"glm-5.2-fast"}) // pick an override first
-	m.openPaletteOn("Compaction model")
-	pp := m.settings.top()
-	if pp == nil || pp.kind != panelCompact {
-		t.Fatal("openPaletteOn should land in the compaction panel")
-	}
-	if !strings.Contains(pp.list[0], "default (") {
-		t.Fatalf("first row should read default (…), got %q", pp.list[0])
-	}
-	for pp.midx != 0 { // navigate to the default row
-		tm, _ := m.paletteKey(tea.KeyMsg{Type: tea.KeyUp})
-		m = tm.(*model)
-	}
-	tm, _ := m.paletteKey(tea.KeyMsg{Type: tea.KeyEnter})
-	m = tm.(*model)
-	if m.compactModel != "" {
-		t.Fatalf("the default row should restore the built-in default: %q", m.compactModel)
-	}
-	// enter popped the panel — and since it was opened directly (not drilled
-	// into from the root list), the whole settings closed with it
-	if m.settings != nil && m.settings.top() != nil {
-		t.Fatal("enter should pop the panel")
 	}
 }
 

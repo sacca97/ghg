@@ -206,4 +206,7 @@ func TestOutputGarbageCollectByAge(t *testing.T) {
 	if err != nil || removed != 1 {
 		t.Fatalf("age cleanup: removed=%d err=%v", removed, err)
 	}
+	if _, err := os.Stat(filepath.Dir(filepath.Join(root, rel))); !os.IsNotExist(err) {
+		t.Fatalf("empty output shard remains: %v", err)
+	}
 }

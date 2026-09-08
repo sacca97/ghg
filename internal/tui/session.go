@@ -21,32 +21,69 @@ type picker struct {
 	idx      int
 	previews map[string][2]string
 	pendingD bool
+	loading  bool
+}
+
+type recentSessionsMsg struct {
+	metas []session.Meta
+	err   error
+}
+
+type sessionPreviewMsg struct {
+	id        string
+	user      string
+	assistant string
+}
+
+type resumeData struct {
+	meta    session.Meta
+	msgs    []models.Message
+	tasks   []session.Task
+	goal    session.GoalRecord
+	hasGoal bool
+	plan    string
+}
+
+type resumeLoadedMsg struct {
+	data resumeData
+	err  error
 }
 
 func (m *model) pickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	p := m.picker
-	moveUp := func() {
+	if p == nil {
+		return m, nil
+	}
+	if p.loading {
+		if msg.Type == tea.KeyEsc || msg.Type == tea.KeyCtrlC {
+			m.picker = nil
+		}
+		return m, nil
+	}
+	moveUp := func() tea.Cmd {
 		p.pendingD = false
 		if p.idx < len(p.metas)-1 {
 			p.idx++
-			p.loadPreview(m.store)
+			return m.previewCmd(p.metas[p.idx].ID)
 		}
+		return nil
 	}
-	moveDown := func() {
+	moveDown := func() tea.Cmd {
 		p.pendingD = false
 		if p.idx > 0 {
 			p.idx--
-			p.loadPreview(m.store)
+			return m.previewCmd(p.metas[p.idx].ID)
 		}
+		return nil
 	}
 	switch msg.Type {
 	case tea.KeyEsc, tea.KeyCtrlC:
 		p.pendingD = false
 		m.picker = nil
 	case tea.KeyUp, tea.KeyCtrlP, tea.KeyShiftTab:
-		moveUp()
+		return m, moveUp()
 	case tea.KeyDown, tea.KeyCtrlN, tea.KeyTab:
-		moveDown()
+		return m, moveDown()
 	case tea.KeyEnter:
 		p.pendingD = false
 		if len(p.metas) == 0 {
@@ -55,15 +92,18 @@ func (m *model) pickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		id := p.metas[p.idx].ID
 		m.picker = nil
+		if m.prog != nil {
+			return m, m.resumeCmd(id)
+		}
 		if err := m.resume(id); err != nil {
 			m.append(errStyle.Render(err.Error()))
 		}
 	case tea.KeyRunes:
 		switch string(msg.Runes) {
 		case "k":
-			moveUp()
+			return m, moveUp()
 		case "j":
-			moveDown()
+			return m, moveDown()
 		case "d":
 			if !p.pendingD {
 				p.pendingD = true
@@ -93,7 +133,7 @@ func (m *model) pickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			if p.idx >= len(p.metas) {
 				p.idx = len(p.metas) - 1
 			}
-			p.loadPreview(m.store)
+			return m, m.previewCmd(p.metas[p.idx].ID)
 		default:
 			p.pendingD = false
 		}
@@ -101,6 +141,38 @@ func (m *model) pickerKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		p.pendingD = false
 	}
 	return m, nil
+}
+
+func (m *model) applyRecentSessions(msg recentSessionsMsg) tea.Cmd {
+	if m.picker == nil {
+		return nil
+	}
+	if msg.err != nil {
+		m.picker = nil
+		m.append(errStyle.Render(msg.err.Error()))
+		return nil
+	}
+	if len(msg.metas) == 0 {
+		m.picker = nil
+		m.append(dimStyle.Render("(no previous sessions)"))
+		return nil
+	}
+	m.picker.metas = msg.metas
+	m.picker.idx = 0
+	m.picker.loading = false
+	return m.previewCmd(msg.metas[0].ID)
+}
+
+func (m *model) applySessionPreview(msg sessionPreviewMsg) {
+	if m.picker == nil {
+		return
+	}
+	for _, meta := range m.picker.metas {
+		if meta.ID == msg.id {
+			m.picker.previews[msg.id] = [2]string{msg.user, msg.assistant}
+			return
+		}
+	}
 }
 
 func (p *picker) loadPreview(store *session.Store) {
@@ -111,20 +183,74 @@ func (p *picker) loadPreview(store *session.Store) {
 	}
 }
 
+func (m *model) previewCmd(id string) tea.Cmd {
+	p := m.picker
+	if p == nil || m.store == nil {
+		return nil
+	}
+	if _, ok := p.previews[id]; ok {
+		return nil
+	}
+	if m.prog == nil {
+		u, a := m.store.LastExchange(id)
+		p.previews[id] = [2]string{u, a}
+		return nil
+	}
+	store := m.store
+	return func() tea.Msg {
+		u, a := store.LastExchange(id)
+		return sessionPreviewMsg{id: id, user: u, assistant: a}
+	}
+}
+
 func (m *model) resume(id string) error {
-	return m.resumeDisplay(id)
+	data, err := loadResumeData(m.store, id)
+	if err != nil {
+		return err
+	}
+	return m.applyResumeData(data)
 }
 
 func (m *model) resumeDisplay(id string) error {
-	if m.store == nil {
-		return errors.New("session store unavailable")
-	}
-	if m.busy {
-		return errors.New("cannot resume while the worker is busy")
-	}
-	meta, msgs, err := m.store.Load(id)
+	data, err := loadResumeData(m.store, id)
 	if err != nil {
 		return err
+	}
+	return m.applyResumeData(data)
+}
+
+func (m *model) resumeCmd(id string) tea.Cmd {
+	store := m.store
+	return func() tea.Msg {
+		data, err := loadResumeData(store, id)
+		return resumeLoadedMsg{data: data, err: err}
+	}
+}
+
+func loadResumeData(store *session.Store, id string) (resumeData, error) {
+	if store == nil {
+		return resumeData{}, errors.New("session store unavailable")
+	}
+	meta, msgs, err := store.Load(id)
+	if err != nil {
+		return resumeData{}, err
+	}
+	data := resumeData{meta: meta, msgs: msgs}
+	data.tasks, _ = store.LoadTasks(meta.ID)
+	data.goal, data.hasGoal, _ = store.LoadGoal(meta.ID)
+	if result, ok, err := store.LatestWorkflowResult(context.Background(), meta.ID, "plan"); err == nil && ok {
+		var payload map[string]string
+		if json.Unmarshal([]byte(result.Payload), &payload) == nil {
+			data.plan = payload["markdown"]
+		}
+	}
+	return data, nil
+}
+
+func (m *model) applyResumeData(data resumeData) error {
+	meta, msgs := data.meta, data.msgs
+	if m.busy {
+		return errors.New("cannot resume while the worker is busy")
 	}
 	if err := m.beginWorkerTransition(); err != nil {
 		return err
@@ -134,12 +260,11 @@ func (m *model) resumeDisplay(id string) error {
 	route, routeErr := resolveDisplayRoute(m.cfg, m.profiles, meta.Model, meta.Provider, role)
 	if routeErr == nil {
 		m.modelName, m.provName, m.modelID = route.ModelName, route.ProviderName, route.APIID
-		m.protocol, m.role, m.contextLimit = route.Protocol, route.Role, route.ContextLimit
+		m.role, m.contextLimit = route.Role, route.ContextLimit
 	} else {
 		m.modelName, m.provName = meta.Model, meta.Provider
 		m.modelID = meta.Model
 		m.role = role
-		m.protocol = ""
 		m.contextLimit = m.contextLimitFor(m.provName, m.modelID)
 	}
 	if meta.Effort != "" {
@@ -155,10 +280,11 @@ func (m *model) resumeDisplay(id string) error {
 	m.sessionID = meta.ID
 	m.usage = usageFromMeta(meta, msgs)
 	m.workerContextTokens = 0
+	m.reviewProgressHistory = nil
 	m.workerTasks = nil
-	if tasks, taskErr := m.store.LoadTasks(meta.ID); taskErr == nil {
-		m.workerTasks = make(map[string]workerwire.TaskState, len(tasks))
-		for _, task := range tasks {
+	if len(data.tasks) > 0 {
+		m.workerTasks = make(map[string]workerwire.TaskState, len(data.tasks))
+		for _, task := range data.tasks {
 			m.workerTasks[task.ID] = workerwire.TaskState{
 				ID: task.ID, Description: task.Description, Prompt: task.Prompt,
 				Status: task.Status, Report: task.Report,
@@ -166,22 +292,14 @@ func (m *model) resumeDisplay(id string) error {
 			}
 		}
 	}
-	if record, ok, loadErr := m.store.LoadGoal(meta.ID); loadErr == nil && ok {
-		m.applyGoalRecord(record)
+	if data.hasGoal {
+		m.applyGoalRecord(data.goal)
 	} else {
 		m.goalRecord = nil
 	}
 	m.modelSlotW = m.statusModelSlotWidth()
 	m.future = nil
-	m.proposedPlanMD = ""
-	if m.store != nil {
-		if planRecord, ok, err := m.store.LatestWorkflowResult(context.Background(), meta.ID, "plan"); err == nil && ok {
-			var payload map[string]string
-			if json.Unmarshal([]byte(planRecord.Payload), &payload) == nil && payload["markdown"] != "" {
-				m.proposedPlanMD = payload["markdown"]
-			}
-		}
-	}
+	m.proposedPlanMD = data.plan
 	m.planCurrent = ""
 	m.blocks = nil
 	m.msgBlock = nil
@@ -201,9 +319,6 @@ func (m *model) resumeDisplay(id string) error {
 	}
 	m.workerStartFailed = false
 	m.workerStartError = ""
-	if m.prog != nil && !m.ensureWorker() {
-		m.append(errStyle.Render("worker unavailable: " + m.workerStartError))
-	}
 	return nil
 }
 
@@ -321,7 +436,10 @@ func (m *model) forkWorker(cut int, title string) {
 		return
 	}
 	requestID := workerRequestID("fork")
-	if err := m.workerClient.Send(workerwire.CommandFork, requestID, workerwire.ForkRequest{Cut: cut, Title: title}); err != nil {
+	view := append(m.messagesSnapshot(), m.future...)
+	if err := m.workerClient.Send(workerwire.CommandFork, requestID, workerwire.ForkRequest{
+		Cut: cut, Title: title, Messages: view,
+	}); err != nil {
 		m.append(errStyle.Render("fork failed: " + err.Error()))
 		return
 	}
@@ -600,6 +718,7 @@ func (m *model) resetSessionState() {
 	m.future = nil
 	m.proposedPlanMD = ""
 	m.planCurrent = ""
+	m.reviewProgressHistory = nil
 	m.setGoal("")
 	m.goalRecord = nil
 	m.sessionID = ""
@@ -609,6 +728,13 @@ const previewLines = 5
 
 func (m *model) pickerView() string {
 	p := m.picker
+	if p.loading {
+		rows := []string{dimStyle.Render(" loading sessions…")}
+		for len(rows) < m.height-1 {
+			rows = append(rows, "")
+		}
+		return strings.Join(rows, "\n")
+	}
 	rows := []string{}
 	expanded := 3 + 2*previewLines
 	budget := max(m.height-2-expanded-1, 2)

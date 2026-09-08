@@ -22,7 +22,7 @@ Almost every bug here is one of the five below.
 
 `Init() tea.Cmd` → `Update(tea.Msg) (tea.Model, tea.Cmd)` → `View() string`,
 serialized on one goroutine. `Update` is a **pointer method** on `*model`
-(`tui.go:1429`), so there is no defensive struct copy between turns — a slice
+(`internal/tui/update.go`), so there is no defensive struct copy between turns — a slice
 you hand out is shared, and anything mutated from another goroutine is a race.
 
 **The rule:** state changes happen in `Update`, never anywhere else. Work that
@@ -36,7 +36,7 @@ mid-turn, mid-render, wedged — a direct `Send` from a worker goroutine blocks
 that worker forever. Detach it:
 
 ```go
-func sendTaskMsg(p *tea.Program, msg taskEventMsg) {
+func sendProg(p *tea.Program, msg tea.Msg) {
     if p == nil {
         return // headless tests
     }
@@ -44,7 +44,7 @@ func sendTaskMsg(p *tea.Program, msg taskEventMsg) {
 }
 ```
 
-(`tasks.go:42`; the regression test is `TestSendTaskMsgNeverBlocksWorker`.)
+(`internal/tui/update.go`; the package helper is `sendProg`.)
 Every path that delivers into the program from a worker goes through a helper
 like this. The `p == nil` guard is what makes headless construction possible —
 see §5.
@@ -62,8 +62,8 @@ and will deadlock. Return a `tea.Cmd` instead.
 
 ## 3. Layout, resize, and the input box
 
-`layout()` (`tui.go:1371`) recomputes viewport and input heights from
-`m.width/m.height`; `growInput()` (`tui.go:1348`) resizes the textarea to its
+`layout()` (`internal/tui/view.go`) recomputes viewport and input heights from
+`m.width/m.height`; `growInput()` (`internal/tui/input.go`) resizes the textarea to its
 content. Two traps:
 
 - A component's **internal** scroll offset survives a resize. The `ctrl+j`
@@ -79,7 +79,7 @@ Anything width-dependent (markdown, diffs, tool rows) re-renders on
 ## 4. Adding a command or keybinding
 
 One registry drives the settings, slash completion, `/help`, and footer hints:
-add the entry to `registry.go` and wire the handler in `m.command()` /
+add the entry to `commands.go` and wire the handler in `m.command()` /
 `m.key()`. Do not add a bare `case` in the key switch without a registry row —
 the command becomes undiscoverable and the settings silently omits it.
 
@@ -100,14 +100,8 @@ Two modes, both used heavily in `internal/tui/*_test.go`:
   ```
 
   **Never read model fields from the test goroutine** — that races the loop.
-  Send a probe and read the answer off a channel:
-
-  ```go
-  ch := make(chan string, 1)
-  p.Send(viewProbe{fn: func(m *model) { ch <- m.input.View() }})
-  ```
-
-  (`probe.go`, dispatched at `tui.go:1432`.) Always `defer func() { p.Kill(); <-done }()`.
+  Exchange test data through messages handled by `Update`. Always kill the
+  program and wait for its loop to finish.
 
 Run `go test -race ./internal/tui` for anything touching a goroutine. Note that
 `TestMain` points `GHG_HOME` at a scratch dir and pins the dark theme —
@@ -118,5 +112,5 @@ tests that persist through `config.Save()` rely on it; do not remove it.
 - Mutating `m` from a goroutine instead of sending a message.
 - `p.Send` inside `Update`, or an undetached `p.Send` from a worker.
 - Reading model state from a test goroutine while a program runs.
-- A new keybinding with no `registry.go` row.
+- A new keybinding with no `commands.go` registry row.
 - `context.Background()` in a turn path — cancellation must reach the tools.

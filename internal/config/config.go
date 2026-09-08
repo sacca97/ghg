@@ -12,12 +12,6 @@ import (
 	"github.com/sacca97/ghg/internal/sandbox"
 )
 
-// DefaultCompactModel is the built-in compaction-model default: the
-// deepseek-v4-flash route wired into the built-in default config. An
-// empty compactModel resolves to this at apply time, falling back to the
-// conversation's model when it's not in the user's config.
-const DefaultCompactModel = "deepseek-v4-flash-0731"
-
 // DefaultCompactPct is the built-in compaction threshold: compact once the
 // estimated context use crosses this percent of the model's context window.
 // 40% keeps compaction deterministic instead of letting the context bloat (see Uber guidelines of compacting at ~400K, we use mostly 1M).
@@ -44,8 +38,6 @@ type Config struct {
 	DefaultModel    string                `json:"defaultModel"`
 	DefaultProvider string                `json:"defaultProvider,omitempty"` // override the model's first provider
 	DefaultEffort   string                `json:"defaultEffort,omitempty"`   // reasoning effort for new sessions: "", "low", "medium", "high"
-	CompactModel    string                `json:"compactModel,omitempty"`    // model for compaction summaries; "" = the built-in default
-	CompactProvider string                `json:"compactProvider,omitempty"` // provider for the compaction model; "" = the model's default routing
 	CompactPct      int                   `json:"compactPct,omitempty"`      // compact at this % of the context window; 0 = DefaultCompactPct
 	Theme           string                `json:"theme,omitempty"`           // "light", "dark", or "" (auto-detect at startup)
 	Mouse           *bool                 `json:"mouse,omitempty"`           // false disables capture so native terminal selection works
@@ -332,8 +324,8 @@ func path() (string, error) {
 // clobbering write (providers/models collapsing, fixture values appearing)
 // without logging secrets.
 func (c *Config) fingerprint() string {
-	return fmt.Sprintf("providers=%d models=%d default=%q compact=%q",
-		len(c.Providers), len(c.Models), c.DefaultModel, c.CompactModel)
+	return fmt.Sprintf("providers=%d models=%d default=%q",
+		len(c.Providers), len(c.Models), c.DefaultModel)
 }
 
 // Load reads ~/.ghg/config.json, writing a default config on first run. The
@@ -480,8 +472,6 @@ func marshalConfig(c *Config) ([]byte, error) {
 // Default returns the first-run config, wired for the built-in default service.
 func Default() *Config {
 	return &Config{
-		DefaultModel: "kimi-k3-fast",
-		CompactModel: DefaultCompactModel,
 		Providers: map[string]Provider{
 			"inference": {
 				Name:      "Inference",
@@ -491,11 +481,7 @@ func Default() *Config {
 				APIKeyEnv: "INFERENCE_API_KEY",
 			},
 		},
-		Models: map[string]Model{
-			"kimi-k3":                {Providers: []string{"inference"}, Context: 1048576, Vision: true},
-			"kimi-k3-fast":           {Providers: []string{"inference"}, Context: 1048576, Vision: true},
-			"glm-5.2-fast":           {Providers: []string{"inference"}, Context: 128000},
-			"deepseek-v4-flash-0731": {Providers: []string{"inference"}, Context: 384000},
-		},
+		// Models are populated from the provider catalog or by the user.
+		Models: map[string]Model{},
 	}
 }

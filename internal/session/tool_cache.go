@@ -84,13 +84,3 @@ func (s *Store) LoadSearchSnapshot(ctx context.Context, sessionID, id string) (s
 	}
 	return snapshot, nil
 }
-
-// ObservationRegistryStore adapts the durable session store to the live registry.
-func (s *Store) ObservationRegistryStore() observation.Store {
-	return s
-}
-
-// SearchRegistryStore adapts the durable session store to the live search registry.
-func (s *Store) SearchRegistryStore() search.Store {
-	return s
-}

@@ -234,7 +234,7 @@ func TestUserShellResolution(t *testing.T) {
 }
 
 func TestBoundedCapturePreviewRollingUTF8(t *testing.T) {
-	c := newBoundedCapture(100)
+	c := newBoundedCapture(100, true)
 	c.Write([]byte("hello"))
 	c.Write([]byte{0xe4})
 	c.Write([]byte{0xb8, 0x96})

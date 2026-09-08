@@ -70,7 +70,7 @@ func TestHistoryIndexSearchReplaceBackfillForkAndRead(t *testing.T) {
 		t.Fatalf("rebuilt rows = %d, want 4 eligible messages", indexed)
 	}
 
-	fork, err := st.Fork(id, 3, "branch")
+	fork, err := st.Fork(id, 3, "branch", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,6 +118,29 @@ func TestHistoryIndexTruncationKeepsUTF8AndByteBound(t *testing.T) {
 	got := boundedHistoryText("ééé", 5)
 	if !utf8.ValidString(got) || len(got) > 5 {
 		t.Fatalf("truncated history = %q, valid=%v, bytes=%d", got, utf8.ValidString(got), len(got))
+	}
+}
+
+func TestReadHistoryBoundsDecodedBytes(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "sessions.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	id, err := st.Create(t.TempDir(), "m", "p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Save(id, 0, []models.Message{{Role: "user", Content: strings.Repeat("x", historyReadBytesLimit)}}, "m", "p"); err != nil {
+		t.Fatal(err)
+	}
+
+	read, diagnostics, err := st.ReadHistory(context.Background(), id, 0, 0, nil, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(read) != 0 || len(diagnostics) != 1 || !strings.Contains(diagnostics[0], "byte limit") {
+		t.Fatalf("oversized history read = %+v diagnostics=%v", read, diagnostics)
 	}
 }
 

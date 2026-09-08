@@ -24,6 +24,8 @@ var imageExts = []string{"png", "jpg", "jpeg", "gif", "webp", "bmp"}
 // Tries wl-paste (Wayland), xclip then xsel (X11), pngpaste (macOS), and
 // PowerShell (Windows/WSL).
 func readClipboardImage() (string, []byte, error) {
+	var lastErr error
+	sawNoImage := false
 	for _, tool := range []struct {
 		name string
 		fn   func() (string, []byte, error)
@@ -38,11 +40,19 @@ func readClipboardImage() (string, []byte, error) {
 			continue
 		}
 		ext, data, err := tool.fn()
-		if err != nil || data != nil {
-			return ext, data, err
+		if data != nil {
+			return ext, data, nil
 		}
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		sawNoImage = true
 	}
-	return "", nil, nil
+	if sawNoImage {
+		return "", nil, nil
+	}
+	return "", nil, lastErr
 }
 
 // hasImageType reports whether types contains an image MIME type.
@@ -150,10 +160,10 @@ func saveClipboardImage(ext string, data []byte) (string, error) {
 // pasteImageCmd reads the clipboard image off the UI thread.
 func pasteImageCmd() tea.Msg {
 	ext, data, err := readClipboardImage()
-	if err != nil {
-		return imageMsg{err: err}
-	}
 	if data == nil {
+		if err != nil {
+			return imageMsg{err: err}
+		}
 		return imageMsg{}
 	}
 	path, err := saveClipboardImage(ext, data)

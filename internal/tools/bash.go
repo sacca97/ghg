@@ -17,7 +17,7 @@ import (
 
 // InteractiveRunner runs a bash command with live PTY input.
 type InteractiveRunner interface {
-	Run(ctx context.Context, command string, timeout time.Duration, keys <-chan []byte) string
+	Run(ctx context.Context, command string, timeout time.Duration, keys <-chan []byte) bashrun.Result
 }
 
 func bashTool() Tool {
@@ -76,8 +76,7 @@ func runBashResult(ctx context.Context, args json.RawMessage) (ToolResult, error
 	}
 	if a.Interactive && runner != nil {
 		keys := make(chan []byte, 16)
-		out := runner.Run(commandCtx, a.Command, dur, keys)
-		return MarkUntrusted(TextResultWithSize(out, boundedTailPreview(out, bashPreviewLimit(a.Command)), int64(len(out)), true, 0), "bash"), nil
+		return bashToolResult(a.Command, runner.Run(commandCtx, a.Command, dur, keys), executionPolicy), nil
 	}
 
 	var update func(string)
@@ -90,7 +89,10 @@ func runBashResult(ctx context.Context, args json.RawMessage) (ToolResult, error
 		opts.Sandbox = executionPolicy
 	}
 	res := bashrun.Run(commandCtx, opts)
+	return bashToolResult(a.Command, res, opts.Sandbox), nil
+}
 
+func bashToolResult(command string, res bashrun.Result, sandboxPolicy *sandbox.Policy) ToolResult {
 	full := res.Output
 	originalBytes := res.OriginalBytes
 	complete := res.Complete
@@ -106,16 +108,16 @@ func runBashResult(ctx context.Context, args json.RawMessage) (ToolResult, error
 		originalBytes += int64(len(marker))
 	}
 	ret := MarkUntrusted(
-		capturedResult(full, boundedTailPreview(full, bashPreviewLimit(a.Command)), originalBytes, complete, boolToExitCode(res.Exit == "" && !res.TimedOut)),
+		capturedResult(full, boundedTailPreview(full, bashPreviewLimit(command)), originalBytes, complete, boolToExitCode(res.Exit == "" && !res.TimedOut)),
 		"bash",
 	)
-	if opts.Sandbox != nil && (res.Exit != "" || res.TimedOut) && isSandboxNetworkDenied(full) {
+	if sandboxPolicy != nil && (res.Exit != "" || res.TimedOut) && isSandboxNetworkDenied(full) {
 		if ret.Metadata == nil {
 			ret.Metadata = make(map[string]string)
 		}
 		ret.Metadata["failure_kind"] = "sandbox_network_denied"
 	}
-	return ret, nil
+	return ret
 }
 
 func isSandboxNetworkDenied(output string) bool {

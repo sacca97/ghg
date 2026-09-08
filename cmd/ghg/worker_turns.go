@@ -265,7 +265,11 @@ func (w *workerProcessState) rewind(request workerwire.RewindRequest) (workerwir
 
 	if cut < len(current) {
 		best, bestIdx := "", -1
-		for idx, ref := range w.store.Snapshots(w.sessionID) {
+		snapshots, err := w.store.Snapshots(w.sessionID)
+		if err != nil {
+			return workerwire.HistoryResult{}, fmt.Errorf("load workspace snapshots: %w", err)
+		}
+		for idx, ref := range snapshots {
 			if idx >= cut && (bestIdx < 0 || idx < bestIdx) {
 				best, bestIdx = ref, idx
 			}
@@ -281,9 +285,10 @@ func (w *workerProcessState) rewind(request workerwire.RewindRequest) (workerwir
 			}
 		}
 	}
-	if err := w.store.DeleteFrom(w.sessionID, cut, request.Messages); err != nil {
+	if err := w.store.DeleteFrom(w.sessionID, cut, current); err != nil {
 		return workerwire.HistoryResult{}, err
 	}
+	w.ag.ResetState()
 	messages := slices.Clone(request.Messages)
 	w.ag.Messages = messages
 	w.ag.RebuildTouched(w.ag.MessagesSnapshot())
@@ -401,9 +406,10 @@ func (w *workerProcessState) runTurn(ctx context.Context, input workerInput) {
 			w.appendLive("think", s)
 			w.publish("think", s, false)
 		},
-		OnSteer: func(s string) { w.publish("steer", s, true) },
-		OnUsage: func(u models.Usage) { addUsage(u); w.publish("usage", u, true) },
-		OnRetry: func(ev models.RetryEvent) { w.publish("retry", ev, true) },
+		OnSteer:  func(s string) { w.publish("steer", s, true) },
+		OnNotice: func(s string) { w.publish("notice", s, true) },
+		OnUsage:  func(u models.Usage) { addUsage(u); w.publish("usage", u, true) },
+		OnRetry:  func(ev models.RetryEvent) { w.publish("retry", ev, true) },
 		OnGoalUpdate: func(update agent.GoalUpdate) {
 			w.persistGoalUpdate(update)
 			w.publish("goal_update", update, true)
@@ -499,9 +505,8 @@ func (w *workerProcessState) runTurn(ctx context.Context, input workerInput) {
 	if wd, err := os.Getwd(); err == nil {
 		clean = session.WorkspaceClean(wd)
 		if clean && snap != "" {
-			session.DropSnapshot(wd, snap)
-			if w.store != nil {
-				_ = w.store.SetSnapshot(w.sessionID, turnAt, "")
+			if w.store != nil && w.store.SetSnapshot(w.sessionID, turnAt, "") == nil {
+				w.store.DropSnapshotIfUnreferenced(wd, snap)
 			}
 		}
 	}
@@ -577,6 +582,10 @@ func (w *workerProcessState) emitWireEvent(value any) {
 		w.activeTool = ""
 		w.mu.Unlock()
 		w.publish(kind, data, false)
+	case "notice":
+		w.publish(kind, data, true)
+	case "review_progress":
+		w.publish(kind, data, true)
 	default:
 		w.publish(kind, data, false)
 	}
@@ -706,17 +715,20 @@ func (w *workerProcessState) fork(request workerwire.ForkRequest) (workerwire.Fo
 	if w.ag == nil {
 		return workerwire.ForkResult{}, errors.New("no active agent to fork")
 	}
-	msgs := w.ag.MessagesSnapshot()
-	if len(msgs) <= 1 {
+	view := w.ag.MessagesSnapshot()
+	if len(request.Messages) > 0 {
+		view = request.Messages
+	}
+	if len(view) <= 1 {
 		return workerwire.ForkResult{}, errors.New("nothing to fork yet")
 	}
-	cut := min(max(request.Cut, 0), len(msgs)-1)
+	cut := min(max(request.Cut, 0), len(view)-1)
 	oldID := w.sessionID
 	oldTitle := oldID
 	if meta, _, err := w.store.Load(oldID); err == nil && meta.Title != "" {
 		oldTitle = meta.Title
 	}
-	newID, err := w.store.Fork(oldID, cut, title)
+	newID, err := w.store.Fork(oldID, cut, title, view)
 	if err != nil {
 		return workerwire.ForkResult{}, fmt.Errorf("fork: %w", err)
 	}

@@ -141,9 +141,6 @@ type ConfigureRequest struct {
 	Effort                 string  `json:"effort,omitempty"`
 	UpdateEffort           bool    `json:"update_effort,omitempty"`
 	Mode                   string  `json:"mode,omitempty"`
-	CompactModel           string  `json:"compact_model,omitempty"`
-	CompactProvider        string  `json:"compact_provider,omitempty"`
-	UpdateCompact          bool    `json:"update_compact,omitempty"`
 	CompactThreshold       float64 `json:"compact_threshold,omitempty"`
 	UpdateCompactThreshold bool    `json:"update_compact_threshold,omitempty"`
 }
@@ -213,8 +210,9 @@ type ContextDoctorResult struct {
 
 // ForkRequest asks the worker to create a new session branching from the current one.
 type ForkRequest struct {
-	Cut   int    `json:"cut"`
-	Title string `json:"title"`
+	Cut      int              `json:"cut"`
+	Title    string           `json:"title"`
+	Messages []models.Message `json:"messages,omitempty"`
 }
 
 // ForkResult reports the newly created session.

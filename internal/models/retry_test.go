@@ -101,6 +101,98 @@ func TestStreamRetriesTransportError(t *testing.T) {
 	}
 }
 
+type retryRoundTripper func(*http.Request) (*http.Response, error)
+
+func (f retryRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) {
+	return f(r)
+}
+
+type errorAfterBody struct {
+	data []byte
+	err  error
+}
+
+func (r *errorAfterBody) Read(p []byte) (int, error) {
+	if len(r.data) == 0 {
+		return 0, r.err
+	}
+	n := copy(p, r.data)
+	r.data = r.data[n:]
+	return n, nil
+}
+
+func (r *errorAfterBody) Close() error { return nil }
+
+const http2GoAwayError = `http2: server sent GOAWAY and closed the connection; LastStreamID=27, ErrCode=NO_ERROR, debug=""`
+
+func TestStreamRetriesHTTP2GoAwayAfterReasoning(t *testing.T) {
+	noSleep(t)
+	var calls atomic.Int32
+	client := testChatClient(t, "http://provider.test", "k")
+	client.HTTP = &http.Client{Transport: retryRoundTripper(func(*http.Request) (*http.Response, error) {
+		if calls.Add(1) == 1 {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body: &errorAfterBody{
+					data: []byte("data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"partial reasoning\"}}]}\n\n"),
+					err:  errors.New(http2GoAwayError),
+				},
+			}, nil
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader("data: {\"choices\":[{\"delta\":{\"content\":\"recovered\"}}]}\n\ndata: [DONE]\n\n")),
+		}, nil
+	})}
+
+	var thinking, text strings.Builder
+	msg, _, err := client.Stream(context.Background(), Request{Model: "m"}, EventSink{
+		OnThink: func(delta string) { thinking.WriteString(delta) },
+		OnText:  func(delta string) { text.WriteString(delta) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := thinking.String(); got != "partial reasoning" {
+		t.Fatalf("thinking = %q, want partial reasoning", got)
+	}
+	if got := text.String(); got != "recovered" || msg.Content != got {
+		t.Fatalf("text = %q, message content = %q, want recovered", got, msg.Content)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("attempts = %d, want 2", got)
+	}
+}
+
+func TestStreamRetriesHTTP2GoAwayPastConfiguredBudget(t *testing.T) {
+	noSleep(t)
+	var calls atomic.Int32
+	client := testChatClient(t, "http://provider.test", "k")
+	client.HTTP = &http.Client{Transport: retryRoundTripper(func(*http.Request) (*http.Response, error) {
+		if calls.Add(1) <= DefaultMaxAttempts {
+			return nil, errors.New(http2GoAwayError)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader("data: {\"choices\":[{\"delta\":{\"content\":\"recovered\"}}]}\n\ndata: [DONE]\n\n")),
+		}, nil
+	})}
+
+	msg, _, err := client.Stream(context.Background(), Request{Model: "m"}, EventSink{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if msg.Content != "recovered" {
+		t.Fatalf("content = %q, want recovered", msg.Content)
+	}
+	if got := calls.Load(); got != DefaultMaxAttempts+1 {
+		t.Fatalf("attempts = %d, want %d", got, DefaultMaxAttempts+1)
+	}
+}
+
 // A permanent error (401) must surface on the first attempt, no retries.
 func TestStreamDoesNotRetryPermanentStatus(t *testing.T) {
 	noSleep(t)

@@ -200,12 +200,10 @@ accumulate per session. Hidden entirely when pricing isn't advertised.
 
 ## Compaction model
 
-Compaction summarizes with a separate, cheaper model: an explicit
-`compactModel`/`compactProvider` override wins; otherwise the configured `tiny`
-role is used. Legacy configs without roles retain
-`deepseek-v4-flash-0731` (`config.DefaultCompactModel`), falling back to the
-conversation's own model when unavailable. `/compact <model> [provider]` picks
-the summarizer by hand. Mechanics: [agent-loop.md](agent-loop.md#compaction).
+Compaction summarizes with the first usable role in this order: `tiny`, `fast`,
+`default`, then `smart`. There is no separate compaction-model setting;
+`/compact` always uses that fallback chain. Mechanics:
+[agent-loop.md](agent-loop.md#compaction).
 
 ## Read next
 

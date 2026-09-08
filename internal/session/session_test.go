@@ -1,6 +1,8 @@
 package session
 
 import (
+	"database/sql"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -69,6 +71,9 @@ func TestStoreRoundTrip(t *testing.T) {
 	id, err := st.Create("/tmp", "kimi-k3-fast", "inference")
 	if err != nil {
 		t.Fatal(err)
+	}
+	if len(id) != 16 {
+		t.Fatalf("session id length = %d, want 16 hex characters", len(id))
 	}
 	sent := time.Date(2025, 6, 1, 14, 30, 0, 0, time.UTC)
 	use := models.Usage{PromptTokens: 12, CompletionTokens: 4}
@@ -189,6 +194,48 @@ func TestMostRecentForCWD(t *testing.T) {
 	if _, err := st.MostRecentForCWD("/missing"); err == nil || !strings.Contains(err.Error(), "no resumable session") {
 		t.Fatalf("missing cwd should be actionable, got %v", err)
 	}
+	if _, err := st.db.Exec(`UPDATE sessions SET updated_at=?`, "2026-01-01T00:00:00Z"); err != nil {
+		t.Fatal(err)
+	}
+	recent, err := st.Recent(3)
+	if err != nil || len(recent) != 3 || recent[0].ID != otherID || recent[1].ID != newID || recent[2].ID != oldID {
+		t.Fatalf("same-time recent ordering: %+v, %v", recent, err)
+	}
+}
+
+func TestRecentPinnedSessionsComeFirst(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "s.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	first, err := st.Create("/tmp", "m", "p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := st.Create("/tmp", "m", "p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	msgs := []models.Message{{Role: "system"}, {Role: "user", Content: "q"}}
+	if err := st.Save(first, 1, msgs, "m", "p"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Save(second, 1, msgs, "m", "p"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetPinned(first, true); err != nil {
+		t.Fatal(err)
+	}
+
+	recent, err := st.Recent(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(recent) != 2 || recent[0].ID != first {
+		t.Fatalf("pinned session ordering: %+v", recent)
+	}
 }
 
 func TestEffortRoundTrip(t *testing.T) {
@@ -224,7 +271,7 @@ func TestEffortRoundTrip(t *testing.T) {
 	}
 
 	// a fork inherits the parent's effort
-	forkID, err := st.Fork(id, 1, "copy")
+	forkID, err := st.Fork(id, 1, "copy", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -296,6 +343,9 @@ func TestUserHistorySkipsInjected(t *testing.T) {
 		{Role: "user", Content: "[goal check] The session goal is:\n…"},           // injected, Authored=false
 		{Role: "user", Content: "another typed message", Authored: true},
 	}, "m", "p")
+	if _, err := st.db.Exec(`INSERT INTO messages (session_id, seq, role, content) VALUES (?,?,?,?)`, id, 99, "user", "{bad"); err != nil {
+		t.Fatal(err)
+	}
 
 	hist, err := st.UserHistory(0)
 	if err != nil {
@@ -311,10 +361,6 @@ func TestStoreEdgeCases(t *testing.T) {
 	if _, err := Open("/nonexistent-dir/x.db"); err == nil {
 		t.Fatal("expected open error")
 	}
-	if truncate(strings.Repeat("a", 100), 10) != strings.Repeat("a", 9)+"…" {
-		t.Fatal("truncate long")
-	}
-
 	st, err := Open(filepath.Join(t.TempDir(), "s.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -340,17 +386,100 @@ func TestStoreEdgeCases(t *testing.T) {
 	}
 }
 
+func TestLoadExactIDWinsPrefixMatch(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "s.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	if err := st.CreateWithID("abcd", "/tmp", "m", "p"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.CreateWithID("abcdef", "/tmp", "m", "p"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Save("abcd", 0, []models.Message{{Role: "user", Content: "exact"}}, "m", "p"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Save("abcdef", 0, []models.Message{{Role: "user", Content: "longer"}}, "m", "p"); err != nil {
+		t.Fatal(err)
+	}
+
+	meta, msgs, err := st.Load("abcd")
+	if err != nil || meta.ID != "abcd" || len(msgs) != 1 || msgs[0].Content != "exact" {
+		t.Fatalf("exact id lookup: meta=%+v msgs=%+v err=%v", meta, msgs, err)
+	}
+}
+
+func TestOpenMigratesLegacyColumns(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.db")
+	db, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE sessions (
+		id TEXT PRIMARY KEY, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+		cwd TEXT NOT NULL, model TEXT NOT NULL, provider TEXT NOT NULL,
+		title TEXT NOT NULL DEFAULT ''
+	)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE artifacts (
+		session_id TEXT NOT NULL, message_seq INTEGER NOT NULL, id TEXT NOT NULL,
+		tool_call_id TEXT NOT NULL, tool_name TEXT NOT NULL, media_type TEXT NOT NULL DEFAULT '',
+		original_bytes INTEGER NOT NULL, stored_bytes INTEGER NOT NULL, hash TEXT NOT NULL,
+		path TEXT NOT NULL, complete INTEGER NOT NULL, created_at TEXT NOT NULL,
+		PRIMARY KEY (session_id, id, tool_call_id)
+	)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	st, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	for _, query := range []string{
+		`SELECT goal, forked_from, fork_seq, tags, pinned, effort, usage_in, usage_cached, usage_out, todos FROM sessions`,
+		`SELECT metadata FROM artifacts`,
+	} {
+		rows, err := st.db.Query(query)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := rows.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 func TestDeleteSessionDropsSnapshotRefs(t *testing.T) {
 	repo := t.TempDir()
 	cmd := exec.Command("git", "-C", repo, "init", "-q")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("git init: %v: %s", err, out)
 	}
+	if err := os.WriteFile(filepath.Join(repo, "tracked.txt"), []byte("snapshot"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cmd = exec.Command("git", "-C", repo, "add", "tracked.txt")
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git add: %v: %s", err, out)
+	}
 	cmd = exec.Command("git", "-C", repo, "-c", "user.name=ghg", "-c", "user.email=ghg@example.com", "commit", "--allow-empty", "-m", "init")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("git commit: %v: %s", err, out)
 	}
-	ref := "test-snapshot"
+	commitOut, err := exec.Command("git", "-C", repo, "rev-parse", "HEAD").Output()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := strings.TrimSpace(string(commitOut))
 	cmd = exec.Command("git", "-C", repo, "update-ref", "refs/ghg/snapshots/"+ref, "HEAD")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("git snapshot ref: %v: %s", err, out)
@@ -368,7 +497,26 @@ func TestDeleteSessionDropsSnapshotRefs(t *testing.T) {
 	if err := st.SetSnapshot(id, 1, ref); err != nil {
 		t.Fatal(err)
 	}
+	otherID, err := st.Create(repo, "m", "p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetSnapshot(otherID, 1, ref); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := RestoreWorkspace(repo, ref); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("git", "-C", repo, "show-ref", "--verify", "--quiet", "refs/ghg/snapshots/"+ref).CombinedOutput(); err != nil {
+		t.Fatalf("restore removed a still-pinned snapshot: %s", out)
+	}
 	if err := st.DeleteSession(id); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("git", "-C", repo, "show-ref", "--verify", "--quiet", "refs/ghg/snapshots/"+ref).CombinedOutput(); err != nil {
+		t.Fatalf("first session deletion removed a shared snapshot: %s", out)
+	}
+	if err := st.DeleteSession(otherID); err != nil {
 		t.Fatal(err)
 	}
 	if out, err := exec.Command("git", "-C", repo, "show-ref", "--verify", "--quiet", "refs/ghg/snapshots/"+ref).CombinedOutput(); err == nil {
@@ -543,6 +691,51 @@ func TestCompactionEvent(t *testing.T) {
 	}
 }
 
+func TestDeleteFromIgnoresSyntheticDanglingToolResults(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "s.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	id, err := st.Create("/tmp", "m", "p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	call := models.ToolCall{ID: "call-1"}
+	call.Function.Name = "read"
+	msgs := []models.Message{
+		{Role: "system", Content: "sys"},
+		{Role: "user", Content: "q1"},
+		{Role: "assistant", Content: "", ToolCalls: []models.ToolCall{call}},
+		{Role: "user", Content: "q2"},
+		{Role: "assistant", Content: "a2"},
+	}
+	if err := st.Save(id, 0, msgs, "m", "p"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RecordCompaction(id, 2, "q1"); err != nil {
+		t.Fatal(err)
+	}
+	_, view, err := st.Load(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(view) != 6 || view[3].Source != interruptedToolResultSource {
+		t.Fatalf("expected interruption repair in view: %+v", view)
+	}
+
+	// View index 4 is the boundary after the synthetic result. The persisted
+	// raw row at seq 3 must survive; only seq 4 is beyond the rewind.
+	if err := st.DeleteFrom(id, 4, view); err != nil {
+		t.Fatal(err)
+	}
+	raw := st.RawMessages(id)
+	if len(raw) != 4 || raw[3].Content != "q2" {
+		t.Fatalf("synthetic row shifted raw cutoff: %+v", raw)
+	}
+}
+
 // The agent reports its compaction cutoff in compacted-view coordinates; the
 // store records raw-log coordinates. After an earlier compaction the view no
 // longer lines up with the raw log, so a second compaction must translate —
@@ -556,7 +749,7 @@ func TestRawCutoffTranslatesThroughPriorCompaction(t *testing.T) {
 
 	id, _ := st.Create("/tmp", "m", "p")
 	// No prior compaction: the cutoff is already raw.
-	if got := st.RawCutoff(id, 4, nil); got != 4 {
+	if got := st.RawCutoff(4, 0, nil); got != 4 {
 		t.Fatalf("pass-through cutoff: %d, want 4", got)
 	}
 
@@ -578,22 +771,14 @@ func TestRawCutoffTranslatesThroughPriorCompaction(t *testing.T) {
 	if err := st.RecordCompaction(id, 4, "first"); err != nil {
 		t.Fatal(err)
 	}
-	// The agent's view after it: [sys, summary, a2, q3, a3, q4, a4] — the
-	// summary is a derived system row, not a raw row. A second compaction
-	// whose tail starts at view index 5 (q4) must record raw row 7.
-	view := []models.Message{
-		{Role: "system", Content: "sys"},
-		{Role: "system", Content: "Summary of the conversation so far:\n\nfirst"},
-		{Role: "assistant", Content: "a2"},
-		{Role: "user", Content: "q3"},
-		{Role: "assistant", Content: "a3"},
-		{Role: "user", Content: "q4"},
-		{Role: "assistant", Content: "a4"},
-	}
-	if got := st.RawCutoff(id, 5, view); got != 7 {
+	// The agent's view after it is [sys, summary, a2, q3, a3, q4, a4].
+	// The derived prefix is two entries, so a second compaction whose tail
+	// starts at view index 5 (q4) must record raw row 7.
+	events := st.Compactions(id)
+	if got := st.RawCutoff(5, 2, events); got != 7 {
 		t.Fatalf("translated cutoff: %d, want 7", got)
 	}
-	if err := st.RecordCompaction(id, st.RawCutoff(id, 5, view), "second"); err != nil {
+	if err := st.RecordCompaction(id, st.RawCutoff(5, 2, events), "second"); err != nil {
 		t.Fatal(err)
 	}
 	// The derived view after the second compaction: summary + the kept tail

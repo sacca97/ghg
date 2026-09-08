@@ -6,6 +6,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/x/ansi"
@@ -67,7 +68,6 @@ const (
 	panelMode
 	panelEffort
 	panelGoal
-	panelCompact
 )
 
 // ppanel is a settings sub-panel: the interactive editor behind a row. Key
@@ -87,11 +87,10 @@ type ppanel struct {
 
 	prepare string // panelGoal: text submitted when the editor closes
 
-	cands []string // panelCompact: model names from config
-	list  []string // panelCompact: "default (…)" + cands
-	midx  int      // panelCompact: selection, 0 = the built-in default
+	list []string // panelRole/panelMode: selectable rows
+	midx int      // panelRole/panelMode: selected row
 
-	err    string // inline error from a failed apply (bad compact model, …)
+	err    string // inline error from a failed apply
 	offset int    // first visible rendered row in a scrollable panel
 
 	// direct marks a panel a slash command opened straight into (bare /effort):
@@ -104,12 +103,15 @@ type ppanel struct {
 // own filter line (opencode's DialogSelect). Typing fuzzy-filters, ↑/↓ moves,
 // enter applies or drills in, ←/→ steps reversible settings, esc pops a level.
 type settings struct {
-	items  []paletteItem // filtered
-	all    []paletteItem // unfiltered
-	idx    int
-	filter string
-	stack  []*ppanel
-	offset int // first visible rendered row in the root list
+	items         []paletteItem // filtered
+	all           []paletteItem // unfiltered
+	idx           int
+	filter        string
+	stack         []*ppanel
+	offset        int // first visible rendered row in the root list
+	rootRows      []string
+	rootPositions []int
+	rootRowsValid bool
 }
 
 // Hint/keybind constants for the settings-only rows that don't dispatch
@@ -246,34 +248,6 @@ func (m *model) paletteItems() []paletteItem {
 			dynDesc: func(m *model) string { return slashHint(m, "/mcp") }, // live count: [n/n ready] badge
 			dynHint: func(m *model) string { return "/mcp" },
 			command: "/mcp"},
-		{title: "Compaction model", category: "Session",
-			dynDesc: func(m *model) string {
-				if m.compactModel == "" {
-					return "default (" + m.defaultCompactModelName() + ")"
-				}
-				return m.compactModel
-			},
-			dynHint: func(m *model) string { return "/compact <model>" },
-			panel: func(m *model) *ppanel {
-				names := make([]string, 0, len(m.cfg.Models))
-				for name := range m.cfg.Models {
-					names = append(names, name)
-				}
-				sort.Strings(names)
-				pp := &ppanel{
-					kind:  panelCompact,
-					title: "Compaction model",
-					cands: names,
-					list:  append([]string{"default (" + m.defaultCompactModelName() + ")"}, names...),
-				}
-				for i, name := range pp.list {
-					if name == m.compactModel {
-						pp.midx = i
-						break
-					}
-				}
-				return pp
-			}},
 		{title: "Compaction level", category: "Session",
 			dynDesc: func(m *model) string {
 				return "auto-compact at this share of the context window"
@@ -408,6 +382,7 @@ func (p *settings) applyFilter(m *model) {
 		}
 	}
 	p.items = grouped
+	p.rootRowsValid = false
 	p.offset = 0
 	if p.idx >= len(p.items) {
 		p.idx = max(len(p.items)-1, 0)
@@ -437,6 +412,7 @@ func (p *settings) move(delta int) {
 		return
 	}
 	p.idx = (p.idx + delta + n) % n
+	p.rootRowsValid = false
 }
 
 // paletteKey handles input while the settings is open: esc pops one level
@@ -486,6 +462,7 @@ func (m *model) paletteKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		p.applyFilter(m)
 	}
 	if m.settings != nil {
+		m.settings.rootRowsValid = false
 		m.ensurePaletteVisible()
 	}
 	return m, nil
@@ -519,7 +496,7 @@ func (m *model) paletteMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 			if len(pp.items) > 0 && pp.role == "" {
 				m.previewModel(pp.items[pp.idx])
 			}
-		case panelRole, panelMode, panelCompact:
+		case panelRole, panelMode:
 			pp.midx = paletteClamp(pp.midx+delta, 0, len(pp.list)-1)
 		case panelEffort:
 			pp.lidx = paletteClamp(pp.lidx+delta, 0, len(pp.levels)-1)
@@ -597,7 +574,7 @@ func (m *model) panelMouse(y int, pp *ppanel) (tea.Model, tea.Cmd) {
 			return m, nil // the empty-state row is not selectable
 		}
 		pp.idx = selected
-	case panelRole, panelMode, panelCompact:
+	case panelRole, panelMode:
 		if selected >= len(pp.list) {
 			return m, nil
 		}
@@ -652,6 +629,9 @@ func (m *model) activatePaletteSelection() (tea.Model, tea.Cmd) {
 		m.refreshMenu()
 	case paletteActionToggleThinking:
 		m.toggleThinking()
+	}
+	if m.settings != nil {
+		m.settings.rootRowsValid = false
 	}
 	return m, nil
 }
@@ -792,37 +772,6 @@ func (m *model) panelKey(msg tea.KeyMsg, pp *ppanel) (tea.Model, tea.Cmd) {
 			}
 		}
 
-	case panelCompact:
-		switch msg.Type {
-		case tea.KeyEsc, tea.KeyCtrlC:
-			pop()
-		case tea.KeyUp, tea.KeyCtrlP, tea.KeyShiftTab:
-			pp.midx = (pp.midx - 1 + len(pp.list)) % len(pp.list)
-		case tea.KeyDown, tea.KeyCtrlN, tea.KeyTab:
-			pp.midx = (pp.midx + 1) % len(pp.list)
-		case tea.KeyLeft, tea.KeyRight, tea.KeyEnter:
-			// apply immediately so a bad pick reports its error inline while
-			// the panel is still open
-			if pp.midx == 0 {
-				m.compactCommand([]string{"off"})
-				pp.err = ""
-			} else {
-				name := pp.list[pp.midx]
-				args := []string{name}
-				if mdl := m.cfg.Models[name]; len(mdl.Providers) > 0 {
-					args = append(args, mdl.Providers[0])
-				}
-				m.compactCommand(args)
-				pp.err = ""
-				if m.compactModel != name {
-					pp.err = "couldn't resolve " + name + " — kept previous"
-				}
-			}
-			if msg.Type == tea.KeyEnter && pp.err == "" {
-				pop()
-			}
-		}
-
 	case panelGoal:
 		switch msg.Type {
 		case tea.KeyEsc, tea.KeyCtrlC:
@@ -851,7 +800,7 @@ func (m *model) previewModel(it modelItem) {
 	route, err := resolveDisplayRoute(m.cfg, m.profiles, it.model, it.provider, config.RoleDefault)
 	if err == nil {
 		m.modelName, m.provName, m.modelID = route.ModelName, route.ProviderName, route.APIID
-		m.protocol, m.role, m.contextLimit = route.Protocol, route.Role, route.ContextLimit
+		m.role, m.contextLimit = route.Role, route.ContextLimit
 		m.effort = m.maxEffort()
 		m.modelSlotW = m.statusModelSlotWidth()
 	}
@@ -927,13 +876,18 @@ func paletteFitLines(lines []string, width, height int) string {
 // rows keeps category headings and blank separators aligned with the list.
 func (m *model) paletteRootRows() ([]string, []int) {
 	p := m.settings
+	if p.rootRowsValid {
+		return p.rootRows, p.rootPositions
+	}
 	rows := make([]string, 0, len(p.items)*2+1)
 	positions := make([]int, len(p.items))
+	hints := make([]string, len(p.items))
 	lastCat := ""
 	hintW := 0
-	for _, it := range p.items {
+	for i, it := range p.items {
 		if it.dynHint != nil {
-			hintW = max(hintW, ansi.StringWidth(it.dynHint(m)))
+			hints[i] = it.dynHint(m)
+			hintW = max(hintW, ansi.StringWidth(hints[i]))
 		}
 	}
 	for i, it := range p.items {
@@ -946,7 +900,7 @@ func (m *model) paletteRootRows() ([]string, []int) {
 		}
 		hint := ""
 		if it.dynHint != nil {
-			hint = dimStyle.Render(fmt.Sprintf("%*s", hintW, it.dynHint(m)))
+			hint = dimStyle.Render(fmt.Sprintf("%*s", hintW, hints[i]))
 		}
 		line := " " + it.title
 		if it.dynDesc != nil {
@@ -963,11 +917,11 @@ func (m *model) paletteRootRows() ([]string, []int) {
 	if len(p.items) == 0 {
 		rows = append(rows, dimStyle.Render("  (no matches)"))
 	}
+	p.rootRows, p.rootPositions, p.rootRowsValid = rows, positions, true
 	return rows, positions
 }
 
 func (m *model) rootListCapacity() int {
-	rows, _ := m.paletteRootRows()
 	if h := m.paletteBodyHeight(); h > 0 {
 		chrome := 6 // title, two separators, filter, separator, footer
 		if m.paletteCompact() {
@@ -975,6 +929,7 @@ func (m *model) rootListCapacity() int {
 		}
 		return max(h-chrome, 1)
 	}
+	rows, _ := m.paletteRootRows()
 	return max(len(rows), 1)
 }
 
@@ -1086,14 +1041,14 @@ func paletteState(m *model, it paletteItem) string {
 func (m *model) panelContent(pp *ppanel) (rows []string, selected int, footer []string) {
 	switch pp.kind {
 	case panelModel:
+		currentModel, currentProvider := m.modelName, m.provName
+		if pp.role != "" {
+			if target, err := m.roleRoute(pp.role); err == nil {
+				currentModel, currentProvider = target.Model, target.Provider
+			}
+		}
 		for i, it := range pp.items {
 			cur := ""
-			currentModel, currentProvider := m.modelName, m.provName
-			if pp.role != "" {
-				if target, err := m.roleRoute(pp.role); err == nil {
-					currentModel, currentProvider = target.Model, target.Provider
-				}
-			}
 			if it.model == currentModel && it.provider == currentProvider {
 				cur = dimStyle.Render("  (current)")
 			}
@@ -1128,17 +1083,17 @@ func (m *model) panelContent(pp *ppanel) (rows []string, selected int, footer []
 		}
 
 	case panelRole:
-		active := m.activeRoleLabel()
 		for i, label := range pp.list {
-			cur := ""
-			if label == active {
-				cur = dimStyle.Render("  (current)")
+			modelName := "(not set)"
+			if target, err := m.roleRoute(label); err == nil && target.Model != "" {
+				modelName = target.Model
 			}
+			line := label + "  " + dimStyle.Render("— "+modelName)
 			if i == pp.midx {
 				selected = len(rows)
-				rows = append(rows, botStyle.Render(" → "+label)+cur)
+				rows = append(rows, botStyle.Render(" → "+line))
 			} else {
-				rows = append(rows, "   "+label+cur)
+				rows = append(rows, "   "+line)
 			}
 		}
 		footer = []string{"", dimStyle.Render("  ↑/↓ select · enter choose model · esc back")}
@@ -1178,27 +1133,6 @@ func (m *model) panelContent(pp *ppanel) (rows []string, selected int, footer []
 			rows = append(rows, dimStyle.Render("  (no effort levels)"))
 		}
 		footer = []string{"", dimStyle.Render("  ↑/↓ select · enter/←/→ apply · esc back")}
-
-	case panelCompact:
-		for i, name := range pp.list {
-			cur := ""
-			if (i == 0 && m.compactModel == "") || (i > 0 && name == m.compactModel) {
-				cur = dimStyle.Render("  (current)")
-			}
-			if i == pp.midx {
-				selected = len(rows)
-				rows = append(rows, botStyle.Render(" → "+name)+cur)
-			} else {
-				rows = append(rows, "   "+name+cur)
-			}
-		}
-		if len(rows) == 0 {
-			rows = append(rows, dimStyle.Render("  (no models configured)"))
-		}
-		if pp.err != "" {
-			footer = append(footer, errStyle.Render("  "+pp.err))
-		}
-		footer = append(footer, "", dimStyle.Render("  ↑/↓ select · enter/←/→ apply · esc back"))
 
 	case panelGoal:
 		rows = []string{" " + youStyle.Render("❯ ") + pp.prepare + dimStyle.Render("█")}
@@ -1465,7 +1399,9 @@ func (m *model) fetchCatalogs(force bool, providers map[string]config.Provider) 
 	}
 	cfg := *m.cfg
 	cfg.Providers = providers
-	cats, err := config.FetchCatalogs(context.Background(), &cfg, m.profiles, force, config.CatalogBackendFactory(auth.NewBackend))
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cats, err := config.FetchCatalogs(ctx, &cfg, m.profiles, force, config.CatalogBackendFactory(auth.NewBackend))
 	if err != nil {
 		config.LogEvent("catalog.fetch", err.Error())
 	}

@@ -25,9 +25,9 @@ import (
 // taskView is the open per-task pane: the worker snapshot of one background
 // subagent (or its stored report once settled).
 type taskView struct {
-	id  string
-	vp  viewport.Model
-	buf strings.Builder // full transcript text; vp shows a window into it
+	id   string
+	vp   viewport.Model
+	text string // full transcript text; vp shows a window into it
 }
 
 // tasksDockHeight is the maximum number of screen rows the dock strip
@@ -64,11 +64,13 @@ func (m *model) dockTasks() []agent.BackgroundTask {
 }
 
 // clampTaskSel keeps the dock selection inside the current task list.
-func (m *model) clampTaskSel(n int) {
-	v := max(len(m.dockTasks()), n)
-	if m.taskSel >= v {
-		m.taskSel = max(v-1, 0)
+func (m *model) clampTaskSel() {
+	n := len(m.dockTasks())
+	if n == 0 {
+		m.taskSel = 0
+		return
 	}
+	m.taskSel = min(max(m.taskSel, 0), n-1)
 }
 
 // tasksDock renders the persistent strip: one row per task with a live
@@ -78,11 +80,11 @@ func (m *model) tasksDock() string {
 	if len(tasks) == 0 {
 		return ""
 	}
-	m.clampTaskSel(len(tasks))
+	sel := min(max(m.taskSel, 0), len(tasks)-1)
 
 	rows := make([]string, 0, len(tasks)+2)
 	if m.tasksFocus {
-		rows = append(rows, dimStyle.Render(" ⚙ subagents — ↑/↓ select · enter open · x cancel · esc back"))
+		rows = append(rows, dimStyle.Render(" ⚙ subagents — ↑/↓ select · enter open · esc back"))
 	}
 
 	budget := tasksDockHeight - len(rows)
@@ -90,8 +92,8 @@ func (m *model) tasksDock() string {
 		budget--
 	}
 	lo := 0
-	if m.tasksFocus && m.taskSel >= budget {
-		lo = m.taskSel - budget + 1 // keep the selection visible
+	if m.tasksFocus && sel >= budget {
+		lo = sel - budget + 1 // keep the selection visible
 	}
 	hi := min(lo+budget, len(tasks))
 
@@ -112,7 +114,7 @@ func (m *model) tasksDock() string {
 			meta = "  " + string(t.Status)
 		}
 		switch {
-		case m.tasksFocus && i == m.taskSel:
+		case m.tasksFocus && i == sel:
 			line = botStyle.Render(" → "+line) + toolStyle.Render(meta)
 		case t.Status == agent.TaskRunning:
 			line = "   " + toolStyle.Render(line) + dimStyle.Render(meta)
@@ -135,18 +137,18 @@ func (m *model) openTask(id string) {
 		return
 	}
 	tv := &taskView{id: id}
-	fmt.Fprintf(&tv.buf, "%s %s  %s\n\n%s %s\n", toolStyle.Render("⚙"), t.ID, t.Description, youStyle.Render("prompt:"), t.Prompt)
+	tv.text = fmt.Sprintf("%s %s  %s\n\n%s %s\n", toolStyle.Render("⚙"), t.ID, t.Description, youStyle.Render("prompt:"), t.Prompt)
 	if t.Status == string(agent.TaskRunning) {
-		fmt.Fprintf(&tv.buf, "\n%s\n", dimStyle.Render("  running…"))
+		tv.text += fmt.Sprintf("\n%s\n", dimStyle.Render("  running…"))
 	} else {
-		fmt.Fprintf(&tv.buf, "\n%s %s\n", toolStyle.Render(t.Status+":"), t.Report)
+		tv.text += fmt.Sprintf("\n%s %s\n", toolStyle.Render(t.Status+":"), t.Report)
 	}
 	m.taskVP = tv
 	m.refreshTaskVP()
 }
 
-// refreshTaskVP resizes the open task pane to the free screen area and
-// reloads its content, following the tail while the task streams.
+// refreshTaskVP resizes the open task pane to the free screen area and reloads
+// its stored content.
 func (m *model) refreshTaskVP() {
 	tv := m.taskVP
 	if tv == nil {
@@ -155,14 +157,14 @@ func (m *model) refreshTaskVP() {
 	// 2 rows of chrome: the header and the footer hint
 	tv.vp.Width, tv.vp.Height = m.width, max(m.height-2, 1)
 	atBottom := tv.vp.AtBottom()
-	tv.vp.SetContent(tv.buf.String())
+	tv.vp.SetContent(tv.text)
 	if atBottom {
 		tv.vp.GotoBottom()
 	}
 }
 
 // taskViewKey handles input while a task detail view is open: scroll keys go
-// to the pane, x cancels a running task, esc backs out to the main thread.
+// to the pane, esc backs out to the main thread.
 func (m *model) taskViewKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	tv := m.taskVP
 	if tv == nil {
@@ -206,6 +208,6 @@ func (m *model) taskViewView() string {
 	}
 	head := toolStyle.Render(fmt.Sprintf(" ⚙ %s — %s", m.taskVP.id, truncLine(description, max(m.width-30, 8)))) +
 		dimStyle.Render("  ("+status+")")
-	foot := dimStyle.Render(" esc back · PgUp/PgDn scroll · x cancel")
+	foot := dimStyle.Render(" esc back · PgUp/PgDn scroll")
 	return head + "\n" + sanitizeView(m.taskVP.vp.View()) + "\n" + foot
 }

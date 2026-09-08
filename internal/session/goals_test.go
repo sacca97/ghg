@@ -3,6 +3,7 @@ package session
 import (
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestGoalLifecycleRoundTrip(t *testing.T) {
@@ -93,6 +94,31 @@ func TestLegacyGoalMigration(t *testing.T) {
 	}
 }
 
+func TestLoadGoalOrdersMixedTimestampFormatsByTime(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "s.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	sessionID, err := st.Create("/tmp", "m", "p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	created := time.Date(2026, 9, 7, 0, 0, 0, 0, time.UTC)
+	if _, err := st.db.Exec(`INSERT INTO goals
+		(session_id, goal_id, objective, status, created_at, updated_at)
+		VALUES (?,?,?,?,?,?), (?,?,?,?,?,?)`,
+		sessionID, "legacy", "legacy", GoalStatusActive, created.Format("2006-01-02 15:04:05"), "2026-09-07 23:00:00",
+		sessionID, "current", "current", GoalStatusActive, formatGoalTime(created), "2026-09-07T01:00:00Z"); err != nil {
+		t.Fatal(err)
+	}
+
+	got, ok, err := st.LoadGoal(sessionID)
+	if err != nil || !ok || got.ID != "legacy" {
+		t.Fatalf("mixed goal ordering: %+v, %v, %v", got, ok, err)
+	}
+}
+
 func TestForkAndDeleteCopyGoalLedger(t *testing.T) {
 	st, err := Open(filepath.Join(t.TempDir(), "s.db"))
 	if err != nil {
@@ -115,7 +141,7 @@ func TestForkAndDeleteCopyGoalLedger(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	fork, err := st.Fork(source, 0, "fork")
+	fork, err := st.Fork(source, 0, "fork", nil)
 	if err != nil {
 		t.Fatal(err)
 	}

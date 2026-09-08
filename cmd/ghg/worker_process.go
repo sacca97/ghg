@@ -274,8 +274,8 @@ func newWorkerProcess(runtimeFile workerwire.Runtime) (*workerProcessState, erro
 	ag.OutputCatalog = store
 	ag.HistoryCatalog = store
 	ag.SubagentsDisabled = !config.SubagentsEnabled(cfg)
-	ag.SetObservationStore(store.ObservationRegistryStore())
-	ag.SetSearchStore(store.SearchRegistryStore())
+	ag.SetObservationStore(store)
+	ag.SetSearchStore(store)
 	ag.SetSessionID(sessionID)
 	ag.LoadTodosJSON(store.Todos(sessionID))
 	if err := ag.BindState(context.Background()); err != nil {
@@ -355,37 +355,42 @@ func newWorkerProcess(runtimeFile workerwire.Runtime) (*workerProcessState, erro
 	return w, nil
 }
 
-// configureWorkerCompaction keeps the worker's compaction route aligned with
-// the interactive role policy. A configured tiny role wins; legacy configs use
-// the built-in compact model and otherwise fall back to the active backend.
+// configureWorkerCompaction keeps usable compaction routes in the configured
+// tiny → fast → default → smart order.
 func configureWorkerCompaction(ag *agent.Agent, cfg *config.Config, profiles models.Profiles, systemPrompt string) {
 	if ag == nil || cfg == nil {
 		return
 	}
-	modelName, providerName := cfg.CompactModel, cfg.CompactProvider
-	if modelName == "" && providerName == "" && len(cfg.Roles) > 0 {
-		target, err := cfg.ResolveRole(config.RoleTiny)
-		if err != nil {
-			return
+	ag.CompactCandidates = nil
+
+	for _, role := range []string{config.RoleTiny, config.RoleFast, config.RoleDefault, config.RoleSmart} {
+		if !compactionRoleConfigured(cfg, role) {
+			continue
 		}
-		modelName, providerName = target.Model, target.Provider
+		target, err := cfg.ResolveRole(role)
+		if err != nil || target.Model == "" {
+			continue
+		}
+		candidate, _, _, err := agent.NewConfigured(agent.BuildOptions{
+			Config: cfg, Profiles: profiles, Model: target.Model, Provider: target.Provider,
+			Role: role, SystemPrompt: systemPrompt,
+		})
+		if err == nil && candidate != nil && candidate.Backend != nil {
+			ag.CompactCandidates = append(ag.CompactCandidates, candidate)
+		}
 	}
-	if modelName == "" {
-		modelName = config.DefaultCompactModel
-	}
-	compact, _, _, err := agent.NewConfigured(agent.BuildOptions{
-		Config: cfg, Profiles: profiles, Model: modelName, Provider: providerName,
-		Role: config.RoleTiny, SystemPrompt: systemPrompt,
-	})
-	if err != nil || compact == nil || compact.Backend == nil {
-		return
-	}
-	ag.CompactBackend = compact.Backend
-	ag.CompactModel = compact.Model
-	ag.CompactProvider = compact.Provider
-	ag.CompactProtocol = compact.Protocol
 }
 
+func compactionRoleConfigured(cfg *config.Config, role string) bool {
+	if role == config.RoleDefault {
+		if _, ok := cfg.Roles[role]; ok {
+			return true
+		}
+		return strings.TrimSpace(cfg.DefaultModel) != ""
+	}
+	_, ok := cfg.Roles[role]
+	return ok
+}
 func (w *workerProcessState) transition(mutate func() (newState workerwire.State, newDetached bool, detail string, ok bool)) bool {
 	w.stateWriteMu.Lock()
 	defer w.stateWriteMu.Unlock()

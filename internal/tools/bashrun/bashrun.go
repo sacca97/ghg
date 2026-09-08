@@ -110,18 +110,21 @@ type boundedCapture struct {
 	tail      []byte
 	rolling   []byte
 	truncated bool
+	preview   bool
 }
 
-func newBoundedCapture(limit int64) *boundedCapture {
+func newBoundedCapture(limit int64, preview bool) *boundedCapture {
 	if limit <= 0 {
 		limit = session.DefaultMaxBytes
 	}
-	return &boundedCapture{limit: int(limit)}
+	return &boundedCapture{limit: int(limit), preview: preview}
 }
 
 func (c *boundedCapture) Write(p []byte) (int, error) {
 	c.total += int64(len(p))
-	c.appendRolling(p, 16<<10)
+	if c.preview {
+		c.appendRolling(p, 16<<10)
+	}
 	if c.truncated {
 		c.appendTail(p)
 		return len(p), nil
@@ -331,7 +334,7 @@ func runPiped(ctx context.Context, cmd *exec.Cmd, opts Options) Result {
 
 	// Drain both pipes concurrently; the readers finish on pipe EOF (process
 	// exit) OR when we close them below after Wait returns.
-	out := newBoundedCapture(session.DefaultMaxBytes)
+	out := newBoundedCapture(session.DefaultMaxBytes, opts.OnUpdate != nil)
 	var mu sync.Mutex
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -448,7 +451,7 @@ func runInteractive(ctx context.Context, cmd *exec.Cmd, opts Options) Result {
 		stop()
 	}()
 
-	buf := newBoundedCapture(session.DefaultMaxBytes)
+	buf := newBoundedCapture(session.DefaultMaxBytes, false)
 	outCh := make(chan []byte, 16)
 
 	// Output pump: copy PTY -> caller + buffer; on read error the child has

@@ -156,7 +156,7 @@ func TestWorkflowResultsRoundTripForkAndRewind(t *testing.T) {
 	}
 
 	// Fork at seq 2: should copy planRes (seq 2 <= 2), sub1/sub2 (seq 1 <= 2), bad-time (seq 1 <= 2) but NOT reviewRes (seq 4 > 2)
-	forkID, err := st.Fork(sessionID, 2, "forked-session")
+	forkID, err := st.Fork(sessionID, 2, "forked-session", nil)
 	if err != nil {
 		t.Fatalf("fork: %v", err)
 	}

@@ -27,6 +27,8 @@ type selectionState struct {
 	edgePending   bool
 }
 
+const transcriptTopRows = 1
+
 func (s *selectionState) hasRange() bool {
 	return s != nil && s.anchor != s.focus
 }
@@ -46,13 +48,13 @@ func (m *model) ensurePlainRows() []string {
 }
 
 // transcriptPosition maps the screen coordinate used by the main viewport to
-// a transcript row. The top two screen rows belong to the header and its
-// separator; contentPad is not part of the selectable transcript.
+// a transcript row. The header occupies the first screen row; contentPad is
+// not part of the selectable transcript.
 func (m *model) transcriptPosition(x, y int) (textPosition, bool) {
-	if x < 0 || y < 2 || m.vp.Height <= 0 || y >= 2+m.vp.Height {
+	if x < 0 || y < transcriptTopRows || m.vp.Height <= 0 || y >= transcriptTopRows+m.vp.Height {
 		return textPosition{}, false
 	}
-	paddedRow := m.vp.YOffset + y - 2
+	paddedRow := m.vp.YOffset + y - transcriptTopRows
 	pad := m.contentPad()
 	row := paddedRow - pad
 	rows := m.ensurePlainRows()

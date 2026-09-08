@@ -162,11 +162,10 @@ func (a *Agent) RebuildTouched(msgs []models.Message) {
 func (a *Agent) recordTouched(toolName, args string) {
 	paths := toolMutationPaths(toolName, args)
 	if toolName == "read" {
-		var in struct {
-			Path string `json:"path"`
-		}
-		if json.Unmarshal([]byte(args), &in) == nil && in.Path != "" {
-			paths = append(paths, in.Path)
+		if requests, ok := normalizeReadRequests(toolName, args); ok {
+			for _, request := range requests {
+				paths = append(paths, request.path)
+			}
 		}
 	}
 	if len(paths) == 0 {

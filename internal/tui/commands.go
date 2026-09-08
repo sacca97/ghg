@@ -29,7 +29,7 @@ var registry = []registryEntry{
 	{Name: "/ask", Hint: "<question> — answer directly; repository questions may be investigated read-only", Category: "Agent", Immediate: true},
 	{Name: "/cd", Hint: "[dir] — change working directory (bare prints it)", Category: "Session"},
 	{Name: "/clear", Hint: "— reset conversation", Category: "Session", Immediate: true},
-	{Name: "/compact", Hint: "[model] [provider]|off — compact now, or pick the compaction model (off restores the default); retry undoes the last compaction, log lists them; compaction level: ctrl+p › Compaction level", Category: "Session", Immediate: true},
+	{Name: "/compact", Hint: "— compact now using tiny → fast → default → smart; retry undoes the last compaction, log lists them; compaction level: ctrl+p › Compaction level", Category: "Session", Immediate: true},
 	{Name: "/context-doctor", Hint: "— audit what a fresh session injects (skills, MCP, tool schemas) and its token cost", Category: "Session", Immediate: true},
 	{Name: "/detach", Hint: "— leave a running worker in the background (ctrl+d)", Keybind: "ctrl+d", Category: "Session", Immediate: true},
 	{Name: "/effort", Hint: "[level] — reasoning effort: off·low·medium·high (bare opens selector)", Category: "Agent", Immediate: true},
@@ -215,27 +215,9 @@ func (m *model) command(text string) (tea.Model, tea.Cmd) {
 				m.compactLog()
 				return m, nil
 			}
-			m.compactCommand(fields[1:])
+			m.append(errStyle.Render("/compact does not accept a model; it always uses tiny → fast → default → smart"))
 			return m, nil
 		}
-		if m.busy {
-			m.append(dimStyle.Render("(busy — /compact will land after this turn)"))
-			return m, nil
-		}
-		if !m.requireAgent() {
-			return m, nil
-		}
-		if m.workerClient == nil && !m.ensureWorker() {
-			m.append(errStyle.Render("compact failed: worker unavailable: " + m.workerStartError))
-			return m, nil
-		}
-		m.busy = true
-		m.append(dimStyle.Render("◎ compacting…"))
-		if err := m.workerClient.Send(workerwire.CommandCompact, workerRequestID("compact"), nil); err != nil {
-			m.busy = false
-			m.append(errStyle.Render("compact failed: " + err.Error()))
-		}
-		return m, m.spin.Tick
 	case "/mcp":
 		return m.mcpCommand(fields)
 	case "/lsp":
@@ -254,7 +236,7 @@ func (m *model) command(text string) (tea.Model, tea.Cmd) {
 		// bare /tasks focuses the dock if it exists, else prints the list
 		if len(m.dockTasks()) > 0 {
 			m.tasksFocus = true
-			m.clampTaskSel(-1)
+			m.clampTaskSel()
 			return m, nil
 		}
 		m.append(m.tasksView())
@@ -386,10 +368,16 @@ func (m *model) command(text string) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if len(fields) > 1 {
+			if m.prog != nil {
+				return m, m.resumeCmd(fields[1])
+			}
 			if err := m.resume(fields[1]); err != nil {
 				m.append(errStyle.Render(err.Error()))
 			}
 			break
+		}
+		if m.prog != nil {
+			return m, m.openPickerCmd()
 		}
 		m.openPicker()
 	case "/context-doctor":
@@ -419,9 +407,7 @@ func (m *model) command(text string) (tea.Model, tea.Cmd) {
 			providers := maps.Clone(m.cfg.Providers)
 			go func() {
 				m.fetchCatalogs(true, providers)
-				if m.prog != nil {
-					m.prog.Send(noticeMsg("model catalogs refreshed — /model shows newly announced models"))
-				}
+				sendProg(m.prog, noticeMsg("model catalogs refreshed — /model shows newly announced models"))
 			}()
 			break
 		}
@@ -449,6 +435,9 @@ func (m *model) command(text string) (tea.Model, tea.Cmd) {
 // degradedProviderNote is the short actionable message shown when the TUI can
 // open but no usable provider credential is available.
 func (m *model) degradedProviderNote() string {
+	if m.modelName == "" {
+		return "No model has been configured — choose one with /model"
+	}
 	return "No provider has been configured — run /auth"
 }
 

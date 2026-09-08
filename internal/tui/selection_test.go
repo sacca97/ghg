@@ -350,7 +350,7 @@ func TestTranscriptSelectionUsesDisplayCells(t *testing.T) {
 	m.Update(mkWinSize(8, 30))
 	m.appendRaw(blockText, "a界🙂z tail")
 	m.refreshVP()
-	y := m.blocks[0].y0 + m.contentPad() - m.vp.YOffset + 2
+	y := m.blocks[0].y0 + m.contentPad() - m.vp.YOffset + transcriptTopRows
 	tm, _ := m.Update(tea.MouseMsg{Action: tea.MouseActionPress, Button: tea.MouseButtonLeft, X: 0, Y: y})
 	m = tm.(*model)
 	tm, _ = m.Update(tea.MouseMsg{Action: tea.MouseActionMotion, Button: tea.MouseButtonLeft, X: 2, Y: y + 1})
@@ -371,7 +371,7 @@ func TestTranscriptDragDoesNotToggleTool(t *testing.T) {
 	m := compactCmdModel()
 	m.Update(mkWinSize(80, 30))
 	m.appendRaw(blockTool, "line1\nline2")
-	y := m.blocks[0].y0 + m.contentPad() - m.vp.YOffset + 2
+	y := m.blocks[0].y0 + m.contentPad() - m.vp.YOffset + transcriptTopRows
 	tm, _ := m.Update(tea.MouseMsg{Action: tea.MouseActionPress, Button: tea.MouseButtonLeft, X: 0, Y: y})
 	m = tm.(*model)
 	tm, _ = m.Update(tea.MouseMsg{Action: tea.MouseActionMotion, Button: tea.MouseButtonLeft, X: 3, Y: y + 1})

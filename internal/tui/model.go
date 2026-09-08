@@ -3,7 +3,9 @@ package tui
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -48,30 +50,19 @@ type goalFromContextMsg struct {
 type goalUpdateMsg struct{ update agent.GoalUpdate }
 type goalUpdateRecordMsg struct{ record agent.GoalRecord }
 
-type compactMsg struct {
-	took, kept int // messages removed / kept after compaction
-	summary    string
-	err        error
-}
 type turnDoneMsg struct {
 	final          string
 	err            error
-	at             int    // conversation index the turn started at (snapshot key)
-	snap           string // pre-turn workspace snapshot commit ("" = not a git repo)
-	clean          bool   // the turn left the tree clean — snap is worthless, drop it
 	plan           string // worker-authoritative proposed plan, when present
-	review         string // worker-authoritative review, when present
 	reviewMarkdown string
 	goal           *agent.GoalRecord
 	goalContinue   bool
-	goalUpdates    []agent.GoalUpdate
-	goalUsage      models.Usage
 }
 type catalogsMsg map[string]config.Catalog // background /models fetch result
 type noticeMsg string                      // dim one-liner appended to the transcript
-type usageMsg models.Usage                 // one request's token usage
-type quitArmMsg struct{}                   // the idle ctrl+c arm window expired
-type taskUpdateMsg struct{}                // a background subagent started/settled — redraw
+type reviewProgressMsg struct{ progress agent.ReviewProgress }
+type quitArmMsg struct{}    // the idle ctrl+c arm window expired
+type taskUpdateMsg struct{} // a background subagent started/settled — redraw
 type mcpStatusMsg struct {
 	statuses []workerwire.MCPStatus
 }                        // an MCP server changed state — redraw
@@ -86,6 +77,13 @@ type workerFrameMsg struct {
 	frame      workerwire.Frame
 	client     *workerwire.Client
 	generation uint64
+}
+type workerStartedMsg struct {
+	sessionID string
+	client    *workerwire.Client
+	process   *workerwire.Process
+	runtime   workerwire.Runtime
+	err       error
 }
 type workerErrorMsg struct {
 	err        error
@@ -116,7 +114,6 @@ type model struct {
 	modelName       string
 	provName        string
 	modelID         string
-	protocol        string
 	role            string
 	effort          string
 	contextLimit    int
@@ -152,12 +149,15 @@ type model struct {
 	store     *session.Store
 	sessionID string
 
-	hist     []string         // submitted inputs, for up/down recall
-	pasteBuf string           // held paste text for the [Pasted ~N lines] placeholder (config collapsePaste)
-	histIdx  int              // len(hist) == not navigating
-	draft    string           // in-progress input saved while navigating history
-	lastUp   time.Time        // last ↑ keypress; repeat detection for history rollover
-	now      func() time.Time // test seam; defaults to time.Now
+	hist                []string         // submitted inputs, for up/down recall
+	pasteBuf            string           // held paste text for the [Pasted ~N lines] placeholder (config collapsePaste)
+	histIdx             int              // len(hist) == not navigating
+	draft               string           // in-progress input saved while navigating history
+	lastUp              time.Time        // last ↑ keypress; repeat detection for history rollover
+	now                 func() time.Time // test seam; defaults to time.Now
+	inputMeasuredValue  string
+	inputMeasuredWidth  int
+	inputMeasuredHeight int
 
 	turnStart time.Time // when the in-flight turn began; zero when idle (busy line shows elapsed)
 
@@ -166,17 +166,21 @@ type model struct {
 	interrupt1 bool     // first ctrl+c pressed while busy; second cancels
 	quit1      bool     // first ctrl+c pressed while idle; second quits (armed briefly)
 
-	goalRecord     *agent.GoalRecord
-	proposedPlanMD string // latest /plan proposal (Markdown), waiting for /execute
-	planCurrent    string // partial line of streamed plan markdown
-	mode           string // user-visible operating mode: plan or execute
-	reviewing      bool   // active one-shot /review turn; restores mode/role on completion
-	wheel          wheelState
-	selection      *selectionState
+	goalRecord               *agent.GoalRecord
+	proposedPlanMD           string // latest /plan proposal (Markdown), waiting for /execute
+	planCurrent              string // partial line of streamed plan markdown
+	mode                     string // user-visible operating mode: plan or execute
+	reviewing                bool   // active one-shot /review turn; restores mode/role on completion
+	reviewProgress           *agent.ReviewProgress
+	reviewProgressHistory    []agent.ReviewProgress
+	reviewScopeShown         bool
+	reviewLastExtensionTo    int
+	reviewFinalEvidenceShown bool
+	reviewClosedShown        bool
+	wheel                    wheelState
+	selection                *selectionState
 
-	mouseOn       bool   // startup mouse setting; nil config means enabled
-	compactModel  string // config model name for compaction summaries; "" = the built-in default
-	compactProv   string
+	mouseOn       bool                      // startup mouse setting; nil config means enabled
 	statusModelX  int                       // screen column where the bottom model control starts
 	statusModelW  int                       // visible width of the bottom model control
 	statusEffortX int                       // screen column where the bottom effort control starts
@@ -184,25 +188,34 @@ type model struct {
 	statusModeX   int                       // screen column where the bottom mode control starts
 	statusModeW   int                       // visible width of the bottom mode control
 	shortCWD      string                    // cached abbreviated working directory
+	workingDir    string                    // full working directory; changed by /cd
 	modelSlotW    int                       // cached max width across role models
 	catalogs      map[string]config.Catalog // provider model lists (capabilities)
 	profiles      models.Profiles           // embedded/user/trusted-project provider metadata
 	// skillScan is the skills discovery seam (skills.Scan over DefaultDirs in
 	// the real model): a field so the context doctor can be tested against
 	// temp-dir skills instead of whatever the test machine happens to have.
-	skillScan    func() []skills.Skill
-	skillsCache  []skills.Skill
-	skillsLoaded int
+	skillScan       func() []skills.Skill
+	skillsCache     []skills.Skill
+	skillsLoaded    int
+	skillsSignature string
 
 	iactive *interactive // in-flight interactive command; nil when idle
 
 	permDialog *permDialog // open permission modal; the turn is paused on it
 
-	tasksFocus bool      // the tasks dock owns ↑/↓/enter/esc instead of the input
-	taskSel    int       // selected row in the dock (index into newest-first tasks)
-	dockSkip   int       // non-task rows at the dock's top (focused hint) — click math skips them
-	taskVP     *taskView // open per-task detail view; nil when on the main thread
-	dockRows   int       // rendered dock height; layout() maintains it for click math
+	tasksFocus       bool      // the tasks dock owns ↑/↓/enter/esc instead of the input
+	taskSel          int       // selected row in the dock (index into newest-first tasks)
+	dockSkip         int       // non-task rows at the dock's top (focused hint) — click math skips them
+	taskVP           *taskView // open per-task detail view; nil when on the main thread
+	dockRows         int       // rendered dock height; layout() maintains it for click math
+	dockView         string    // rendered dock cached by layout for the following View
+	frameViewsValid  bool
+	frameCurrent     string
+	frameThinking    string
+	frameInteractive string
+	framePermission  string
+	frameRewind      string
 
 	rew    *rewindState     // open rewind picker (double-esc while idle)
 	esc1   bool             // first idle esc pressed; second opens the rewind picker
@@ -222,10 +235,13 @@ type model struct {
 	detachRequestID      string
 	workerStartFailed    bool
 	workerStartError     string
+	workerStarting       bool
+	pendingWorkerAction  func() tea.Cmd
 	workerContextTokens  int
 	workerHistoryRequest string
 	workerRewindRestore  string
 	workerChdirRequest   string
+	forkNotice           string
 	workerMCPStatuses    []workerwire.MCPStatus
 	cautious             bool
 }
@@ -261,7 +277,11 @@ func (m *model) currentUsage() models.Usage {
 }
 
 func (m *model) Init() tea.Cmd {
-	return textarea.Blink
+	workerCmd := m.startWorkerCmd()
+	if workerCmd == nil {
+		return textarea.Blink
+	}
+	return tea.Batch(textarea.Blink, workerCmd)
 }
 
 func cwd() string {
@@ -276,15 +296,6 @@ func (m *model) nowFn() time.Time {
 		return m.now()
 	}
 	return time.Now()
-}
-
-func (m *model) defaultCompactModelName() string {
-	if m.cfg != nil && len(m.cfg.Roles) > 0 {
-		if target, err := m.cfg.ResolveRole(config.RoleTiny); err == nil && target.Model != "" {
-			return target.Model
-		}
-	}
-	return config.DefaultCompactModel
 }
 
 func (m *model) switchModel(name, prov string) {
@@ -317,6 +328,19 @@ func (m *model) openPicker() {
 	}
 	m.picker = &picker{metas: metas, previews: map[string][2]string{}}
 	m.picker.loadPreview(m.store)
+}
+
+func (m *model) openPickerCmd() tea.Cmd {
+	if m.store == nil {
+		m.append(errStyle.Render("session store unavailable"))
+		return nil
+	}
+	m.picker = &picker{previews: map[string][2]string{}, loading: true}
+	store := m.store
+	return func() tea.Msg {
+		metas, err := store.Recent(50)
+		return recentSessionsMsg{metas: metas, err: err}
+	}
 }
 
 // openMenu starts tab completion: every candidate for the token's prefix is
@@ -472,11 +496,45 @@ func (m *model) scanSkills() []skills.Skill {
 	return skills.Scan(skills.DefaultDirs()...)
 }
 
+// refreshSkills checks skill metadata before reparsing every SKILL.md. New,
+// removed, resized, or retimestamped skills still take effect on the next
+// turn, while an unchanged directory avoids rereading all skill files.
+func (m *model) refreshSkills() []skills.Skill {
+	if m.skillScan != nil {
+		return m.scanSkills()
+	}
+	var sig strings.Builder
+	for _, dir := range skills.DefaultDirs() {
+		sig.WriteString(dir)
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, entry := range entries {
+			if !entry.IsDir() {
+				continue
+			}
+			info, err := os.Stat(filepath.Join(dir, entry.Name(), "SKILL.md"))
+			if err != nil {
+				sig.WriteString(entry.Name() + ":missing;")
+				continue
+			}
+			sig.WriteString(entry.Name() + ":" + strconv.FormatInt(info.ModTime().UnixNano(), 10) + ":" + strconv.FormatInt(info.Size(), 10) + ";")
+		}
+	}
+	key := sig.String()
+	if m.skillsCache != nil && key == m.skillsSignature {
+		return m.skillsCache
+	}
+	m.skillsSignature = key
+	return m.scanSkills()
+}
+
 // skillCands uses the startup snapshot while the completion menu is open.
 // prepareTurn is the explicit refresh point for newly added skills.
 func (m *model) skillCands() []cand {
 	if m.skillsCache == nil {
-		m.skillsCache = m.scanSkills()
+		m.skillsCache = m.refreshSkills()
 		if m.skillsCache == nil {
 			m.skillsCache = []skills.Skill{}
 		}
@@ -495,7 +553,7 @@ func (m *model) skillCands() []cand {
 // tokens in the input. It returns the expanded text plus any image parts
 // extracted from @image tags.
 func (m *model) prepareTurn(text string) (string, []models.ContentPart) {
-	sk := m.scanSkills()
+	sk := m.refreshSkills()
 	if sk == nil {
 		sk = []skills.Skill{}
 	}
@@ -567,6 +625,12 @@ func (m *model) submitTurnMode(text string, authored, ask bool) (tea.Model, tea.
 	if !m.requireAgent() {
 		return m, nil
 	}
+	if m.workerClient == nil && m.prog != nil && m.store != nil && !m.workerStartFailed {
+		return m.ensureWorkerAction(func() tea.Cmd {
+			_, cmd := m.submitTurnMode(text, authored, ask)
+			return cmd
+		})
+	}
 	if !m.ensureWorker() {
 		m.workerStartFailed = true
 		m.busy = false
@@ -581,8 +645,7 @@ func (m *model) submitTurnMode(text string, authored, ask bool) (tea.Model, tea.
 	m.busy = true
 	m.turnStart = m.nowFn()
 	prepared, parts := m.prepareTurn(text)
-	userMsgIdx := 0
-	userMsgIdx = m.messageCount()
+	userMsgIdx := m.messageCount()
 	m.discardFuture() // new activity while rewound kills the redo stack
 	goalCtx, hasGoal := m.goalRecordForSession()
 	if ask {
@@ -593,7 +656,7 @@ func (m *model) submitTurnMode(text string, authored, ask bool) (tea.Model, tea.
 		if !hasGoal {
 			return nil
 		}
-		copy := goalCtx
-		return &copy
+		goalCopy := goalCtx
+		return &goalCopy
 	}(), ask)
 }

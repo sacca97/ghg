@@ -39,8 +39,6 @@ func NewGoal(objective string) GoalRecord { return session.NewGoal(objective) }
 
 func NewGoalID() string { return session.NewGoalID() }
 
-func ValidGoalStatus(status GoalStatus) bool { return session.ValidGoalStatus(status) }
-
 // GoalUpdate is the structured result of the model-facing update_goal tool.
 // Active is a progress checkpoint; complete and blocked are terminal for the
 // current goal run. Paused and limit states are controlled by the host.

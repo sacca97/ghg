@@ -238,4 +238,25 @@ func TestRenderChatMarkdownAndJSON(t *testing.T) {
 	if !strings.Contains(string(jsonBytes), "How do I test this?") {
 		t.Fatalf("missing user message in json: %s", string(jsonBytes))
 	}
+
+	progressPayload, err := json.Marshal(ChatPayload{
+		Messages: msgs,
+		ReviewProgress: []agent.ReviewProgress{{
+			Phase: "inventory", Allocation: 10, HardLimit: 38,
+			Inventory: &agent.ReviewInventory{Files: []string{"internal/agent/agent.go"}},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	withProgress := record
+	withProgress.Payload = string(progressPayload)
+	progressMD, err := RenderResult(withProgress, FormatMarkdown)
+	if err != nil || !strings.Contains(string(progressMD), "## Review progress") {
+		t.Fatalf("rendered progress markdown = %s, err = %v", string(progressMD), err)
+	}
+	progressJSON, err := RenderResult(withProgress, FormatJSON)
+	if err != nil || !strings.Contains(string(progressJSON), `"review_progress"`) {
+		t.Fatalf("rendered progress json = %s, err = %v", string(progressJSON), err)
+	}
 }

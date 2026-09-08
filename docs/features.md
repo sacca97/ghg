@@ -71,7 +71,8 @@ Tests: `internal/tools/search_test.go` — `TestGrepTool`,
 `TestSearchLimitsCancellationAndInvalidArguments`,
 `TestMalformedGitignore`, and `TestExplicitIgnoredFileIsSearchable`.
 
-`internal/tools/phase25_test.go` and `internal/search/state_test.go` cover OR
+`internal/tools/phase25_test.go`, `internal/search/snapshot_test.go`, and
+`internal/search/fileindex_test.go` cover OR
 patterns, stable cursors, noisy-file diversity, fuzzy late matches, long-result
 byte ceilings, later-page accounting, and exploration redirects. The Phase 2.5
 acceptance matrix also covers every observed edit operation, overlap/stale/
@@ -174,11 +175,9 @@ LLM-generated summary. Two triggers:
   $\min(\text{ContextLimit}/4, 24000)$ tokens. Kept groups are selected atomically so tool
   results are never severed from their assistant calls.
 
-The summary runs as a non-streaming `Complete` on the configured `tiny` role when a roles
-block is present. A legacy config without roles uses the built-in
-`deepseek-v4-flash-0731` (`config.DefaultCompactModel`). An explicit
-`compactModel` / `compactProvider` remains the per-session override, and an
-unavailable fallback leaves compaction on the conversation's own model.
+The summary runs as a non-streaming `Complete` on the first usable configured
+role in the `tiny`, `fast`, `default`, `smart` fallback chain. There is no
+per-session compaction-model override.
 
 Token bookkeeping: `models.Usage` (prompt/completion/cached) is read off the
 terminal stream chunk (`stream_options: include_usage`) and folded into session
@@ -189,12 +188,9 @@ triggering `maybeCompact()` proactively before dispatching bloated requests. If 
 exceeds context limits mid-generation, an overflow watchdog aborts the stream, compacts,
 and transparently retries the turn.
 
-Commands: `/compact` (compact now), `/compact <model> [provider]` (pick the
-summarizer), `/compact off` (restore the configured `tiny` role, or the legacy
-built-in default). The settings's
-"Compaction model" panel lists every configured model behind a
-"default (…)" row that restores the default; "Compaction level" steps the
-threshold ←/→.
+Commands: `/compact` (compact now using the fallback chain), `/compact retry`
+(undo the latest compaction and retry), and `/compact log` (inspect recorded
+compaction events). "Compaction level" steps the threshold ←/→.
 
 ### Plan runaway guard & per-turn tool lifecycle
 

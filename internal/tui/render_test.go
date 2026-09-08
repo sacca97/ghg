@@ -16,6 +16,7 @@ import (
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	"github.com/charmbracelet/x/ansi"
+	"github.com/sacca97/ghg/internal/agent"
 	"github.com/sacca97/ghg/internal/config"
 	"github.com/sacca97/ghg/internal/models"
 	"github.com/sacca97/ghg/internal/tools"
@@ -119,6 +120,11 @@ func TestFrameNeverExceedsTerminalHeight(t *testing.T) {
 		}},
 		{"rewind open", func(m *model) {
 			m.rew = &rewindState{entries: []rewindEntry{{text: "hello"}}}
+		}},
+		{"tasks dock", func(m *model) {
+			m.workerTasks = map[string]workerwire.TaskState{
+				"task-1": {ID: "task-1", Description: "background work", Status: "running", StartedAt: time.Now()},
+			}
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1054,6 +1060,48 @@ func TestStatusLineAlwaysShown(t *testing.T) {
 	}
 }
 
+func TestReviewProgressRendersScopeAndLease(t *testing.T) {
+	m := newGrowModel()
+	m.reviewing = true
+	m.busy = true
+	m.Update(mkWinSize(80, 30))
+	m.Update(reviewProgressMsg{progress: agent.ReviewProgress{
+		Phase: "inventory", Allocation: 16, HardLimit: 38,
+		Inventory: &agent.ReviewInventory{ProductionFiles: 20, TestFiles: 10, ProductionLOC: 8420, LargeFiles: []string{"a.go", "b.go", "c.go", "d.go", "e.go"}},
+		Focus:     []string{"update.go", "view.go", "worker.go", "input.go", "palette.go"},
+	}})
+	m.Update(reviewProgressMsg{progress: agent.ReviewProgress{
+		Phase: "extension", Allocation: 20, HardLimit: 38, FromAllocation: 16, ToAllocation: 20,
+		Reason: "trace fork/rewind history replacement",
+	}})
+	m.Update(reviewProgressMsg{progress: agent.ReviewProgress{
+		Phase: "extension", Allocation: 20, HardLimit: 38, FromAllocation: 16, ToAllocation: 20,
+		Reason: "trace fork/rewind history replacement",
+	}})
+	view := ansi.Strip(m.View())
+	for _, want := range []string{
+		"◎ review scope", "20 production · 10 tests · 8.4k LOC · 5 large files", "budget: 16 exploration rounds · hard limit: 38",
+		"◎ review budget extended · 16 → 20 · hard limit 38", "reason: trace fork/rewind history replacement",
+	} {
+		if !strings.Contains(view, want) {
+			t.Fatalf("view missing %q:\n%s", want, view)
+		}
+	}
+	if strings.Count(view, "◎ review budget extended") != 1 {
+		t.Fatalf("duplicate extension notice:\n%s", view)
+	}
+	if !strings.Contains(m.reviewBusyHint(), "exploration 0/20") {
+		t.Fatalf("busy hint = %q", m.reviewBusyHint())
+	}
+	m.finishTurnState()
+	if m.reviewProgress != nil {
+		t.Fatal("review progress should clear when the turn finishes")
+	}
+	if len(m.reviewProgressHistory) != 3 {
+		t.Fatalf("review progress history = %d, want 3", len(m.reviewProgressHistory))
+	}
+}
+
 func TestContextStatusUsesLatestReportedRequest(t *testing.T) {
 	m := statusModel()
 	m.contextLimit = 128000
@@ -1147,6 +1195,71 @@ func TestBottomStatusHitboxMatchesRenderedRow(t *testing.T) {
 	}
 	if renderedRow != statusInfoRow(m.height) {
 		t.Fatalf("status hitbox row=%d, rendered row=%d; the bottom controls would not receive clicks", statusInfoRow(m.height), renderedRow)
+	}
+}
+
+func TestDockAndStatusHitboxesMatchRenderedRows(t *testing.T) {
+	m := statusModel()
+	m.workerTasks = map[string]workerwire.TaskState{
+		"task-1": {ID: "task-1", Description: "background work", Status: "running", StartedAt: time.Now()},
+	}
+	tm, _ := m.Update(mkWinSize(100, 30))
+	m = tm.(*model)
+	lines := strings.Split(ansi.Strip(m.View()), "\n")
+	dockRow := -1
+	for i, line := range lines {
+		if strings.Contains(line, "task-1") {
+			dockRow = i
+			break
+		}
+	}
+	if dockRow < 0 {
+		t.Fatalf("could not find the rendered dock row:\n%s", m.View())
+	}
+	if dockRow != m.dockTop() {
+		t.Fatalf("dock hitbox row=%d, rendered row=%d", m.dockTop(), dockRow)
+	}
+	statusRow := -1
+	for i, line := range lines {
+		if strings.Contains(line, "execute") && strings.Contains(line, "ctx") {
+			statusRow = i
+			break
+		}
+	}
+	if statusRow != statusInfoRow(m.height) {
+		t.Fatalf("status hitbox row=%d, rendered row=%d", statusInfoRow(m.height), statusRow)
+	}
+}
+
+func TestDockClickOpensClickedTask(t *testing.T) {
+	m := statusModel()
+	now := time.Now()
+	m.workerTasks = map[string]workerwire.TaskState{
+		"older": {ID: "older", Description: "old", Status: "running", StartedAt: now.Add(-time.Minute)},
+		"newer": {ID: "newer", Description: "new", Status: "running", StartedAt: now},
+	}
+	tm, _ := m.Update(mkWinSize(100, 30))
+	m = tm.(*model)
+	m.taskSel = 1
+	_, _ = m.Update(tea.MouseMsg{Action: tea.MouseActionPress, Button: tea.MouseButtonLeft, X: 1, Y: m.dockTop()})
+	if m.taskVP == nil || m.taskVP.id != "newer" {
+		t.Fatalf("dock click opened %+v, want newer", m.taskVP)
+	}
+}
+
+func TestStatusClickBlockedByPermissionDialog(t *testing.T) {
+	m := statusModel()
+	m.permDialog = &permDialog{}
+	tm, _ := m.Update(mkWinSize(100, 30))
+	m = tm.(*model)
+	_ = m.View() // populate the status hitbox coordinates
+	before := m.modelName
+	_, _ = m.Update(tea.MouseMsg{
+		Action: tea.MouseActionPress, Button: tea.MouseButtonLeft,
+		X: m.statusModelX, Y: statusInfoRow(m.height),
+	})
+	if m.modelName != before {
+		t.Fatalf("status click changed model through permission dialog: %q -> %q", before, m.modelName)
 	}
 }
 
@@ -1522,7 +1635,7 @@ func TestToolExpand(t *testing.T) {
 	// click on the block row expands it
 	m.refreshVP()
 	y0 := m.blocks[0].y0 + m.contentPad()
-	screenY := y0 - m.vp.YOffset + 2
+	screenY := y0 - m.vp.YOffset + transcriptTopRows
 	tm, _ = m.Update(tea.MouseMsg{Action: tea.MouseActionPress, Button: tea.MouseButtonLeft, X: 5, Y: screenY})
 	m = tm.(*model)
 	tm, _ = m.Update(tea.MouseMsg{Action: tea.MouseActionRelease, Button: tea.MouseButtonLeft, X: 5, Y: screenY})

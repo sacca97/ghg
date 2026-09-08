@@ -37,7 +37,7 @@ func seeded(t *testing.T) (*Store, string) {
 func TestForkRecordsLinkage(t *testing.T) {
 	st, id := seeded(t)
 
-	newID, err := st.Fork(id, 2, "experiment")
+	newID, err := st.Fork(id, 2, "experiment", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -49,14 +49,6 @@ func TestForkRecordsLinkage(t *testing.T) {
 		t.Fatalf("fork linkage: %+v", meta)
 	}
 
-	// the source lists the fork among its children
-	forks, err := st.ForksOf(id)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(forks) != 1 || forks[0].ID != newID {
-		t.Fatalf("ForksOf: %+v", forks)
-	}
 	// a root session has no parent linkage
 	root, _, _ := st.Load(id)
 	if root.ForkedFrom != "" || root.ForkSeq != 0 {
@@ -99,8 +91,20 @@ func TestSessionTagsAndPinned(t *testing.T) {
 
 func TestForkCopiesPrefix(t *testing.T) {
 	st, id := seeded(t)
+	if err := st.SetTags(id, []string{"work", "branch"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetPinned(id, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetTodos(id, `{"items":[{"text":"finish fork"}]}`); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetUsage(id, 11, 7, 5); err != nil {
+		t.Fatal(err)
+	}
 
-	newID, err := st.Fork(id, 2, "experiment") // rows seq <= 2 → user q1 + assistant a1
+	newID, err := st.Fork(id, 2, "experiment", nil) // rows seq <= 2 → user q1 + assistant a1
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -115,6 +119,16 @@ func TestForkCopiesPrefix(t *testing.T) {
 		meta.Model != "kimi-k3-fast" || meta.Provider != "inference" || meta.CWD != "/tmp" {
 		t.Fatalf("meta not carried over: %+v", meta)
 	}
+	if !meta.Pinned || len(meta.Tags) != 2 || meta.UsageIn != 11 || meta.UsageCached != 7 || meta.UsageOut != 5 {
+		t.Fatalf("fork metadata not carried over: %+v", meta)
+	}
+	var todos string
+	if err := st.db.QueryRow(`SELECT todos FROM sessions WHERE id=?`, newID).Scan(&todos); err != nil {
+		t.Fatal(err)
+	}
+	if todos != `{"items":[{"text":"finish fork"}]}` {
+		t.Fatalf("fork todos = %q", todos)
+	}
 	if len(msgs) != 2 || msgs[0].Content != "q1" || msgs[1].Content != "a1" {
 		t.Fatalf("forked prefix: %+v", msgs)
 	}
@@ -126,10 +140,22 @@ func TestForkCopiesPrefix(t *testing.T) {
 	}
 }
 
+func TestForkRejectsMissingSource(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "s.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	if id, err := st.Fork("missing", 1, "fork", nil); err == nil || id != "" {
+		t.Fatalf("missing source fork = %q, %v", id, err)
+	}
+}
+
 func TestForkFullHistory(t *testing.T) {
 	st, id := seeded(t)
 
-	newID, err := st.Fork(id, 5, "copy") // one past the last row = full copy
+	newID, err := st.Fork(id, 5, "copy", nil) // one past the last row = full copy
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -146,7 +172,7 @@ func TestForkTitle(t *testing.T) {
 	if err != nil || title != "first question here (fork #1)" {
 		t.Fatalf("got %q %v", title, err)
 	}
-	if _, err := st.Fork(id, 4, title); err != nil {
+	if _, err := st.Fork(id, 4, title, nil); err != nil {
 		t.Fatal(err)
 	}
 	next, err := st.ForkTitle("first question here")
@@ -240,5 +266,49 @@ func TestDeleteFromAfterCompactionUsesRawSequence(t *testing.T) {
 	}
 	if len(view) != 3 || view[2].Content != "a2" {
 		t.Fatalf("compacted view after rewind = %+v, want summary plus a2", view)
+	}
+}
+
+func TestDeleteFromKeepsOlderCompactions(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "s.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	id, err := st.Create(t.TempDir(), "m", "p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw := []models.Message{
+		{Role: "system", Content: "sys"},
+		{Role: "user", Content: "q1"},
+		{Role: "assistant", Content: "a1"},
+		{Role: "user", Content: "q2"},
+		{Role: "assistant", Content: "a2"},
+		{Role: "user", Content: "q3"},
+		{Role: "assistant", Content: "a3"},
+		{Role: "user", Content: "q4"},
+		{Role: "assistant", Content: "a4"},
+	}
+	if err := st.Save(id, 0, raw, "m", "p"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RecordCompaction(id, 4, "first"); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.RecordCompaction(id, 7, "second"); err != nil {
+		t.Fatal(err)
+	}
+	_, view, err := st.Load(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.DeleteFrom(id, 1, view); err != nil {
+		t.Fatal(err)
+	}
+	events := st.Compactions(id)
+	if len(events) != 1 || events[0].Cutoff != 4 {
+		t.Fatalf("rewind compactions = %+v, want only the older event", events)
 	}
 }

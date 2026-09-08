@@ -390,8 +390,8 @@ func runCLI(args []string) error {
 	if store != nil {
 		ag.OutputCatalog = store
 		ag.HistoryCatalog = store
-		ag.SetObservationStore(store.ObservationRegistryStore())
-		ag.SetSearchStore(store.SearchRegistryStore())
+		ag.SetObservationStore(store)
+		ag.SetSearchStore(store)
 	}
 	ag.SetSessionID(sessionID)
 	if err := ag.BindState(ctx); err != nil {
@@ -451,6 +451,12 @@ func setupWireEvents(ev *agent.Events, emit func(any)) {
 	}
 	ev.OnText = func(delta string) {
 		emit(map[string]any{"type": "text", "delta": delta})
+	}
+	ev.OnNotice = func(text string) {
+		emit(map[string]any{"type": "notice", "text": text})
+	}
+	ev.OnReviewProgress = func(progress agent.ReviewProgress) {
+		emit(map[string]any{"type": "review_progress", "progress": progress})
 	}
 	ev.OnToolStart = func(id, name, args string) {
 		emit(map[string]any{"type": "tool_start", "id": id, "name": name, "args": args})

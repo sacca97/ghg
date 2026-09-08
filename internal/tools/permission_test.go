@@ -2,12 +2,42 @@ package tools
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
+	"sort"
+	"sync"
 	"testing"
 
 	"github.com/sacca97/ghg/internal/sandbox"
 )
+
+func TestPermRulesAllowAlwaysKeepsConcurrentUpdates(t *testing.T) {
+	t.Setenv("GHG_HOME", t.TempDir())
+	rules := &PermRules{rules: make(map[string]bool)}
+	const count = 8
+	var wg sync.WaitGroup
+	for i := 0; i < count; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			rules.AllowAlways("bash", "command-"+string(rune('a'+i)))
+		}(i)
+	}
+	wg.Wait()
+
+	data, err := os.ReadFile(filepath.Join(os.Getenv("GHG_HOME"), "permissions.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got []string
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != count || !sort.StringsAreSorted(got) {
+		t.Fatalf("persisted rules = %v, want %d sorted rules", got, count)
+	}
+}
 
 func TestSegmentShellKeepsQuotedOperatorsAndRejectsSubstitution(t *testing.T) {
 	segments, err := SegmentShell(`printf "%s && still one" && printf done`)
@@ -25,6 +55,10 @@ func TestSegmentShellKeepsQuotedOperatorsAndRejectsSubstitution(t *testing.T) {
 	}
 	if got := CommandRule(`git status && rm -rf build`); got != "git status && rm -rf build" {
 		t.Fatalf("compound CommandRule = %q", got)
+	}
+	segments, err = SegmentShell(`printf 'a\'; echo ok`)
+	if err != nil || len(segments) != 2 || len(segments[0].Argv) != 2 || segments[0].Argv[1] != `a\` {
+		t.Fatalf("backslash in single quotes parsed incorrectly: segments=%+v err=%v", segments, err)
 	}
 }
 
@@ -296,6 +330,8 @@ func TestCommandRuleUnwrapsTransparentPrefixes(t *testing.T) {
 		{name: "nice ls", command: "nice ls -la", want: "ls"},
 		{name: "command -p grep", command: "command -p grep pattern file", want: "grep"},
 		{name: "plain git status", command: "git status", want: "git status"},
+		{name: "git flag is not a rule", command: "git -C /other/repo status", want: "git -C /other/repo status"},
+		{name: "npm flag is not a rule", command: "npm --prefix /other/repo ci", want: "npm --prefix /other/repo ci"},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

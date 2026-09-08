@@ -92,6 +92,11 @@ func TestReadCoverageSuppressesRedundantRanges(t *testing.T) {
 		!strings.Contains(batch[1].Preview, "301\tline 301") {
 		t.Fatalf("same-offset batch results = %+v", batch)
 	}
+	batched := run(readCall("read-batch", fmt.Sprintf(`{"ranges":[{"path":%q,"offset":261,"limit":20},{"path":%q,"offset":281,"limit":20}]}`, path, path)))[0]
+	batchedRepeat := run(readCall("read-batch-repeat", fmt.Sprintf(`{"ranges":[{"path":%q,"offset":261,"limit":20},{"path":%q,"offset":281,"limit":20}]}`, path, path)))[0]
+	if batched.ExitCode != 0 || batched.Metadata["observation_count"] != "2" || batchedRepeat.Metadata["duplicate_suppressed"] != "true" {
+		t.Fatalf("batched read coverage = first=%+v repeat=%+v", batched, batchedRepeat)
+	}
 
 	missing := fmt.Sprintf(`{"path":%q,"offset":1,"limit":1}`, filepath.Join(filepath.Dir(path), "missing.go"))
 	failed := run(readCall("read-failed-1", missing))[0]
@@ -146,10 +151,57 @@ func TestReadCoverageSuppressesRedundantRanges(t *testing.T) {
 	}
 }
 
+func TestReadCoverageTrackerCapsHistory(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "source.go")
+	if err := os.WriteFile(path, []byte("package p\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	guard := newReadCoverageTracker()
+	guard.coverage = make([]readCoverage, maxReadCoverageEntries)
+	guard.record(tools.ToolResult{
+		ExitCode: 0,
+		Metadata: map[string]string{
+			"observation_id":    "new",
+			"observation_path":  path,
+			"observation_start": "1",
+			"observation_end":   "1",
+		},
+	})
+	if len(guard.coverage) != maxReadCoverageEntries {
+		t.Fatalf("coverage entries = %d, want %d", len(guard.coverage), maxReadCoverageEntries)
+	}
+}
+
 type fakeBackend struct {
 	streamRequests   []models.Request
 	completeRequests []models.Request
 }
+
+type compactResponse struct {
+	message models.Message
+	err     error
+}
+
+type compactSequenceBackend struct {
+	responses []compactResponse
+	requests  []models.Request
+}
+
+func (b *compactSequenceBackend) Stream(context.Context, models.Request, models.EventSink) (models.Message, models.Usage, error) {
+	return models.Message{}, models.Usage{}, nil
+}
+
+func (b *compactSequenceBackend) Complete(_ context.Context, req models.Request) (models.Message, models.Usage, error) {
+	b.requests = append(b.requests, req)
+	if len(b.responses) == 0 {
+		return models.Message{}, models.Usage{}, errors.New("unexpected compaction call")
+	}
+	response := b.responses[0]
+	b.responses = b.responses[1:]
+	return response.message, models.Usage{}, response.err
+}
+
+var _ models.Backend = (*compactSequenceBackend)(nil)
 
 func (b *fakeBackend) Stream(_ context.Context, req models.Request, sink models.EventSink) (models.Message, models.Usage, error) {
 	b.streamRequests = append(b.streamRequests, req)
@@ -964,7 +1016,10 @@ func (b *checkpointBackend) Complete(_ context.Context, _ models.Request) (model
 	return models.Message{Role: "assistant", Content: "done"}, models.Usage{}, nil
 }
 
-func TestExplorationCheckpointsAreTransientAndNonBlocking(t *testing.T) {
+func TestExplorationCheckpointsAreTransientAndBlockPendingTools(t *testing.T) {
+	const expectedFinalRound = 24
+	expectedCheckpointRounds := map[int]int{10: 1, 16: 2, expectedFinalRound: 3}
+
 	call := func(id, name, args string) models.ToolCall {
 		return models.ToolCall{ID: id, Type: "function", Function: struct {
 			Name      string `json:"name"`
@@ -981,7 +1036,7 @@ func TestExplorationCheckpointsAreTransientAndNonBlocking(t *testing.T) {
 		Role:      "assistant",
 		ToolCalls: []models.ToolCall{call("read-verify", "read", `{"path":"changed.go"}`)},
 	}}
-	for i := 0; i < explorationCheckpointFinal; i++ {
+	for i := 0; i < expectedFinalRound; i++ {
 		responses = append(responses, models.Message{
 			Role:      "assistant",
 			ToolCalls: []models.ToolCall{call(fmt.Sprintf("grep-%d", i+2), "grep", fmt.Sprintf(`{"pattern":"query-%d"}`, i))},
@@ -991,38 +1046,104 @@ func TestExplorationCheckpointsAreTransientAndNonBlocking(t *testing.T) {
 
 	backend := &checkpointBackend{responses: responses}
 	ag := New(backend, "model", 100, "system")
+	var executed atomic.Int32
 	ag.Tools = []tools.Tool{
-		{Def: models.NewTool("read", "read", `{"type":"object"}`), Run: func(context.Context, json.RawMessage) (string, error) { return "ok", nil }},
-		{Def: models.NewTool("grep", "grep", `{"type":"object"}`), Run: func(context.Context, json.RawMessage) (string, error) { return "ok", nil }},
-		{Def: models.NewTool("write", "write", `{"type":"object"}`), Run: func(context.Context, json.RawMessage) (string, error) { return "ok", nil }},
+		{Def: models.NewTool("read", "read", `{"type":"object"}`), Run: func(context.Context, json.RawMessage) (string, error) { executed.Add(1); return "ok", nil }},
+		{Def: models.NewTool("grep", "grep", `{"type":"object"}`), Run: func(context.Context, json.RawMessage) (string, error) { executed.Add(1); return "ok", nil }},
+		{Def: models.NewTool("write", "write", `{"type":"object"}`), Run: func(context.Context, json.RawMessage) (string, error) { executed.Add(1); return "ok", nil }},
 	}
 	var ends []ModelCallEnd
-	if _, err := ag.Turn(context.Background(), "explore", Events{OnModelCallEnd: func(end ModelCallEnd) { ends = append(ends, end) }}); err != nil {
+	var notices []string
+	if _, err := ag.Turn(context.Background(), "explore", Events{
+		OnModelCallEnd: func(end ModelCallEnd) { ends = append(ends, end) },
+		OnNotice:       func(notice string) { notices = append(notices, notice) },
+	}); err != nil {
 		t.Fatal(err)
 	}
-	if len(backend.requests) != explorationCheckpointFinal+3 || len(ends) != len(backend.requests) {
-		t.Fatalf("model calls = %d/%d, want %d", len(backend.requests), len(ends), explorationCheckpointFinal+3)
+	if len(backend.requests) != expectedFinalRound+3 || len(ends) != len(backend.requests) {
+		t.Fatalf("model calls = %d/%d, want %d", len(backend.requests), len(ends), expectedFinalRound+3)
 	}
-	for index, level := range map[int]int{explorationCheckpointOne + 2: 1, explorationCheckpointTwo + 2: 2, explorationCheckpointFinal + 2: 3} {
+	if got, want := executed.Load(), int32(2+1+expectedFinalRound-len(expectedCheckpointRounds)); got != want {
+		t.Fatalf("executed tool calls = %d, want %d", got, want)
+	}
+	baselineTools := backend.requests[0].Tools
+	if want := []string{"◎ exploration checkpoint · round 10", "◎ exploration checkpoint · round 16", "◎ exploration checkpoint · round 24"}; !reflect.DeepEqual(notices, want) {
+		t.Fatalf("notices = %v, want %v", notices, want)
+	}
+	for round, level := range expectedCheckpointRounds {
+		index := round + 2
 		if !requestContains(backend.requests[index], fmt.Sprintf(`level="%d"`, level)) {
 			t.Fatalf("request %d lacks checkpoint level %d", index+1, level)
 		}
 		if ends[index].CheckpointLevel != level {
 			t.Fatalf("model call %d checkpoint level = %d, want %d", index+1, ends[index].CheckpointLevel, level)
 		}
+		if !reflect.DeepEqual(backend.requests[index].Tools, baselineTools) {
+			t.Fatalf("checkpoint %d changed the tool set", level)
+		}
 	}
-	if ends[explorationCheckpointFinal+2].ContinuedAfterCheckpoint {
+	if ends[expectedFinalRound+2].ContinuedAfterCheckpoint {
 		t.Fatal("final response incorrectly reported continuation after checkpoint")
 	}
 	for i, req := range backend.requests {
-		if i != explorationCheckpointOne+2 && i != explorationCheckpointTwo+2 && i != explorationCheckpointFinal+2 && requestContains(req, "<exploration_checkpoint") {
+		if _, checkpoint := expectedCheckpointRounds[i-2]; checkpoint {
+			continue
+		}
+		if requestContains(req, "<exploration_checkpoint") {
 			t.Fatalf("checkpoint reminder repeated at request %d", i+1)
 		}
 	}
 	for _, message := range ag.MessagesSnapshot() {
-		if strings.Contains(message.Content, "<exploration_checkpoint") {
+		if strings.Contains(message.Content, "<exploration_checkpoint level=") {
 			t.Fatal("checkpoint reminder was persisted in conversation history")
 		}
+	}
+}
+
+func TestReadOnlyFinalEvidenceMalformedBatchRetriesOnce(t *testing.T) {
+	call := func(id, args string) models.ToolCall {
+		return models.ToolCall{ID: id, Type: "function", Function: struct {
+			Name      string `json:"name"`
+			Arguments string `json:"arguments"`
+		}{Name: "read", Arguments: args}}
+	}
+	responses := make([]models.Message, 0, 13)
+	for i := 0; i < 10; i++ {
+		responses = append(responses, models.Message{Role: "assistant", ToolCalls: []models.ToolCall{
+			call(fmt.Sprintf("read-%d", i), fmt.Sprintf(`{"path":"file-%d.go"}`, i)),
+		}})
+	}
+	responses = append(responses,
+		models.Message{Role: "assistant", ToolCalls: []models.ToolCall{call("malformed-final", "{invalid")}},
+		models.Message{Role: "assistant", ToolCalls: []models.ToolCall{call("valid-final", `{"path":"final.go"}`)}},
+		models.Message{Role: "assistant", Content: "<proposed_plan>done</proposed_plan>"},
+	)
+	backend := &checkpointBackend{responses: responses}
+	ag := New(backend, "model", 100, "system")
+	ag.PlanMode = true
+	var executed atomic.Int32
+	ag.Tools = []tools.Tool{{
+		Def: models.NewTool("read", "read", `{"type":"object"}`),
+		Run: func(context.Context, json.RawMessage) (string, error) {
+			executed.Add(1)
+			return "ok", nil
+		},
+	}}
+	final, err := ag.TurnAuthored(context.Background(), "make a plan", Events{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if final != "<proposed_plan>done</proposed_plan>" {
+		t.Fatalf("final = %q", final)
+	}
+	if len(backend.requests) != 13 {
+		t.Fatalf("model calls = %d, want 13", len(backend.requests))
+	}
+	if got := executed.Load(); got != 10 {
+		t.Fatalf("executed reads = %d, want 10 (9 initial plus one retry)", got)
+	}
+	if len(backend.requests[12].Tools) != 0 {
+		t.Fatalf("synthesis request exposed tools: %+v", backend.requests[12].Tools)
 	}
 }
 
@@ -1396,23 +1517,36 @@ func TestNoProactiveCompactBelowThresholdOrWithoutLimit(t *testing.T) {
 	}
 }
 
-func TestCompactUsesCompactModel(t *testing.T) {
+func TestCompactUsesCandidate(t *testing.T) {
 	var modelIDs []string
+	var maxTokens []int
 	main := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Error("summary call must not hit the conversation's provider")
 	}))
 	defer main.Close()
 	sum := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var req models.Request
+		var req struct {
+			Model     string `json:"model"`
+			MaxTokens int    `json:"max_tokens"`
+			Thinking  struct {
+				Type string `json:"type"`
+			} `json:"thinking"`
+		}
 		json.NewDecoder(r.Body).Decode(&req)
 		modelIDs = append(modelIDs, req.Model)
+		maxTokens = append(maxTokens, req.MaxTokens)
+		if req.Thinking.Type != "disabled" {
+			t.Errorf("compaction must disable reasoning, got %q", req.Thinking.Type)
+		}
 		w.Write([]byte(`{"choices":[{"message":{"content":"sim"}}]}`))
 	}))
 	defer sum.Close()
 
 	ag := New(testBackend(main.URL, "k"), "conversation-model", 100, "sys")
-	ag.CompactBackend = testBackend(sum.URL, "k")
-	ag.CompactModel = "summary-model"
+	candidate := New(testBackend(sum.URL, "k"), "summary-model", 1200, "sys")
+	candidate.Role = "tiny"
+	candidate.ReasoningToggle = true
+	ag.CompactCandidates = []*Agent{candidate}
 	for i := 0; i < 8; i++ {
 		ag.Messages = append(ag.Messages,
 			models.Message{Role: "user", Content: fmt.Sprintf("q%d", i)},
@@ -1425,6 +1559,171 @@ func TestCompactUsesCompactModel(t *testing.T) {
 	if len(modelIDs) != 1 || modelIDs[0] != "summary-model" {
 		t.Fatalf("summary should run on summary-model, got %v", modelIDs)
 	}
+	if len(maxTokens) != 1 || maxTokens[0] != 1200 {
+		t.Fatalf("summary output budget = %v, want [1200]", maxTokens)
+	}
+}
+
+func TestCompactionRecoversFromTruncation(t *testing.T) {
+	tests := []struct {
+		name               string
+		stop               string
+		fallback           bool
+		reasoningToggle    bool
+		wantFirstCalls     int
+		wantCandidateCalls int
+	}{
+		{name: "length retry", stop: "length", wantFirstCalls: 2},
+		{name: "max tokens retry", stop: "max_tokens", wantFirstCalls: 2},
+		{name: "max output tokens retry", stop: "max_output_tokens", wantFirstCalls: 2},
+		{name: "falls through after retry", stop: "length", fallback: true, wantFirstCalls: 2, wantCandidateCalls: 1},
+		{name: "uses advertised reasoning toggle", stop: "max_tokens", reasoningToggle: true, wantFirstCalls: 2},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			retryResponse := compactResponse{message: models.Message{Role: "assistant", Content: "complete"}}
+			if tc.fallback {
+				retryResponse = compactResponse{message: models.Message{Role: "assistant", Content: "still partial", StopReason: tc.stop}}
+			}
+			first := &compactSequenceBackend{responses: []compactResponse{
+				{message: models.Message{Role: "assistant", Content: "partial", StopReason: tc.stop}},
+				retryResponse,
+			}}
+			candidate := &compactSequenceBackend{responses: []compactResponse{
+				{message: models.Message{Role: "assistant", Content: "complete"}},
+			}}
+			firstAgent := New(first, "first-model", 37, "sys")
+			firstAgent.ContextLimit = 1000
+			firstAgent.Role = "tiny"
+			firstAgent.Provider = "first-provider"
+			firstAgent.ReasoningToggle = tc.reasoningToggle
+			ag := New(nil, "conversation-model", 0, "sys")
+			ag.Messages = compactionTestHistory()
+			ag.CompactCandidates = []*Agent{firstAgent}
+			if tc.fallback {
+				secondAgent := New(candidate, "second-model", 41, "sys")
+				secondAgent.Role = "fast"
+				secondAgent.Provider = "second-provider"
+				ag.CompactCandidates = append(ag.CompactCandidates, secondAgent)
+			}
+
+			if err := ag.ManualCompact(context.Background(), Events{}); err != nil {
+				t.Fatal(err)
+			}
+			if len(first.requests) != tc.wantFirstCalls {
+				t.Fatalf("first candidate calls = %d, want %d", len(first.requests), tc.wantFirstCalls)
+			}
+			if tc.fallback && len(candidate.requests) != tc.wantCandidateCalls {
+				t.Fatalf("fallback candidate calls = %d, want %d", len(candidate.requests), tc.wantCandidateCalls)
+			}
+			if first.requests[0].MaxTokens != first.requests[1].MaxTokens {
+				t.Fatalf("retry changed max tokens: first=%d retry=%d", first.requests[0].MaxTokens, first.requests[1].MaxTokens)
+			}
+			if tc.reasoningToggle && (first.requests[0].ReasoningEnabled == nil || *first.requests[0].ReasoningEnabled) {
+				t.Fatal("compaction should disable reasoning when the candidate advertises the capability")
+			}
+			if !strings.Contains(ag.Messages[1].Content, "complete") {
+				t.Fatalf("complete checkpoint was not installed: %q", ag.Messages[1].Content)
+			}
+		})
+	}
+}
+
+func TestCompactionFailuresLeaveHistoryUntouched(t *testing.T) {
+	oversized := strings.Repeat("x", 200_000)
+	first := &compactSequenceBackend{responses: []compactResponse{
+		{message: models.Message{Role: "assistant", Content: oversized}},
+		{message: models.Message{Role: "assistant", Content: oversized}},
+	}}
+	second := &compactSequenceBackend{responses: []compactResponse{
+		{err: errors.New("fallback unavailable")},
+	}}
+	ag := New(nil, "conversation-model", 0, "sys")
+	ag.Messages = compactionTestHistory()
+	ag.CompactCandidates = []*Agent{
+		New(first, "first-model", 37, "sys"),
+		New(second, "second-model", 41, "sys"),
+	}
+	before := ag.MessagesSnapshot()
+	persisted := false
+	err := ag.ManualCompact(context.Background(), Events{OnCompactionReady: func([]models.Message, string, int) error {
+		persisted = true
+		return nil
+	}})
+	if err == nil || !strings.Contains(err.Error(), "compaction summary failed") {
+		t.Fatalf("expected all-candidate failure, got %v", err)
+	}
+	if persisted || !reflect.DeepEqual(ag.MessagesSnapshot(), before) {
+		t.Fatalf("failed compaction changed state: persisted=%v", persisted)
+	}
+}
+
+func TestCompactionBuildsFortyThousandTokenWorkingSet(t *testing.T) {
+	backend := &compactSequenceBackend{responses: []compactResponse{{message: models.Message{Role: "assistant", Content: "checkpoint"}}}}
+	candidate := New(backend, "summary-model", 1_000_000, "sys")
+	candidate.ContextLimit = 100_000
+	ag := New(nil, "conversation-model", 0, "sys")
+	for i := 0; i < 400; i++ {
+		ag.Messages = append(ag.Messages,
+			models.Message{Role: "user", Content: strings.Repeat("question ", 40)},
+			models.Message{Role: "assistant", Content: strings.Repeat("answer ", 40)},
+		)
+	}
+	last := len(ag.Messages) - 1
+	ag.Messages[last].Usage = &models.Usage{PromptTokens: EstimateTokens(ag.Messages[:last]) + 2_000}
+	ag.CompactCandidates = []*Agent{candidate}
+
+	if err := ag.ManualCompact(context.Background(), Events{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(backend.requests) != 1 {
+		t.Fatalf("compaction calls = %d, want one", len(backend.requests))
+	}
+	if backend.requests[0].MaxTokens >= 1_000_000 || backend.requests[0].MaxTokens > 10_000 {
+		t.Fatalf("summary output cap = %d, want the 40k-derived allowance", backend.requests[0].MaxTokens)
+	}
+	if got := EstimateTokens(ag.Messages); got+2_000 > compactionContextTarget {
+		t.Fatalf("post-compaction working set = %d, exceeds %d", got+2_000, compactionContextTarget)
+	}
+}
+
+func TestCompactionFoldsHistoryChunksForSmallCandidate(t *testing.T) {
+	backend := &compactSequenceBackend{}
+	for i := 0; i < 20; i++ {
+		backend.responses = append(backend.responses, compactResponse{message: models.Message{Role: "assistant", Content: fmt.Sprintf("checkpoint %d", i)}})
+	}
+	candidate := New(backend, "small-summary-model", 0, "sys")
+	candidate.ContextLimit = 2_000
+	ag := New(nil, "conversation-model", 0, "sys")
+	ag.ContextLimit = 2_000
+	for i := 0; i < 40; i++ {
+		ag.Messages = append(ag.Messages,
+			models.Message{Role: "user", Content: strings.Repeat("question ", 20)},
+			models.Message{Role: "assistant", Content: strings.Repeat("answer ", 20)},
+		)
+	}
+	ag.CompactCandidates = []*Agent{candidate}
+
+	if err := ag.ManualCompact(context.Background(), Events{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(backend.requests) < 2 {
+		t.Fatalf("chunked compaction calls = %d, want multiple", len(backend.requests))
+	}
+	if !strings.Contains(backend.requests[1].Messages[1].Content, "<previous_checkpoint>") {
+		t.Fatal("later chunk did not include the cumulative checkpoint")
+	}
+}
+
+func compactionTestHistory() []models.Message {
+	msgs := []models.Message{{Role: "system", Content: "sys"}}
+	for i := 0; i < 8; i++ {
+		msgs = append(msgs,
+			models.Message{Role: "user", Content: fmt.Sprintf("question %d", i)},
+			models.Message{Role: "assistant", Content: fmt.Sprintf("answer %d", i)},
+		)
+	}
+	return msgs
 }
 
 func TestCompactionTelemetryUsesSummaryRoute(t *testing.T) {
@@ -1432,10 +1731,11 @@ func TestCompactionTelemetryUsesSummaryRoute(t *testing.T) {
 	summary := &routeBackend{protocol: models.ProtocolAnthropicMessages}
 	ag := New(conversation, "conversation-model", 100, "sys")
 	ag.Role, ag.Provider, ag.Protocol = "fast", "main-provider", string(conversation.protocol)
-	ag.CompactBackend = summary
-	ag.CompactModel = "tiny-model"
-	ag.CompactProvider = "tiny-provider"
-	ag.CompactProtocol = string(summary.protocol)
+	candidate := New(summary, "tiny-model", 0, "sys")
+	candidate.Role = "tiny"
+	candidate.Provider = "tiny-provider"
+	candidate.Protocol = string(summary.protocol)
+	ag.CompactCandidates = []*Agent{candidate}
 	for i := 0; i < 8; i++ {
 		ag.Messages = append(ag.Messages,
 			models.Message{Role: "user", Content: fmt.Sprintf("question %d", i)},
@@ -1748,6 +2048,33 @@ func TestCompactionRejectsTruncatedSummary(t *testing.T) {
 	err := ag.ManualCompact(context.Background(), Events{})
 	if err == nil || !strings.Contains(err.Error(), "truncated by token limit") {
 		t.Fatalf("expected truncated by token limit error, got %v", err)
+	}
+}
+
+func TestCompactionRetriesTruncatedSummary(t *testing.T) {
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		if calls == 1 {
+			w.Write([]byte(`{"choices":[{"message":{"content":"truncated summary..."},"finish_reason":"length"}]}`))
+			return
+		}
+		w.Write([]byte(`{"choices":[{"message":{"content":"complete checkpoint"},"finish_reason":"stop"}]}`))
+	}))
+	defer srv.Close()
+
+	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
+	for i := 0; i < 8; i++ {
+		ag.Messages = append(ag.Messages,
+			models.Message{Role: "user", Content: fmt.Sprintf("q%d", i)},
+			models.Message{Role: "assistant", Content: fmt.Sprintf("a%d", i)},
+		)
+	}
+	if err := ag.ManualCompact(context.Background(), Events{}); err != nil {
+		t.Fatalf("compact should retry a truncated checkpoint: %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("compaction calls = %d, want 2", calls)
 	}
 }
 

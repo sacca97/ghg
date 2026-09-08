@@ -32,6 +32,9 @@ func TestNewConfiguredForRoleBuildsSharedRoute(t *testing.T) {
 	if ag.Model != "wire-model" || ag.ContextLimit != 4096 {
 		t.Fatalf("agent route = %q, context %d", ag.Model, ag.ContextLimit)
 	}
+	if ag.MaxTokens != 0 {
+		t.Fatalf("unknown output cap = %d, want provider default", ag.MaxTokens)
+	}
 	if _, ok := ag.Backend.(*models.Client); !ok {
 		t.Fatalf("backend = %T, want OpenAI", ag.Backend)
 	}

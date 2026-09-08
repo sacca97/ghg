@@ -288,12 +288,12 @@ func TestGrepPatternsGroupingAndStableCursor(t *testing.T) {
 	if page.Metadata["search_cursor"] == "" || page.Metadata["search_remaining"] != "2" {
 		t.Fatalf("first page metadata = %+v", page.Metadata)
 	}
-	if !strings.Contains(page.Preview, first+":") || !strings.Contains(page.Preview, "TODO one") {
+	if !strings.Contains(page.Preview, `pattern "TODO":`) || !strings.Contains(page.Preview, first+":") || !strings.Contains(page.Preview, "TODO one") {
 		t.Fatalf("first grouped page = %q", page.Preview)
 	}
 	page2Args := fmt.Sprintf(`{"cursor":%q,"max_results":2}`, page.Metadata["search_cursor"])
 	page2 := ExecuteResult(ctx, All(), "grep", json.RawMessage(page2Args))
-	if page2.Metadata["search_cursor"] != "" || !strings.Contains(page2.Preview, second+":") || !strings.Contains(page2.Preview, "FIXME four") {
+	if page2.Metadata["search_cursor"] != "" || !strings.Contains(page2.Preview, `pattern "FIXME":`) || !strings.Contains(page2.Preview, second+":") || !strings.Contains(page2.Preview, "FIXME four") {
 		t.Fatalf("second stable page = %+v", page2)
 	}
 	if strings.Contains(page2.Preview, "TODO one") {

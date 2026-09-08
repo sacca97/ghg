@@ -454,12 +454,6 @@ func resolveObservedEdit(operation editOperation, opName, content string, record
 		}
 	}
 	relCurrentStart, relCurrentEnd := currentStart, currentEnd
-	if opName == "replace" && content == "" {
-		// Empty replacement is valid, but an omitted content field is too easy
-		// to confuse with malformed model JSON. Keep the operation explicit in
-		// the schema while still allowing intentional empty replacement.
-		content = ""
-	}
 	start, end := relCurrentStart, relCurrentEnd
 	if opName == "insert_before" {
 		end = start
@@ -660,15 +654,6 @@ func atomicWriteFile(path string, data []byte, mode os.FileMode) error {
 
 func preserveModeBits(mode os.FileMode) os.FileMode {
 	return mode.Perm() | mode&(os.ModeSetuid|os.ModeSetgid|os.ModeSticky)
-}
-
-func rollbackPublished(published []string, plans map[string]*editFilePlan) error {
-	files := make([]editPublication, 0, len(published))
-	for _, path := range published {
-		plan := plans[path]
-		files = append(files, editPublication{path: path, original: plan.original, mode: plan.mode})
-	}
-	return rollbackEditFiles(files)
 }
 
 func rollbackEditFiles(published []editPublication) error {

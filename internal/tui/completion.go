@@ -58,9 +58,10 @@ func completions(val string, models, providers, authProviders, skillCands, effor
 	case len(fields) == 1 && fields[0] == "/effort":
 		cands = filterPrefix(efforts, token)
 	case len(fields) == 1 && fields[0] == "/compact":
-		cands = filterPrefix(append([]cand{{"off", "compact with the current model"}}, models...), token)
-	case len(fields) == 2 && fields[0] == "/compact":
-		cands = filterPrefix(providers, token)
+		cands = filterPrefix([]cand{
+			{"retry", "undo the latest compaction and retry"},
+			{"log", "list recorded compactions"},
+		}, token)
 	case len(fields) == 1 && (fields[0] == "/export" || fields[0] == "/export-result"):
 		cands = filterPrefix(exportKindCands, token)
 	case strings.HasPrefix(token, "$"): // codex-style skill invocation

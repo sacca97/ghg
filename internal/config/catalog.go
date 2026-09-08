@@ -57,7 +57,7 @@ func (c Catalog) ContextLength(id string) int {
 }
 
 // MaxCompletionTokens reports the advertised output-token cap for a model id
-// (0 when unknown — callers must fall back to the configured context).
+// (0 when unknown).
 func (c Catalog) MaxCompletionTokens(id string) int {
 	if mi := c.Find(id); mi != nil {
 		return mi.MaxCompletionTokens
@@ -239,7 +239,7 @@ func (c *Config) CatalogWantedModels(cats map[string]Catalog) map[string]struct{
 			wanted[id] = struct{}{}
 		}
 	}
-	for _, name := range []string{c.DefaultModel, c.CompactModel} {
+	for _, name := range []string{c.DefaultModel} {
 		id := strings.TrimSpace(name)
 		if id == "" {
 			continue

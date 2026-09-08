@@ -165,7 +165,7 @@ func NewConfiguredRuntime(workspace string, cfg *config.ExecutionConfig, headles
 			cleanup()
 			return nil, func() {}, fmt.Errorf("cache %s: %w", leaf.Source, ensureErr)
 		}
-		cacheRoots = appendUniquePath(cacheRoots, canonical)
+		cacheRoots = appendUniqueString(cacheRoots, canonical)
 		canonicalCachePaths[filepath.Clean(leaf.Path)] = canonical
 	}
 	if cfg != nil {
@@ -182,17 +182,17 @@ func NewConfiguredRuntime(workspace string, cfg *config.ExecutionConfig, headles
 				cleanup()
 				return nil, func() {}, fmt.Errorf("configured cache root: %w", validateErr)
 			}
-			cacheRoots = appendUniquePath(cacheRoots, canonical)
+			cacheRoots = appendUniqueString(cacheRoots, canonical)
 		}
 	}
 	for _, sysTemp := range []string{"/tmp", "/var/tmp"} {
 		if canonical, err := sandbox.CanonicalPath(sysTemp, false); err == nil && canonical != "" {
 			if privateCanonical == "" || !cacheRootsOverlap(canonical, privateCanonical) {
-				configuredTemp = appendUniquePath(configuredTemp, canonical)
+				configuredTemp = appendUniqueString(configuredTemp, canonical)
 			}
 		}
 	}
-	configuredTemp = appendUniquePath(configuredTemp, tempRoot)
+	configuredTemp = appendUniqueString(configuredTemp, tempRoot)
 
 	for key, value := range envOverrides {
 		if canonical, ok := canonicalCachePaths[filepath.Clean(value)]; ok {
@@ -552,24 +552,6 @@ func homePath(home, suffix string) string {
 		return ""
 	}
 	return filepath.Join(home, suffix)
-}
-
-func appendUniquePath(dst []string, values ...string) []string {
-	seen := make(map[string]struct{}, len(dst)+len(values))
-	for _, value := range dst {
-		seen[value] = struct{}{}
-	}
-	for _, value := range values {
-		if value == "" {
-			continue
-		}
-		if _, ok := seen[value]; ok {
-			continue
-		}
-		seen[value] = struct{}{}
-		dst = append(dst, value)
-	}
-	return dst
 }
 
 func ensureCacheLeaf(path, allowedBase string) (string, error) {

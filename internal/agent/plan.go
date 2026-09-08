@@ -117,6 +117,8 @@ Use grep for text, structural_search for syntax-aware code shapes, lsp for seman
 
 Inspect only the code necessary to understand requirements, locate relevant components, and resolve ambiguity. Reuse evidence already gathered and do not reread unchanged source. Once the remaining uncertainties cannot materially change the implementation decisions, stop exploring and produce the plan.
 
+When the user message contains a tagged-path note, treat its paths as the authoritative scope inventory. Inspect those paths directly; do not use glob or find_files to rediscover them, and do not call both for the same target.
+
 End your response with a Markdown implementation plan in a single, exact block:
 
 <proposed_plan>
@@ -124,6 +126,29 @@ End your response with a Markdown implementation plan in a single, exact block:
 </proposed_plan>
 
 A response without that block is valid only when actively gathering necessary initial evidence or asking clarifying questions. Only emit <proposed_plan> once, as your final answer.`
+
+func planTaggedScopePrompt(a *Agent, target string) string {
+	if !strings.Contains(target, "[note: the user tagged ") {
+		return ""
+	}
+	inventory := reviewInventoryAt(reviewWorkspace(a), target)
+	if len(inventory.Files) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("<tagged_scope>\n")
+	b.WriteString("The following deterministic inventory comes from the user's tagged paths. Inspect these paths directly; do not use glob or find_files to rediscover listed paths.\nfiles:\n")
+	for _, file := range inventory.Files {
+		b.WriteString("- ")
+		b.WriteString(file)
+		b.WriteByte('\n')
+	}
+	if inventory.Partial {
+		b.WriteString("inventory: partial; use a scoped discovery call only if needed to complete the tagged directory.\n")
+	}
+	b.WriteString("</tagged_scope>")
+	return b.String()
+}
 
 const askModePrompt = `You are answering the user's question in a read-only mode. Answer the question directly; it may be about the repository or a general subject, and infer which from the question.
 
@@ -158,6 +183,19 @@ func filterPlanTools(all []tools.Tool) []tools.Tool {
 	var out []tools.Tool
 	for _, t := range all {
 		if planSafeTools[t.Def.Function.Name] {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+func filterReviewDiscoveryTools(all []tools.Tool) []tools.Tool {
+	var out []tools.Tool
+	for _, t := range all {
+		switch t.Def.Function.Name {
+		case "glob", "find_files":
+			continue
+		default:
 			out = append(out, t)
 		}
 	}
@@ -317,7 +355,6 @@ type rolloutBudget struct {
 	cachedInput  int
 	outputTokens int
 	calls        int
-	finalized    bool
 }
 
 func newPlanRolloutBudget() *rolloutBudget {

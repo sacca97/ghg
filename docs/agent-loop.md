@@ -109,10 +109,9 @@ flowchart TB
     C --> after["system + cumulative summary + tail<br/>(tail never orphans a tool call)"]
 ```
 
-The summarizer defaults to `deepseek-v4-flash-0731`
-(`config.DefaultCompactModel`), falls back to the configured
-`compactModel`/`compactProvider`, then to the conversation's own model.
-`/compact [model] [provider]` does it by hand.
+The summarizer uses the first usable configured role in this order: `tiny`,
+`fast`, `default`, then `smart`. `/compact` does not accept a model argument;
+it always uses this fallback chain.
 
 ## Per-turn tool freezing & plan runaway guard
 

@@ -126,12 +126,17 @@ func (m *model) finishTurnState() {
 	m.cancel = nil
 	m.interrupt1 = false
 	m.turnStart = time.Time{}
+	m.reviewProgress = nil
+	m.reviewScopeShown = false
+	m.reviewLastExtensionTo = 0
+	m.reviewFinalEvidenceShown = false
+	m.reviewClosedShown = false
 }
 
 func (m *model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	// The middle row of the bottom status box owns the model, effort, and mode
 	// controls, so clicks there must not fall through to transcript scrolling.
-	if m.settings == nil && m.picker == nil && m.taskVP == nil &&
+	if m.settings == nil && m.picker == nil && m.taskVP == nil && m.permDialog == nil && m.rew == nil &&
 		m.height > 0 && msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft && msg.Y == statusInfoRow(m.height) {
 		if m.statusModelW > 0 && msg.X >= m.statusModelX && msg.X < m.statusModelX+m.statusModelW {
 			m.cycleStatusModel()
@@ -168,10 +173,7 @@ func (m *model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft {
-				sel := m.taskSel
-				if m.tasksFocus {
-					sel = msg.Y - top
-				}
+				sel := msg.Y - top
 				m.tasksFocus = true
 				m.taskSel = min(sel, n-1)
 				// re-fetch: the list can change between the hitbox check
@@ -210,12 +212,19 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		var cmd tea.Cmd
 		m.spin, cmd = m.spin.Update(tick)
+		// Task durations share the spinner cadence, but this fast path skips
+		// layout; let View rebuild the cached dock for the next frame.
+		m.dockView = ""
+		m.frameViewsValid = false
 		return m, cmd
 	}
 	if _, ok := msg.(cursor.BlinkMsg); ok {
 		var cmd tea.Cmd
 		m.input, cmd = m.input.Update(msg)
 		return m, cmd
+	}
+	if m.settings != nil {
+		m.settings.rootRowsValid = false
 	}
 	defer m.layout()
 
@@ -238,6 +247,59 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 		m.input.SetWidth(msg.Width - 2)
+		return m, nil
+
+	case recentSessionsMsg:
+		return m, m.applyRecentSessions(msg)
+
+	case sessionPreviewMsg:
+		m.applySessionPreview(msg)
+		return m, nil
+
+	case resumeLoadedMsg:
+		if msg.err != nil {
+			m.append(errStyle.Render(msg.err.Error()))
+			return m, nil
+		}
+		if err := m.applyResumeData(msg.data); err != nil {
+			m.append(errStyle.Render(err.Error()))
+			return m, nil
+		}
+		if m.forkNotice != "" {
+			m.append(dimStyle.Render(m.forkNotice))
+			m.forkNotice = ""
+		}
+		return m, m.startWorkerCmd()
+
+	case workerStartedMsg:
+		action := m.pendingWorkerAction
+		m.pendingWorkerAction = nil
+		m.workerStarting = false
+		if msg.sessionID != "" && msg.sessionID != m.sessionID {
+			if msg.client != nil {
+				_ = msg.client.Close()
+			}
+			if msg.process != nil {
+				_ = msg.process.Stop()
+			}
+			return m, nil
+		}
+		if msg.err != nil {
+			m.workerStartFailed = true
+			m.workerStartError = msg.err.Error()
+			config.LogEvent("worker.start", msg.err.Error())
+			return m, nil
+		}
+		m.workerStartFailed = false
+		m.workerStartError = ""
+		m.workerProcess = msg.process
+		generation := m.attachWorkerClient(msg.client, msg.runtime)
+		if msg.process != nil {
+			m.monitorWorker(msg.process, msg.runtime, generation)
+		}
+		if action != nil {
+			return m, action()
+		}
 		return m, nil
 
 	case workerFrameMsg:
@@ -338,9 +400,11 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case toolEndMsg:
+		matched := false
 		for i := len(m.blocks) - 1; i >= 0; i-- {
 			b := &m.blocks[i]
 			if b.kind == blockToolRun && b.toolRunning && b.toolID == msg.id {
+				matched = true
 				b.toolRunning = false
 				b.toolFailed = strings.HasPrefix(msg.result, "Error:")
 				if b.toolFailed {
@@ -358,6 +422,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.transcriptDirty = true
 				break
 			}
+		}
+		if !matched {
+			m.closeAttachedTool()
 		}
 		return m, nil
 
@@ -462,27 +529,6 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
-	case compactMsg:
-		// compaction lands between turns after its event is durable; note it
-		// inline. The raw message log stays on disk — Load derives the
-		// compacted view from the event, so a bad summary is inspectable and
-		// retryable (/compact retry). A live turn fires two compactMsgs per
-		// compaction (OnCompact's counts, then OnCompacted's summary); only the
-		// one carrying the summary adds the note.
-		m.flushStreaming()
-		switch {
-		case msg.err != nil:
-			m.append(errStyle.Render("compact failed: " + msg.err.Error()))
-		case msg.summary == "":
-			// counts-only path (no summary means no event was produced);
-			// nothing to record
-		default:
-			m.append(dimStyle.Render(fmt.Sprintf("◎ compacted — summarized %d msgs, %d kept · raw history preserved", msg.took, msg.kept)))
-			m.future = nil   // compaction rewrote history; stale redo entries would resurrect it
-			m.msgBlock = nil // indices no longer match; rebuilt as blocks stream in
-		}
-		return m, nil
-
 	case workerCompactDoneMsg:
 		m.flushStreaming()
 		m.finishTurnState()
@@ -521,10 +567,34 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case noticeMsg:
+		m.flushStreaming()
 		m.append(dimStyle.Render(string(msg)))
 		return m, nil
 
-	case usageMsg:
+	case reviewProgressMsg:
+		m.reviewProgressHistory = append(m.reviewProgressHistory, msg.progress)
+		if !m.reviewing {
+			return m, nil
+		}
+		m.flushStreaming()
+		progress := msg.progress
+		m.reviewProgress = &progress
+		if progress.Phase == "inventory" && progress.Inventory != nil && !m.reviewScopeShown {
+			m.reviewScopeShown = true
+			m.append(dimStyle.Render(renderReviewScope(progress)))
+		}
+		if progress.Phase == "extension" && progress.ToAllocation > progress.FromAllocation && progress.ToAllocation != m.reviewLastExtensionTo {
+			m.reviewLastExtensionTo = progress.ToAllocation
+			m.append(dimStyle.Render(renderReviewExtension(progress)))
+		}
+		if progress.Phase == "final_evidence" && !m.reviewFinalEvidenceShown {
+			m.reviewFinalEvidenceShown = true
+			m.append(dimStyle.Render("◎ review · final evidence batch"))
+		}
+		if progress.Phase == "exploration_closed" && !m.reviewClosedShown {
+			m.reviewClosedShown = true
+			m.append(dimStyle.Render("◎ review · exploration closed · synthesizing"))
+		}
 		return m, nil
 
 	case quitArmMsg:
@@ -565,6 +635,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *model) handleTurnDone(msg turnDoneMsg) (tea.Model, tea.Cmd) {
+	m.closeAttachedTool()
 	m.flushStreaming()
 	m.finishTurnState()
 	// Cancellation arrives wrapped from the in-flight http request
@@ -617,4 +688,16 @@ func (m *model) handleTurnDone(msg turnDoneMsg) (tea.Model, tea.Cmd) {
 		}
 	}
 	return m, nil
+}
+
+func (m *model) closeAttachedTool() {
+	for i := len(m.blocks) - 1; i >= 0; i-- {
+		b := &m.blocks[i]
+		if b.kind == blockToolRun && b.toolRunning && b.toolID == "attach-active" {
+			b.toolRunning = false
+			b.stale = true
+			m.transcriptDirty = true
+			return
+		}
+	}
 }

@@ -33,6 +33,7 @@ const (
 	historyIndexTextLimit = 16 << 10
 	historyQueryLimit     = 200
 	historyReadLimit      = 4000
+	historyReadBytesLimit = 16 << 20
 	maxHistoryQueryBytes  = 512
 )
 
@@ -261,12 +262,18 @@ func (s *Store) ReadHistory(ctx context.Context, sessionID string, start, end in
 	defer func() { _ = rows.Close() }()
 	var out []HistoryMessage
 	var diagnostics []string
+	bytesRead := 0
 	for rows.Next() {
 		var seq int
 		var data string
 		if err := rows.Scan(&seq, &data); err != nil {
 			return nil, nil, err
 		}
+		if len(data) > historyReadBytesLimit-bytesRead {
+			diagnostics = append(diagnostics, fmt.Sprintf("history read stopped at the %d-byte limit", historyReadBytesLimit))
+			break
+		}
+		bytesRead += len(data)
 		var msg models.Message
 		if err := json.Unmarshal([]byte(data), &msg); err != nil {
 			if len(diagnostics) < 4 {

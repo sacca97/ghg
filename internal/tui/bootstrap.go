@@ -69,17 +69,16 @@ func runTUI(cfg *config.Config, modelName, provName, sysPrompt, resumeID string,
 	}
 	m := &model{
 		cfg: cfg, modelName: route.ModelName, provName: route.ProviderName,
-		modelID: route.APIID, protocol: route.Protocol, role: route.Role,
+		modelID: route.APIID, role: route.Role,
 		effort: route.Effort, contextLimit: route.ContextLimit,
 		messages:  []models.Message{{Role: "system", Content: sysPrompt}},
 		sysPrompt: sysPrompt,
 		input:     ti, spin: spinner.New(spinner.WithSpinner(spinner.Dot)), follow: true,
 		catalogs: config.LoadCatalogs(), profiles: profiles, mouseOn: mouseOn, now: time.Now, showThinking: showThinking,
-		compactModel: cfg.CompactModel, compactProv: cfg.CompactProvider,
-		mode:      uiModeExecute,
-		cautious:  cautious,
-		skillScan: func() []skills.Skill { return skills.Scan(skills.DefaultDirs()...) },
-		shortCWD:  shortCWD(),
+		mode:       uiModeExecute,
+		cautious:   cautious,
+		shortCWD:   shortCWD(),
+		workingDir: cwd(),
 	}
 	m.modelSlotW = m.statusModelSlotWidth()
 	if dir, derr := config.Dir(); derr == nil {

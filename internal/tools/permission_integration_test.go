@@ -15,9 +15,9 @@ import (
 func TestExplorationSchemasDescribeTheBoundedToolSurface(t *testing.T) {
 	want := map[string][]string{
 		"bash":       {"Prefer grep", "glob", "find_files"},
-		"read":       {"observation", "offset", "limit"},
+		"read":       {"observation", "offset", "limit", "ranges"},
 		"edit":       {"observed", "exact", "edits"},
-		"grep":       {"patterns", "cursor", "default 25"},
+		"grep":       {"patterns", "cursor", "default 25", "Independent"},
 		"glob":       {"cursor", "default 25"},
 		"find_files": {"fuzzy", "default 25"},
 	}

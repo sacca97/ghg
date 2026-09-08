@@ -394,11 +394,6 @@ func (w *workerProcessState) configure(request workerConfigureRequest) error {
 		w.mode = request.Mode
 		w.ag.PlanMode = (request.Mode == "plan")
 	}
-	if request.UpdateCompact {
-		w.cfg.CompactModel = request.CompactModel
-		w.cfg.CompactProvider = request.CompactProvider
-		configureWorkerCompaction(w.ag, w.cfg, w.profiles, systemPrompt)
-	}
 	if request.UpdateCompactThreshold && request.CompactThreshold > 0 {
 		w.ag.CompactThreshold = request.CompactThreshold
 	}

@@ -22,11 +22,13 @@ import (
 )
 
 const (
-	maxToolCallsPerResponse = 64
-	maxConcurrentTools      = 4
+	maxToolCallsPerResponse      = 64
+	maxConcurrentTools           = 4
+	reviewFinalEvidenceToolLimit = 4
 
 	planFinalizationToolError   = "Error: exploration is complete for this plan. Tools are disabled; emit the final <proposed_plan> block now."
 	reviewFinalizationToolError = "Error: exploration is complete for this review. Only submit_review is available; submit the best evidence-backed result now."
+	askFinalizationToolError    = "Error: exploration is complete for this answer. Tools are disabled; answer directly using the evidence gathered."
 	malformedToolCallError      = "Error: tool call arguments were malformed (invalid JSON or exceeded the per-call size limit) and were omitted. Reissue the call with valid JSON arguments."
 	oversizedToolBatchError     = "Error: the tool-call batch exceeded the aggregate argument size limit. Split the calls into smaller batches and reissue them with valid JSON arguments."
 
@@ -36,9 +38,10 @@ const (
 	// duplicate history becomes a product requirement.
 	maxSeenOperations = 4096
 
-	explorationCheckpointOne   = 10
-	explorationCheckpointTwo   = 20
-	explorationCheckpointFinal = 30
+	explorationCheckpointOne        = 10
+	explorationCheckpointTwo        = 16
+	explorationCheckpointFinal      = 24
+	explorationCheckpointFinalLevel = 3
 )
 
 // HistoryCatalog is the durable session boundary for bounded history recall.
@@ -97,16 +100,11 @@ type Agent struct {
 	// enable both; callers can disable either without changing the other.
 	Checkpointing bool
 	HistoryRecall bool
-	// CompactBackend and CompactModel run the compaction summary; nil/"" uses
-	// the conversation's own backend and model. The provider/protocol fields
-	// keep route telemetry correct when the summary uses the tiny role.
-	CompactBackend      models.Backend
-	CompactModel        string
-	CompactProvider     string
-	CompactProtocol     string
-	CompactContextLimit int
+	// CompactCandidates are configured routes tried in compaction order. Each
+	// candidate carries its own backend and model capabilities.
+	CompactCandidates []*Agent
 	// CompactThreshold is the fraction of ContextLimit at which Turn compacts
-	// proactively; 0 uses defaultCompactThreshold.
+	// proactively; 0 uses the adaptive 80% default.
 	CompactThreshold float64
 	// OutputReserve is the token headroom reserved for model generation and
 	// safety margin before proactive compaction triggers. 0 uses max(MaxTokens, 16384).
@@ -568,7 +566,7 @@ func (a *Agent) validateToolBatch(calls []models.ToolCall) error {
 		return fmt.Errorf("model returned an unsafe tool batch: %d calls exceeds limit %d", len(calls), maxToolCallsPerResponse)
 	}
 	seenIDs := make(map[string]bool, len(calls))
-	seenFingerprints := make(map[string]struct{}, len(calls))
+	seenCalls := make(map[string]struct{}, len(calls))
 	duplicateCounts := make(map[string]int)
 	firstDuplicateTool := ""
 
@@ -585,14 +583,14 @@ func (a *Agent) validateToolBatch(calls []models.ToolCall) error {
 			return errors.New("model returned a tool call with empty name")
 		}
 
-		fp := a.operationFingerprint(tc.Function.Name, tc.Function.Arguments)
-		if _, exists := seenFingerprints[fp]; exists {
+		identity := tc.Function.Name + "\x00" + strings.TrimSpace(tc.Function.Arguments)
+		if _, exists := seenCalls[identity]; exists {
 			duplicateCounts[tc.Function.Name]++
 			if firstDuplicateTool == "" {
 				firstDuplicateTool = tc.Function.Name
 			}
 		} else {
-			seenFingerprints[fp] = struct{}{}
+			seenCalls[identity] = struct{}{}
 		}
 	}
 
@@ -855,19 +853,20 @@ func explorationCheckpointLevel(round int) int {
 }
 
 func explorationCheckpointReminder(level, rounds int) string {
-	prompt := "Before another repository-navigation call, state the specific unresolved question and why the call can materially change the result. Tools remain available."
+	prompt := "Attention: the pending repository-navigation tool calls were withheld. Before continuing, state the specific unresolved question and why the next call can materially change the result. Continue with the next necessary call or synthesize."
 	switch level {
 	case 2:
-		prompt = "Reassess whether more exploration is necessary. If you continue, state the specific unresolved question and why the next call can materially change the result. Tools remain available."
-	case 3:
-		prompt = "This is the final exploration checkpoint. Continue only for a concrete unresolved question, state why the next call can materially change the result, then synthesize or implement. Tools remain available."
+		prompt = "Attention: this is the second exploration checkpoint. The pending tool calls were withheld. Reassess whether more exploration is necessary, then state the specific unresolved question and why the next call can materially change the result. Continue with the next necessary call or synthesize."
+	case explorationCheckpointFinalLevel:
+		prompt = "Attention: this is the third and strongest exploration checkpoint warning. The pending tool calls were withheld. Reassess whether more exploration is necessary, state the specific unresolved question and why the next call can materially change the result, then continue with the next necessary call or synthesize."
 	}
 	return fmt.Sprintf("<exploration_checkpoint level=\"%d\">\nYou have completed %d repository-exploration rounds in this turn.\n%s\n</exploration_checkpoint>", level, rounds, prompt)
 }
 
 // Turn sends user input and loops until the model stops calling tools.
 // It returns the final assistant text. When the latest successful request's
-// reported context size crosses CompactThreshold (default 50%) of the
+// reported context size crosses the adaptive 80% compaction budget (or the
+// explicit CompactThreshold override) of the
 // provider-advertised context limit, Turn compacts proactively before the next
 // request; if the provider still rejects the request because the conversation
 // exceeded its context window, Turn auto-compacts (summarizing old turns) and
@@ -965,56 +964,37 @@ func currentToolGuidance(ts []tools.Tool, notices []string) string {
 // a byte-stable prefix across turns and tool rounds:
 //  1. Base system prompt (history[0])
 //  2. Stable collaboration-mode prompt (planModePrompt / reviewModePrompt)
-//  3. Current capability guidance (if non-empty)
-//  4. Exploration checkpoint reminder (if non-empty)
-//  5. Budget reminder (if non-empty)
-//  6. Conversation history (history[1:])
+//  3. Scope preflight (if non-empty)
+//  4. Current capability guidance (if non-empty)
+//  5. Conversation history (history[1:])
+//  6. Changing transient blocks (exploration/budget reminders)
 //  7. Trailing transient blocks (todoContent, goalContent)
-func (a *Agent) assembleRequestMessages(history []models.Message, todoContent, goalContent, budgetReminder, capabilityGuidance, explorationReminder string) []models.Message {
+func (a *Agent) assembleRequestMessages(history []models.Message, todoContent, goalContent, budgetReminder, capabilityGuidance, explorationReminder, reviewPreflight string) []models.Message {
 	if len(history) == 0 {
 		return history
 	}
-	if !a.readOnlyCollaborationMode() && todoContent == "" && goalContent == "" && budgetReminder == "" && capabilityGuidance == "" && explorationReminder == "" {
+	if !a.readOnlyCollaborationMode() && todoContent == "" && goalContent == "" && budgetReminder == "" && capabilityGuidance == "" && explorationReminder == "" && reviewPreflight == "" {
 		return history
 	}
-	prefixCount := 1
-	if a.readOnlyCollaborationMode() {
-		prefixCount++
-	}
-	if capabilityGuidance != "" {
-		prefixCount++
-	}
-	if explorationReminder != "" {
-		prefixCount++
-	}
-	if a.readOnlyCollaborationMode() && budgetReminder != "" {
-		prefixCount++
-	}
-	suffixCount := 0
-	if todoContent != "" {
-		suffixCount++
-	}
-	if goalContent != "" {
-		suffixCount++
-	}
-	reqMsgs := make([]models.Message, 0, prefixCount+len(history)-1+suffixCount)
+	reqMsgs := make([]models.Message, 0, len(history)+7)
 	reqMsgs = append(reqMsgs, history[0])
 	if a.readOnlyCollaborationMode() {
 		reqMsgs = append(reqMsgs, models.Message{Role: "system", Content: a.collaborationPrompt()})
 	}
+	if reviewPreflight != "" {
+		reqMsgs = append(reqMsgs, models.Message{Role: "system", Content: reviewPreflight})
+	}
 	if capabilityGuidance != "" {
 		reqMsgs = append(reqMsgs, models.Message{Role: "system", Content: capabilityGuidance})
+	}
+	if len(history) > 1 {
+		reqMsgs = append(reqMsgs, history[1:]...)
 	}
 	if explorationReminder != "" {
 		reqMsgs = append(reqMsgs, models.Message{Role: "system", Content: explorationReminder})
 	}
-	if a.readOnlyCollaborationMode() {
-		if budgetReminder != "" {
-			reqMsgs = append(reqMsgs, models.Message{Role: "system", Content: budgetReminder})
-		}
-	}
-	if len(history) > 1 {
-		reqMsgs = append(reqMsgs, history[1:]...)
+	if budgetReminder != "" {
+		reqMsgs = append(reqMsgs, models.Message{Role: "system", Content: budgetReminder})
 	}
 	if todoContent != "" {
 		reqMsgs = append(reqMsgs, models.Message{Role: "system", Content: todoContent})
@@ -1043,7 +1023,7 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 		msg.SentAt = &now
 	}
 	a.msgsMu.Lock()
-	if len(a.Messages) > 0 && a.Messages[len(a.Messages)-1].Role == "user" && a.Messages[len(a.Messages)-1].Authored && len(parts) == 0 && (strings.TrimSpace(input) == "continue" || strings.TrimSpace(input) == "Continue") {
+	if len(a.Messages) > 0 && a.Messages[len(a.Messages)-1].Role == "user" && a.Messages[len(a.Messages)-1].Authored && len(parts) == 0 && strings.EqualFold(strings.TrimSpace(input), "continue") {
 		// User is explicitly asking to continue the prior unanswered prompt.
 		prev := a.Messages[len(a.Messages)-1]
 		msg.Content = prev.Content
@@ -1059,6 +1039,13 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 	if (a.PlanMode || a.ReviewMode) && authored {
 		planBudget = newPlanRolloutBudget()
 	}
+	var reviewBudget *ReviewBudget
+	if a.ReviewMode && authored {
+		// Scope sizing is a preflight for the real review request. It has no
+		// repository tools and falls back deterministically when the optional
+		// tiny assessor is not configured.
+		reviewBudget = a.newReviewBudget(ctx, reviewTarget, ev)
+	}
 	readGuard := newReadCoverageTracker()
 	compactionEvents := ev
 	compactionEvents.OnCompacted = func(summary string, cutoff int) {
@@ -1068,11 +1055,15 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 		}
 	}
 
-	// Freeze tools and precompute definitions once for the entire turn.
-	turnTools := a.AllTools()
+	// Freeze tools and precompute definitions once for the entire turn. Keep the
+	// unfiltered set so stale calls can receive the mode-specific unavailable
+	// result instead of an opaque unknown-tool error.
+	knownTools := a.AllTools()
+	turnTools := append([]tools.Tool(nil), knownTools...)
 	if a.readOnlyCollaborationMode() {
 		turnTools = filterPlanTools(turnTools)
 		if a.ReviewMode {
+			turnTools = filterReviewDiscoveryTools(turnTools)
 			turnTools = append(turnTools, submitReviewTool())
 		}
 	}
@@ -1095,6 +1086,40 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 	explorationReminder := ""
 	checkpointLevel := 0
 	postEditVerification := false
+	finalEvidencePending := false
+	finalEvidenceRetryUsed := false
+	explorationClosed := false
+	finalEvidenceNoticeSent := false
+	reviewCheckpointPending := false
+	reviewClosed := false
+	scopePreflight := ""
+	if reviewBudget != nil {
+		scopePreflight = reviewPreflightPrompt(reviewBudget)
+	} else if a.PlanMode {
+		scopePreflight = planTaggedScopePrompt(a, reviewTarget)
+	}
+	closeExploration := func() {
+		finalEvidencePending = false
+		if explorationClosed {
+			return
+		}
+		explorationClosed = true
+		if ev.OnNotice != nil {
+			ev.OnNotice("◎ exploration closed · synthesizing")
+		}
+	}
+	closeReviewExploration := func() {
+		if reviewBudget == nil {
+			return
+		}
+		reviewCheckpointPending = false
+		reviewBudget.checkpointOpen = false
+		if reviewClosed {
+			return
+		}
+		reviewClosed = true
+		a.emitReviewProgress(ev, reviewBudget, "exploration_closed", "")
+	}
 	for {
 		if a.MaxTurns > 0 && rounds >= a.MaxTurns {
 			return "", fmt.Errorf("max turns (%d) reached — the model kept calling tools; re-run with a higher -max-turns or a more specific prompt", a.MaxTurns)
@@ -1103,26 +1128,64 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 		if err := a.maybeCompact(ctx, compactionEvents); err != nil {
 			return "", err
 		}
+		if reviewClosed {
+			// A closed review is terminal. Clear stale state defensively so a
+			// malformed post-finalization response cannot reopen its boundary.
+			reviewCheckpointPending = false
+			reviewBudget.checkpointOpen = false
+		}
 		requestCheckpointLevel := checkpointLevel
 		checkpointLevel = 0
 		requestExplorationReminder := explorationReminder
 		explorationReminder = ""
+		reviewCheckpointRequest := reviewBudget != nil && reviewCheckpointPending && !reviewClosed
+		if reviewCheckpointRequest {
+			requestExplorationReminder = reviewBudgetCheckpointReminder(reviewBudget)
+		}
+		finalEvidenceBatch := a.readOnlyCollaborationMode() && finalEvidencePending
+		budgetFinalizing := planBudget != nil && planBudget.IsReserveCrossed()
+		if requestCheckpointLevel > 0 && !(a.readOnlyCollaborationMode() && finalEvidencePending) {
+			budgetFinalizing = false
+		}
+		if finalEvidenceBatch && budgetFinalizing {
+			closeExploration()
+			finalEvidenceBatch = false
+		}
+		if finalEvidenceBatch && !finalEvidenceNoticeSent {
+			finalEvidenceNoticeSent = true
+			if ev.OnNotice != nil {
+				ev.OnNotice("◎ final evidence batch")
+			}
+		}
 
-		finalizing := planBudget != nil && planBudget.IsReserveCrossed()
+		// Keep budget finalization separate from exploration closure. A pending
+		// checkpoint gets its evidence request unless the reserve was crossed.
+		finalizing := explorationClosed || budgetFinalizing
 		var budgetReminder string
 		if planBudget != nil {
-			budgetReminder = planBudget.reminderBlock(finalizing, a.ReviewMode)
+			budgetReminder = planBudget.reminderBlock(budgetFinalizing, a.ReviewMode)
 		}
 		todoContent := a.todoBlock()
 		var goalContent string
 		if activeGoal != nil {
 			goalContent = GoalContextBlock(*activeGoal)
 		}
-		msgs := a.assembleRequestMessages(a.Messages, todoContent, goalContent, budgetReminder, capabilityGuidance, requestExplorationReminder)
+		msgs := a.assembleRequestMessages(a.Messages, todoContent, goalContent, budgetReminder, capabilityGuidance, requestExplorationReminder, scopePreflight)
 
+		// Checkpoint reminders only add transient context; this snapshot keeps
+		// the plan, review, or execute tool set unchanged for ordinary requests.
 		reqDefs := turnDefs
 		available := turnTools
-		if a.readOnlyCollaborationMode() && finalizing {
+		if reviewCheckpointRequest && !budgetFinalizing {
+			available = append([]tools.Tool(nil), turnTools...)
+			if reviewBudget.Allocation < reviewBudget.HardLimit {
+				available = append(available, requestReviewExtensionTool())
+			}
+			reqDefs = tools.Defs(available)
+		} else if reviewBudget != nil && reviewClosed {
+			available = []tools.Tool{submitReviewTool()}
+			reqDefs = tools.Defs(available)
+		} else if a.readOnlyCollaborationMode() && finalizing {
 			if a.ReviewMode {
 				available = []tools.Tool{submitReviewTool()}
 				reqDefs = tools.Defs(available)
@@ -1131,7 +1194,6 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 				available = nil // Reserve crossed: disable tools for final synthesis request
 			}
 		}
-
 		// Surface transient-request retries through the event hook so the UI
 		// shows "retrying" instead of looking hung. The sink is request-local;
 		// the backend remains safe to share with foreground and background turns.
@@ -1234,9 +1296,73 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 			return "", err
 		}
 		hasNavigation, hasMutation := explorationBatch(msg.ToolCalls)
+		reviewNavigationBatch := reviewBudget != nil && !reviewClosed && !reviewCheckpointRequest && hasNavigation && !hasMutation
+		reviewFinalEvidenceBatch := false
+		var reviewExtension *reviewExtensionRequest
+		reviewCheckpointError := ""
+		if reviewCheckpointRequest {
+			extensionCount, submitCount := 0, 0
+			for _, call := range msg.ToolCalls {
+				switch call.Function.Name {
+				case "request_review_extension":
+					extensionCount++
+				case "submit_review":
+					submitCount++
+				}
+			}
+			switch {
+			case extensionCount > 0:
+				if reviewBudget.Allocation >= reviewBudget.HardLimit {
+					reviewCheckpointError = "review exploration has reached its absolute limit; submit_review or use final evidence"
+				} else if extensionCount != 1 || len(msg.ToolCalls) != 1 {
+					reviewCheckpointError = "request_review_extension must be the only tool call at a review checkpoint"
+				} else {
+					request, err := parseReviewExtension(json.RawMessage(msg.ToolCalls[0].Function.Arguments))
+					if err != nil {
+						reviewCheckpointError = err.Error()
+					} else {
+						reviewExtension = &request
+					}
+				}
+			case hasNavigation:
+				if submitCount > 0 {
+					reviewCheckpointError = "final evidence navigation cannot be combined with submit_review"
+				} else if len(msg.ToolCalls) > reviewFinalEvidenceToolLimit {
+					reviewCheckpointError = fmt.Sprintf("final evidence is limited to %d tool calls", reviewFinalEvidenceToolLimit)
+				} else {
+					for _, call := range msg.ToolCalls {
+						if !isRepositoryNavigationTool(call.Function.Name) {
+							reviewCheckpointError = "final evidence may contain only repository-navigation tools"
+							break
+						}
+					}
+					if reviewCheckpointError == "" {
+						reviewFinalEvidenceBatch = true
+					}
+				}
+			case submitCount > 0 && len(msg.ToolCalls) != 1:
+				reviewCheckpointError = "submit_review must be the only tool call at a review checkpoint"
+			}
+		}
+		if reviewCheckpointError != "" {
+			msg.Usage = &usage
+			msg.Model = a.Model + " @ " + a.Provider
+			a.msgsMu.Lock()
+			a.Messages = append(a.Messages, msg)
+			for _, tc := range msg.ToolCalls {
+				a.Messages = append(a.Messages, models.Message{
+					Role: "tool", Content: "Error: " + reviewCheckpointError,
+					ToolCallID: tc.ID, Name: tc.Function.Name,
+				})
+			}
+			a.msgsMu.Unlock()
+			continue
+		}
+		evidenceBatch := finalEvidenceBatch || reviewFinalEvidenceBatch
+		checkpointTriggered := false
 		if hasMutation {
 			postEditVerification = true
-		} else if hasNavigation {
+		} else if hasNavigation && !finalEvidenceBatch && reviewBudget == nil {
 			if postEditVerification {
 				// ponytail: skip only the first navigation-only response after a
 				// mutation; distinguishing later exploration from verification
@@ -1244,16 +1370,37 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 				postEditVerification = false
 			} else {
 				explorationRounds++
-				if level := explorationCheckpointLevel(explorationRounds); level > 0 {
+				if level := explorationCheckpointLevel(explorationRounds); level > 0 &&
+					(!a.readOnlyCollaborationMode() || level == 1) {
 					checkpointLevel = level
 					explorationReminder = explorationCheckpointReminder(level, explorationRounds)
+					if a.readOnlyCollaborationMode() {
+						finalEvidencePending = true
+					}
+					checkpointTriggered = true
 				}
 			}
+		}
+		if checkpointTriggered {
+			if ev.OnNotice != nil {
+				ev.OnNotice(fmt.Sprintf("◎ exploration checkpoint · round %d", explorationRounds))
+			}
+			continue
 		}
 		if len(msg.ToolCalls) > 0 {
 			malformedIndices, batchTooLarge := findMalformedToolCalls(msg.ToolCalls)
 			if len(malformedIndices) > 0 || batchTooLarge {
-				if malformedRoundsInTurn > 0 {
+				if evidenceBatch {
+					if finalEvidenceRetryUsed {
+						if reviewFinalEvidenceBatch {
+							closeReviewExploration()
+						} else {
+							closeExploration()
+						}
+					} else {
+						finalEvidenceRetryUsed = true
+					}
+				} else if malformedRoundsInTurn > 0 {
 					if batchTooLarge {
 						return "", errors.New("model tool batch remained oversized")
 					}
@@ -1295,8 +1442,36 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 			}
 
 			if err := a.validateToolBatch(msg.ToolCalls); err != nil {
-				return "", err
+				if !evidenceBatch {
+					return "", err
+				}
+				if finalEvidenceRetryUsed {
+					if reviewFinalEvidenceBatch {
+						closeReviewExploration()
+					} else {
+						closeExploration()
+					}
+				} else {
+					finalEvidenceRetryUsed = true
+				}
+				msg.Usage = &usage
+				msg.Model = a.Model + " @ " + a.Provider
+				a.msgsMu.Lock()
+				a.Messages = append(a.Messages, msg)
+				for _, tc := range msg.ToolCalls {
+					a.Messages = append(a.Messages, models.Message{
+						Role:       "tool",
+						Content:    "Error: final evidence batch was rejected before execution: " + err.Error(),
+						ToolCallID: tc.ID,
+						Name:       tc.Function.Name,
+					})
+				}
+				a.msgsMu.Unlock()
+				continue
 			}
+		}
+		if finalEvidenceBatch && len(msg.ToolCalls) > 0 {
+			closeExploration()
 		}
 		msg.Usage = &usage
 		msg.Model = a.Model + " @ " + a.Provider
@@ -1305,13 +1480,15 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 		a.msgsMu.Unlock()
 		if len(msg.ToolCalls) > 0 {
 			finalizationError := ""
-			if finalizing {
+			if finalizing || (a.ReviewMode && reviewClosed) {
 				finalizationError = planFinalizationToolError
 				if a.ReviewMode {
 					finalizationError = reviewFinalizationToolError
+				} else if a.AskMode {
+					finalizationError = askFinalizationToolError
 				}
 			}
-			results := a.runToolResultsWithPolicy(ctx, msg.ToolCalls, ev, available, turnTools, finalizationError, readGuard)
+			results := a.runToolResultsWithPolicy(ctx, msg.ToolCalls, ev, available, knownTools, finalizationError, readGuard)
 			a.msgsMu.Lock()
 			for i, tc := range msg.ToolCalls {
 				a.Messages = append(a.Messages, models.Message{
@@ -1329,6 +1506,32 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 				if res.Metadata != nil && res.Metadata["failure_kind"] == "sandbox_network_denied" {
 					cmdName := toolDiagnosticName(msg.ToolCalls[i])
 					return "", fmt.Errorf("sandbox capability failure (%s): local network listener denied by sandbox policy", cmdName)
+				}
+			}
+			if reviewExtension != nil && len(results) == 1 {
+				if _, failed := toolResultError(results[0]); !failed {
+					from := reviewBudget.Allocation
+					grant := reviewExtensionAllocation(from, reviewBudget.HardLimit)
+					if grant > 0 {
+						reviewBudget.Allocation += grant
+						scopePreflight = reviewPreflightPrompt(reviewBudget)
+						reviewBudget.checkpointOpen = false
+						reviewCheckpointPending = false
+						a.emitReviewExtensionProgress(ev, reviewBudget, from, reviewBudget.Allocation, reviewExtension.UnresolvedIssue)
+					}
+				}
+			}
+			if reviewFinalEvidenceBatch {
+				reviewCheckpointPending = false
+				a.emitReviewProgress(ev, reviewBudget, "final_evidence", "")
+				closeReviewExploration()
+			} else if reviewNavigationBatch {
+				reviewBudget.CurrentRound++
+				a.emitReviewProgress(ev, reviewBudget, "exploration", "")
+				if reviewBudget.CurrentRound >= reviewBudget.Allocation {
+					reviewBudget.checkpointOpen = true
+					reviewCheckpointPending = true
+					a.emitReviewProgress(ev, reviewBudget, "budget_boundary", "")
 				}
 			}
 			for i, tc := range msg.ToolCalls {
@@ -1368,6 +1571,9 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 			}
 		}
 		if len(msg.ToolCalls) == 0 && len(steered) == 0 {
+			if reviewCheckpointRequest || (reviewBudget != nil && reviewClosed) {
+				continue
+			}
 			a.compacted = false // reset for the next Turn
 			return msg.Content, nil
 		}
@@ -1380,26 +1586,32 @@ func (a *Agent) reviewTerminal(target string, msg models.Message, results []tool
 			continue
 		}
 		reviewArgs := string(call.Function.Arguments)
-		if rev, err := ParseReview(reviewArgs); err == nil && a.HistoryCatalog != nil && a.currentSessionID() != "" && ev.OnCompactionReady != nil {
+		if rev, err := ParseReview(reviewArgs); err == nil {
 			checkpoint := buildReviewCheckpoint(target, rev)
-			took := len(a.Messages)
-			cutoff := took
-			if err := ev.OnCompactionReady(append([]models.Message(nil), a.Messages...), checkpoint, cutoff); err == nil {
-				a.msgsMu.Lock()
-				a.Messages = []models.Message{
-					a.Messages[0],
-					{Role: "system", Content: "Summary of the conversation so far:\n\n" + checkpoint},
+			reason := "durable history persistence unavailable"
+			if a.HistoryCatalog != nil && a.currentSessionID() != "" && ev.OnCompactionReady != nil {
+				took := len(a.Messages)
+				if err := ev.OnCompactionReady(append([]models.Message(nil), a.Messages...), checkpoint, took); err == nil {
+					a.msgsMu.Lock()
+					a.Messages = []models.Message{
+						a.Messages[0],
+						{Role: "system", Content: "Summary of the conversation so far:\n\n" + checkpoint},
+					}
+					a.msgsMu.Unlock()
+					if ev.OnCompact != nil {
+						ev.OnCompact(took-len(a.Messages), len(a.Messages))
+					}
+					if ev.OnCompacted != nil {
+						ev.OnCompacted(checkpoint, took)
+					}
+					a.resetSeenOperations()
+					a.compacted = true
+					return reviewArgs, true
 				}
-				a.msgsMu.Unlock()
-				if ev.OnCompact != nil {
-					ev.OnCompact(took-len(a.Messages), len(a.Messages))
-				}
-				if ev.OnCompacted != nil {
-					ev.OnCompacted(checkpoint, cutoff)
-				}
-				a.resetSeenOperations()
-				a.compacted = true
-				return reviewArgs, true
+				reason = "durable history persistence failed"
+			}
+			if ev.OnNotice != nil {
+				ev.OnNotice(fmt.Sprintf("◎ review checkpoint skipped; %s, conversation retained", reason))
 			}
 		}
 		a.compacted = false

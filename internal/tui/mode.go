@@ -136,7 +136,7 @@ func (m *model) activateRoute(modelName, providerName, role string) error {
 		return err
 	}
 	m.modelName, m.provName, m.modelID = route.ModelName, route.ProviderName, route.APIID
-	m.protocol, m.role, m.contextLimit = route.Protocol, role, route.ContextLimit
+	m.role, m.contextLimit = role, route.ContextLimit
 	m.effort = m.maxEffort()
 	m.modelSlotW = m.statusModelSlotWidth()
 	m.syncWorkerConfiguration(true)

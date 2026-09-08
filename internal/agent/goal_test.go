@@ -32,16 +32,13 @@ func TestUpdateValidationRequiresMeaningfulNotes(t *testing.T) {
 	}
 }
 
-func TestRecordValidationAndLifecycleHelpers(t *testing.T) {
+func TestRecordValidation(t *testing.T) {
 	record := NewGoal("ship it")
 	if err := record.Validate(); err != nil {
 		t.Fatal(err)
 	}
-	if record.ID == "" || record.Status != GoalStatusActive || record.Status.Terminal() || record.Status.Resumable() {
+	if record.ID == "" || record.Status != GoalStatusActive {
 		t.Fatalf("new record: %+v", record)
-	}
-	if !GoalStatusComplete.Terminal() || GoalStatusComplete.Resumable() || !GoalStatusPaused.Resumable() {
-		t.Fatal("lifecycle helper mismatch")
 	}
 }
 

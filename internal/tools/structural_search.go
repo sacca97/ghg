@@ -12,20 +12,16 @@ import (
 	"path"
 	"slices"
 	"strings"
-	"sync"
-	"time"
 
 	"github.com/sacca97/ghg/internal/models"
 	"github.com/sacca97/ghg/internal/sandbox"
 	"github.com/sacca97/ghg/internal/search"
-	"github.com/sacca97/ghg/internal/structuralsearch"
 	"golang.org/x/sync/errgroup"
 )
 
 const (
-	structuralSearchKind  = "structural_search"
-	maxStructuralFileSize = 16 << 20
-	maxStructuralFiles    = 10000
+	structuralSearchKind = "structural_search"
+	maxStructuralFiles   = 10000
 	// ponytail: keep the worker count fixed; raise it only from a measured bottleneck.
 	maxStructuralWorkers = 4
 )
@@ -41,8 +37,8 @@ type structuralSearchArgs struct {
 
 func structuralSearchTool() Tool {
 	return resultTool(models.NewTool(structuralSearchKind,
-		"Search Go source structurally using bounded code patterns and metavariables. Results are grouped by file and paginate with cursor.",
-		`{"type":"object","properties":{"patterns":{"type":"array","items":{"type":"string"},"description":"Small list of Go code patterns; supports $NAME, $_, and $$$ARGS metavariables"},"language":{"type":"string","enum":["go"],"description":"Source language; V1 supports Go only"},"path":{"type":"string","description":"Go file or directory to search (default: current working directory)"},"max_results":{"type":"integer","description":"Matches per page (default 25, maximum 250)"},"cursor":{"type":"string","description":"Opaque cursor returned by an earlier structural_search page"},"observe":{"type":"boolean","description":"Issue edit-authorizing observations for visible results (default false)"}},"required":["patterns","language"]}`),
+		"Search Go source structurally using bounded code patterns and metavariables. Results are grouped by file and paginate with an opaque cursor. Never construct or infer a cursor; pass it only when this tool explicitly returned one and copy it exactly.",
+		`{"type":"object","properties":{"patterns":{"type":"array","items":{"type":"string"},"description":"Small list of Go code patterns; supports $NAME, $_, and $$$ARGS metavariables"},"language":{"type":"string","enum":["go"],"description":"Source language; V1 supports Go only"},"path":{"type":"string","description":"Go file or directory to search (default: current working directory)"},"max_results":{"type":"integer","description":"Matches per page (default 25, maximum 250)"},"cursor":{"type":"string","description":"Opaque cursor returned by this same tool in an earlier result; copy it exactly and do not infer or construct one"},"observe":{"type":"boolean","description":"Issue edit-authorizing observations for visible results (default false)"}},"required":["patterns","language"]}`),
 		runStructuralSearchResult)
 }
 
@@ -56,7 +52,7 @@ func runStructuralSearchResult(ctx context.Context, args json.RawMessage) (ToolR
 		if err != nil {
 			return ToolResult{}, err
 		}
-		return renderStructuralSearchResult(ctx, snapshot, cursor, pageSize(a.MaxResults), a.Observe), nil
+		return renderSearchResult(ctx, snapshot, cursor, pageSize(a.MaxResults), structuralSearchPageOptions(ctx, a.Observe)), nil
 	}
 	if len(a.Patterns) == 0 {
 		return ToolResult{}, errors.New("patterns is required")
@@ -64,8 +60,8 @@ func runStructuralSearchResult(ctx context.Context, args json.RawMessage) (ToolR
 	if strings.TrimSpace(a.Language) == "" {
 		return ToolResult{}, errors.New("language is required")
 	}
-	query := structuralsearch.Query{Language: a.Language, Patterns: a.Patterns}
-	matcher, err := structuralsearch.Compile(query)
+	query := search.Query{Language: a.Language, Patterns: a.Patterns}
+	matcher, err := search.Compile(query)
 	if err != nil {
 		return ToolResult{}, err
 	}
@@ -73,10 +69,10 @@ func runStructuralSearchResult(ctx context.Context, args json.RawMessage) (ToolR
 	if err != nil {
 		return ToolResult{}, err
 	}
-	return renderStructuralSearchResult(ctx, snapshot, searchCursor{Kind: structuralSearchKind, ID: snapshot.ID}, pageSize(a.MaxResults), a.Observe), nil
+	return renderSearchResult(ctx, snapshot, searchCursor{Kind: structuralSearchKind, ID: snapshot.ID}, pageSize(a.MaxResults), structuralSearchPageOptions(ctx, a.Observe)), nil
 }
 
-func collectStructuralSnapshot(ctx context.Context, args structuralSearchArgs, matcher *structuralsearch.Matcher) (search.Snapshot, error) {
+func collectStructuralSnapshot(ctx context.Context, args structuralSearchArgs, matcher *search.Matcher) (search.Snapshot, error) {
 	scope, err := openSearchScope(ctx, args.Path)
 	if err != nil {
 		return search.Snapshot{}, err
@@ -87,7 +83,6 @@ func collectStructuralSnapshot(ctx context.Context, args structuralSearchArgs, m
 	}
 
 	collector := newSearchCollector()
-	var collectorMu sync.Mutex
 	jobs := make(chan string, maxStructuralWorkers)
 	group, workCtx := errgroup.WithContext(ctx)
 	group.SetLimit(maxStructuralWorkers)
@@ -101,7 +96,7 @@ func collectStructuralSnapshot(ctx context.Context, args structuralSearchArgs, m
 					if !ok {
 						return nil
 					}
-					if err := structuralSearchFile(workCtx, scope, name, matcher, collector, &collectorMu); err != nil {
+					if err := structuralSearchFile(workCtx, scope, name, matcher, collector); err != nil {
 						return err
 					}
 				}
@@ -112,9 +107,7 @@ func collectStructuralSnapshot(ctx context.Context, args structuralSearchArgs, m
 	scheduled := 0
 	schedule := func(name string) error {
 		if scheduled >= maxStructuralFiles {
-			collectorMu.Lock()
 			collector.stop(fmt.Sprintf("scan limited to %d Go files", maxStructuralFiles))
-			collectorMu.Unlock()
 			return errSearchLimit
 		}
 		scheduled++
@@ -126,22 +119,9 @@ func collectStructuralSnapshot(ctx context.Context, args structuralSearchArgs, m
 		}
 	}
 
-	if scope.single {
-		err = schedule(scope.start)
-	} else {
-		walker := newSearchWalker(scope)
-		err = walker.walk(workCtx, func(name string, entry fs.DirEntry, ignored bool) error {
-			if ignored || entry.IsDir() || !isRegularEntry(entry) || path.Ext(name) != ".go" {
-				return nil
-			}
-			return schedule(name)
-		})
-		if walker.scanLimited {
-			collectorMu.Lock()
-			collector.stop(fmt.Sprintf("scan limited to %d entries", maxSearchEntries))
-			collectorMu.Unlock()
-		}
-	}
+	err = walkSearchFiles(workCtx, scope, collector,
+		func(name string, entry fs.DirEntry) bool { return path.Ext(name) == ".go" },
+		schedule)
 	close(jobs)
 	groupErr := group.Wait()
 	if err != nil && !errors.Is(err, errSearchLimit) && !errors.Is(err, context.Canceled) {
@@ -161,22 +141,11 @@ func collectStructuralSnapshot(ctx context.Context, args structuralSearchArgs, m
 	if len(collector.items) > 0 {
 		modified = gitModifiedPaths(ctx, scope.rootPath)
 	}
-	rankSearchItems(collector.items, scope, args.Path, searchHintsFor(ctx), modified)
-	snapshot := search.Snapshot{
-		ID:        search.NewID(structuralSearchKind),
-		Kind:      structuralSearchKind,
-		Items:     collector.items,
-		Complete:  collector.complete,
-		Reason:    collector.reason,
-		CreatedAt: time.Now().UTC(),
-	}
-	if err := saveSearchSnapshot(ctx, snapshot); err != nil {
-		return search.Snapshot{}, err
-	}
-	return snapshot, nil
+	rankSearchItems(collector.items, scope, args.Path, SearchHintsFor(ctx), modified)
+	return finishSearchSnapshot(ctx, structuralSearchKind, collector, nil)
 }
 
-func structuralSearchFile(ctx context.Context, scope *searchScope, name string, matcher *structuralsearch.Matcher, collector *searchCollector, collectorMu *sync.Mutex) error {
+func structuralSearchFile(ctx context.Context, scope *searchScope, name string, matcher *search.Matcher, collector *searchCollector) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -189,20 +158,19 @@ func structuralSearchFile(ctx context.Context, scope *searchScope, name string, 
 	if err != nil {
 		return fmt.Errorf("stat %s: %w", scope.displayPath(name), err)
 	}
-	if info.Size() > maxStructuralFileSize {
-		collectorMu.Lock()
-		collector.stop(fmt.Sprintf("skipped %s: file exceeds %d-byte limit", scope.displayPath(name), maxStructuralFileSize))
-		collectorMu.Unlock()
+	skipTooLarge := func() {
+		collector.stop(fmt.Sprintf("skipped %s: file exceeds %d-byte limit", scope.displayPath(name), search.MaxSourceBytes))
+	}
+	if info.Size() > search.MaxSourceBytes {
+		skipTooLarge()
 		return nil
 	}
-	source, err := io.ReadAll(io.LimitReader(f, maxStructuralFileSize+1))
+	source, err := io.ReadAll(io.LimitReader(f, search.MaxSourceBytes+1))
 	if err != nil {
 		return fmt.Errorf("read %s: %w", scope.displayPath(name), err)
 	}
-	if len(source) > maxStructuralFileSize {
-		collectorMu.Lock()
-		collector.stop(fmt.Sprintf("skipped %s: file exceeds %d-byte limit", scope.displayPath(name), maxStructuralFileSize))
-		collectorMu.Unlock()
+	if len(source) > search.MaxSourceBytes {
+		skipTooLarge()
 		return nil
 	}
 	matches, err := matcher.Search(ctx, source)
@@ -234,9 +202,7 @@ func structuralSearchFile(ctx context.Context, scope *searchScope, name string, 
 			Pattern:     match.Pattern,
 			Text:        string(source[match.StartByte:match.EndByte]),
 		}
-		collectorMu.Lock()
 		err := collector.add(ctx, item)
-		collectorMu.Unlock()
 		if err != nil {
 			return err
 		}
@@ -269,62 +235,14 @@ func (p *structuralPositioner) at(offset int) (int, int) {
 	return p.line, offset - p.lineStart + 1
 }
 
-func renderStructuralSearchResult(ctx context.Context, snapshot search.Snapshot, cursor searchCursor, size int, observe bool) ToolResult {
-	if !observe {
-		return renderSearchResult(ctx, snapshot, cursor, size, searchPerFileCap, true)
+func structuralSearchPageOptions(ctx context.Context, observe bool) searchPageOptions {
+	opts := searchPageOptions{perFileCap: searchPerFileCap, grouped: true}
+	if observe {
+		if _, store := observationContextFor(ctx); store != nil {
+			opts.observe = observeStructuralPage
+		}
 	}
-	if _, store := observationContextFor(ctx); store == nil {
-		return renderSearchResult(ctx, snapshot, cursor, size, searchPerFileCap, true)
-	}
-	if err := ctx.Err(); err != nil {
-		return errorToolResult(err)
-	}
-	if size <= 0 {
-		size = defaultSearchMaxResults
-	}
-	chunks := searchPageChunks(snapshot.Items, searchPerFileCap, true)
-	if cursor.Offset < 0 || cursor.Offset > len(chunks) {
-		return errorToolResult(errors.New("search cursor offset is out of range"))
-	}
-	_, searchStore := searchContextFor(ctx)
-	page, nextOffset := selectSearchPage(snapshot, chunks, cursor.Offset, size, searchStore != nil, true)
-	hasMore := searchStore != nil && nextOffset < len(chunks)
-	remaining := len(snapshot.Items) - searchPageItemsBefore(chunks, nextOffset)
-	if preview := renderSearchPage(snapshot.Kind, page, len(snapshot.Items), len(page), remaining, hasMore,
-		searchCursor{Kind: snapshot.Kind, ID: snapshot.ID, Offset: nextOffset}, true, snapshot); len(preview) > searchPreviewBytes {
-		page = nil
-		nextOffset = cursor.Offset
-		hasMore = searchStore != nil && nextOffset < len(chunks)
-		remaining = len(snapshot.Items) - searchPageItemsBefore(chunks, nextOffset)
-	}
-	page = observeStructuralPage(ctx, page)
-	if err := ctx.Err(); err != nil {
-		return errorToolResult(err)
-	}
-	pageText := renderSearchPage(snapshot.Kind, page, len(snapshot.Items), len(page), remaining, hasMore,
-		searchCursor{Kind: snapshot.Kind, ID: snapshot.ID, Offset: nextOffset}, true, snapshot)
-	if len(pageText) > searchPreviewBytes {
-		page = nil
-		nextOffset = cursor.Offset
-		hasMore = searchStore != nil && nextOffset < len(chunks)
-		remaining = len(snapshot.Items) - searchPageItemsBefore(chunks, nextOffset)
-		pageText = renderSearchPage(snapshot.Kind, page, len(snapshot.Items), 0, remaining, hasMore,
-			searchCursor{Kind: snapshot.Kind, ID: snapshot.ID, Offset: nextOffset}, true, snapshot)
-		pageText += fmt.Sprintf("\n[next result exceeds the %d-byte preview; narrow the search before continuing]", searchPreviewBytes)
-	}
-	result := capturedResult(pageText, pageText, int64(len(pageText)), snapshot.Complete, 0)
-	result.Metadata = map[string]string{
-		"search_id":               snapshot.ID,
-		"search_kind":             snapshot.Kind,
-		"search_displayed":        fmt.Sprint(len(page)),
-		"search_remaining":        fmt.Sprint(max(remaining, 0)),
-		"search_incomplete":       fmt.Sprint(!snapshot.Complete),
-		"search_cursor_available": fmt.Sprint(searchStore != nil),
-	}
-	if hasMore {
-		result.Metadata["search_cursor"] = searchCursorString(searchCursor{Kind: snapshot.Kind, ID: snapshot.ID, Offset: nextOffset})
-	}
-	return MarkUntrusted(result, snapshot.Kind)
+	return opts
 }
 
 func observeStructuralPage(ctx context.Context, page []search.Item) []search.Item {

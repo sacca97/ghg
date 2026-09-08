@@ -15,6 +15,9 @@ import (
 const (
 	readCoverageDefaultLimit = 250
 	readCoverageMaxLimit     = 1000
+	// ponytail: keep redundant-read suppression bounded; older observations
+	// can safely be reread once they fall out of this small working set.
+	maxReadCoverageEntries = 1024
 )
 
 type readCoverage struct {
@@ -35,6 +38,7 @@ type readRequest struct {
 
 type readDecision struct {
 	request    readRequest
+	requests   []readRequest
 	coverage   readCoverage
 	prefix     bool
 	suppressed bool
@@ -69,11 +73,14 @@ func (t *readCoverageTracker) prepare(calls []models.ToolCall, unavailable map[s
 		if potentiallyMutatingReadGuardTool(call.Function.Name, call.Function.Arguments) {
 			hasMutation = true
 		}
-		request, ok := normalizeReadRequest(call.Function.Name, call.Function.Arguments)
+		requests, ok := normalizeReadRequests(call.Function.Name, call.Function.Arguments)
 		if !ok {
 			continue
 		}
-		decisions[i].request = request
+		decisions[i].requests = requests
+		if len(requests) == 1 {
+			decisions[i].request = requests[0]
+		}
 		hasRead = true
 	}
 	if hasRead && hasMutation {
@@ -82,21 +89,32 @@ func (t *readCoverageTracker) prepare(calls []models.ToolCall, unavailable map[s
 	t.discardStale()
 
 	for i, call := range calls {
-		request := decisions[i].request
-		if request.path == "" {
+		requests := decisions[i].requests
+		if len(requests) == 0 {
 			continue
 		}
 		if _, disabled := unavailable[call.Function.Name]; disabled {
 			continue
 		}
-		if coverage, ok := t.covered(request); ok {
-			decisions[i].coverage = coverage
-			decisions[i].suppressed = true
-			continue
+		allCovered := true
+		for _, request := range requests {
+			coverage, ok := t.covered(request)
+			if !ok {
+				allCovered = false
+				if len(requests) == 1 {
+					if prefixCoverage, prefixOK := t.expandingPrefix(request); prefixOK {
+						decisions[i].coverage = prefixCoverage
+						decisions[i].prefix = true
+						decisions[i].suppressed = true
+					}
+				}
+				break
+			}
+			if decisions[i].coverage.observation == "" {
+				decisions[i].coverage = coverage
+			}
 		}
-		if coverage, ok := t.expandingPrefix(request); ok {
-			decisions[i].coverage = coverage
-			decisions[i].prefix = true
+		if allCovered {
 			decisions[i].suppressed = true
 		}
 	}
@@ -104,7 +122,7 @@ func (t *readCoverageTracker) prepare(calls []models.ToolCall, unavailable map[s
 	// Only same-offset reads are collapsed in a batch. Arbitrary interval
 	// merging is intentionally left out of this guard.
 	for i := range decisions {
-		if decisions[i].request.path == "" || decisions[i].suppressed {
+		if len(decisions[i].requests) != 1 || decisions[i].suppressed {
 			continue
 		}
 		root := i
@@ -126,23 +144,52 @@ func (t *readCoverageTracker) prepare(calls []models.ToolCall, unavailable map[s
 	return decisions
 }
 
-func normalizeReadRequest(name, args string) (readRequest, bool) {
+func normalizeReadRequests(name, args string) ([]readRequest, bool) {
 	if name != "read" {
-		return readRequest{}, false
+		return nil, false
 	}
 	var input struct {
 		Path   string `json:"path"`
 		Offset int    `json:"offset"`
 		Limit  int    `json:"limit"`
+		Ranges []struct {
+			Path   string `json:"path"`
+			Offset int    `json:"offset"`
+			Limit  int    `json:"limit"`
+		} `json:"ranges"`
 	}
-	if json.Unmarshal([]byte(args), &input) != nil || strings.TrimSpace(input.Path) == "" {
+	if json.Unmarshal([]byte(args), &input) != nil {
+		return nil, false
+	}
+	if input.Ranges != nil {
+		if strings.TrimSpace(input.Path) != "" || len(input.Ranges) == 0 {
+			return nil, false
+		}
+		requests := make([]readRequest, 0, len(input.Ranges))
+		for _, item := range input.Ranges {
+			request, ok := normalizeReadRange(item.Path, item.Offset, item.Limit)
+			if !ok {
+				return nil, false
+			}
+			requests = append(requests, request)
+		}
+		return requests, true
+	}
+	request, ok := normalizeReadRange(input.Path, input.Offset, input.Limit)
+	if !ok {
+		return nil, false
+	}
+	return []readRequest{request}, true
+}
+
+func normalizeReadRange(path string, offset, limit int) (readRequest, bool) {
+	if strings.TrimSpace(path) == "" {
 		return readRequest{}, false
 	}
-	start := input.Offset
+	start := offset
 	if start <= 0 {
 		start = 1
 	}
-	limit := input.Limit
 	if limit <= 0 {
 		limit = readCoverageDefaultLimit
 	}
@@ -152,11 +199,11 @@ func normalizeReadRequest(name, args string) (readRequest, bool) {
 	if start > int(^uint(0)>>1)-limit+1 {
 		return readRequest{}, false
 	}
-	path := canonicalPath(input.Path)
-	if path == "" {
+	canonical := canonicalPath(path)
+	if canonical == "" {
 		return readRequest{}, false
 	}
-	return readRequest{path: path, start: start, end: start + limit - 1}, true
+	return readRequest{path: canonical, start: start, end: start + limit - 1}, true
 }
 
 func potentiallyMutatingReadGuardTool(name, args string) bool {
@@ -223,31 +270,62 @@ func (t *readCoverageTracker) discardStale() {
 }
 
 func readCoverageFromResult(result tools.ToolResult) (readCoverage, bool) {
-	if !readGuardResultSucceeded(result) {
+	coverages := readCoveragesFromResult(result)
+	if len(coverages) == 0 {
 		return readCoverage{}, false
 	}
+	return coverages[0], true
+}
+
+func readCoveragesFromResult(result tools.ToolResult) []readCoverage {
+	if !readGuardResultSucceeded(result) {
+		return nil
+	}
 	metadata := result.Metadata
+	if raw := strings.TrimSpace(metadata["observations"]); raw != "" {
+		var entries []struct {
+			ID         string `json:"id"`
+			Path       string `json:"path"`
+			StartLine  int    `json:"start_line"`
+			EndLine    int    `json:"end_line"`
+			NextOffset int    `json:"next_offset"`
+		}
+		if json.Unmarshal([]byte(raw), &entries) != nil {
+			return nil
+		}
+		coverages := make([]readCoverage, 0, len(entries))
+		for _, entry := range entries {
+			if entry.ID == "" || entry.Path == "" || entry.StartLine <= 0 || entry.EndLine < entry.StartLine || entry.NextOffset < 0 {
+				continue
+			}
+			coverages = append(coverages, readCoverage{
+				path: entry.Path, start: entry.StartLine, end: entry.EndLine,
+				nextOffset: entry.NextOffset, observation: entry.ID,
+			})
+		}
+		return coverages
+	}
 	path := strings.TrimSpace(metadata["observation_path"])
 	observation := strings.TrimSpace(metadata["observation_id"])
 	if path == "" || observation == "" {
-		return readCoverage{}, false
+		return nil
 	}
 	start, err := strconv.Atoi(metadata["observation_start"])
 	if err != nil || start <= 0 {
-		return readCoverage{}, false
+		return nil
 	}
 	end, err := strconv.Atoi(metadata["observation_end"])
 	if err != nil || end < start {
-		return readCoverage{}, false
+		return nil
 	}
 	nextOffset := 0
 	if raw := metadata["observation_next_offset"]; raw != "" {
 		nextOffset, err = strconv.Atoi(raw)
 		if err != nil || nextOffset < 0 {
-			return readCoverage{}, false
+			return nil
 		}
 	}
-	return readCoverage{path: path, start: start, end: end, nextOffset: nextOffset, observation: observation}, true
+	return []readCoverage{{path: path, start: start, end: end, nextOffset: nextOffset, observation: observation}}
 }
 
 func readGuardResultSucceeded(result tools.ToolResult) bool {
@@ -255,14 +333,17 @@ func readGuardResultSucceeded(result tools.ToolResult) bool {
 }
 
 func (t *readCoverageTracker) record(result tools.ToolResult) {
-	if coverage, ok := readCoverageFromResult(result); ok {
+	for _, coverage := range readCoveragesFromResult(result) {
 		info, err := os.Stat(coverage.path)
 		if err != nil {
-			return
+			continue
 		}
 		coverage.size = info.Size()
 		coverage.modTime = info.ModTime()
 		t.coverage = append(t.coverage, coverage)
+	}
+	if len(t.coverage) > maxReadCoverageEntries {
+		t.coverage = t.coverage[len(t.coverage)-maxReadCoverageEntries:]
 	}
 }
 
@@ -270,9 +351,12 @@ func (t *readCoverageTracker) apply(a *Agent, ev Events, calls []models.ToolCall
 	if t == nil {
 		return
 	}
-	sameToolCounts := make(map[string]int)
-	for _, call := range calls {
-		sameToolCounts[call.Function.Name]++
+	var sameToolCounts map[string]int
+	if ev.OnToolTelemetry != nil {
+		sameToolCounts = make(map[string]int)
+		for _, call := range calls {
+			sameToolCounts[call.Function.Name]++
+		}
 	}
 	for i, decision := range decisions {
 		if !decision.suppressed {
@@ -365,6 +449,9 @@ func (t *readCoverageTracker) apply(a *Agent, ev Events, calls []models.ToolCall
 }
 
 func decisionResult(decision readDecision, results []tools.ToolResult) tools.ToolResult {
+	if len(decision.requests) > 1 && decision.suppressed {
+		return readGuidanceResult(fmt.Sprintf("Skipped redundant read: all %d requested ranges are already available from prior observations.", len(decision.requests)), decision.coverage)
+	}
 	if decision.batchRoot >= 0 {
 		root := results[decision.batchRoot]
 		if !readGuardResultSucceeded(root) {

@@ -1,12 +1,12 @@
-// Package structuralsearch exposes the bounded, filesystem-free structural
-// search seam used by the native tool.
-package structuralsearch
+package search
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
-	"sort"
+	"math"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -16,13 +16,7 @@ import (
 	"github.com/odvcencio/gotreesitter/grep"
 )
 
-const (
-	maxPatterns     = 8
-	maxPatternBytes = 16 << 10
-	maxSourceBytes  = 16 << 20
-	maxParseTime    = 250 * time.Millisecond
-	maxMatches      = 2000
-)
+const maxParseTime = 250 * time.Millisecond
 
 // Query describes a structural search. The caller owns authorization and
 // supplies one already-authorized source buffer at a time.
@@ -48,14 +42,11 @@ type Matcher struct {
 
 // Compile validates and compiles a structural query once for reuse.
 func Compile(query Query) (*Matcher, error) {
-	if err := validateQuery(query); err != nil {
+	entry, err := validateQuery(query)
+	if err != nil {
 		return nil, err
 	}
 
-	entry := grammars.DetectLanguageByName("go")
-	if entry == nil || entry.Language == nil {
-		return nil, errors.New("Go grammar is unavailable")
-	}
 	lang := entry.Language()
 	compiled := make([]*grep.CompiledPattern, len(query.Patterns))
 	for i, pattern := range query.Patterns {
@@ -68,38 +59,23 @@ func Compile(query Query) (*Matcher, error) {
 	return &Matcher{language: lang, tokenSourceFactory: entry.TokenSourceFactory, patterns: compiled}, nil
 }
 
-// Search parses source and returns structural matches. It deliberately has no
-// filesystem, path, ranking, pagination, observation, or mutation behavior.
-func Search(ctx context.Context, query Query, source []byte) ([]Match, error) {
-	matcher, err := Compile(query)
-	if err != nil {
-		return nil, err
-	}
-	return matcher.Search(ctx, source)
-}
-
 // Search parses one source buffer with the previously compiled query.
 func (m *Matcher) Search(ctx context.Context, source []byte) ([]Match, error) {
 	if m == nil || m.language == nil || len(m.patterns) == 0 {
 		return nil, errors.New("structural search matcher is nil or empty")
 	}
-	if len(source) > maxSourceBytes {
-		return nil, fmt.Errorf("source exceeds %d-byte limit", maxSourceBytes)
+	if len(source) > MaxSourceBytes {
+		return nil, fmt.Errorf("source exceeds %d-byte limit", MaxSourceBytes)
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 
 	var cancelled uint32
-	stopWatcher := make(chan struct{})
-	go func() {
-		select {
-		case <-ctx.Done():
-			atomic.StoreUint32(&cancelled, 1)
-		case <-stopWatcher:
-		}
-	}()
-	defer close(stopWatcher)
+	stopWatcher := context.AfterFunc(ctx, func() {
+		atomic.StoreUint32(&cancelled, 1)
+	})
+	defer stopWatcher()
 
 	parser := gotreesitter.NewParser(m.language)
 	parser.SetCancellationFlag(&cancelled)
@@ -159,43 +135,47 @@ func (m *Matcher) Search(ctx context.Context, source []byte) ([]Match, error) {
 			return nil, err
 		}
 	}
-	sort.SliceStable(matches, func(i, j int) bool {
-		if matches[i].StartByte != matches[j].StartByte {
-			return matches[i].StartByte < matches[j].StartByte
-		}
-		if matches[i].EndByte != matches[j].EndByte {
-			return matches[i].EndByte < matches[j].EndByte
-		}
-		return matches[i].Pattern < matches[j].Pattern
-	})
+	slices.SortStableFunc(matches, compareMatches)
 	return matches, nil
 }
 
-func validateQuery(query Query) error {
+func compareMatches(a, b Match) int {
+	return cmp.Or(
+		cmp.Compare(a.StartByte, b.StartByte),
+		cmp.Compare(a.EndByte, b.EndByte),
+		cmp.Compare(a.Pattern, b.Pattern),
+	)
+}
+
+func validateQuery(query Query) (*grammars.LangEntry, error) {
 	if strings.TrimSpace(query.Language) != "go" {
-		return fmt.Errorf("unsupported structural search language %q; only go is supported", query.Language)
+		return nil, fmt.Errorf("unsupported structural search language %q; only go is supported", query.Language)
+	}
+	entry := grammars.DetectLanguageByName("go")
+	if entry == nil || entry.Language == nil {
+		return nil, errors.New("Go grammar is unavailable")
 	}
 	if len(query.Patterns) == 0 {
-		return errors.New("at least one structural search pattern is required")
+		return nil, errors.New("at least one structural search pattern is required")
 	}
 	if len(query.Patterns) > maxPatterns {
-		return fmt.Errorf("structural search accepts at most %d patterns", maxPatterns)
+		return nil, fmt.Errorf("structural search accepts at most %d patterns", maxPatterns)
 	}
 	total := 0
 	for i, pattern := range query.Patterns {
 		if strings.TrimSpace(pattern) == "" {
-			return fmt.Errorf("structural search pattern %d is empty", i)
+			return nil, fmt.Errorf("structural search pattern %d is empty", i)
 		}
 		total += len(pattern)
 		if total > maxPatternBytes {
-			return fmt.Errorf("structural search patterns exceed %d-byte limit", maxPatternBytes)
+			return nil, fmt.Errorf("structural search patterns exceed %d-byte limit", maxPatternBytes)
 		}
 	}
-	return nil
+	return entry, nil
 }
 
 func matchRange(root *gotreesitter.Node, queryMatch gotreesitter.QueryMatch, sexpr string, lang *gotreesitter.Language) (uint32, uint32, bool) {
-	start := ^uint32(0)
+	start := uint32(math.MaxUint32)
 	var end uint32
 	var first *gotreesitter.Node
 	for _, capture := range queryMatch.Captures {
@@ -212,22 +192,30 @@ func matchRange(root *gotreesitter.Node, queryMatch gotreesitter.QueryMatch, sex
 			end = byte
 		}
 	}
-	if start == ^uint32(0) || end < start || first == nil {
+	if start == uint32(math.MaxUint32) || end < start || first == nil {
 		return 0, 0, false
 	}
 	if rootType := sExprRootType(sexpr); rootType != "" && rootType != "_" {
-		for node := first; node != nil; node = node.Parent() {
-			if node.Type(lang) == rootType && node.StartByte() <= start && node.EndByte() >= end {
-				return node.StartByte(), node.EndByte(), true
-			}
+		if enclosingStart, enclosingEnd, ok := enclosing(root, first, lang, rootType, start, end); ok {
+			return enclosingStart, enclosingEnd, true
 		}
 	}
-	for node := first; node != nil; node = node.Parent() {
-		if node.StartByte() <= start && node.EndByte() >= end {
+	return enclosing(root, first, lang, "", start, end)
+}
+
+func enclosing(root, from *gotreesitter.Node, lang *gotreesitter.Language, wantType string, start, end uint32) (uint32, uint32, bool) {
+	for node := from; node != nil; node = node.Parent() {
+		if (wantType == "" || node.Type(lang) == wantType) && node.StartByte() <= start && node.EndByte() >= end {
 			return node.StartByte(), node.EndByte(), true
 		}
+		if node == root {
+			break
+		}
 	}
-	return start, end, true
+	if wantType == "" {
+		return start, end, true
+	}
+	return 0, 0, false
 }
 
 func sExprRootType(sexpr string) string {
