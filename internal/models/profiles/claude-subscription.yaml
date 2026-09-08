@@ -1,0 +1,15 @@
+schema: 1
+id: claude-subscription
+display_name: Claude Pro/Max (browser login)
+protocol: anthropic-messages
+base_url: https://api.anthropic.com/v1
+auth:
+  kind: claude-subscription
+catalog:
+  kind: anthropic-models
+  public: false
+capabilities:
+  tools: true
+  vision: true
+  thinking: true
+  prompt_cache: provider

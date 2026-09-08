@@ -233,16 +233,20 @@ func authOAuthCLI(name string, resolved models.Resolved) error {
 	opts := auth.LoginOptions{
 		OpenBrowser: true,
 		Printer: func(url string) {
-			fmt.Printf("Open the following authorization URL in your browser:\n\n  %s\n\nWaiting for callback on http://localhost:1455…\n", url)
+			fmt.Printf("Open the following authorization URL in your browser:\n\n  %s\n\nBrowser login in progress…\n", url)
+		},
+		Prompt: func(label string) (string, error) {
+			fmt.Print(label + " ")
+			return bufio.NewReader(os.Stdin).ReadString('\n')
 		},
 	}
-	creds, err := auth.Login(ctx, opts)
+	accountID, err := auth.LoginFor(ctx, resolved, opts)
 	if err != nil {
 		return fmt.Errorf("OAuth login failed: %w", err)
 	}
 	fmt.Println("OAuth login successful!")
-	if creds.AccountID != "" {
-		fmt.Printf("Account ID: %s\n", creds.AccountID)
+	if accountID != "" {
+		fmt.Printf("Account ID: %s\n", accountID)
 	}
 	return configureOAuthPostLogin(name, resolved)
 }
@@ -283,7 +287,18 @@ func configureOAuthPostLogin(name string, resolved models.Resolved) error {
 }
 
 func authStatusCLI(name string) error {
-	mgr := auth.DefaultCodexCredentialManager()
+	profiles, err := loadProviderProfiles()
+	if err != nil {
+		return err
+	}
+	resolved, err := auth.ResolveProfile(profiles, name)
+	if err != nil {
+		return err
+	}
+	mgr, err := auth.CredentialManagerFor(resolved)
+	if err != nil {
+		return err
+	}
 	st, err := mgr.Status(context.Background())
 	if err != nil {
 		return err
@@ -298,6 +313,8 @@ func authStatusCLI(name string) error {
 	}
 	if st.Expired {
 		fmt.Printf("  Status:     expired at %s\n", st.ExpiresAt.Format(time.RFC3339))
+	} else if st.ExpiresAt.IsZero() {
+		fmt.Println("  Status:     valid (no expiry)")
 	} else {
 		fmt.Printf("  Status:     valid until %s\n", st.ExpiresAt.Format(time.RFC3339))
 	}
@@ -305,7 +322,18 @@ func authStatusCLI(name string) error {
 }
 
 func authLogoutCLI(name string) error {
-	mgr := auth.DefaultCodexCredentialManager()
+	profiles, err := loadProviderProfiles()
+	if err != nil {
+		return err
+	}
+	resolved, err := auth.ResolveProfile(profiles, name)
+	if err != nil {
+		return err
+	}
+	mgr, err := auth.CredentialManagerFor(resolved)
+	if err != nil {
+		return err
+	}
 	if err := mgr.Logout(context.Background()); err != nil {
 		return err
 	}

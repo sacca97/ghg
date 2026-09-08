@@ -25,6 +25,8 @@ const (
 // AnthropicClient talks to the native Anthropic Messages API.
 type AnthropicClient struct {
 	transport
+
+	Authorizer RequestAuthorizer
 }
 
 // newAnthropicClient creates an Anthropic Messages adapter. BaseURL is
@@ -39,6 +41,28 @@ func newAnthropicClient(baseURL, apiKey string) *AnthropicClient {
 
 // AdapterProtocol reports the Anthropic Messages adapter selected by this client.
 func (c *AnthropicClient) AdapterProtocol() Protocol { return ProtocolAnthropicMessages }
+
+func (c *AnthropicClient) setRequestHeaders(req *http.Request) error {
+	if c.Authorizer != nil {
+		// Apply non-credential transport defaults before the subscription
+		// authorizer adds its bearer token and OAuth beta header.
+		if err := applyRequestHeaders(req, c.Headers, "", AuthNone, ""); err != nil {
+			return err
+		}
+		return c.Authorizer.Authorize(req)
+	}
+	return c.transport.setRequestHeaders(req)
+}
+
+func (c *AnthropicClient) tryForceRefresh(ctx context.Context) bool {
+	if c.Authorizer == nil {
+		return false
+	}
+	if refresher, ok := c.Authorizer.(interface{ ForceRefresh(context.Context) error }); ok {
+		return refresher.ForceRefresh(ctx) == nil
+	}
+	return false
+}
 
 // Stream implements Backend.
 func (c *AnthropicClient) Stream(ctx context.Context, req Request, sink EventSink) (Message, Usage, error) {
@@ -535,6 +559,10 @@ func (c *AnthropicClient) stream(ctx context.Context, req Request, sink EventSin
 }
 
 func (c *AnthropicClient) streamOnce(ctx context.Context, body []byte, onText, onThink func(string)) (Message, Usage, error) {
+	return c.doStreamOnce(ctx, body, onText, onThink, true)
+}
+
+func (c *AnthropicClient) doStreamOnce(ctx context.Context, body []byte, onText, onThink func(string), canRefresh bool) (Message, Usage, error) {
 	endpoint, err := c.endpoint("/messages")
 	if err != nil {
 		return Message{}, Usage{}, err
@@ -550,6 +578,12 @@ func (c *AnthropicClient) streamOnce(ctx context.Context, body []byte, onText, o
 	resp, err := c.httpClient().Do(req)
 	if err != nil {
 		return Message{}, Usage{}, err
+	}
+	if resp.StatusCode == http.StatusUnauthorized && canRefresh {
+		_ = resp.Body.Close()
+		if c.tryForceRefresh(ctx) {
+			return c.doStreamOnce(ctx, body, onText, onThink, false)
+		}
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
@@ -602,6 +636,10 @@ func (c *AnthropicClient) complete(ctx context.Context, req Request, sink EventS
 }
 
 func (c *AnthropicClient) completeOnce(ctx context.Context, body []byte) (Message, Usage, error) {
+	return c.doCompleteOnce(ctx, body, true)
+}
+
+func (c *AnthropicClient) doCompleteOnce(ctx context.Context, body []byte, canRefresh bool) (Message, Usage, error) {
 	endpoint, err := c.endpoint("/messages")
 	if err != nil {
 		return Message{}, Usage{}, err
@@ -617,6 +655,12 @@ func (c *AnthropicClient) completeOnce(ctx context.Context, body []byte) (Messag
 	resp, err := c.httpClient().Do(req)
 	if err != nil {
 		return Message{}, Usage{}, err
+	}
+	if resp.StatusCode == http.StatusUnauthorized && canRefresh {
+		_ = resp.Body.Close()
+		if c.tryForceRefresh(ctx) {
+			return c.doCompleteOnce(ctx, body, false)
+		}
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {

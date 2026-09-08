@@ -58,12 +58,16 @@ func NewConfigured(opts BuildOptions) (*Agent, string, string, error) {
 			return nil, "", "", fmt.Errorf("no API key for provider %q (set apiKey/apiKeyEnv in ~/.ghg/config.json)", providerName)
 		}
 	} else if resolved.RequiresOAuth() {
-		status, _ := auth.DefaultCodexCredentialManager().Status(context.Background())
+		manager, managerErr := auth.CredentialManagerFor(resolved)
+		if managerErr != nil {
+			return nil, "", "", managerErr
+		}
+		status, _ := manager.Status(context.Background())
 		if !status.Configured {
 			if opts.AllowMissingCredentials {
 				return nil, modelName, providerName, nil
 			}
-			return nil, "", "", fmt.Errorf("provider %q requires authentication; run 'ghg auth codex-subscription' to log in", providerName)
+			return nil, "", "", fmt.Errorf("provider %q requires authentication; run 'ghg auth %s' to log in", providerName, resolved.Profile.ID)
 		}
 	}
 

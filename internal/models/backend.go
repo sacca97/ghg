@@ -94,6 +94,7 @@ func NewBackend(resolved Resolved, opts BackendOptions) (Backend, error) {
 		client.Headers = maps.Clone(resolved.DefaultHeaders)
 		client.AuthKind = resolved.Auth.Kind
 		client.AuthHeader = resolved.Auth.Header
+		client.Authorizer = opts.Authorizer
 		return client, nil
 	case ProtocolAnthropicMessages:
 		client := newAnthropicClient(resolved.BaseURL, opts.APIKey)
@@ -106,6 +107,7 @@ func NewBackend(resolved Resolved, opts BackendOptions) (Backend, error) {
 		}
 		client.AuthKind = resolved.Auth.Kind
 		client.AuthHeader = resolved.Auth.Header
+		client.Authorizer = opts.Authorizer
 		return client, nil
 	case ProtocolOpenAIResponses:
 		client := newOpenAIResponses(resolved.BaseURL, opts.APIKey)

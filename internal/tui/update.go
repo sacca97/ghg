@@ -559,7 +559,22 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case authOAuthWaitingMsg:
-		m.append(dimStyle.Render("open the following authorization URL in your browser:\n\n  " + msg.url + "\n\nwaiting for callback on http://localhost:1455…"))
+		m.append(dimStyle.Render("open the following authorization URL in your browser:\n\n  " + msg.url + "\n\nbrowser login in progress…"))
+		return m, nil
+
+	case authOAuthCodeRequestMsg:
+		m.openNamePrompt(msg.label, "", func(value string) {
+			select {
+			case msg.reply <- value:
+			default:
+			}
+		})
+		m.namePrompt.onCancel = func() {
+			select {
+			case msg.cancel <- struct{}{}:
+			default:
+			}
+		}
 		return m, nil
 
 	case authOAuthResultMsg:

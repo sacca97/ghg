@@ -1,0 +1,15 @@
+schema: 1
+id: zai-coding-plan
+display_name: Z.AI GLM Coding Plan (browser login)
+protocol: openai-chat-completions
+base_url: https://api.z.ai/api/coding/paas/v4
+auth:
+  kind: zai-coding-plan
+catalog:
+  kind: openai-models
+  public: false
+capabilities:
+  tools: true
+  vision: true
+  thinking: true
+  prompt_cache: provider

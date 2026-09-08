@@ -360,6 +360,7 @@ func (m *codexCredentialManager) Logout(_ context.Context) error {
 type LoginOptions struct {
 	OpenBrowser bool
 	Printer     func(url string)
+	Prompt      func(label string) (string, error)
 	Port        int
 	AuthDir     string
 }

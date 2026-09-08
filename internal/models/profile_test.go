@@ -13,7 +13,7 @@ func TestLoadEmbeddedProfiles(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, id := range []string{"anthropic", "commandcode", "generic-openai", "inference", "openrouter", "opencode", "codex-subscription"} {
+	for _, id := range []string{"anthropic", "commandcode", "generic-openai", "inference", "openrouter", "opencode", "codex-subscription", "claude-subscription", "zai-coding-plan"} {
 		if _, ok := profiles.Lookup(id); !ok {
 			t.Fatalf("embedded profile %q missing; ids=%v", id, profiles.IDs())
 		}
@@ -28,6 +28,28 @@ func TestLoadEmbeddedProfiles(t *testing.T) {
 	}
 	if res.RequiresAPIKey() || !res.RequiresOAuth() {
 		t.Fatalf("expected requiresAPIKey=false requiresOAuth=true, got %v / %v", res.RequiresAPIKey(), res.RequiresOAuth())
+	}
+	claude, ok := profiles.Lookup("claude-subscription")
+	if !ok || claude.Protocol != ProtocolAnthropicMessages || claude.Auth.Kind != AuthClaudeSubscription {
+		t.Fatalf("claude-subscription profile: %+v", claude)
+	}
+	res, err = profiles.Resolve(Instance{Name: "claude-subscription", Profile: "claude-subscription"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.RequiresAPIKey() || !res.RequiresOAuth() {
+		t.Fatalf("expected Claude subscription to require OAuth only, got %v / %v", res.RequiresAPIKey(), res.RequiresOAuth())
+	}
+	zai, ok := profiles.Lookup("zai-coding-plan")
+	if !ok || zai.Protocol != ProtocolOpenAIChatCompletions || zai.Auth.Kind != AuthZaiCodingPlan {
+		t.Fatalf("zai-coding-plan profile: %+v", zai)
+	}
+	res, err = profiles.Resolve(Instance{Name: "zai-coding-plan", Profile: "zai-coding-plan"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.RequiresAPIKey() || !res.RequiresOAuth() {
+		t.Fatalf("expected Z.AI Coding Plan to require OAuth only, got %v / %v", res.RequiresAPIKey(), res.RequiresOAuth())
 	}
 	p, ok := profiles.Lookup("openrouter")
 	if !ok {

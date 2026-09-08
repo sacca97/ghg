@@ -28,10 +28,12 @@ const (
 	// ghg. A profile must opt into this version explicitly.
 	SchemaVersion = 1
 
-	AuthBearer            = "bearer"
-	AuthHeader            = "header"
-	AuthNone              = "none"
-	AuthCodexSubscription = "codex-subscription"
+	AuthBearer             = "bearer"
+	AuthHeader             = "header"
+	AuthNone               = "none"
+	AuthCodexSubscription  = "codex-subscription"
+	AuthClaudeSubscription = "claude-subscription"
+	AuthZaiCodingPlan      = "zai-coding-plan"
 
 	CatalogOpenAIModels    = "openai-models"
 	CatalogAnthropicModels = "anthropic-models"
@@ -129,12 +131,12 @@ type Resolved struct {
 // RequiresAPIKey reports whether the selected auth mode needs a JSONC
 // apiKey/apiKeyEnv or another credential source.
 func (r Resolved) RequiresAPIKey() bool {
-	return r.Auth.Kind != AuthNone && r.Auth.Kind != AuthCodexSubscription
+	return r.Auth.Kind != AuthNone && r.Auth.Kind != AuthCodexSubscription && r.Auth.Kind != AuthClaudeSubscription && r.Auth.Kind != AuthZaiCodingPlan
 }
 
 // RequiresOAuth reports whether the selected auth mode requires an OAuth flow.
 func (r Resolved) RequiresOAuth() bool {
-	return r.Auth.Kind == AuthCodexSubscription
+	return r.Auth.Kind == AuthCodexSubscription || r.Auth.Kind == AuthClaudeSubscription || r.Auth.Kind == AuthZaiCodingPlan
 }
 
 // Profiles is the loaded profile set. Its zero value is useful: resolving an
@@ -429,9 +431,9 @@ func validateProfile(profile *Profile) error {
 		if profile.Auth.Header != "" || profile.Auth.EnvVar != "" {
 			return fmt.Errorf("profile %q auth.header and auth.env_var must be empty when auth.kind is none", profile.ID)
 		}
-	case AuthCodexSubscription:
+	case AuthCodexSubscription, AuthClaudeSubscription, AuthZaiCodingPlan:
 		if profile.Auth.Header != "" || profile.Auth.EnvVar != "" {
-			return fmt.Errorf("profile %q auth.header and auth.env_var must be empty when auth.kind is codex-subscription", profile.ID)
+			return fmt.Errorf("profile %q auth.header and auth.env_var must be empty when auth.kind is %s", profile.ID, profile.Auth.Kind)
 		}
 	case AuthBearer, AuthHeader:
 		if !validHeaderName(profile.Auth.Header) {
@@ -441,7 +443,7 @@ func validateProfile(profile *Profile) error {
 			return fmt.Errorf("profile %q auth.env_var must be a valid environment variable name", profile.ID)
 		}
 	default:
-		return fmt.Errorf("profile %q has unknown auth.kind %q (want bearer, header, none, or codex-subscription)", profile.ID, profile.Auth.Kind)
+		return fmt.Errorf("profile %q has unknown auth.kind %q (want bearer, header, none, codex-subscription, claude-subscription, or zai-coding-plan)", profile.ID, profile.Auth.Kind)
 	}
 
 	profile.Docs.KeysURL = strings.TrimSpace(profile.Docs.KeysURL)

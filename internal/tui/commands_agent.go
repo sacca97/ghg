@@ -88,7 +88,11 @@ func (m *model) authConfigured(id string) bool {
 			continue
 		}
 		if resolved.RequiresOAuth() {
-			st, err := auth.DefaultCodexCredentialManager().Status(context.Background())
+			manager, err := auth.CredentialManagerFor(resolved)
+			if err != nil {
+				return false
+			}
+			st, err := manager.Status(context.Background())
 			return err == nil && st.Configured && !st.Expired
 		}
 		if !resolved.RequiresAPIKey() {
@@ -282,6 +286,13 @@ type authOAuthWaitingMsg struct {
 	url  string
 }
 
+type authOAuthCodeRequestMsg struct {
+	name   string
+	label  string
+	reply  chan<- string
+	cancel chan<- struct{}
+}
+
 type authOAuthResultMsg struct {
 	name     string
 	profile  models.Resolved
@@ -303,8 +314,21 @@ func (m *model) startOAuthLogin(name string, resolved models.Resolved) {
 			Printer: func(url string) {
 				sendProg(m.prog, authOAuthWaitingMsg{name: name, url: url})
 			},
+			Prompt: func(label string) (string, error) {
+				reply := make(chan string, 1)
+				cancelled := make(chan struct{}, 1)
+				sendProg(m.prog, authOAuthCodeRequestMsg{name: name, label: label, reply: reply, cancel: cancelled})
+				select {
+				case value := <-reply:
+					return value, nil
+				case <-cancelled:
+					return "", errors.New("OAuth code entry cancelled")
+				case <-ctx.Done():
+					return "", ctx.Err()
+				}
+			},
 		}
-		_, err := auth.Login(ctx, opts)
+		_, err := auth.LoginFor(ctx, resolved, opts)
 		if err != nil {
 			sendProg(m.prog, authOAuthResultMsg{name: name, profile: resolved, err: err})
 			return

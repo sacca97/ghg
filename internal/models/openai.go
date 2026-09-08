@@ -377,10 +377,22 @@ func NewTool(name, desc, schema string) Tool {
 // Client talks to one provider endpoint.
 type Client struct {
 	transport
+
+	Authorizer RequestAuthorizer
 }
 
 func newClient(baseURL, apiKey string) *Client {
 	return &Client{transport: newTransport(baseURL, apiKey)}
+}
+
+func (c *Client) setRequestHeaders(req *http.Request) error {
+	if c.Authorizer != nil {
+		if err := applyRequestHeaders(req, c.Headers, "", AuthNone, ""); err != nil {
+			return err
+		}
+		return c.Authorizer.Authorize(req)
+	}
+	return c.transport.setRequestHeaders(req)
 }
 
 // Request is a provider-neutral assistant request. Wire-only transport flags
