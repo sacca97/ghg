@@ -120,10 +120,11 @@ func (m *model) interactiveView() string {
 }
 
 type namePrompt struct {
-	label string
-	draft string
-	mask  bool
-	onOK  func(string)
+	label    string
+	draft    string
+	mask     bool
+	onOK     func(string)
+	onCancel func()
 }
 
 func restoreCollapsedPaste(text, paste string) string {
@@ -368,7 +369,11 @@ func (m *model) key(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		switch {
 		case m.namePrompt != nil: // cancel the inline fork/rename/auth prompt
 			masked := m.namePrompt.mask
+			onCancel := m.namePrompt.onCancel
 			m.closeNamePrompt()
+			if onCancel != nil {
+				onCancel()
+			}
 			if masked { // the draft stash must not record a key into history
 				m.escClr = false
 				return m, nil
