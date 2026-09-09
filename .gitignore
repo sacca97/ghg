@@ -6,3 +6,4 @@ chat-*
 editors/vscode/node_modules/
 editors/vscode/out/
 editors/vscode/*.vsix
+.npm*
