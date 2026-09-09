@@ -853,12 +853,12 @@ func explorationCheckpointLevel(round int) int {
 }
 
 func explorationCheckpointReminder(level, rounds int) string {
-	prompt := "Attention: the pending repository-navigation tool calls were withheld. Before continuing, state the specific unresolved question and why the next call can materially change the result. Continue with the next necessary call or synthesize."
+	prompt := "Reassess whether more exploration is necessary, state the specific unresolved question and why the next call can materially change the result, then continue with the next necessary call or synthesize."
 	switch level {
 	case 2:
-		prompt = "Attention: this is the second exploration checkpoint. The pending tool calls were withheld. Reassess whether more exploration is necessary, then state the specific unresolved question and why the next call can materially change the result. Continue with the next necessary call or synthesize."
+		prompt = "This is the second exploration checkpoint. Reassess whether more exploration is necessary, state the specific unresolved question and why the next call can materially change the result, then continue with the next necessary call or synthesize."
 	case explorationCheckpointFinalLevel:
-		prompt = "Attention: this is the third and strongest exploration checkpoint warning. The pending tool calls were withheld. Reassess whether more exploration is necessary, state the specific unresolved question and why the next call can materially change the result, then continue with the next necessary call or synthesize."
+		prompt = "This is the third and strongest exploration checkpoint warning. Reassess whether more exploration is necessary, state the specific unresolved question and why the next call can materially change the result, then continue with the next necessary call or synthesize."
 	}
 	return fmt.Sprintf("<exploration_checkpoint level=\"%d\">\nYou have completed %d repository-exploration rounds in this turn.\n%s\n</exploration_checkpoint>", level, rounds, prompt)
 }
@@ -1067,6 +1067,21 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 			turnTools = append(turnTools, submitReviewTool())
 		}
 	}
+	var askUserMu sync.Mutex
+	askUserUsed := false
+	if a.PlanMode && authored && a.Runtime != nil && !a.Runtime.Headless && ev.OnQuestion != nil {
+		askTool := askUserTool(ev.OnQuestion, func() bool {
+			askUserMu.Lock()
+			defer askUserMu.Unlock()
+			if askUserUsed {
+				return false
+			}
+			askUserUsed = true
+			return true
+		})
+		knownTools = append(knownTools, askTool)
+		turnTools = append(turnTools, askTool)
+	}
 	if activeGoal != nil && !a.readOnlyCollaborationMode() {
 		turnTools = append(turnTools, GoalTool(*activeGoal))
 	}
@@ -1077,7 +1092,6 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 		capabilityGuidance = currentToolGuidance(turnTools, capabilityNotices)
 	}
 	turnDefs := tools.Defs(turnTools)
-	var synthesisDefs []models.Tool
 
 	turnErrors := make(map[string]int)
 	malformedRoundsInTurn := 0
@@ -1086,10 +1100,7 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 	explorationReminder := ""
 	checkpointLevel := 0
 	postEditVerification := false
-	finalEvidencePending := false
-	finalEvidenceRetryUsed := false
-	explorationClosed := false
-	finalEvidenceNoticeSent := false
+	reviewFinalEvidenceRetryUsed := false
 	reviewCheckpointPending := false
 	reviewClosed := false
 	scopePreflight := ""
@@ -1097,16 +1108,6 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 		scopePreflight = reviewPreflightPrompt(reviewBudget)
 	} else if a.PlanMode {
 		scopePreflight = planTaggedScopePrompt(a, reviewTarget)
-	}
-	closeExploration := func() {
-		finalEvidencePending = false
-		if explorationClosed {
-			return
-		}
-		explorationClosed = true
-		if ev.OnNotice != nil {
-			ev.OnNotice("◎ exploration closed · synthesizing")
-		}
 	}
 	closeReviewExploration := func() {
 		if reviewBudget == nil {
@@ -1142,25 +1143,9 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 		if reviewCheckpointRequest {
 			requestExplorationReminder = reviewBudgetCheckpointReminder(reviewBudget)
 		}
-		finalEvidenceBatch := a.readOnlyCollaborationMode() && finalEvidencePending
 		budgetFinalizing := planBudget != nil && planBudget.IsReserveCrossed()
-		if requestCheckpointLevel > 0 && !(a.readOnlyCollaborationMode() && finalEvidencePending) {
-			budgetFinalizing = false
-		}
-		if finalEvidenceBatch && budgetFinalizing {
-			closeExploration()
-			finalEvidenceBatch = false
-		}
-		if finalEvidenceBatch && !finalEvidenceNoticeSent {
-			finalEvidenceNoticeSent = true
-			if ev.OnNotice != nil {
-				ev.OnNotice("◎ final evidence batch")
-			}
-		}
 
-		// Keep budget finalization separate from exploration closure. A pending
-		// checkpoint gets its evidence request unless the reserve was crossed.
-		finalizing := explorationClosed || budgetFinalizing
+		finalizing := budgetFinalizing
 		var budgetReminder string
 		if planBudget != nil {
 			budgetReminder = planBudget.reminderBlock(budgetFinalizing, a.ReviewMode)
@@ -1190,7 +1175,7 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 				available = []tools.Tool{submitReviewTool()}
 				reqDefs = tools.Defs(available)
 			} else {
-				reqDefs = synthesisDefs
+				reqDefs = nil
 				available = nil // Reserve crossed: disable tools for final synthesis request
 			}
 		}
@@ -1358,11 +1343,11 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 			a.msgsMu.Unlock()
 			continue
 		}
-		evidenceBatch := finalEvidenceBatch || reviewFinalEvidenceBatch
+		evidenceBatch := reviewFinalEvidenceBatch
 		checkpointTriggered := false
 		if hasMutation {
 			postEditVerification = true
-		} else if hasNavigation && !finalEvidenceBatch && reviewBudget == nil {
+		} else if hasNavigation && reviewBudget == nil {
 			if postEditVerification {
 				// ponytail: skip only the first navigation-only response after a
 				// mutation; distinguishing later exploration from verification
@@ -1370,13 +1355,9 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 				postEditVerification = false
 			} else {
 				explorationRounds++
-				if level := explorationCheckpointLevel(explorationRounds); level > 0 &&
-					(!a.readOnlyCollaborationMode() || level == 1) {
+				if level := explorationCheckpointLevel(explorationRounds); level > 0 {
 					checkpointLevel = level
 					explorationReminder = explorationCheckpointReminder(level, explorationRounds)
-					if a.readOnlyCollaborationMode() {
-						finalEvidencePending = true
-					}
 					checkpointTriggered = true
 				}
 			}
@@ -1385,20 +1366,18 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 			if ev.OnNotice != nil {
 				ev.OnNotice(fmt.Sprintf("◎ exploration checkpoint · round %d", explorationRounds))
 			}
-			continue
+			if !a.readOnlyCollaborationMode() {
+				continue
+			}
 		}
 		if len(msg.ToolCalls) > 0 {
 			malformedIndices, batchTooLarge := findMalformedToolCalls(msg.ToolCalls)
 			if len(malformedIndices) > 0 || batchTooLarge {
 				if evidenceBatch {
-					if finalEvidenceRetryUsed {
-						if reviewFinalEvidenceBatch {
-							closeReviewExploration()
-						} else {
-							closeExploration()
-						}
+					if reviewFinalEvidenceRetryUsed {
+						closeReviewExploration()
 					} else {
-						finalEvidenceRetryUsed = true
+						reviewFinalEvidenceRetryUsed = true
 					}
 				} else if malformedRoundsInTurn > 0 {
 					if batchTooLarge {
@@ -1445,14 +1424,10 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 				if !evidenceBatch {
 					return "", err
 				}
-				if finalEvidenceRetryUsed {
-					if reviewFinalEvidenceBatch {
-						closeReviewExploration()
-					} else {
-						closeExploration()
-					}
+				if reviewFinalEvidenceRetryUsed {
+					closeReviewExploration()
 				} else {
-					finalEvidenceRetryUsed = true
+					reviewFinalEvidenceRetryUsed = true
 				}
 				msg.Usage = &usage
 				msg.Model = a.Model + " @ " + a.Provider
@@ -1469,9 +1444,6 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 				a.msgsMu.Unlock()
 				continue
 			}
-		}
-		if finalEvidenceBatch && len(msg.ToolCalls) > 0 {
-			closeExploration()
 		}
 		msg.Usage = &usage
 		msg.Model = a.Model + " @ " + a.Provider

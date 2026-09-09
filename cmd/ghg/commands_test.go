@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -10,6 +12,39 @@ import (
 	"github.com/sacca97/ghg/internal/models"
 	"github.com/sacca97/ghg/internal/session"
 )
+
+func TestModelsCLIJSON(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("GHG_HOME", home)
+	configJSON := `{"defaultModel":"fallback","defaultProvider":"provider","providers":{"provider":{"baseUrl":"https://example.test"}},"models":{"fallback":{"providers":["provider"]},"smart-model":{"providers":["provider"]}},"roles":{"smart":{"model":"smart-model","provider":"provider"}}}`
+	if err := os.WriteFile(filepath.Join(home, "config.json"), []byte(configJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	out := captureStdout(t, func() {
+		if err := modelsCLI([]string{"--format", "json"}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	var got map[string]string
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["smart"] != "smart-model" || got["fast"] != "fallback" {
+		t.Fatalf("role models = %#v", got)
+	}
+	out = captureStdout(t, func() {
+		if err := modelsCLI([]string{"--all", "--format", "json"}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	var choices []catalogModelChoice
+	if err := json.Unmarshal([]byte(out), &choices); err != nil {
+		t.Fatal(err)
+	}
+	if len(choices) != 2 || choices[0].Model != "fallback" || choices[1].Model != "smart-model" {
+		t.Fatalf("catalog models = %#v", choices)
+	}
+}
 
 func TestSessionsCLI(t *testing.T) {
 	dir := t.TempDir()

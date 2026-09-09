@@ -250,6 +250,10 @@ func (m *model) key(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.iactive != nil {
 		return m.iactiveKey(msg)
 	}
+	if m.questionDialog != nil {
+		m.questionKey(msg)
+		return m, nil
+	}
 	if m.permDialog != nil {
 		m.permKey(msg)
 		return m, nil

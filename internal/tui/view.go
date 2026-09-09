@@ -305,6 +305,7 @@ func (m *model) layout() {
 	m.frameThinking = ""
 	m.frameInteractive = ""
 	m.framePermission = ""
+	m.frameQuestion = ""
 	m.frameRewind = ""
 	m.growInput()
 	// Rows View() spends outside the viewport, counted against m.height. Get
@@ -342,6 +343,10 @@ func (m *model) layout() {
 	if m.permDialog != nil {
 		m.framePermission = m.permView()
 		chrome += lipgloss.Height(m.framePermission) + 1
+	}
+	if m.questionDialog != nil {
+		m.frameQuestion = m.questionView()
+		chrome += lipgloss.Height(m.frameQuestion) + 1
 	}
 	if m.rew != nil {
 		m.frameRewind = m.rewindView()
@@ -699,6 +704,13 @@ func (m *model) framePermissionView() string {
 	return m.permView()
 }
 
+func (m *model) frameQuestionView() string {
+	if m.frameViewsValid {
+		return m.frameQuestion
+	}
+	return m.questionView()
+}
+
 func (m *model) frameRewindView() string {
 	if m.frameViewsValid {
 		return m.frameRewind
@@ -737,6 +749,9 @@ func (m *model) View() string {
 	}
 	if m.permDialog != nil {
 		b.WriteString("\n" + m.framePermissionView() + "\n")
+	}
+	if m.questionDialog != nil {
+		b.WriteString("\n" + m.frameQuestionView() + "\n")
 	}
 	if m.busy {
 		hint := " thinking… (enter queues · /effort run now · esc interrupts · ctrl+c ctrl+c interrupts)"

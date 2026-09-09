@@ -1,11 +1,13 @@
 package tui
 
 import (
+	"fmt"
+	"strings"
+
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/x/ansi"
 	"github.com/sacca97/ghg/internal/tools"
 	workerwire "github.com/sacca97/ghg/internal/worker"
-	"strings"
 )
 
 // permDialog is the UI-thread modal state while a request is open.
@@ -15,6 +17,127 @@ type permDialog struct {
 	sel       int  // 0=allow once, 1=allow always, 2=reject
 	rejecting bool // typing the redirect message
 	rejectIn  string
+}
+
+type questionDialog struct {
+	request workerwire.QuestionRequest
+	index   int
+	sel     int
+	other   bool
+	otherIn string
+	answers []workerwire.QuestionAnswer
+}
+
+func (m *model) questionKey(msg tea.KeyMsg) {
+	d := m.questionDialog
+	if d == nil || d.index >= len(d.request.Questions) {
+		return
+	}
+	question := d.request.Questions[d.index]
+	if d.other {
+		switch msg.Type {
+		case tea.KeyEnter:
+			if strings.TrimSpace(d.otherIn) != "" {
+				m.acceptQuestion(strings.TrimSpace(d.otherIn))
+			}
+		case tea.KeyEsc:
+			d.other, d.otherIn = false, ""
+		case tea.KeyBackspace, tea.KeyDelete:
+			if len(d.otherIn) > 0 {
+				d.otherIn = d.otherIn[:len(d.otherIn)-1]
+			}
+		case tea.KeyRunes, tea.KeySpace:
+			if len(d.otherIn) < 4096 {
+				d.otherIn += string(msg.Runes)
+				if msg.Type == tea.KeySpace {
+					d.otherIn += " "
+				}
+			}
+		}
+		return
+	}
+	last := len(question.Options)
+	switch msg.Type {
+	case tea.KeyUp, tea.KeyLeft:
+		d.sel = (d.sel + last) % (last + 1)
+	case tea.KeyDown, tea.KeyRight:
+		d.sel = (d.sel + 1) % (last + 1)
+	case tea.KeyEnter:
+		if d.sel == last {
+			d.other = true
+			d.otherIn = ""
+		} else {
+			m.acceptQuestion(question.Options[d.sel].Label)
+		}
+	case tea.KeyEsc:
+		m.sendQuestionAnswer(true)
+	}
+}
+
+func (m *model) acceptQuestion(value string) {
+	d := m.questionDialog
+	if d == nil {
+		return
+	}
+	d.answers = append(d.answers, workerwire.QuestionAnswer{ID: d.request.Questions[d.index].ID, Value: value})
+	if d.index+1 < len(d.request.Questions) {
+		d.index++
+		d.sel = 0
+		d.other = false
+		d.otherIn = ""
+		return
+	}
+	m.sendQuestionAnswer(false)
+}
+
+func (m *model) sendQuestionAnswer(cancelled bool) {
+	d := m.questionDialog
+	if d == nil || m.workerClient == nil {
+		return
+	}
+	request := workerwire.QuestionAnswerRequest{ID: d.request.ID, Answers: d.answers, Cancelled: cancelled}
+	if err := m.workerClient.Send(workerwire.CommandAnswerQuestion, workerRequestID("question"), request); err != nil {
+		m.append(errStyle.Render("question failed: " + err.Error()))
+		return
+	}
+	if cancelled {
+		_ = m.workerClient.Send(workerwire.CommandCancel, workerRequestID("question-cancel"), nil)
+	}
+	m.questionDialog = nil
+}
+
+func (m *model) questionView() string {
+	d := m.questionDialog
+	if d == nil || d.index >= len(d.request.Questions) {
+		return ""
+	}
+	question := d.request.Questions[d.index]
+	var b strings.Builder
+	label := fmt.Sprintf("? %d/%d", d.index+1, len(d.request.Questions))
+	b.WriteString(youStyle.Render(label + " " + question.Question))
+	if d.other {
+		b.WriteString("\n  " + d.otherIn + "█")
+		b.WriteString(dimStyle.Render("\n  enter sends · esc back"))
+		return b.String()
+	}
+	for i, option := range question.Options {
+		b.WriteString("\n  ")
+		if i == d.sel {
+			b.WriteString(youStyle.Render("❯ " + option.Label))
+		} else {
+			b.WriteString(dimStyle.Render("  " + option.Label))
+		}
+		if option.Description != "" {
+			b.WriteString(dimStyle.Render(" — " + option.Description))
+		}
+	}
+	b.WriteString("\n  ")
+	if d.sel == len(question.Options) {
+		b.WriteString(youStyle.Render("❯ Other"))
+	} else {
+		b.WriteString(dimStyle.Render("  Other"))
+	}
+	return b.String()
 }
 
 // permKey handles keys while the dialog is open. Returns (handled).

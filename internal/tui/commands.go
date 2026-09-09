@@ -146,7 +146,7 @@ func (m *model) command(text string) (tea.Model, tea.Cmd) {
 	case "/quit", "/exit", "/q":
 		return m, tea.Quit
 	case "/detach":
-		live := m.busy || m.workerState == workerwire.StateRunning || m.workerState == workerwire.StateWaitingApproval || m.workerLiveWork
+		live := m.busy || m.workerState == workerwire.StateRunning || m.workerState == workerwire.StateWaitingApproval || m.workerState == workerwire.StateWaitingQuestion || m.workerLiveWork
 		if m.workerClient == nil || !live {
 			m.append(dimStyle.Render("(nothing running to detach)"))
 			return m, nil

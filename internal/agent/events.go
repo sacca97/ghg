@@ -1,6 +1,10 @@
 package agent
 
-import "github.com/sacca97/ghg/internal/models"
+import (
+	"context"
+
+	"github.com/sacca97/ghg/internal/models"
+)
 
 // Events receives streaming callbacks during a turn. All fields are optional.
 type Events struct {
@@ -21,6 +25,7 @@ type Events struct {
 	OnModelCallStart func(ModelCallStart)
 	OnPromptView     func(PromptView)
 	OnModelCallEnd   func(ModelCallEnd)
+	OnQuestion       func(context.Context, QuestionRequest) (QuestionResult, error)
 	// OnPlanDelta receives the streamed body of the <proposed_plan> block while
 	// the agent is in Plan mode, as it is generated. The surrounding normal text
 	// continues to stream through OnText.
@@ -102,6 +107,7 @@ func FanIn(evs ...Events) Events {
 	var hasText, hasThink, hasToolStart, hasToolOutput, hasToolEnd, hasTelemetry, hasSteer bool
 	var hasCompact, hasCompacted, hasCompactionReady, hasUsage, hasGoalUpdate, hasNotice, hasReviewProgress bool
 	var hasModelCallStart, hasPromptView, hasModelCallEnd, hasPlanDelta, hasRetry bool
+	var question func(context.Context, QuestionRequest) (QuestionResult, error)
 
 	for _, e := range evs {
 		if e.OnText != nil {
@@ -160,6 +166,9 @@ func FanIn(evs ...Events) Events {
 		}
 		if e.OnPlanDelta != nil {
 			hasPlanDelta = true
+		}
+		if question == nil && e.OnQuestion != nil {
+			question = e.OnQuestion
 		}
 	}
 
@@ -337,5 +346,6 @@ func FanIn(evs ...Events) Events {
 			}
 		}
 	}
+	out.OnQuestion = question
 	return out
 }

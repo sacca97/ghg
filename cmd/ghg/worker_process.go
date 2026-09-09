@@ -53,6 +53,8 @@ type (
 	workerConfigureRequest  = workerwire.ConfigureRequest
 	workerSnapshot          = workerwire.Snapshot
 	workerPermissionRequest = workerwire.PermissionRequest
+	workerQuestionRequest   = workerwire.QuestionRequest
+	workerQuestionAnswer    = workerwire.QuestionAnswer
 )
 
 type workerProcessState struct {
@@ -87,6 +89,8 @@ type workerProcessState struct {
 	idleTimer       *time.Timer
 	pending         map[string]*workerApprovalFlight
 	approvalSeq     atomic.Uint64
+	pendingQuestion *workerQuestionFlight
+	questionSeq     atomic.Uint64
 	done            chan struct{}
 	turns           sync.WaitGroup
 	liveMu          sync.Mutex
@@ -290,6 +294,7 @@ func newWorkerProcess(runtimeFile workerwire.Runtime) (*workerProcessState, erro
 	} else {
 		ag.Effort = defaultEffort(cfg)
 	}
+	ag.Effort = workerEffortForModel(providerName, ag.Model, ag.Effort, ag.ReasoningToggle)
 	var usage models.Usage
 	usage.PromptTokens, usage.CompletionTokens = meta.UsageIn, meta.UsageOut
 	usage.AddCached(meta.UsageCached)
@@ -461,6 +466,7 @@ func (w *workerProcessState) requestStop(interrupted bool, detail string) {
 			}
 		}
 		w.rejectApprovals("worker stopped")
+		w.rejectQuestion("worker stopped")
 		go func() {
 			w.turns.Wait()
 			w.waitTasks()

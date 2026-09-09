@@ -410,6 +410,9 @@ func (w *workerProcessState) runTurn(ctx context.Context, input workerInput) {
 		OnNotice: func(s string) { w.publish("notice", s, true) },
 		OnUsage:  func(u models.Usage) { addUsage(u); w.publish("usage", u, true) },
 		OnRetry:  func(ev models.RetryEvent) { w.publish("retry", ev, true) },
+		OnQuestion: func(questionCtx context.Context, request agent.QuestionRequest) (agent.QuestionResult, error) {
+			return w.questionGate(questionCtx, request)
+		},
 		OnGoalUpdate: func(update agent.GoalUpdate) {
 			w.persistGoalUpdate(update)
 			w.publish("goal_update", update, true)

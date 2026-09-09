@@ -161,7 +161,7 @@ func TestRunJSONStream(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	var sawText, sawDone bool
+	var sawText, sawSession, sawDone bool
 	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
 		var ev map[string]any
 		if err := json.Unmarshal([]byte(line), &ev); err != nil {
@@ -170,6 +170,11 @@ func TestRunJSONStream(t *testing.T) {
 		switch ev["type"] {
 		case "text":
 			sawText = true
+		case "session":
+			sawSession = true
+			if id, _ := ev["session_id"].(string); id == "" {
+				t.Fatal("session event has no session_id")
+			}
 		case "done":
 			sawDone = true
 			if text, _ := ev["text"].(string); text != "all done" {
@@ -177,8 +182,8 @@ func TestRunJSONStream(t *testing.T) {
 			}
 		}
 	}
-	if !sawText || !sawDone {
-		t.Fatalf("want a text event and a done event, got:\n%s", out)
+	if !sawText || !sawSession || !sawDone {
+		t.Fatalf("want session, text, and done events, got:\n%s", out)
 	}
 }
 

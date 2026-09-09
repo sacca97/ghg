@@ -136,7 +136,7 @@ func (m *model) finishTurnState() {
 func (m *model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	// The middle row of the bottom status box owns the model, effort, and mode
 	// controls, so clicks there must not fall through to transcript scrolling.
-	if m.settings == nil && m.picker == nil && m.taskVP == nil && m.permDialog == nil && m.rew == nil &&
+	if m.settings == nil && m.picker == nil && m.taskVP == nil && m.permDialog == nil && m.questionDialog == nil && m.rew == nil &&
 		m.height > 0 && msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft && msg.Y == statusInfoRow(m.height) {
 		if m.statusModelW > 0 && msg.X >= m.statusModelX && msg.X < m.statusModelX+m.statusModelW {
 			m.cycleStatusModel()
@@ -339,6 +339,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.workerState = workerwire.StateInterrupted
 			m.workerLiveWork = false
 			m.workerDetached = false
+			m.questionDialog = nil
 			m.finishTurnState()
 			m.flushThink()
 			m.thinkStart = time.Time{}
@@ -352,6 +353,12 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.permDialog = &permDialog{
 			req:      tools.GateRequest{Tool: msg.approval.Tool, Command: msg.approval.Command, Rule: msg.approval.Rule},
 			workerID: msg.approval.ID,
+		}
+		return m, nil
+
+	case workerQuestionMsg:
+		if m.questionDialog == nil {
+			m.questionDialog = &questionDialog{request: msg.request}
 		}
 		return m, nil
 

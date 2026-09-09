@@ -69,3 +69,13 @@ func TestConfigureWorkerCompactionFallsBackByRole(t *testing.T) {
 		})
 	}
 }
+
+func TestWorkerEffortForModelUsesAdvertisedEffort(t *testing.T) {
+	t.Setenv("GHG_HOME", t.TempDir())
+	if err := config.SaveCatalog("test", "", []models.ModelInfo{{ID: "model", ReasoningEfforts: []string{"low", "high"}}}); err != nil {
+		t.Fatal(err)
+	}
+	if got := workerEffortForModel("test", "model", "", false); got != "high" {
+		t.Fatalf("effort = %q, want high", got)
+	}
+}

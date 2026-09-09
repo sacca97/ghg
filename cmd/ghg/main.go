@@ -89,6 +89,8 @@ func main() {
 		fmt.Fprintln(flag.CommandLine.Output(), `
 commands:
   run       execute one headless turn
+  bridge    expose a persistent worker over newline-delimited JSON
+  models    list configured role models
   sessions  list saved sessions
   ps        list background workers
   attach    attach to a background worker
@@ -115,6 +117,16 @@ commands:
 		switch flag.Arg(0) {
 		case "run":
 			if err := runCLI(args); err != nil {
+				die(err)
+			}
+			return
+		case "bridge":
+			if err := bridgeCLI(args); err != nil {
+				die(err)
+			}
+			return
+		case "models":
+			if err := modelsCLI(args); err != nil {
 				die(err)
 			}
 			return

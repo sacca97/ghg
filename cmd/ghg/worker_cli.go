@@ -35,7 +35,7 @@ func workerPSCLI() error {
 		if runtimeErr == nil {
 			if runtimeFile.Live() {
 				live = " live"
-			} else if state.State == workerwire.StateRunning || state.State == workerwire.StateWaitingApproval || state.State == workerwire.StateStopping {
+			} else if state.State == workerwire.StateRunning || state.State == workerwire.StateWaitingApproval || state.State == workerwire.StateWaitingQuestion || state.State == workerwire.StateStopping {
 				state.State = workerwire.StateInterrupted
 				state.Detached = false
 				state.Detail = "worker exited before clean shutdown"

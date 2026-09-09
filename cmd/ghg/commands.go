@@ -2,11 +2,13 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"time"
 
 	"github.com/sacca97/ghg/internal/config"
@@ -27,6 +29,94 @@ func defaultEffort(cfg *config.Config) string {
 		return "medium"
 	}
 	return cfg.DefaultEffort
+}
+
+func modelsCLI(args []string) error {
+	fs := flag.NewFlagSet("models", flag.ContinueOnError)
+	format := fs.String("format", "text", "output format: text or json")
+	all := fs.Bool("all", false, "list all configured catalog models")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *format != "text" && *format != "json" {
+		return fmt.Errorf("unknown --format %q (want text|json)", *format)
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		return err
+	}
+	if *all {
+		choices := configuredCatalogModels(cfg)
+		if *format == "json" {
+			return json.NewEncoder(os.Stdout).Encode(choices)
+		}
+		for _, choice := range choices {
+			fmt.Printf("%s/%s\n", choice.Provider, choice.Model)
+		}
+		return nil
+	}
+	roleModels := make(map[string]string, len(config.SupportedRoles()))
+	for _, role := range config.SupportedRoles() {
+		resolved, resolveErr := cfg.ResolveRole(role)
+		if resolveErr == nil && resolved.Model != "" {
+			roleModels[role] = resolved.Model
+		}
+	}
+	if *format == "json" {
+		return json.NewEncoder(os.Stdout).Encode(roleModels)
+	}
+	for _, role := range config.SupportedRoles() {
+		if model := roleModels[role]; model != "" {
+			fmt.Printf("%s\t%s\n", role, model)
+		}
+	}
+	return nil
+}
+
+type catalogModelChoice struct {
+	Model    string `json:"model"`
+	Provider string `json:"provider"`
+}
+
+func configuredCatalogModels(cfg *config.Config) []catalogModelChoice {
+	seen := map[string]struct{}{}
+	var choices []catalogModelChoice
+	add := func(model, provider string) {
+		if model == "" || provider == "" {
+			return
+		}
+		if _, ok := cfg.Providers[provider]; !ok {
+			return
+		}
+		key := provider + "\x00" + model
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		choices = append(choices, catalogModelChoice{Model: model, Provider: provider})
+	}
+	for model, definition := range cfg.Models {
+		for _, provider := range definition.Providers {
+			add(model, provider)
+		}
+	}
+	for _, role := range config.SupportedRoles() {
+		if target, err := cfg.ResolveRole(role); err == nil {
+			add(target.Model, target.Provider)
+		}
+	}
+	for provider, catalog := range config.LoadCatalogs() {
+		for _, model := range catalog.Models {
+			add(model.ID, provider)
+		}
+	}
+	sort.Slice(choices, func(i, j int) bool {
+		if choices[i].Model != choices[j].Model {
+			return choices[i].Model < choices[j].Model
+		}
+		return choices[i].Provider < choices[j].Provider
+	})
+	return choices
 }
 
 const installURL = "https://raw.githubusercontent.com/sacca97/ghg/main/install.sh"

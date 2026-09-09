@@ -1,0 +1,80 @@
+{
+  "name": "ghg-vscode",
+  "displayName": "ghg",
+  "description": "Use ghg in a dedicated VS Code workspace view.",
+  "version": "0.1.1",
+  "publisher": "sacca97",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.95.0"
+  },
+  "categories": ["Other"],
+  "activationEvents": [
+    "onView:ghg.chatView",
+    "onCommand:ghg.newSession",
+    "onCommand:ghg.resumeSession"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "ghg",
+          "title": "ghg",
+          "icon": "./media/ghg.svg"
+        }
+      ]
+    },
+    "views": {
+      "ghg": [
+        {
+          "type": "webview",
+          "id": "ghg.chatView",
+          "name": "Chat"
+        }
+      ]
+    },
+    "menus": {
+      "view/title": [
+        {
+          "command": "ghg.newSession",
+          "when": "view == ghg.chatView",
+          "group": "navigation@1"
+        },
+        {
+          "command": "ghg.resumeSession",
+          "when": "view == ghg.chatView",
+          "group": "navigation@2"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "ghg.newSession",
+        "title": "ghg: New Session"
+      },
+      {
+        "command": "ghg.resumeSession",
+        "title": "ghg: Resume Session"
+      }
+    ],
+    "configuration": {
+      "title": "ghg",
+      "properties": {
+        "ghg.binaryPath": {
+          "type": "string",
+          "default": "ghg",
+          "description": "Path to the ghg executable."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ."
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/vscode": "^1.95.0",
+    "typescript": "^5.7.0"
+  }
+}

@@ -8,7 +8,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"reflect"
 	"strings"
 	"testing"
 
@@ -181,13 +180,80 @@ func TestAskModeAnswersWithReadOnlyTools(t *testing.T) {
 	}
 }
 
-func TestReadOnlyModesCloseAfterFinalEvidenceBatch(t *testing.T) {
+func TestInteractivePlanAskUserResumesOnce(t *testing.T) {
+	backend := &questionBackend{}
+	ag := New(backend, "model", 100, "system")
+	ag.PlanMode = true
+	runtime, err := tools.NewToolRuntime(nil, tools.ApprovalAsk, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ag.Runtime = runtime
+	asked := 0
+	final, err := ag.TurnAuthored(context.Background(), "make a plan", Events{
+		OnQuestion: func(_ context.Context, request QuestionRequest) (QuestionResult, error) {
+			asked++
+			if len(request.Questions) != 1 || request.Questions[0].ID != "scope" {
+				t.Fatalf("unexpected question request: %+v", request)
+			}
+			return QuestionResult{Answers: []QuestionAnswer{{ID: "scope", Value: "Current package"}}}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if asked != 1 || backend.calls != 3 {
+		t.Fatalf("question callbacks/model calls = %d/%d, want 1/3", asked, backend.calls)
+	}
+	if !strings.Contains(final, "<proposed_plan>") {
+		t.Fatalf("final = %q", final)
+	}
+	if !strings.Contains(backend.toolResults, "ask_user may be called only once") {
+		t.Fatalf("second ask_user call was not rejected: %q", backend.toolResults)
+	}
+}
+
+type questionBackend struct {
+	calls       int
+	toolResults string
+}
+
+func (b *questionBackend) Stream(_ context.Context, req models.Request, _ models.EventSink) (models.Message, models.Usage, error) {
+	b.calls++
+	for _, message := range req.Messages {
+		if message.Role == "tool" {
+			b.toolResults += message.Content
+		}
+	}
+	switch b.calls {
+	case 1:
+		return questionCall("q1", `{"questions":[{"id":"scope","question":"Which scope should the plan cover?","options":[{"label":"Current package"},{"label":"Whole repository"}]}]}`), models.Usage{}, nil
+	case 2:
+		return questionCall("q2", `{"questions":[{"id":"again","question":"Ask again?","options":[{"label":"Yes"},{"label":"No"}]}]}`), models.Usage{}, nil
+	default:
+		return models.Message{Role: "assistant", Content: "<proposed_plan>done</proposed_plan>"}, models.Usage{}, nil
+	}
+}
+
+func questionCall(id, args string) models.Message {
+	return models.Message{Role: "assistant", ToolCalls: []models.ToolCall{{
+		ID: id, Type: "function", Function: struct {
+			Name      string `json:"name"`
+			Arguments string `json:"arguments"`
+		}{Name: "ask_user", Arguments: args},
+	}}}
+}
+
+func (b *questionBackend) Complete(context.Context, models.Request) (models.Message, models.Usage, error) {
+	return models.Message{}, models.Usage{}, nil
+}
+
+func TestReadOnlyModesKeepExploringAfterCheckpoints(t *testing.T) {
 	reviewArgs := `{"summary":"all clean","verdict":"approve","findings":[]}`
 	cases := []struct {
 		name       string
 		configure  func(*Agent)
 		final      models.Message
-		wantTools  []string
 		wantResult string
 	}{
 		{
@@ -205,7 +271,6 @@ func TestReadOnlyModesCloseAfterFinalEvidenceBatch(t *testing.T) {
 					Arguments string `json:"arguments"`
 				}{Name: "submit_review", Arguments: reviewArgs},
 			}}},
-			wantTools:  []string{"submit_review"},
 			wantResult: reviewArgs,
 		},
 		{
@@ -218,7 +283,7 @@ func TestReadOnlyModesCloseAfterFinalEvidenceBatch(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			responses := readOnlyCheckpointResponses(tc.final)
-			wantCalls := 12
+			wantCalls := 26
 			if tc.name == "review" {
 				// ReviewMode has its own scope-aware boundary coordinator; this
 				// table only checks the immediate terminal handoff for that mode.
@@ -249,15 +314,29 @@ func TestReadOnlyModesCloseAfterFinalEvidenceBatch(t *testing.T) {
 				}
 				return
 			}
-			if !requestContains(backend.requests[10], `<exploration_checkpoint level="1">`) {
-				t.Fatal("final evidence request lacks the checkpoint reminder")
+			for _, checkpoint := range []struct {
+				request int
+				level   int
+			}{
+				{request: 10, level: 1},
+				{request: 16, level: 2},
+				{request: 24, level: 3},
+			} {
+				if !requestContains(backend.requests[checkpoint.request], fmt.Sprintf(`level="%d"`, checkpoint.level)) {
+					t.Fatalf("request %d lacks checkpoint level %d reminder", checkpoint.request+1, checkpoint.level)
+				}
+				if len(backend.requests[checkpoint.request].Tools) != 2 {
+					t.Fatalf("request %d lost read-only tools: %+v", checkpoint.request+1, backend.requests[checkpoint.request].Tools)
+				}
 			}
-			gotTools := make([]string, 0, len(backend.requests[11].Tools))
-			for _, tool := range backend.requests[11].Tools {
-				gotTools = append(gotTools, tool.Function.Name)
+			toolResults := 0
+			for _, message := range ag.MessagesSnapshot() {
+				if message.Role == "tool" {
+					toolResults++
+				}
 			}
-			if len(gotTools) != len(tc.wantTools) || (len(gotTools) > 0 && !reflect.DeepEqual(gotTools, tc.wantTools)) {
-				t.Fatalf("synthesis tools = %v, want %v", gotTools, tc.wantTools)
+			if toolResults != 25 {
+				t.Fatalf("executed tool calls = %d, want 25", toolResults)
 			}
 		})
 	}
@@ -270,8 +349,8 @@ func readOnlyCheckpointResponses(final models.Message) []models.Message {
 			Arguments string `json:"arguments"`
 		}{Name: "read", Arguments: fmt.Sprintf(`{"path":"file-%d.go"}`, n)}}
 	}
-	responses := make([]models.Message, 0, 12)
-	for i := 0; i < 11; i++ {
+	responses := make([]models.Message, 0, 26)
+	for i := 0; i < 25; i++ {
 		responses = append(responses, models.Message{Role: "assistant", ToolCalls: []models.ToolCall{read(fmt.Sprintf("read-%d", i), i)}})
 	}
 	return append(responses, final)

@@ -30,8 +30,9 @@ const (
 )
 
 const (
-	EventPlanDelta = "plan_delta"
-	EventShellDone = "shell_done"
+	EventPlanDelta       = "plan_delta"
+	EventShellDone       = "shell_done"
+	EventQuestionRequest = "question_request"
 )
 
 const (
@@ -39,6 +40,7 @@ const (
 	CommandCancel          = "cancel"
 	CommandInput           = "input"
 	CommandApprove         = "approve"
+	CommandAnswerQuestion  = "answer_question"
 	CommandConfigure       = "configure"
 	CommandCompact         = "compact"
 	CommandStop            = "stop"
@@ -255,7 +257,7 @@ func knownType(kind string) bool {
 
 func knownCommand(name string) bool {
 	switch name {
-	case CommandDetach, CommandCancel, CommandInput, CommandApprove,
+	case CommandDetach, CommandCancel, CommandInput, CommandApprove, CommandAnswerQuestion,
 		CommandConfigure, CommandCompact,
 		CommandStop, CommandPing, CommandLSPStatus, CommandMCPStatus,
 		CommandMCPReconnect, CommandMCPEnable, CommandMCPDisable, CommandContextDoctor, CommandRewind,

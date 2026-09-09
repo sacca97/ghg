@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -8,6 +9,92 @@ import (
 	"github.com/sacca97/ghg/internal/models"
 	"github.com/sacca97/ghg/internal/tools"
 )
+
+// QuestionRequest is one bounded clarification batch for an interactive plan.
+type QuestionRequest struct {
+	Questions []Question `json:"questions"`
+}
+
+type Question struct {
+	ID       string           `json:"id"`
+	Question string           `json:"question"`
+	Options  []QuestionOption `json:"options"`
+}
+
+type QuestionOption struct {
+	Label       string `json:"label"`
+	Description string `json:"description,omitempty"`
+}
+
+type QuestionAnswer struct {
+	ID    string `json:"id"`
+	Value string `json:"value"`
+}
+
+type QuestionResult struct {
+	Answers []QuestionAnswer `json:"answers"`
+}
+
+func (r QuestionRequest) Validate() error {
+	if len(r.Questions) == 0 || len(r.Questions) > 3 {
+		return fmt.Errorf("ask_user requires 1 to 3 questions")
+	}
+	seen := make(map[string]struct{}, len(r.Questions))
+	for i, question := range r.Questions {
+		id := strings.TrimSpace(question.ID)
+		if id == "" || len(id) > 64 {
+			return fmt.Errorf("question %d has an invalid id", i+1)
+		}
+		if _, ok := seen[id]; ok {
+			return fmt.Errorf("question id %q is repeated", id)
+		}
+		seen[id] = struct{}{}
+		if strings.TrimSpace(question.Question) == "" || len(question.Question) > 240 {
+			return fmt.Errorf("question %d is empty or too long", i+1)
+		}
+		if len(question.Options) < 2 || len(question.Options) > 3 {
+			return fmt.Errorf("question %d requires 2 or 3 options", i+1)
+		}
+		for j, option := range question.Options {
+			if strings.TrimSpace(option.Label) == "" || len(option.Label) > 100 {
+				return fmt.Errorf("question %d option %d is empty or too long", i+1, j+1)
+			}
+			if len(option.Description) > 200 {
+				return fmt.Errorf("question %d option %d description is too long", i+1, j+1)
+			}
+		}
+	}
+	return nil
+}
+
+func askUserTool(ask func(context.Context, QuestionRequest) (QuestionResult, error), claim func() bool) tools.Tool {
+	return tools.Tool{
+		Def: models.NewTool("ask_user",
+			"Ask only when the answer would materially change the plan and cannot be safely inferred. Otherwise make a reasonable assumption. Combine all necessary questions into one call.",
+			`{"type":"object","properties":{"questions":{"type":"array","minItems":1,"maxItems":3,"items":{"type":"object","properties":{"id":{"type":"string"},"question":{"type":"string"},"options":{"type":"array","minItems":2,"maxItems":3,"items":{"type":"object","properties":{"label":{"type":"string"},"description":{"type":"string"}},"required":["label"],"additionalProperties":false}}},"required":["id","question","options"],"additionalProperties":false}}},"required":["questions"],"additionalProperties":false}`),
+		RunResult: func(ctx context.Context, args json.RawMessage) (tools.ToolResult, error) {
+			if !claim() {
+				return tools.ToolResult{}, fmt.Errorf("ask_user may be called only once per planning turn")
+			}
+			var request QuestionRequest
+			if err := json.Unmarshal(args, &request); err != nil {
+				return tools.ToolResult{}, fmt.Errorf("invalid ask_user request: %w", err)
+			}
+			if err := request.Validate(); err != nil {
+				return tools.ToolResult{}, err
+			}
+			result, err := ask(ctx, request)
+			if err != nil {
+				return tools.ToolResult{}, err
+			}
+			data, err := json.Marshal(result)
+			if err != nil {
+				return tools.ToolResult{}, err
+			}
+			return tools.TextResult(string(data), string(data)), nil
+		},
+	}
+}
 
 // Plan is the structured result produced by the planning workflow. Steps are
 // deliberately plain text: todowrite owns execution state, while acceptance
@@ -116,6 +203,8 @@ const planModePrompt = `You are planning in a read-only collaboration mode. Use 
 Use grep for text, structural_search for syntax-aware code shapes, lsp for semantic symbol questions, and read only for the exact source needed. Prefer composite lsp operations when they eliminate an otherwise deterministic locate→navigate→read sequence.
 
 Inspect only the code necessary to understand requirements, locate relevant components, and resolve ambiguity. Reuse evidence already gathered and do not reread unchanged source. Once the remaining uncertainties cannot materially change the implementation decisions, stop exploring and produce the plan.
+
+If clarification is unavailable, make reasonable assumptions and state them in the plan.
 
 When the user message contains a tagged-path note, treat its paths as the authoritative scope inventory. Inspect those paths directly; do not use glob or find_files to rediscover them, and do not call both for the same target.
 

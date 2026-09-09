@@ -27,12 +27,29 @@ const (
 )
 
 type structuralSearchArgs struct {
-	Patterns   []string `json:"patterns"`
-	Language   string   `json:"language"`
-	Path       string   `json:"path"`
-	MaxResults int      `json:"max_results"`
-	Cursor     string   `json:"cursor"`
-	Observe    bool     `json:"observe"`
+	Patterns   stringList `json:"patterns"`
+	Language   string     `json:"language"`
+	Path       string     `json:"path"`
+	MaxResults int        `json:"max_results"`
+	Cursor     string     `json:"cursor"`
+	Observe    bool       `json:"observe"`
+}
+
+// stringList tolerates models collapsing a one-item list to a scalar.
+type stringList []string
+
+func (s *stringList) UnmarshalJSON(data []byte) error {
+	var many []string
+	if err := json.Unmarshal(data, &many); err == nil {
+		*s = many
+		return nil
+	}
+	var one string
+	if err := json.Unmarshal(data, &one); err != nil {
+		return err
+	}
+	*s = stringList{one}
+	return nil
 }
 
 func structuralSearchTool() Tool {
@@ -60,7 +77,7 @@ func runStructuralSearchResult(ctx context.Context, args json.RawMessage) (ToolR
 	if strings.TrimSpace(a.Language) == "" {
 		return ToolResult{}, errors.New("language is required")
 	}
-	query := search.Query{Language: a.Language, Patterns: a.Patterns}
+	query := search.Query{Language: a.Language, Patterns: []string(a.Patterns)}
 	matcher, err := search.Compile(query)
 	if err != nil {
 		return ToolResult{}, err

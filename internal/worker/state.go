@@ -17,6 +17,7 @@ const (
 	StateIdle            State = "idle"
 	StateRunning         State = "running"
 	StateWaitingApproval State = "waiting_for_approval"
+	StateWaitingQuestion State = "waiting_for_question"
 	StateStopping        State = "stopping"
 	StateInterrupted     State = "interrupted"
 )

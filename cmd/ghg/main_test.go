@@ -460,3 +460,50 @@ func TestWorkerHumanGateAndPermRules(t *testing.T) {
 		t.Fatalf("expected 0 pending flights, got %d", pendingLen)
 	}
 }
+
+func TestWorkerQuestionRoundTrip(t *testing.T) {
+	w := &workerProcessState{}
+	request := agent.QuestionRequest{Questions: []agent.Question{{
+		ID: "scope", Question: "Which scope?", Options: []agent.QuestionOption{{Label: "package"}, {Label: "repo"}},
+	}}}
+	done := make(chan struct{})
+	var result agent.QuestionResult
+	var resultErr error
+	go func() {
+		result, resultErr = w.questionGate(context.Background(), request)
+		close(done)
+	}()
+
+	var id string
+	for i := 0; i < 50; i++ {
+		time.Sleep(10 * time.Millisecond)
+		w.mu.Lock()
+		if w.pendingQuestion != nil {
+			id = w.pendingQuestion.request.ID
+		}
+		w.mu.Unlock()
+		if id != "" {
+			break
+		}
+	}
+	if id == "" {
+		t.Fatal("expected pending question")
+	}
+	w.mu.Lock()
+	state := w.state
+	w.mu.Unlock()
+	if state != workerwire.StateWaitingQuestion {
+		t.Fatalf("state = %q, want waiting_for_question", state)
+	}
+	if !w.answerQuestion(workerwire.QuestionAnswerRequest{ID: id, Answers: []workerwire.QuestionAnswer{{ID: "scope", Value: "package"}}}) {
+		t.Fatal("answerQuestion returned false")
+	}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("question did not resume")
+	}
+	if resultErr != nil || len(result.Answers) != 1 || result.Answers[0].Value != "package" {
+		t.Fatalf("question result = %+v, err=%v", result, resultErr)
+	}
+}

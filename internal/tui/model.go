@@ -92,6 +92,7 @@ type workerErrorMsg struct {
 	generation uint64
 }
 type workerPermissionMsg struct{ approval workerwire.Approval }
+type workerQuestionMsg struct{ request workerwire.QuestionRequest }
 type workerCompactDoneMsg struct {
 	err           error
 	usage         models.Usage
@@ -202,7 +203,8 @@ type model struct {
 
 	iactive *interactive // in-flight interactive command; nil when idle
 
-	permDialog *permDialog // open permission modal; the turn is paused on it
+	permDialog     *permDialog // open permission modal; the turn is paused on it
+	questionDialog *questionDialog
 
 	tasksFocus       bool      // the tasks dock owns ↑/↓/enter/esc instead of the input
 	taskSel          int       // selected row in the dock (index into newest-first tasks)
@@ -215,6 +217,7 @@ type model struct {
 	frameThinking    string
 	frameInteractive string
 	framePermission  string
+	frameQuestion    string
 	frameRewind      string
 
 	rew    *rewindState     // open rewind picker (double-esc while idle)

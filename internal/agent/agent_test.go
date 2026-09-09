@@ -1100,7 +1100,7 @@ func TestExplorationCheckpointsAreTransientAndBlockPendingTools(t *testing.T) {
 	}
 }
 
-func TestReadOnlyFinalEvidenceMalformedBatchRetriesOnce(t *testing.T) {
+func TestReadOnlyCheckpointMalformedBatchRetriesNormally(t *testing.T) {
 	call := func(id, args string) models.ToolCall {
 		return models.ToolCall{ID: id, Type: "function", Function: struct {
 			Name      string `json:"name"`
@@ -1139,11 +1139,11 @@ func TestReadOnlyFinalEvidenceMalformedBatchRetriesOnce(t *testing.T) {
 	if len(backend.requests) != 13 {
 		t.Fatalf("model calls = %d, want 13", len(backend.requests))
 	}
-	if got := executed.Load(); got != 10 {
-		t.Fatalf("executed reads = %d, want 10 (9 initial plus one retry)", got)
+	if got := executed.Load(); got != 11 {
+		t.Fatalf("executed reads = %d, want 11 (checkpoint batch plus retry)", got)
 	}
-	if len(backend.requests[12].Tools) != 0 {
-		t.Fatalf("synthesis request exposed tools: %+v", backend.requests[12].Tools)
+	if len(backend.requests[12].Tools) == 0 {
+		t.Fatal("read-only checkpoint should not disable tools before budget finalization")
 	}
 }
 

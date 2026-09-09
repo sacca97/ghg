@@ -26,6 +26,14 @@ type workerApprovalFlight struct {
 	once     sync.Once
 }
 
+type workerQuestionFlight struct {
+	done    chan struct{}
+	request workerQuestionRequest
+	answers []workerQuestionAnswer
+	err     error
+	once    sync.Once
+}
+
 func (w *workerProcessState) Snapshot(context.Context) (any, error) {
 	w.mu.Lock()
 	state, detached, activeTool := w.state, w.detached, w.activeTool
@@ -48,7 +56,7 @@ func (w *workerProcessState) Snapshot(context.Context) (any, error) {
 		Role: role, Protocol: protocol, Effort: effort, Mode: mode,
 		ContextLimit: contextLimit, ContextTokens: ag.ContextTokens(),
 		Usage: ag.Usage(), Messages: boundedWorkerMessages(ag.MessagesSnapshot()),
-		Tasks: w.taskStates(), Pending: w.pendingState(), ActiveTool: activeTool,
+		Tasks: w.taskStates(), Pending: w.pendingState(), PendingQuestion: w.pendingQuestionState(), ActiveTool: activeTool,
 		LiveText: live.text, LiveThink: live.think, LiveTool: live.tool, LivePlan: live.plan,
 	}, nil
 }
@@ -79,6 +87,15 @@ func (w *workerProcessState) Command(_ context.Context, command workerwire.Comma
 		}
 		if !w.answerApproval(answer) {
 			return workerwire.CommandResult{}, errors.New("approval request is no longer pending")
+		}
+		return workerwire.CommandResult{Payload: json.RawMessage(`{"accepted":true}`)}, nil
+	case workerwire.CommandAnswerQuestion:
+		var answer workerwire.QuestionAnswerRequest
+		if err := json.Unmarshal(command.Payload, &answer); err != nil {
+			return workerwire.CommandResult{}, errors.New("question answer is invalid")
+		}
+		if !w.answerQuestion(answer) {
+			return workerwire.CommandResult{}, errors.New("question request is no longer pending")
 		}
 		return workerwire.CommandResult{Payload: json.RawMessage(`{"accepted":true}`)}, nil
 	case workerwire.CommandConfigure:
@@ -208,7 +225,7 @@ func (w *workerProcessState) Command(_ context.Context, command workerwire.Comma
 		return workerwire.CommandResult{Payload: data}, nil
 	case workerwire.CommandDetach:
 		w.mu.Lock()
-		allowed := w.state == workerwire.StateRunning || w.state == workerwire.StateWaitingApproval || w.hasLiveWork()
+		allowed := w.state == workerwire.StateRunning || w.state == workerwire.StateWaitingApproval || w.state == workerwire.StateWaitingQuestion || w.hasLiveWork()
 		w.mu.Unlock()
 		if !allowed {
 			return workerwire.CommandResult{}, errors.New("nothing running to detach")
@@ -377,6 +394,11 @@ func (w *workerProcessState) configure(request workerConfigureRequest) error {
 		w.mu.Unlock()
 		return err
 	}
+	effort := w.ag.Effort
+	if !request.UpdateEffort {
+		effort = workerEffortForModel(resolvedProvider, candidate.Model, effort, candidate.ReasoningToggle)
+	}
+	effortChanged := effort != w.ag.Effort
 	w.ag.Backend = candidate.Backend
 	w.ag.Model = candidate.Model
 	w.ag.ModelName = resolvedModel
@@ -388,8 +410,9 @@ func (w *workerProcessState) configure(request workerConfigureRequest) error {
 	w.ag.SubagentFactory = candidate.SubagentFactory
 	w.ag.Role = role
 	if request.UpdateEffort {
-		w.ag.Effort = request.Effort
+		effort = request.Effort
 	}
+	w.ag.Effort = effort
 	if request.Mode != "" {
 		w.mode = request.Mode
 		w.ag.PlanMode = (request.Mode == "plan")
@@ -399,7 +422,6 @@ func (w *workerProcessState) configure(request workerConfigureRequest) error {
 	}
 	w.modelName, w.provider, w.role = resolvedModel, resolvedProvider, role
 	configureWorkerCompaction(w.ag, w.cfg, w.profiles, systemPrompt)
-	effort := w.ag.Effort
 	protocol := w.ag.Protocol
 	modelID := w.ag.Model
 	mode := w.mode
@@ -407,7 +429,7 @@ func (w *workerProcessState) configure(request workerConfigureRequest) error {
 	w.mu.Unlock()
 	if w.store != nil {
 		_ = w.store.SetRoute(w.sessionID, resolvedModel, resolvedProvider)
-		if request.UpdateEffort {
+		if request.UpdateEffort || effortChanged {
 			_ = w.store.SetEffort(w.sessionID, effort)
 		}
 	}
@@ -418,6 +440,44 @@ func (w *workerProcessState) configure(request workerConfigureRequest) error {
 	}, true)
 	w.setState(state, detached, "route changed")
 	return nil
+}
+
+func workerEffortForModel(provider, model, current string, toggle bool) string {
+	current = strings.TrimSpace(current)
+	if strings.EqualFold(current, "off") || strings.EqualFold(current, "none") {
+		current = ""
+	}
+	info := config.LoadCatalogs()[provider].Find(model)
+	if info == nil || (!info.ReasoningKnown && len(info.ReasoningEfforts) == 0 && !info.ReasoningToggle && !toggle) {
+		return current
+	}
+	levels := []string{""}
+	if info.ReasoningToggle && len(info.ReasoningEfforts) == 0 {
+		levels = append(levels, "on")
+	} else {
+		for _, effort := range info.ReasoningEfforts {
+			effort = strings.TrimSpace(effort)
+			if effort == "" || strings.EqualFold(effort, "off") || strings.EqualFold(effort, "none") {
+				continue
+			}
+			seen := false
+			for _, level := range levels {
+				if level == effort {
+					seen = true
+					break
+				}
+			}
+			if !seen {
+				levels = append(levels, effort)
+			}
+		}
+	}
+	for _, level := range levels {
+		if current != "" && strings.EqualFold(level, current) {
+			return level
+		}
+	}
+	return levels[len(levels)-1]
 }
 
 func (w *workerProcessState) Attached(context.Context) {
@@ -486,6 +546,83 @@ func (w *workerProcessState) humanGate(req tools.GateRequest) (tools.GateDecisio
 	return decision, redirect
 }
 
+func (w *workerProcessState) questionGate(ctx context.Context, request agent.QuestionRequest) (agent.QuestionResult, error) {
+	questions := make([]workerwire.Question, len(request.Questions))
+	for i, question := range request.Questions {
+		options := make([]workerwire.QuestionOption, len(question.Options))
+		for j, option := range question.Options {
+			options[j] = workerwire.QuestionOption{Label: option.Label, Description: option.Description}
+		}
+		questions[i] = workerwire.Question{ID: question.ID, Question: question.Question, Options: options}
+	}
+	id := fmt.Sprintf("question-%d", w.questionSeq.Add(1))
+	flight := &workerQuestionFlight{done: make(chan struct{}), request: workerQuestionRequest{ID: id, Questions: questions}}
+	w.mu.Lock()
+	if w.pendingQuestion != nil {
+		w.mu.Unlock()
+		return agent.QuestionResult{}, errors.New("another question is already pending")
+	}
+	w.pendingQuestion = flight
+	w.mu.Unlock()
+	w.transition(func() (workerwire.State, bool, string, bool) {
+		return workerwire.StateWaitingQuestion, w.detached, "question requested", true
+	})
+	w.publish(workerwire.EventQuestionRequest, flight.request, true)
+	select {
+	case <-flight.done:
+	case <-ctx.Done():
+		flight.once.Do(func() {
+			flight.err = ctx.Err()
+			close(flight.done)
+		})
+	}
+	w.transition(func() (workerwire.State, bool, string, bool) {
+		if w.pendingQuestion == flight {
+			w.pendingQuestion = nil
+		}
+		if w.stopRequested {
+			return w.state, w.detached, "", false
+		}
+		return workerwire.StateRunning, w.detached, "question answered", true
+	})
+	if flight.err != nil {
+		return agent.QuestionResult{}, flight.err
+	}
+	answers := make([]agent.QuestionAnswer, len(flight.answers))
+	for i, answer := range flight.answers {
+		answers[i] = agent.QuestionAnswer{ID: answer.ID, Value: answer.Value}
+	}
+	return agent.QuestionResult{Answers: answers}, nil
+}
+
+func (w *workerProcessState) answerQuestion(answer workerwire.QuestionAnswerRequest) bool {
+	w.mu.Lock()
+	flight := w.pendingQuestion
+	w.mu.Unlock()
+	if flight == nil || flight.request.ID != answer.ID {
+		return false
+	}
+	if !answer.Cancelled {
+		if len(answer.Answers) != len(flight.request.Questions) {
+			return false
+		}
+		for i, value := range answer.Answers {
+			if value.ID != flight.request.Questions[i].ID || strings.TrimSpace(value.Value) == "" || len(value.Value) > 4096 {
+				return false
+			}
+		}
+	}
+	flight.once.Do(func() {
+		if answer.Cancelled {
+			flight.err = context.Canceled
+		} else {
+			flight.answers = append([]workerwire.QuestionAnswer(nil), answer.Answers...)
+		}
+		close(flight.done)
+	})
+	return true
+}
+
 func (w *workerProcessState) answerApproval(answer workerApprovalAnswer) bool {
 	w.mu.Lock()
 	flight := w.pending[answer.ID]
@@ -533,6 +670,18 @@ func (w *workerProcessState) rejectApprovals(reason string) {
 	}
 }
 
+func (w *workerProcessState) rejectQuestion(reason string) {
+	w.mu.Lock()
+	flight := w.pendingQuestion
+	w.mu.Unlock()
+	if flight != nil {
+		flight.once.Do(func() {
+			flight.err = errors.New(reason)
+			close(flight.done)
+		})
+	}
+}
+
 func (w *workerProcessState) pendingState() *workerApproval {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -540,6 +689,17 @@ func (w *workerProcessState) pendingState() *workerApproval {
 		return &request.request
 	}
 	return nil
+}
+
+func (w *workerProcessState) pendingQuestionState() *workerQuestionRequest {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.pendingQuestion == nil {
+		return nil
+	}
+	request := w.pendingQuestion.request
+	request.Questions = append([]workerwire.Question(nil), request.Questions...)
+	return &request
 }
 
 const workerLiveTailBytes = 128 << 10

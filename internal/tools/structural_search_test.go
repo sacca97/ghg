@@ -86,6 +86,25 @@ func TestStructuralSearchPaginatesAndAuthorizesVisibleEdit(t *testing.T) {
 	}
 }
 
+func TestStructuralSearchAcceptsSinglePattern(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "sample.go"), []byte("package p\n\nfunc first() {}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(map[string]any{
+		"patterns": "func $NAME() { $$$BODY }",
+		"language": "go",
+		"path":     dir,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := ExecuteResult(context.Background(), All(), "structural_search", data)
+	if result.ExitCode != 0 || !strings.Contains(result.Preview, "func first()") {
+		t.Fatalf("single-pattern structural search = %+v", result)
+	}
+}
+
 func TestStructuralSearchDoesNotIssueStaleObservation(t *testing.T) {
 	dir := t.TempDir()
 	file := filepath.Join(dir, "sample.go")

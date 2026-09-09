@@ -79,7 +79,7 @@ func workerError(message string) error {
 }
 
 func workerStateBusy(state workerwire.State) bool {
-	return state == workerwire.StateRunning || state == workerwire.StateWaitingApproval
+	return state == workerwire.StateRunning || state == workerwire.StateWaitingApproval || state == workerwire.StateWaitingQuestion
 }
 
 func (m *model) attachWorkerClient(client *workerwire.Client, runtimeFile workerwire.Runtime) uint64 {
@@ -269,7 +269,7 @@ func (m *model) monitorWorker(proc *workerwire.Process, runtimeFile workerwire.R
 		err := proc.Wait()
 		if state, stateErr := runtimeFile.ReadState(); stateErr == nil {
 			switch state.State {
-			case workerwire.StateRunning, workerwire.StateWaitingApproval, workerwire.StateStopping:
+			case workerwire.StateRunning, workerwire.StateWaitingApproval, workerwire.StateWaitingQuestion, workerwire.StateStopping:
 				_ = runtimeFile.WriteState(workerwire.StateRecord{
 					SessionID: runtimeFile.SessionID, State: workerwire.StateInterrupted,
 					Role: state.Role, PID: proc.PID(), Detail: "worker exited before clean shutdown",
@@ -633,6 +633,9 @@ func (m *model) applyWorkerSnapshot(snapshot workerwire.Snapshot) {
 			workerID: snapshot.Pending.ID,
 		}
 	}
+	if snapshot.PendingQuestion != nil && m.questionDialog == nil {
+		m.questionDialog = &questionDialog{request: *snapshot.PendingQuestion}
+	}
 }
 
 func (m *model) workerEvent(event workerEvent) tea.Cmd {
@@ -784,6 +787,10 @@ func (m *model) workerEvent(event workerEvent) tea.Cmd {
 			return func() tea.Msg {
 				return workerPermissionMsg{approval: value.Approval}
 			}
+		}
+	case workerwire.EventQuestionRequest:
+		if value, ok := decodeEvent[workerwire.QuestionRequest](event.Data); ok {
+			return func() tea.Msg { return workerQuestionMsg{request: value} }
 		}
 	case "turn_done":
 		search.InvalidateFileIndex(m.workingDirectory())

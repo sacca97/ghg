@@ -393,6 +393,9 @@ func runCLI(args []string) error {
 		ag.SetObservationStore(store)
 		ag.SetSearchStore(store)
 	}
+	if emit != nil && sessionID != "" {
+		emit(map[string]string{"type": "session", "session_id": sessionID})
+	}
 	ag.SetSessionID(sessionID)
 	if err := ag.BindState(ctx); err != nil {
 		return fmt.Errorf("bind session tool state: %w", err)
