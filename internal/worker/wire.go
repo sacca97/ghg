@@ -150,29 +150,57 @@ type PermissionRequest struct {
 	Approval Approval `json:"approval"`
 }
 
+type QuestionOption struct {
+	Label       string `json:"label"`
+	Description string `json:"description,omitempty"`
+}
+
+type Question struct {
+	ID       string           `json:"id"`
+	Question string           `json:"question"`
+	Options  []QuestionOption `json:"options"`
+}
+
+type QuestionRequest struct {
+	ID        string     `json:"id"`
+	Questions []Question `json:"questions"`
+}
+
+type QuestionAnswer struct {
+	ID    string `json:"id"`
+	Value string `json:"value"`
+}
+
+type QuestionAnswerRequest struct {
+	ID        string           `json:"id"`
+	Answers   []QuestionAnswer `json:"answers,omitempty"`
+	Cancelled bool             `json:"cancelled,omitempty"`
+}
+
 // Snapshot is the full controller-attach state.
 type Snapshot struct {
-	SessionID     string           `json:"session_id"`
-	State         State            `json:"state"`
-	Detached      bool             `json:"detached"`
-	Model         string           `json:"model"`
-	ModelName     string           `json:"model_name"`
-	Provider      string           `json:"provider"`
-	Role          string           `json:"role,omitempty"`
-	Protocol      string           `json:"protocol,omitempty"`
-	Effort        string           `json:"effort,omitempty"`
-	ContextLimit  int              `json:"context_limit,omitempty"`
-	ContextTokens int              `json:"context_tokens"`
-	Usage         models.Usage     `json:"usage"`
-	Messages      []models.Message `json:"messages,omitempty"`
-	Tasks         []TaskState      `json:"tasks,omitempty"`
-	Pending       *Approval        `json:"pending_approval,omitempty"`
-	ActiveTool    string           `json:"active_tool,omitempty"`
-	LiveText      string           `json:"live_text,omitempty"`
-	LiveThink     string           `json:"live_think,omitempty"`
-	LiveTool      string           `json:"live_tool_output,omitempty"`
-	Mode          string           `json:"mode,omitempty"`
-	LivePlan      string           `json:"live_plan,omitempty"`
+	SessionID       string           `json:"session_id"`
+	State           State            `json:"state"`
+	Detached        bool             `json:"detached"`
+	Model           string           `json:"model"`
+	ModelName       string           `json:"model_name"`
+	Provider        string           `json:"provider"`
+	Role            string           `json:"role,omitempty"`
+	Protocol        string           `json:"protocol,omitempty"`
+	Effort          string           `json:"effort,omitempty"`
+	ContextLimit    int              `json:"context_limit,omitempty"`
+	ContextTokens   int              `json:"context_tokens"`
+	Usage           models.Usage     `json:"usage"`
+	Messages        []models.Message `json:"messages,omitempty"`
+	Tasks           []TaskState      `json:"tasks,omitempty"`
+	Pending         *Approval        `json:"pending_approval,omitempty"`
+	PendingQuestion *QuestionRequest `json:"pending_question,omitempty"`
+	ActiveTool      string           `json:"active_tool,omitempty"`
+	LiveText        string           `json:"live_text,omitempty"`
+	LiveThink       string           `json:"live_think,omitempty"`
+	LiveTool        string           `json:"live_tool_output,omitempty"`
+	Mode            string           `json:"mode,omitempty"`
+	LivePlan        string           `json:"live_plan,omitempty"`
 }
 
 // AppendRequest carries a local context message (shell-escape output) to the
