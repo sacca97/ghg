@@ -245,6 +245,14 @@ func TestRenderChatMarkdownAndJSON(t *testing.T) {
 			Phase: "inventory", Allocation: 10, HardLimit: 38,
 			Inventory: &agent.ReviewInventory{Files: []string{"internal/agent/agent.go"}},
 		}},
+		Telemetry: []session.TelemetryEvent{{
+			Seq: 1, Kind: "model_call_start", Payload: json.RawMessage(`{"model":"m"}`),
+			CreatedAt: time.Date(2026, 9, 9, 12, 0, 0, 0, time.UTC),
+		}},
+		ReviewFailures: []session.WorkflowResultRecord{{
+			ResultID: "failure-1", Kind: "review_failure", Model: "qwen-flash", Provider: "qwen",
+			Payload: `{"error":"review evidence was retained but final submission failed: timeout"}`,
+		}},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -252,11 +260,11 @@ func TestRenderChatMarkdownAndJSON(t *testing.T) {
 	withProgress := record
 	withProgress.Payload = string(progressPayload)
 	progressMD, err := RenderResult(withProgress, FormatMarkdown)
-	if err != nil || !strings.Contains(string(progressMD), "## Review progress") {
+	if err != nil || !strings.Contains(string(progressMD), "## Review progress") || !strings.Contains(string(progressMD), "## Telemetry") || !strings.Contains(string(progressMD), "## Review failures") || !strings.Contains(string(progressMD), "qwen-flash") || !strings.Contains(string(progressMD), "qwen") || !strings.Contains(string(progressMD), "timeout") {
 		t.Fatalf("rendered progress markdown = %s, err = %v", string(progressMD), err)
 	}
 	progressJSON, err := RenderResult(withProgress, FormatJSON)
-	if err != nil || !strings.Contains(string(progressJSON), `"review_progress"`) {
+	if err != nil || !strings.Contains(string(progressJSON), `"review_progress"`) || !strings.Contains(string(progressJSON), `"telemetry"`) || !strings.Contains(string(progressJSON), `"review_failures"`) || !strings.Contains(string(progressJSON), `qwen-flash`) || !strings.Contains(string(progressJSON), `timeout`) {
 		t.Fatalf("rendered progress json = %s, err = %v", string(progressJSON), err)
 	}
 }

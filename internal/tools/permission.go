@@ -1009,7 +1009,7 @@ func checkGate(ctx context.Context, tool, command string) string {
 	if runtime == nil || runtime.HumanGate == nil {
 		return ""
 	}
-	decision, redirect := runtime.HumanGate(GateRequest{Tool: tool, Command: command, Rule: CommandRule(command)})
+	decision, redirect := runtime.HumanGate(ctx, GateRequest{Tool: tool, Command: command, Rule: CommandRule(command)})
 	if decision == GateReject {
 		if redirect == "" {
 			redirect = "the user rejected this action"

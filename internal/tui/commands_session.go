@@ -360,12 +360,42 @@ func (m *model) exportRecord(kind string) (session.WorkflowResultRecord, bool, e
 		if len(msgs) == 0 {
 			return session.WorkflowResultRecord{}, false, nil
 		}
+		var meta session.Meta
+		var telemetry []session.TelemetryEvent
+		var failures []session.WorkflowResultRecord
+		if m.store != nil && m.sessionID != "" {
+			var err error
+			meta, _, err = m.store.Load(m.sessionID)
+			if err != nil {
+				return session.WorkflowResultRecord{}, false, err
+			}
+			telemetry, err = m.store.ListTelemetry(context.Background(), m.sessionID)
+			if err != nil {
+				return session.WorkflowResultRecord{}, false, err
+			}
+			failures, err = m.store.ListWorkflowResults(context.Background(), m.sessionID, "review_failure")
+			if err != nil {
+				return session.WorkflowResultRecord{}, false, err
+			}
+		}
 		var payload any = msgs
-		if len(m.reviewProgressHistory) > 0 {
-			payload = export.ChatPayload{Messages: msgs, ReviewProgress: slices.Clone(m.reviewProgressHistory)}
+		version := 1
+		if len(m.reviewProgressHistory) > 0 || len(telemetry) > 0 || len(failures) > 0 {
+			version = 2
+			payload = export.ChatPayload{
+				Messages:       msgs,
+				ReviewProgress: slices.Clone(m.reviewProgressHistory),
+				Telemetry:      telemetry,
+				ReviewFailures: failures,
+			}
 		}
 		rawPayload, _ := json.Marshal(payload)
-		return newExportRecord("chat", m.sessionID, "chat", 1, string(rawPayload)), true, nil
+		record := newExportRecord("chat", m.sessionID, "chat", version, string(rawPayload))
+		record.Model, record.Provider = meta.Model, meta.Provider
+		if !meta.UpdatedAt.IsZero() {
+			record.CreatedAt = meta.UpdatedAt
+		}
+		return record, true, nil
 	}
 	if kind == "message" {
 		lastMsg, found := m.findLastAssistantMessage()

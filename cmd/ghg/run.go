@@ -408,6 +408,7 @@ func runCLI(args []string) error {
 			saved = len(ag.MessagesSnapshot())
 		}
 	}
+	appendTelemetryCallbacks(&ev, store, sessionID)
 	if *resumeFlag != "" {
 		ag.RebuildTouched(ag.MessagesSnapshot())
 	}
@@ -435,6 +436,15 @@ func runCLI(args []string) error {
 			config.LogEvent("session.save", "run FAILED id="+sessionID+": "+serr.Error())
 		}
 		note("session %s — resume with: ghg run -resume %s \"…\" · or interactively: ghg --resume %s", sessionID, sessionID, sessionID)
+		if err == nil && strings.TrimSpace(final) != "" {
+			workspace := "workspace"
+			if wd, wdErr := os.Getwd(); wdErr == nil {
+				workspace = filepath.Base(wd)
+			}
+			if notifyErr := sendTelegramCompletion(context.Background(), store, sessionID, workspace, "completion", final); notifyErr != nil {
+				config.LogEvent("telegram.send", "FAILED: "+notifyErr.Error())
+			}
+		}
 	}
 	return err
 }
@@ -506,5 +516,42 @@ func setupWireEvents(ev *agent.Events, emit func(any)) {
 	}
 	ev.OnPlanDelta = func(delta string) {
 		emit(map[string]any{"type": "plan_delta", "delta": delta})
+	}
+}
+
+// appendTelemetryCallbacks composes persistence with any existing wire/UI
+// callbacks. Telemetry writes use a non-cancelled context so a stopped turn
+// still leaves its model/tool diagnostics in the session.
+func appendTelemetryCallbacks(ev *agent.Events, store *session.Store, sessionID string) {
+	if ev == nil || store == nil || strings.TrimSpace(sessionID) == "" {
+		return
+	}
+	previous := *ev
+	appendEvent := func(kind string, payload any) {
+		_ = store.AppendTelemetry(context.Background(), sessionID, kind, payload)
+	}
+	ev.OnReviewProgress = func(value agent.ReviewProgress) {
+		if previous.OnReviewProgress != nil {
+			previous.OnReviewProgress(value)
+		}
+		appendEvent("review_progress", value)
+	}
+	ev.OnToolTelemetry = func(value agent.ToolTelemetry) {
+		if previous.OnToolTelemetry != nil {
+			previous.OnToolTelemetry(value)
+		}
+		appendEvent("tool_telemetry", value)
+	}
+	ev.OnModelCallStart = func(value agent.ModelCallStart) {
+		if previous.OnModelCallStart != nil {
+			previous.OnModelCallStart(value)
+		}
+		appendEvent("model_call_start", value)
+	}
+	ev.OnModelCallEnd = func(value agent.ModelCallEnd) {
+		if previous.OnModelCallEnd != nil {
+			previous.OnModelCallEnd(value)
+		}
+		appendEvent("model_call_end", value)
 	}
 }

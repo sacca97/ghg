@@ -374,7 +374,6 @@ func (m *model) pumpWorker(client *workerwire.Client, generation uint64) {
 
 func (m *model) stopWorker() {
 	client, proc := m.workerClient, m.workerProcess
-	detached := m.workerDetached
 	m.workerGeneration++
 	m.workerClient, m.workerProcess = nil, nil
 	m.workerRuntime = workerwire.Runtime{}
@@ -383,12 +382,10 @@ func (m *model) stopWorker() {
 		return
 	}
 	if client != nil {
-		if !detached {
-			_ = client.Send(workerwire.CommandStop, workerRequestID("stop"), nil)
-		}
+		_ = client.Send(workerwire.CommandStop, workerRequestID("stop"), nil)
 		_ = client.Close()
 	}
-	if proc != nil && !detached {
+	if proc != nil {
 		if !waitProcess(proc, 2*time.Second) {
 			_ = proc.Stop()
 			waitProcess(proc, time.Second)
@@ -471,6 +468,10 @@ func (m *model) handleWorkerFrame(frame workerwire.Frame) (tea.Model, tea.Cmd) {
 	case workerwire.TypeAttached:
 		return m, nil
 	case workerwire.TypeAck:
+		if frame.RequestID == m.workerStopRequestID {
+			m.workerStopRequestID = ""
+			return m, tea.Quit
+		}
 		if strings.HasPrefix(frame.RequestID, "lsp-") {
 			var statuses []workerwire.LSPStatus
 			if err := json.Unmarshal(frame.Payload, &statuses); err == nil {
@@ -545,9 +546,9 @@ func (m *model) handleWorkerFrame(frame workerwire.Frame) (tea.Model, tea.Cmd) {
 			}
 		}
 	case workerwire.TypeDetachAck:
-		if frame.RequestID == m.detachRequestID {
+		if frame.RequestID == m.workerStopRequestID {
 			m.workerDetached = true
-			m.detachRequestID = ""
+			m.workerStopRequestID = ""
 			return m, tea.Quit
 		}
 	case workerwire.TypeAlreadyControlled:
@@ -556,8 +557,8 @@ func (m *model) handleWorkerFrame(frame workerwire.Frame) (tea.Model, tea.Cmd) {
 	case workerwire.TypeError:
 		var payload workerwire.ErrorPayload
 		_ = json.Unmarshal(frame.Payload, &payload)
-		if frame.RequestID == m.detachRequestID {
-			m.detachRequestID = ""
+		if frame.RequestID == m.workerStopRequestID {
+			m.workerStopRequestID = ""
 		}
 		if frame.RequestID == m.workerHistoryRequest {
 			m.workerHistoryRequest = ""
@@ -587,6 +588,9 @@ func (m *model) applyWorkerSnapshot(snapshot workerwire.Snapshot) {
 	m.provName = snapshot.Provider
 	m.role = snapshot.Role
 	m.effort = snapshot.Effort
+	if snapshot.Approval != "" {
+		m.approval = snapshot.Approval
+	}
 	if len(snapshot.Messages) > 0 {
 		m.setMessages(snapshot.Messages)
 		// The snapshot is authoritative: re-render from it so a turn that
@@ -642,17 +646,26 @@ func (m *model) workerEvent(event workerEvent) tea.Cmd {
 	switch event.Kind {
 	case "route":
 		if value, ok := decodeEvent[workerwire.ConfigureRequest](event.Data); ok {
-			m.modelID = value.Model
-			m.modelName, m.provName = value.ModelName, value.Provider
-			if m.modelName == "" {
-				m.modelName = value.Model
+			if value.Model != "" {
+				m.modelID = value.Model
 			}
-			m.role = value.Role
+			if value.ModelName != "" || value.Provider != "" {
+				m.modelName, m.provName = value.ModelName, value.Provider
+				if m.modelName == "" {
+					m.modelName = value.Model
+				}
+			}
+			if value.Role != "" {
+				m.role = value.Role
+			}
 			if value.UpdateEffort {
 				m.effort = value.Effort
 			}
 			if value.Mode != "" {
 				m.mode = value.Mode
+			}
+			if value.Approval != "" {
+				m.approval = value.Approval
 			}
 		}
 		return nil

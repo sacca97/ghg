@@ -189,7 +189,7 @@ func (w *workerProcessState) runCompact(ctx context.Context) {
 	before := len(w.ag.MessagesSnapshot())
 	var summary string
 	var cutoff int
-	err := w.ag.ManualCompact(ctx, agent.Events{
+	ev := agent.Events{
 		OnCompactionReady: func(messages []models.Message, summary string, cutoff int) error {
 			w.mu.Lock()
 			saved, modelName, providerName := w.saved, w.modelName, w.provider
@@ -199,7 +199,9 @@ func (w *workerProcessState) runCompact(ctx context.Context) {
 		OnCompacted: func(value string, at int) { summary, cutoff = value, at },
 		OnUsage:     func(usage models.Usage) { w.publish("usage", usage, true) },
 		OnRetry:     func(retry models.RetryEvent) { w.publish("retry", retry, true) },
-	})
+	}
+	appendTelemetryCallbacks(&ev, w.store, w.sessionID)
+	err := w.ag.ManualCompact(ctx, ev)
 	if err == nil {
 		kept := len(w.ag.MessagesSnapshot())
 		w.mu.Lock()
@@ -374,7 +376,7 @@ func (w *workerProcessState) runTurn(ctx context.Context, input workerInput) {
 		w.ag.AskMode = true
 		w.ag.ReviewMode = false
 		w.ag.PlanMode = false
-	} else if input.ReviewMode {
+	} else if input.ReviewMode || (strings.EqualFold(strings.TrimSpace(input.Input), "continue") && w.ag.ReviewPending()) {
 		w.ag.ReviewMode = true
 		w.ag.PlanMode = false
 		w.ag.AskMode = false
@@ -431,6 +433,7 @@ func (w *workerProcessState) runTurn(ctx context.Context, input workerInput) {
 		},
 	}
 	setupWireEvents(&ev, w.emitWireEvent)
+	appendTelemetryCallbacks(&ev, w.store, w.sessionID)
 	var final string
 	var err error
 	switch {
@@ -469,12 +472,12 @@ func (w *workerProcessState) runTurn(ctx context.Context, input workerInput) {
 	}
 	var reviewPayload string
 	var reviewMarkdown string
-	if w.ag.ReviewMode && final != "" && err == nil {
-		if review, parseErr := agent.ParseReview(final); parseErr == nil {
-			reviewPayload = final
-			reviewMarkdown = export.RenderReviewMarkdown(review)
-			if w.store != nil && w.sessionID != "" {
-				msgSeq := len(w.ag.MessagesSnapshot())
+	if w.ag.ReviewMode && w.store != nil && w.sessionID != "" {
+		msgSeq := len(w.ag.MessagesSnapshot())
+		if err == nil && final != "" {
+			if review, parseErr := agent.ParseReview(final); parseErr == nil {
+				reviewPayload = final
+				reviewMarkdown = export.RenderReviewMarkdown(review)
 				_ = w.store.SaveWorkflowResult(context.Background(), session.WorkflowResultRecord{
 					ResultID:   fmt.Sprintf("review-%x", time.Now().UnixNano()),
 					SessionID:  w.sessionID,
@@ -482,10 +485,26 @@ func (w *workerProcessState) runTurn(ctx context.Context, input workerInput) {
 					Version:    1,
 					Payload:    reviewPayload,
 					Role:       w.ag.Role,
+					Provider:   w.provider,
+					Model:      w.ag.Model,
 					MessageSeq: msgSeq,
 					CreatedAt:  time.Now().UTC(),
 				})
 			}
+		} else if err != nil && strings.Contains(err.Error(), "review evidence was retained but final submission failed") {
+			failurePayload, _ := json.Marshal(map[string]string{"error": err.Error()})
+			_ = w.store.SaveWorkflowResult(context.Background(), session.WorkflowResultRecord{
+				ResultID:   fmt.Sprintf("review-failure-%x", time.Now().UnixNano()),
+				SessionID:  w.sessionID,
+				Kind:       "review_failure",
+				Version:    1,
+				Payload:    string(failurePayload),
+				Role:       w.ag.Role,
+				Provider:   w.provider,
+				Model:      w.ag.Model,
+				MessageSeq: msgSeq,
+				CreatedAt:  time.Now().UTC(),
+			})
 		}
 	}
 	var goalRecord *agent.GoalRecord
@@ -526,6 +545,7 @@ func (w *workerProcessState) runTurn(ctx context.Context, input workerInput) {
 		result.Error = err.Error()
 	}
 	w.publish("turn_done", result, true)
+	w.notifyCompletion(result)
 }
 
 func replaceProjectInstructions(prompt, project string) string {

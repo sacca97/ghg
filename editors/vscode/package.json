@@ -38,11 +38,13 @@
       "view/title": [
         {
           "command": "ghg.newSession",
+          "icon": "$(add)",
           "when": "view == ghg.chatView",
           "group": "navigation@1"
         },
         {
           "command": "ghg.resumeSession",
+          "icon": "$(history)",
           "when": "view == ghg.chatView",
           "group": "navigation@2"
         }
@@ -51,11 +53,13 @@
     "commands": [
       {
         "command": "ghg.newSession",
-        "title": "ghg: New Session"
+        "title": "ghg: New Session",
+        "icon": "$(add)"
       },
       {
         "command": "ghg.resumeSession",
-        "title": "ghg: Resume Session"
+        "title": "ghg: Resume Session",
+        "icon": "$(history)"
       }
     ],
     "configuration": {

@@ -117,6 +117,7 @@ type model struct {
 	modelID         string
 	role            string
 	effort          string
+	approval        string
 	contextLimit    int
 	usage           models.Usage
 	messages        []models.Message
@@ -235,7 +236,7 @@ type model struct {
 	workerState          workerwire.State
 	workerLiveWork       bool
 	workerTasks          map[string]workerwire.TaskState
-	detachRequestID      string
+	workerStopRequestID  string
 	workerStartFailed    bool
 	workerStartError     string
 	workerStarting       bool

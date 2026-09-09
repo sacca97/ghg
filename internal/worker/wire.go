@@ -131,7 +131,8 @@ type ApprovalAnswer struct {
 	Redirect string `json:"redirect,omitempty"`
 }
 
-// ConfigureRequest retargets the idle worker's model route.
+// ConfigureRequest retargets the idle worker's model route or changes its
+// live approval mode.
 type ConfigureRequest struct {
 	Model                  string  `json:"model,omitempty"`
 	ModelName              string  `json:"model_name,omitempty"`
@@ -141,6 +142,7 @@ type ConfigureRequest struct {
 	Effort                 string  `json:"effort,omitempty"`
 	UpdateEffort           bool    `json:"update_effort,omitempty"`
 	Mode                   string  `json:"mode,omitempty"`
+	Approval               string  `json:"approval,omitempty"`
 	CompactThreshold       float64 `json:"compact_threshold,omitempty"`
 	UpdateCompactThreshold bool    `json:"update_compact_threshold,omitempty"`
 }
@@ -188,6 +190,7 @@ type Snapshot struct {
 	Role            string           `json:"role,omitempty"`
 	Protocol        string           `json:"protocol,omitempty"`
 	Effort          string           `json:"effort,omitempty"`
+	Approval        string           `json:"approval,omitempty"`
 	ContextLimit    int              `json:"context_limit,omitempty"`
 	ContextTokens   int              `json:"context_tokens"`
 	Usage           models.Usage     `json:"usage"`
@@ -260,4 +263,16 @@ type RenameRequest struct {
 type RenameResult struct {
 	SessionID string `json:"session_id"`
 	Title     string `json:"title"`
+}
+
+// NotifyRequest changes or reports a session's Telegram notification state.
+type NotifyRequest struct {
+	Action   string `json:"action,omitempty"`
+	BotToken string `json:"bot_token,omitempty"`
+	ChatID   string `json:"chat_id,omitempty"`
+}
+
+// NotifyResult reports the persisted notification state.
+type NotifyResult struct {
+	Enabled bool `json:"enabled"`
 }

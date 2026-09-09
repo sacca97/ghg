@@ -123,7 +123,8 @@ type Agent struct {
 	// ReviewMode restricts the agent to a read-only tool allowlist plus
 	// submit_review and injects a review prompt. It is a one-shot collaboration
 	// mode that terminates upon successful review submission.
-	ReviewMode bool
+	ReviewMode         bool
+	reviewContinuation *reviewContinuation
 
 	// AskMode restricts one turn to read-only tools and injects a direct
 	// question-answering prompt.
@@ -424,6 +425,7 @@ func (a *Agent) ResetState() {
 	if a == nil {
 		return
 	}
+	a.reviewContinuation = nil
 	a.stateMu.Lock()
 	observations := observation.NewRegistry()
 	observations.SetPersistent(a.observationStore)
@@ -459,6 +461,7 @@ func (a *Agent) ShareState(other *Agent) {
 	other.touchedMu.Lock()
 	other.touched = touched
 	other.touchedMu.Unlock()
+	other.reviewContinuation = a.reviewContinuation
 }
 
 // BindState persists observations and search snapshots collected before the
@@ -908,6 +911,11 @@ func (a *Agent) TurnWithImagesAndGoal(ctx context.Context, input string, parts [
 	return a.turn(ctx, input, parts, true, &goal, ev)
 }
 
+// ReviewPending reports whether a failed review turn can be resumed.
+func (a *Agent) ReviewPending() bool {
+	return a != nil && a.reviewContinuation != nil
+}
+
 func (a *Agent) readOnlyCollaborationMode() bool {
 	return a.PlanMode || a.ReviewMode || a.AskMode
 }
@@ -1007,6 +1015,7 @@ func (a *Agent) assembleRequestMessages(history []models.Message, todoContent, g
 
 func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPart, authored bool, goalCtx *GoalRecord, ev Events) (string, error) {
 	a.compacted = false // compaction retry state is scoped to this turn
+	resumeReview := a.ReviewMode && authored && len(parts) == 0 && strings.EqualFold(strings.TrimSpace(input), "continue") && a.reviewContinuation != nil
 	var activeGoal *GoalRecord
 	if goalCtx != nil {
 		goal := *goalCtx
@@ -1023,12 +1032,26 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 		msg.SentAt = &now
 	}
 	a.msgsMu.Lock()
-	if len(a.Messages) > 0 && a.Messages[len(a.Messages)-1].Role == "user" && a.Messages[len(a.Messages)-1].Authored && len(parts) == 0 && strings.EqualFold(strings.TrimSpace(input), "continue") {
+	if len(parts) == 0 && strings.EqualFold(strings.TrimSpace(input), "continue") {
 		// User is explicitly asking to continue the prior unanswered prompt.
-		prev := a.Messages[len(a.Messages)-1]
-		msg.Content = prev.Content
-		msg.Parts = append([]models.ContentPart(nil), prev.Parts...)
-		a.Messages[len(a.Messages)-1] = msg
+		// A canceled tool turn persists an interrupted assistant/tool tail, so
+		// remove that tail before replaying the authored prompt.
+		promptAt := -1
+		for i := len(a.Messages) - 1; i >= 0; i-- {
+			if a.Messages[i].Role == "user" && a.Messages[i].Authored {
+				promptAt = i
+				break
+			}
+		}
+		if promptAt >= 0 && (promptAt == len(a.Messages)-1 || interruptedTail(a.Messages[promptAt+1:])) {
+			prev := a.Messages[promptAt]
+			a.Messages = a.Messages[:promptAt+1]
+			msg.Content = prev.Content
+			msg.Parts = append([]models.ContentPart(nil), prev.Parts...)
+			a.Messages[promptAt] = msg
+		} else {
+			a.Messages = append(a.Messages, msg)
+		}
 	} else {
 		a.Messages = append(a.Messages, msg)
 	}
@@ -1041,10 +1064,16 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 	}
 	var reviewBudget *ReviewBudget
 	if a.ReviewMode && authored {
-		// Scope sizing is a preflight for the real review request. It has no
-		// repository tools and falls back deterministically when the optional
-		// tiny assessor is not configured.
-		reviewBudget = a.newReviewBudget(ctx, reviewTarget, ev)
+		if resumeReview {
+			reviewTarget = a.reviewContinuation.target
+			reviewBudget = a.reviewContinuation.budget
+		} else {
+			// Scope sizing is a preflight for the real review request. It has no
+			// repository tools and falls back deterministically when the optional
+			// tiny assessor is not configured.
+			reviewBudget = a.newReviewBudget(ctx, reviewTarget, ev)
+			a.reviewContinuation = &reviewContinuation{target: reviewTarget, budget: reviewBudget}
+		}
 	}
 	readGuard := newReadCoverageTracker()
 	compactionEvents := ev
@@ -1101,10 +1130,25 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 	checkpointLevel := 0
 	postEditVerification := false
 	reviewFinalEvidenceRetryUsed := false
+	reviewFinalizationRetryUsed := false
 	reviewCheckpointPending := false
 	reviewClosed := false
 	scopePreflight := ""
 	if reviewBudget != nil {
+		state := a.reviewContinuation
+		if state != nil {
+			reviewCheckpointPending = state.checkpointPending
+			reviewClosed = state.closed
+			if resumeReview {
+				a.emitReviewProgress(ev, reviewBudget, "exploration", "resumed")
+			}
+			defer func() {
+				if a.reviewContinuation == state {
+					state.checkpointPending = reviewCheckpointPending
+					state.closed = reviewClosed
+				}
+			}()
+		}
 		scopePreflight = reviewPreflightPrompt(reviewBudget)
 	} else if a.PlanMode {
 		scopePreflight = planTaggedScopePrompt(a, reviewTarget)
@@ -1239,6 +1283,13 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 					}
 					a.msgsMu.Unlock()
 				}
+			}
+			if reviewClosed && ctx.Err() == nil {
+				if !reviewFinalizationRetryUsed {
+					reviewFinalizationRetryUsed = true
+					continue
+				}
+				return "", fmt.Errorf("review evidence was retained but final submission failed: %w", err)
 			}
 			if a.Checkpointing && !a.compacted && models.IsContextLimit(err) && ctx.Err() == nil {
 				a.compacted = true
@@ -1517,7 +1568,8 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 				}
 			}
 			if a.ReviewMode {
-				if reviewArgs, ok := a.reviewTerminal(reviewTarget, msg, results, ev); ok {
+				if reviewArgs, ok := a.reviewTerminal(msg, results); ok {
+					a.reviewContinuation = nil
 					return reviewArgs, nil
 				}
 			}
@@ -1552,40 +1604,30 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 	}
 }
 
-func (a *Agent) reviewTerminal(target string, msg models.Message, results []tools.ToolResult, ev Events) (string, bool) {
+func interruptedTail(messages []models.Message) bool {
+	if len(messages) == 0 {
+		return false
+	}
+	sawInterrupted := false
+	for _, message := range messages {
+		if message.Role == "assistant" && strings.EqualFold(message.StopReason, "interrupted") {
+			sawInterrupted = true
+			continue
+		}
+		if sawInterrupted && message.Role == "tool" && strings.HasPrefix(message.Content, "Error: tool call interrupted") {
+			continue
+		}
+		return false
+	}
+	return sawInterrupted
+}
+
+func (a *Agent) reviewTerminal(msg models.Message, results []tools.ToolResult) (string, bool) {
 	for i, call := range msg.ToolCalls {
 		if _, isErr := toolResultError(results[i]); isErr || call.Function.Name != "submit_review" {
 			continue
 		}
 		reviewArgs := string(call.Function.Arguments)
-		if rev, err := ParseReview(reviewArgs); err == nil {
-			checkpoint := buildReviewCheckpoint(target, rev)
-			reason := "durable history persistence unavailable"
-			if a.HistoryCatalog != nil && a.currentSessionID() != "" && ev.OnCompactionReady != nil {
-				took := len(a.Messages)
-				if err := ev.OnCompactionReady(append([]models.Message(nil), a.Messages...), checkpoint, took); err == nil {
-					a.msgsMu.Lock()
-					a.Messages = []models.Message{
-						a.Messages[0],
-						{Role: "system", Content: "Summary of the conversation so far:\n\n" + checkpoint},
-					}
-					a.msgsMu.Unlock()
-					if ev.OnCompact != nil {
-						ev.OnCompact(took-len(a.Messages), len(a.Messages))
-					}
-					if ev.OnCompacted != nil {
-						ev.OnCompacted(checkpoint, took)
-					}
-					a.resetSeenOperations()
-					a.compacted = true
-					return reviewArgs, true
-				}
-				reason = "durable history persistence failed"
-			}
-			if ev.OnNotice != nil {
-				ev.OnNotice(fmt.Sprintf("◎ review checkpoint skipped; %s, conversation retained", reason))
-			}
-		}
 		a.compacted = false
 		return reviewArgs, true
 	}

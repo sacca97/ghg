@@ -401,7 +401,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case toolStartMsg:
 		m.flushStreaming()
-		row := toolStyle.Render("⚒ "+msg.name+" ") + dimStyle.Render(msg.args)
+		row := toolStyle.Render("⚒ "+msg.name+" ") + dimStyle.Render(toolCallSummary(msg.name, msg.args))
 		m.blocks = append(m.blocks, block{kind: blockToolRun, text: row, toolID: msg.id, toolRunning: true})
 		m.transcriptDirty = true
 		return m, nil
@@ -595,6 +595,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case reviewProgressMsg:
 		m.reviewProgressHistory = append(m.reviewProgressHistory, msg.progress)
+		if msg.progress.Reason == "resumed" {
+			m.reviewing = true
+		}
 		if !m.reviewing {
 			return m, nil
 		}
@@ -604,6 +607,9 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if progress.Phase == "inventory" && progress.Inventory != nil && !m.reviewScopeShown {
 			m.reviewScopeShown = true
 			m.append(dimStyle.Render(renderReviewScope(progress)))
+		}
+		if progress.Phase == "assessment" && progress.Inventory != nil && len(progress.Inventory.Scope) > 0 {
+			m.append(dimStyle.Render("◎ review scope resolved\n  scope: " + strings.Join(progress.Inventory.Scope, ", ")))
 		}
 		if progress.Phase == "extension" && progress.ToAllocation > progress.FromAllocation && progress.ToAllocation != m.reviewLastExtensionTo {
 			m.reviewLastExtensionTo = progress.ToAllocation

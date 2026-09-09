@@ -92,9 +92,9 @@ commands:
   bridge    expose a persistent worker over newline-delimited JSON
   models    list configured role models
   sessions  list saved sessions
-  ps        list background workers
-  attach    attach to a background worker
-  stop      stop a background worker
+  ps        list live workers
+  attach    attach to a live worker or resume its session
+  stop      stop a live worker
   outputs   collect unreferenced output payloads
   mcp       manage MCP servers
   auth      configure provider credentials
@@ -131,7 +131,7 @@ commands:
 			}
 			return
 		case "sessions":
-			if err := sessionsCLI(); err != nil {
+			if err := sessionsCLI(args); err != nil {
 				die(err)
 			}
 			return

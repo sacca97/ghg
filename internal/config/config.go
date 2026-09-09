@@ -48,6 +48,7 @@ type Config struct {
 	MaxRetries      int                   `json:"maxRetries,omitempty"`      // attempts per provider request on transient failures (429/5xx/network); 0 = models.DefaultMaxAttempts, 1 = no retries
 	Outputs         *OutputConfig         `json:"outputs,omitempty"`         // bounded tool-result persistence; nil/enabled nil uses defaults
 	Artifacts       *OutputConfig         `json:"-"`                         // legacy in-memory alias for Outputs
+	Telegram        *TelegramConfig       `json:"telegram,omitempty"`        // optional completion notifications
 	Execution       *ExecutionConfig      `json:"execution,omitempty"`       // filesystem/network/approval policy for tool subprocesses
 	Providers       map[string]Provider   `json:"providers"`
 	Models          map[string]Model      `json:"models"`

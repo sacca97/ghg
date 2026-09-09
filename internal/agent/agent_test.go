@@ -877,6 +877,22 @@ func TestContinueReplaysOnlyAuthoredMessageParts(t *testing.T) {
 	if len(injected.Messages) != 4 || injected.Messages[1].Content != "injected prompt" || len(injected.Messages[1].Parts) != 1 || injected.Messages[2].Content != "continue" {
 		t.Fatalf("injected continue was incorrectly replayed: %+v", injected.Messages)
 	}
+
+	interrupted := New(testBackend(srv.URL, "k"), "m", 100, "sys")
+	var call models.ToolCall
+	call.ID = "call-1"
+	call.Function.Name = "read"
+	interrupted.Messages = append(interrupted.Messages,
+		models.Message{Role: "user", Content: "retry this turn", Authored: true},
+		models.Message{Role: "assistant", StopReason: "interrupted", ToolCalls: []models.ToolCall{call}},
+		models.Message{Role: "tool", Name: "read", ToolCallID: "call-1", Content: "Error: tool call interrupted — the turn was canceled by user before execution completed"},
+	)
+	if _, err := interrupted.TurnAuthored(context.Background(), "continue", Events{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(interrupted.Messages) != 3 || interrupted.Messages[1].Content != "retry this turn" || interrupted.Messages[2].Content != "done" {
+		t.Fatalf("interrupted continue should replay without its stale tail: %+v", interrupted.Messages)
+	}
 }
 
 // TestUsageAccumulates verifies every stream call folds its usage into the

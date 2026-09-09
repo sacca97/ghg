@@ -61,7 +61,7 @@ install script above.
 ```
 /plan <text>        propose a read-only plan before execution (/execute to run)
 /goal <text>        work until a structured goal update completes it
-/detach             detach the TUI while background streams and tasks keep running
+/detach             stop the worker and exit; resume the saved session later
 /context-doctor     audit what a fresh session injects, in tokens
 /model              pick a model — type to filter (new) entries come from the
                     provider catalog, no config needed

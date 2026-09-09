@@ -133,7 +133,15 @@ func updateCLI() error {
 	return nil
 }
 
-func sessionsCLI() error {
+func sessionsCLI(args []string) error {
+	fs := flag.NewFlagSet("sessions", flag.ContinueOnError)
+	format := fs.String("format", "text", "output format: text or json")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *format != "text" && *format != "json" {
+		return fmt.Errorf("unknown --format %q (want text|json)", *format)
+	}
 	dir, err := config.Dir()
 	if err != nil {
 		return err
@@ -148,8 +156,18 @@ func sessionsCLI() error {
 		return err
 	}
 	if len(metas) == 0 {
+		if *format == "json" {
+			return json.NewEncoder(os.Stdout).Encode([]any{})
+		}
 		fmt.Println("no sessions yet")
 		return nil
+	}
+	if *format == "json" {
+		items := make([]sessionListItem, len(metas))
+		for i, mt := range metas {
+			items[i] = sessionListItem{ID: mt.ID, Title: mt.Title, Model: mt.Model, UpdatedAt: mt.UpdatedAt}
+		}
+		return json.NewEncoder(os.Stdout).Encode(items)
 	}
 	for _, mt := range metas {
 		title := mt.Title
@@ -161,11 +179,22 @@ func sessionsCLI() error {
 	return nil
 }
 
+type sessionListItem struct {
+	ID        string    `json:"id"`
+	Title     string    `json:"title"`
+	Model     string    `json:"model"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
 func trunc(s string, n int) string {
-	if len(s) <= n {
+	if n <= 0 {
+		return ""
+	}
+	runes := []rune(s)
+	if len(runes) <= n {
 		return s
 	}
-	return s[:n-1] + "…"
+	return string(runes[:n-1]) + "…"
 }
 
 func ago(t time.Time) string {

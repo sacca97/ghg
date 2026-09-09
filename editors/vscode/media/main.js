@@ -8,21 +8,28 @@
   const composer = document.getElementById("composer");
   const send = document.getElementById("send");
   const role = document.getElementById("role");
-  const chatMode = document.getElementById("chat-mode");
-  const planMode = document.getElementById("plan-mode");
+  const effort = document.getElementById("effort");
+  const modeToggle = document.getElementById("mode-toggle");
+  const modeLabels = { execute: "Execute", plan: "Plan", review: "Review" };
+  const effortLevels = ["", "low", "medium", "high"];
   const saved = vscode.getState() || {};
   const state = {
     blocks: Array.isArray(saved.blocks) ? saved.blocks : [],
     draft: typeof saved.draft === "string" ? saved.draft : "",
-    mode: saved.mode === "plan" ? "plan" : "chat",
+    mode: saved.mode === "plan" ? "plan" : saved.mode === "review" ? "review" : "execute",
     role: ["default", "smart", "tiny", "fast"].includes(saved.role) ? saved.role : "fast",
+    effort: effortLevels.includes(saved.effort) ? saved.effort : "medium",
     models: saved.models && typeof saved.models === "object" ? saved.models : {},
     references: Array.isArray(saved.references) ? saved.references.filter((path) => typeof path === "string") : [],
     proposedPlan: typeof saved.proposedPlan === "string" ? saved.proposedPlan : "",
   };
   let active = false;
+  let pendingUser = false;
+  let planDeltaSeen = false;
   let currentAssistant;
   let currentAssistantElement;
+  let assistantRenderFrame = 0;
+  let assistantFollow = false;
   let model = "";
   let context = 0;
   let contextLimit = 0;
@@ -34,16 +41,23 @@
   let completionIndex = 0;
   let completionKind = "reference";
   const tools = new Map();
+
+  function setSendButton(running) {
+    send.textContent = running ? "■" : "↑";
+    send.setAttribute("aria-label", running ? "Stop" : "Send");
+    send.title = running ? "Stop" : "Send";
+  }
   const slashCommands = [
-    ["/ask", "answer a question"], ["/auth", "configure a provider"], ["/cd", "change directory"],
+    ["/ask", "answer a question"], ["/cd", "change directory"],
     ["/clear", "reset conversation"], ["/compact", "compact context"], ["/context-doctor", "audit context"],
-    ["/detach", "leave the worker running"], ["/effort", "set reasoning effort"], ["/execute", "execute a plan"],
-    ["/export", "export the session"], ["/fork", "fork the session"], ["/goal", "set or manage a goal"],
-    ["/goal-from-context", "formulate a goal"], ["/help", "show commands"], ["/mcp", "manage MCP servers"],
-    ["/memory", "manage memories"], ["/model", "switch model"], ["/plan", "enter plan mode"],
+    ["/effort", "set reasoning effort"], ["/execute", "execute a plan"], ["/goal-from-context", "formulate a goal"],
+	    ["/help", "show commands"], ["/lsp", "show language server status"], ["/mcp", "manage MCP servers"],
+	["/model", "switch model"], ["/plan", "enter plan mode"],
+	["/approval", "switch approval mode (ask|auto-review|never)"],
+	["/notify", "Telegram completion notifications (config|on|off)"],
+	["/continue", "continue an interrupted turn"],
     ["/pwd", "print working directory"], ["/quit", "exit"], ["/rename", "rename session"],
-    ["/report", "create a bug report"], ["/resume", "resume a session"], ["/review", "review a target"],
-    ["/schedule", "schedule a turn"], ["/tasks", "show background tasks"], ["/commands", "show commands"],
+    ["/resume", "resume a session"], ["/review", "review a target"], ["/commands", "show commands"],
   ].map(([name, hint]) => ({ name, hint }));
 
   function save() {
@@ -61,6 +75,11 @@
 
   function text(value) {
     return typeof value === "string" ? value : "";
+  }
+
+  function hideToolDisplayHash(value) {
+    return text(value).replace(/sha256:[0-9a-f]{8,}/gi, (match) =>
+      match.length > 15 ? `${match.slice(0, 15)}…` : match);
   }
 
   function inlineMarkdown(element, source) {
@@ -188,14 +207,43 @@
     flushText();
   }
 
+  function compactToolArgs(name, args) {
+    let parsed;
+    try {
+      parsed = JSON.parse(args);
+    } catch (_) {
+      return text(args).trim();
+    }
+    if (!parsed || typeof parsed !== "object") return text(args).trim();
+    if (name === "read") {
+      const ranges = Array.isArray(parsed.ranges)
+        ? parsed.ranges
+        : parsed.path ? [parsed] : [];
+      return ranges.map((range) => {
+        const path = text(range.path).trim();
+        if (!path) return "";
+        const offset = Number(range.offset) > 0 ? Number(range.offset) : 1;
+        const limit = Number(range.limit) > 0 ? Number(range.limit) : 0;
+        return limit ? `${path}:${offset}-${offset + limit - 1}` : `${path}:${offset}`;
+      }).filter(Boolean).join(", ");
+    }
+    if (text(parsed.command).trim()) return text(parsed.command).trim();
+    const parts = [];
+    if (text(parsed.path).trim()) parts.push(text(parsed.path).trim());
+    if (text(parsed.pattern).trim()) parts.push(text(parsed.pattern).trim());
+    else if (text(parsed.query).trim()) parts.push(text(parsed.query).trim());
+    return parts.length ? parts.join(" ") : text(args).trim();
+  }
+
   function renderToolContent(element, block) {
     element.replaceChildren();
     const label = document.createElement("span");
     label.textContent = `⚒ ${block.name || "tool"}`;
     element.append(label);
-    if (block.args) {
+    const summary = hideToolDisplayHash(compactToolArgs(block.name, block.args));
+    if (summary) {
       const args = document.createElement("code");
-      args.textContent = ` ${block.args}`;
+      args.textContent = ` ${summary}`;
       element.append(args);
     }
     if (block.failed) {
@@ -204,6 +252,10 @@
       failed.textContent = " — failed";
       element.append(failed);
     }
+  }
+
+  function isInternalReviewTool(name) {
+    return name === "submit_review" || name === "request_review_extension";
   }
 
   function renderBlock(block) {
@@ -267,6 +319,7 @@
 
   function assistantBlock() {
     if (!currentAssistant) {
+      assistantFollow = nearBottom();
       currentAssistant = { kind: "assistant", text: "" };
       state.blocks.push(currentAssistant);
       currentAssistantElement = renderBlock(currentAssistant);
@@ -275,14 +328,26 @@
   }
 
   function appendText(delta) {
-    const followNow = nearBottom();
     const block = assistantBlock();
     block.text += delta;
-    renderMarkdown(currentAssistantElement.body, block.text);
-    save();
-    if (followNow) {
-      follow();
+    if (assistantRenderFrame) return;
+    assistantRenderFrame = requestAnimationFrame(() => {
+      assistantRenderFrame = 0;
+      renderMarkdown(currentAssistantElement.body, block.text);
+      if (assistantFollow) follow();
+    });
+  }
+
+  function flushAssistantRender() {
+    if (assistantRenderFrame) {
+      cancelAnimationFrame(assistantRenderFrame);
+      assistantRenderFrame = 0;
     }
+    if (currentAssistant && currentAssistantElement) {
+      renderMarkdown(currentAssistantElement.body, currentAssistant.text);
+      if (assistantFollow) follow();
+    }
+    assistantFollow = false;
   }
 
   function formatCount(value) {
@@ -301,12 +366,13 @@
   }
 
   function updateMode() {
-    chatMode.classList.toggle("selected", state.mode === "chat");
-    planMode.classList.toggle("selected", state.mode === "plan");
-    chatMode.setAttribute("aria-pressed", String(state.mode === "chat"));
-    planMode.setAttribute("aria-pressed", String(state.mode === "plan"));
+    const label = modeLabels[state.mode] || modeLabels.execute;
+    modeToggle.textContent = label;
+    modeToggle.setAttribute("aria-label", `Mode: ${label}. Click to switch`);
+    modeToggle.title = `Switch mode (currently ${label})`;
     role.disabled = false;
     role.value = state.role;
+    effort.value = state.effort;
     for (const option of role.options) {
       option.textContent = state.models[option.value] || "Configured";
     }
@@ -317,25 +383,70 @@
     return messages.flatMap((message) => {
       if (!message || typeof message !== "object") return [];
       if (message.role === "user" && typeof message.content === "string") return [{ kind: "user", text: message.content }];
-      if (message.role === "assistant" && typeof message.content === "string" && message.content) return [{ kind: "assistant", text: message.content }];
-      if (message.role === "tool" && typeof message.content === "string" && message.content) return [{ kind: "notice", text: message.content }];
+      if (message.role === "assistant") {
+        const blocks = [];
+        const content = text(message.content);
+        const plan = content.match(/<proposed_plan>\s*([\s\S]*?)\s*<\/proposed_plan>/);
+        const visible = plan ? content.replace(plan[0], "").trim() : content;
+        if (visible) blocks.push({ kind: "assistant", text: visible });
+        if (plan && plan[1].trim()) blocks.push({ kind: "assistant", text: plan[1].trim() });
+        for (const call of Array.isArray(message.tool_calls) ? message.tool_calls : []) {
+          if (!call || typeof call !== "object" || !call.function || typeof call.function !== "object") continue;
+          const name = text(call.function.name);
+          if (!isInternalReviewTool(name)) {
+            blocks.push({ kind: "tool", name, args: text(call.function.arguments), failed: false });
+          }
+        }
+        return blocks;
+      }
       return [];
     });
   }
 
   function applySnapshot(snapshot) {
     if (!snapshot || typeof snapshot !== "object") return;
+    flushAssistantRender();
     const nextModel = snapshot.model_name || snapshot.model;
     if (typeof nextModel === "string") model = nextModel;
     if (typeof snapshot.context_tokens === "number") context = snapshot.context_tokens;
     if (typeof snapshot.context_limit === "number") contextLimit = snapshot.context_limit;
+    if (typeof snapshot.effort === "string" && effortLevels.includes(snapshot.effort)) state.effort = snapshot.effort;
     if (["default", "smart", "tiny", "fast"].includes(snapshot.role) && typeof nextModel === "string") state.models[snapshot.role] = nextModel;
     if (snapshot.mode === "plan") state.mode = "plan";
-    if (snapshot.mode === "execute") state.mode = "chat";
-    if (Array.isArray(snapshot.messages)) state.blocks = snapshotMessages(snapshot.messages);
+    if (snapshot.mode === "execute" && state.mode !== "review") state.mode = "execute";
+    const busyStates = ["running", "waiting_approval", "waiting_question", "stopping"];
+    active = busyStates.includes(snapshot.state);
+    activity = snapshot.state === "waiting_approval" ? "Waiting for approval" : snapshot.state === "waiting_question" ? "Waiting for answer" : active ? "Thinking" : "Ready";
+    let liveBlock;
+    if (!pendingUser) {
+      state.blocks = snapshotMessages(Array.isArray(snapshot.messages) ? snapshot.messages : []);
+      if (snapshot.live_text) {
+        liveBlock = { kind: "assistant", text: text(snapshot.live_text) };
+        state.blocks.push(liveBlock);
+      }
+      if (snapshot.live_plan) {
+        liveBlock = { kind: "assistant", text: text(snapshot.live_plan) };
+        state.blocks.push(liveBlock);
+      }
+      if (snapshot.active_tool) state.blocks.push({ kind: "tool", name: text(snapshot.active_tool), args: "", failed: false });
+      if (Array.isArray(snapshot.tasks)) {
+        for (const task of snapshot.tasks) {
+          if (task && typeof task === "object" && typeof task.description === "string") {
+            state.blocks.push({ kind: "notice", text: `Task ${task.status || "unknown"}: ${task.description}` });
+          }
+        }
+      }
+    }
     currentAssistant = undefined;
     currentAssistantElement = undefined;
     rerender();
+    setSendButton(active);
+    send.classList.toggle("stop", active);
+    if (active && liveBlock) {
+      currentAssistant = liveBlock;
+      currentAssistantElement = transcript.children[state.blocks.indexOf(liveBlock)];
+      assistantFollow = true;
+    }
     save();
     updateStatus();
   }
@@ -365,7 +476,20 @@
     for (const path of state.references) {
       const item = document.createElement("span");
       item.className = "reference";
-      item.textContent = path;
+      const label = document.createElement("span");
+      label.textContent = path;
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "reference-remove";
+      remove.setAttribute("aria-label", `Remove ${path}`);
+      remove.title = "Remove reference";
+      remove.textContent = "×";
+      remove.addEventListener("click", () => {
+        state.references = state.references.filter((value) => value !== path);
+        renderReferences();
+        save();
+      });
+      item.append(label, remove);
       references.append(item);
     }
   }
@@ -483,18 +607,22 @@
     switch (raw.type) {
       case "turn_start":
         active = true;
+        planDeltaSeen = false;
         activity = "Thinking";
         thinkingSince = Date.now();
-        send.textContent = "Stop";
+        setSendButton(true);
         send.classList.add("stop");
         updateStatus();
         break;
       case "turn_end":
+        flushAssistantRender();
+        pendingUser = false;
+        planDeltaSeen = false;
         active = false;
         currentAssistant = undefined;
         currentAssistantElement = undefined;
         activity = "Ready";
-        send.textContent = "Send";
+        setSendButton(false);
         send.classList.remove("stop");
         updateStatus();
         save();
@@ -507,10 +635,10 @@
         if (typeof nextModel === "string") model = nextModel;
         if (["default", "smart", "tiny", "fast"].includes(raw.role) && typeof nextModel === "string") {
           state.models[raw.role] = nextModel;
-          state.role = raw.role;
         }
         if (raw.mode === "plan") state.mode = "plan";
-        if (raw.mode === "execute") state.mode = "chat";
+        if (raw.mode === "execute" && state.mode !== "review") state.mode = "execute";
+        if (typeof raw.effort === "string" && effortLevels.includes(raw.effort)) state.effort = raw.effort;
         updateMode();
         updateStatus();
         save();
@@ -527,6 +655,7 @@
       case "text":
       case "plan_delta":
         if (typeof raw.delta === "string") {
+          planDeltaSeen = true;
           appendText(raw.delta);
           activity = "Responding";
           updateStatus();
@@ -534,7 +663,13 @@
         break;
       case "tool_start": {
         currentAssistant = undefined;
-        const block = { kind: "tool", name: text(raw.name), args: text(raw.args), failed: false };
+        const name = text(raw.name);
+        if (isInternalReviewTool(name)) {
+          activity = "Thinking";
+          updateStatus();
+          break;
+        }
+        const block = { kind: "tool", name, args: text(raw.args), failed: false };
         append(block);
         const element = transcript.lastElementChild;
         tools.set(typeof raw.id === "string" ? raw.id : String(tools.size), { block, element });
@@ -549,30 +684,60 @@
           entry.block.failed = typeof raw.result === "string" && /^(error|failed)/i.test(raw.result.trim());
           renderToolContent(entry.element, entry.block);
           tools.delete(id);
+          save();
         }
         activity = "Thinking";
         thinkingSince = Date.now();
         updateStatus();
         break;
       }
+      case "state":
+        active = ["running", "waiting_approval", "waiting_question", "stopping"].includes(raw.state);
+        activity = raw.state === "waiting_approval" ? "Waiting for approval" : raw.state === "waiting_question" ? "Waiting for answer" : active ? "Thinking" : "Ready";
+        updateStatus();
+        break;
+      case "retry":
+        append({ kind: "notice", text: `⚠ retrying request (attempt ${Number(raw.attempt || 0) + 1}/${raw.max || "?"})` }, true);
+        break;
+      case "steer":
+        if (typeof raw.text === "string") append({ kind: "user", text: `${raw.text} (steered)` }, true);
+        break;
+      case "usage":
+        if (typeof raw.prompt_tokens === "number" || typeof raw.completion_tokens === "number") {
+          context = (Number(raw.prompt_tokens) || 0) + (Number(raw.completion_tokens) || 0);
+          updateStatus();
+        }
+        break;
+      case "task":
+        if (typeof raw.description === "string" && typeof raw.status === "string") {
+          append({ kind: "notice", text: `Task ${raw.status}: ${raw.description}` }, true);
+        }
+        break;
+      case "goal": {
+        const status = text(raw.status || raw.Status);
+        const objective = text(raw.objective || raw.Objective);
+        if (status || objective) append({ kind: "notice", text: `Goal ${status || "updated"}${objective ? `: ${objective}` : ""}` }, true);
+        break;
+      }
+      case "goal_update": {
+        const status = text(raw.status || raw.Status);
+        const progress = text(raw.progress || raw.Progress);
+        const blocker = text(raw.blocker || raw.Blocker);
+        const detail = blocker ? `blocked: ${blocker}` : progress;
+        if (status || detail) append({ kind: "notice", text: `Goal ${status || "updated"}${detail ? `: ${detail}` : ""}` }, true);
+        break;
+      }
+      case "mcp":
+        append({ kind: "notice", text: "MCP status updated." }, true);
+        break;
       case "prompt_view":
         if (typeof raw.model === "string") model = raw.model;
-        if (["default", "smart", "tiny", "fast"].includes(raw.role) && typeof raw.model === "string") {
-          state.models[raw.role] = raw.model;
-          updateMode();
-          save();
-        }
         if (typeof raw.estimated_tokens === "number") context = raw.estimated_tokens;
         if (typeof raw.context_limit === "number") contextLimit = raw.context_limit;
         updateStatus();
         break;
       case "model_call_start":
         if (typeof raw.model === "string") model = raw.model;
-        if (["default", "smart", "tiny", "fast"].includes(raw.role) && typeof raw.model === "string") {
-          state.models[raw.role] = raw.model;
-          updateMode();
-          save();
-        }
         updateStatus();
         break;
       case "models":
@@ -585,8 +750,21 @@
         }
         break;
       case "turn_done":
+        {
+          const visible = state.blocks.filter((block) => block.kind !== "tool" || !isInternalReviewTool(block.name));
+          if (visible.length !== state.blocks.length) {
+            state.blocks = visible;
+            rerender();
+          }
+        }
         if (typeof raw.plan === "string" && raw.plan) {
           state.proposedPlan = raw.plan;
+          if (!planDeltaSeen) {
+            append({ kind: "assistant", text: raw.plan }, true);
+          }
+        }
+        if (typeof raw.review_markdown === "string" && raw.review_markdown) {
+          append({ kind: "assistant", text: raw.review_markdown }, true);
           save();
         }
         if (typeof raw.error === "string" && raw.error) append({ kind: "error", text: raw.error }, true);
@@ -594,6 +772,9 @@
       case "compact_done":
         if (typeof raw.error === "string" && raw.error) append({ kind: "error", text: raw.error }, true);
         else append({ kind: "notice", text: "Context compacted." }, true);
+        break;
+      case "compact":
+        append({ kind: "notice", text: "Context compaction completed; raw history preserved." }, true);
         break;
       case "goal_from_context":
         if (raw.goal && typeof raw.goal.objective === "string") append({ kind: "notice", text: `Goal: ${raw.goal.objective}` }, true);
@@ -608,11 +789,12 @@
         if (typeof raw.text === "string") append({ kind: "notice", text: raw.text });
         break;
       case "error":
+        flushAssistantRender();
         append({ kind: "error", text: text(raw.error) || "ghg failed" }, true);
         activity = "Error";
         if (active) {
           active = false;
-          send.textContent = "Send";
+          setSendButton(false);
           send.classList.remove("stop");
         }
         updateStatus();
@@ -621,6 +803,7 @@
         if (raw.requestId === completionRequest && Array.isArray(raw.items)) renderCompletions(raw.items);
         break;
       case "new_session":
+        pendingUser = false;
         state.blocks = [];
         state.references = [];
         currentAssistant = undefined;
@@ -641,6 +824,7 @@
       return;
     }
     append({ kind: "user", text: prompt.value.trim() }, true);
+    pendingUser = true;
     const message = { type: "send", prompt: prompt.value, mode: state.mode, role: state.role, references: state.references, plan: state.proposedPlan };
     prompt.value = "";
     save();
@@ -681,29 +865,45 @@
       composer.requestSubmit();
     }
   });
-  chatMode.addEventListener("click", () => {
-    state.mode = "chat";
+  modeToggle.addEventListener("click", () => {
+    const modes = ["execute", "plan", "review"];
+    state.mode = modes[(modes.indexOf(state.mode) + 1) % modes.length];
     updateMode();
     save();
-    vscode.postMessage({ type: "configureRole", role: state.role, mode: "chat" });
-  });
-  planMode.addEventListener("click", () => {
-    state.mode = "plan";
-    updateMode();
-    save();
-    vscode.postMessage({ type: "configureRole", role: state.role, mode: "plan" });
+    vscode.postMessage({ type: "configureRole", role: state.role, mode: state.mode });
   });
   role.addEventListener("change", () => {
     if (["default", "smart", "tiny", "fast"].includes(role.value)) {
       state.role = role.value;
       save();
-      vscode.postMessage({ type: "configureRole", role: state.role, mode: state.mode === "plan" ? "plan" : "chat" });
+      vscode.postMessage({ type: "configureRole", role: state.role, mode: state.mode });
     }
+  });
+  effort.addEventListener("change", () => {
+    if (!effortLevels.includes(effort.value)) return;
+    state.effort = effort.value;
+    save();
+    vscode.postMessage({
+      type: "configureRole",
+      role: state.role,
+      mode: state.mode,
+      effort: state.effort,
+      updateEffort: true,
+    });
+  });
+  transcript.addEventListener("click", (event) => {
+    const target = event.target;
+    const anchor = target instanceof Element ? target.closest("a[href]") : null;
+    if (!anchor) return;
+    event.preventDefault();
+    vscode.postMessage({ type: "openExternal", uri: anchor.href });
   });
   window.addEventListener("message", (event) => handleEvent(event.data));
   setInterval(() => { if (active && activity === "Thinking") updateStatus(); }, 1000);
 
   prompt.value = state.draft;
   rerender();
+  setSendButton(false);
   updateStatus();
+  vscode.postMessage({ type: "ready" });
 })();

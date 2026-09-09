@@ -38,6 +38,10 @@ func (w *workerProcessState) Snapshot(context.Context) (any, error) {
 	w.mu.Lock()
 	state, detached, activeTool := w.state, w.detached, w.activeTool
 	modelName, providerName, role, mode := w.modelName, w.provider, w.role, w.mode
+	var approval string
+	if w.runtime != nil {
+		approval = string(w.runtime.CurrentApprovalMode())
+	}
 	ag := w.ag
 	var modelID, protocol, effort string
 	var contextLimit int
@@ -48,12 +52,12 @@ func (w *workerProcessState) Snapshot(context.Context) (any, error) {
 	w.mu.Unlock()
 	live := w.liveSnapshot()
 	if ag == nil {
-		return workerSnapshot{SessionID: w.sessionID, State: state, Detached: detached, Mode: mode}, nil
+		return workerSnapshot{SessionID: w.sessionID, State: state, Detached: detached, Mode: mode, Approval: approval}, nil
 	}
 	return workerSnapshot{
 		SessionID: w.sessionID, State: state, Detached: detached,
 		Model: modelID, ModelName: modelName, Provider: providerName,
-		Role: role, Protocol: protocol, Effort: effort, Mode: mode,
+		Role: role, Protocol: protocol, Effort: effort, Approval: approval, Mode: mode,
 		ContextLimit: contextLimit, ContextTokens: ag.ContextTokens(),
 		Usage: ag.Usage(), Messages: boundedWorkerMessages(ag.MessagesSnapshot()),
 		Tasks: w.taskStates(), Pending: w.pendingState(), PendingQuestion: w.pendingQuestionState(), ActiveTool: activeTool,
@@ -61,7 +65,7 @@ func (w *workerProcessState) Snapshot(context.Context) (any, error) {
 	}, nil
 }
 
-func (w *workerProcessState) Command(_ context.Context, command workerwire.Command) (workerwire.CommandResult, error) {
+func (w *workerProcessState) Command(ctx context.Context, command workerwire.Command) (workerwire.CommandResult, error) {
 	switch command.Name {
 	case workerwire.CommandInput:
 		var input workerInput
@@ -223,6 +227,21 @@ func (w *workerProcessState) Command(_ context.Context, command workerwire.Comma
 			return workerwire.CommandResult{}, fmt.Errorf("marshal rename: %w", err)
 		}
 		return workerwire.CommandResult{Payload: data}, nil
+	case workerwire.CommandNotify:
+		var request workerwire.NotifyRequest
+		if err := json.Unmarshal(command.Payload, &request); err != nil {
+			return workerwire.CommandResult{}, errors.New("notify payload is invalid")
+		}
+		result, message, err := w.notifyCommand(ctx, request)
+		if err != nil {
+			return workerwire.CommandResult{}, err
+		}
+		w.publish("notice", message, true)
+		data, err := json.Marshal(result)
+		if err != nil {
+			return workerwire.CommandResult{}, fmt.Errorf("marshal notify result: %w", err)
+		}
+		return workerwire.CommandResult{Payload: data}, nil
 	case workerwire.CommandDetach:
 		w.mu.Lock()
 		allowed := w.state == workerwire.StateRunning || w.state == workerwire.StateWaitingApproval || w.state == workerwire.StateWaitingQuestion || w.hasLiveWork()
@@ -364,10 +383,13 @@ func canonicalDir(path string) (string, error) {
 	return resolved, nil
 }
 
-// configure changes only the idle worker's route. Keeping the existing Agent
+// configure changes the live approval setting or the idle worker's route. Keeping the existing Agent
 // preserves its task registry, observations, history, and session resources;
 // the replacement agent is used only as a route builder.
 func (w *workerProcessState) configure(request workerConfigureRequest) error {
+	if strings.TrimSpace(request.Approval) != "" {
+		return w.configureApproval(request.Approval)
+	}
 	w.mu.Lock()
 	if w.activeCancel != nil || w.stopRequested || w.state == workerwire.StateStopping {
 		w.mu.Unlock()
@@ -439,6 +461,32 @@ func (w *workerProcessState) configure(request workerConfigureRequest) error {
 		Mode: mode,
 	}, true)
 	w.setState(state, detached, "route changed")
+	return nil
+}
+
+func (w *workerProcessState) configureApproval(value string) error {
+	mode, err := tools.ParseApprovalMode(value)
+	if err != nil {
+		return err
+	}
+	w.mu.Lock()
+	if w.runtime == nil || w.cfg == nil {
+		w.mu.Unlock()
+		return errors.New("worker approval runtime is unavailable")
+	}
+	if w.cfg.Execution == nil {
+		w.cfg.Execution = &config.ExecutionConfig{}
+	}
+	w.cfg.Execution.Approval = string(mode)
+	runtime := w.runtime
+	cfg := w.cfg
+	w.mu.Unlock()
+
+	runtime.SetApprovalMode(mode)
+	if err := cfg.Save(); err != nil {
+		return fmt.Errorf("save approval mode: %w", err)
+	}
+	w.publish("route", workerConfigureRequest{Approval: string(mode)}, true)
 	return nil
 }
 
@@ -518,7 +566,7 @@ func (w *workerProcessState) publish(kind string, data any, important bool) {
 	}
 }
 
-func (w *workerProcessState) humanGate(req tools.GateRequest) (tools.GateDecision, string) {
+func (w *workerProcessState) humanGate(ctx context.Context, req tools.GateRequest) (tools.GateDecision, string) {
 	if w.perms != nil && w.perms.CoveredBy(req) {
 		return tools.GateAllowOnce, ""
 	}
@@ -531,7 +579,15 @@ func (w *workerProcessState) humanGate(req tools.GateRequest) (tools.GateDecisio
 		return workerwire.StateWaitingApproval, w.detached, "approval requested", true
 	})
 	w.publish("permission_request", workerPermissionRequest{Approval: *pending}, true)
-	<-flight.done
+	select {
+	case <-flight.done:
+	case <-ctx.Done():
+		flight.once.Do(func() {
+			flight.decision = tools.GateReject
+			flight.redirect = "worker operation canceled"
+			close(flight.done)
+		})
+	}
 
 	var decision tools.GateDecision
 	var redirect string

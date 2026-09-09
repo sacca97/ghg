@@ -32,10 +32,10 @@ type bridgeRequest struct {
 type bridge struct {
 	client    *workerwire.Client
 	process   *workerwire.Process
-	owned     bool
 	cfg       *config.Config
 	profiles  models.Profiles
 	role      string
+	turnDone  bool
 	outMu     sync.Mutex
 	pendingMu sync.Mutex
 	pending   map[string]string
@@ -98,7 +98,6 @@ func bridgeCLI(args []string) error {
 
 	var client *workerwire.Client
 	var process *workerwire.Process
-	owned := false
 	if runtimeFile.Live() {
 		client, err = bridgeConnect(runtimeFile)
 	} else {
@@ -122,7 +121,6 @@ func bridgeCLI(args []string) error {
 		}
 		process, err = workerwire.Launch(context.Background(), os.Args[0], env)
 		if err == nil {
-			owned = true
 			client, err = bridgeConnect(runtimeFile)
 		}
 		if err != nil {
@@ -134,7 +132,7 @@ func bridgeCLI(args []string) error {
 		}
 	}
 
-	b := &bridge{client: client, process: process, owned: owned, cfg: cfg, profiles: profiles, role: *roleFlag, pending: make(map[string]string)}
+	b := &bridge{client: client, process: process, cfg: cfg, profiles: profiles, role: *roleFlag, pending: make(map[string]string)}
 	defer b.close()
 	b.emit(map[string]any{"type": "bridge_ready", "session_id": sessionID})
 	ctx, stop := signalContext()
@@ -147,7 +145,7 @@ func signalContext() (context.Context, context.CancelFunc) {
 	ctx, cancel := context.WithCancel(context.Background())
 	ch := make(chan os.Signal, 1)
 	// The bridge is a short-lived controller; the worker owns the durable state.
-	// A signal only ends this controller and lets close() stop or detach cleanly.
+	// A signal only ends this controller; close() stops the worker cleanly.
 	signal.Notify(ch, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		select {
@@ -180,11 +178,7 @@ func bridgeConnect(runtimeFile workerwire.Runtime) (*workerwire.Client, error) {
 
 func (b *bridge) close() {
 	if b.client != nil {
-		name := workerwire.CommandStop
-		if !b.owned {
-			name = workerwire.CommandDetach
-		}
-		_ = b.client.Send(name, "bridge-close", nil)
+		_ = b.client.Send(workerwire.CommandStop, "bridge-close", nil)
 		_ = b.client.Close()
 	}
 	if b.process != nil {
@@ -287,9 +281,10 @@ func (b *bridge) handle(request bridgeRequest) error {
 	}
 	if request.Name == "configure_role" {
 		var payload struct {
-			Role   string `json:"role"`
-			Mode   string `json:"mode,omitempty"`
-			Effort string `json:"effort,omitempty"`
+			Role         string `json:"role"`
+			Mode         string `json:"mode,omitempty"`
+			Effort       string `json:"effort,omitempty"`
+			UpdateEffort bool   `json:"update_effort,omitempty"`
 		}
 		if err := json.Unmarshal(request.Payload, &payload); err != nil || !config.IsRole(payload.Role) {
 			return errors.New("bridge role configuration is invalid")
@@ -301,7 +296,7 @@ func (b *bridge) handle(request bridgeRequest) error {
 		request.Name = workerwire.CommandConfigure
 		request.Payload, err = json.Marshal(workerwire.ConfigureRequest{
 			Model: modelName, Provider: providerName, Role: payload.Role,
-			Effort: payload.Effort, UpdateEffort: payload.Effort != "", Mode: payload.Mode,
+			Effort: strings.TrimSpace(payload.Effort), UpdateEffort: payload.UpdateEffort || payload.Effort != "", Mode: payload.Mode,
 		})
 		if err != nil {
 			return err
@@ -334,7 +329,8 @@ func workerCommandName(name string) bool {
 		name == workerwire.CommandMCPEnable || name == workerwire.CommandMCPDisable || name == workerwire.CommandContextDoctor ||
 		name == workerwire.CommandRewind || name == workerwire.CommandCompactRetry || name == workerwire.CommandGoal ||
 		name == workerwire.CommandGoalFromContext || name == workerwire.CommandChdir || name == workerwire.CommandAppend ||
-		name == workerwire.CommandShell || name == workerwire.CommandFork || name == workerwire.CommandRename
+		name == workerwire.CommandShell || name == workerwire.CommandFork || name == workerwire.CommandRename ||
+		name == workerwire.CommandNotify
 }
 
 func (b *bridge) forward(ctx context.Context) {
@@ -416,6 +412,18 @@ func (b *bridge) forwardEvent(envelope workerwire.EventEnvelope) {
 		b.emit(map[string]any{"type": envelope.Kind, field: value})
 	}
 	if envelope.Kind == "turn_done" {
-		b.emit(map[string]any{"type": "turn_end"})
+		// The worker publishes turn_done before its operation wrapper clears
+		// activeCancel. Wait for the following idle state before advertising a
+		// turn end, otherwise the next command can race cleanup.
+		b.turnDone = true
+	}
+	if envelope.Kind == "state" {
+		if stateValue, ok := value.(map[string]any); ok {
+			state, ok := stateValue["state"].(string)
+			if ok && b.turnDone && (state == string(workerwire.StateIdle) || state == string(workerwire.StateInterrupted)) {
+				b.turnDone = false
+				b.emit(map[string]any{"type": "turn_end"})
+			}
+		}
 	}
 }

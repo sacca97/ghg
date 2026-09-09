@@ -94,6 +94,11 @@ Acting sessions use `fast`, planning uses `smart`, and compaction plus
 delegated tasks use `tiny`; omitted roles fall back to `defaultModel` and
 `defaultProvider`.
 
+Completion notifications are opt-in per session. Run `/notify config` inside
+ghg to enter the Telegram bot token and chat ID; ghg sends a test message
+before saving the configuration and enabling that session. `/notify on` and
+`/notify off` toggle an already configured session.
+
 `context` is the model's **input** window (context limit); the latest successful
 request's provider-reported `PromptTokens + CompletionTokens` drives proactive
 compaction against it. The provider's `/models` `context_length` overrides it

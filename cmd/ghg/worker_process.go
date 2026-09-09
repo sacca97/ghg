@@ -154,6 +154,9 @@ func runWorkerProcess() error {
 			w.requestStop(true, detail)
 		}
 	}
+	// The session is durable in SQLite. Runtime state only describes a live
+	// process, so do not leave a cleanly stopped worker in `ghg ps`.
+	_ = runtimeFile.RemoveState()
 	_ = server.Close()
 	server.Wait()
 	<-w.done
@@ -335,9 +338,9 @@ func newWorkerProcess(runtimeFile workerwire.Runtime) (*workerProcessState, erro
 		}
 	}
 	configuredRuntime.HumanGate = w.humanGate
-	if configuredRuntime.ApprovalMode == tools.ApprovalAutoReview {
-		configuredRuntime.Reviewer = ag.ApproveForMe
-	}
+	// Keep the reviewer wired for the worker's lifetime; ApprovalMode is
+	// changed live by /approval and decides whether it is used.
+	configuredRuntime.Reviewer = ag.ApproveForMe
 	if cautious, _ := strconv.ParseBool(os.Getenv(workerCautiousEnv)); cautious {
 		configuredRuntime.Cautious = true
 	}

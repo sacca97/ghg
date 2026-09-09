@@ -11,7 +11,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/sacca97/ghg/internal/models"
 	"github.com/sacca97/ghg/internal/search"
@@ -24,6 +23,8 @@ const reviewModePrompt = `You are reviewing in a read-only collaboration mode. I
 
 Report only actionable, evidence-backed findings. Order findings by severity and expected impact. Distinguish confirmed defects from opportunities that require measurement. Do not invent findings to fill categories. If no material problems are found, say so in the summary and submit an empty findings list.
 
+Before submitting, sample every area explicitly requested by the user. If the hard limit prevents that, disclose the unreviewed area in the summary.
+
 When finished, call submit_review exactly once. Do not implement fixes or return an implementation plan.
 
 The first request includes a deterministic <review_preflight> inventory with the authoritative scope and file list. Start from it; do not call glob or find_files to rediscover the scope. Use read.ranges as the default shape even for one range. Never construct or infer an opaque pagination cursor: pass cursor only when that same tool explicitly returned one, copied exactly.
@@ -32,35 +33,47 @@ For files over 500 lines, locate the relevant symbol or range with structural_se
 
 At a review budget checkpoint, either call request_review_extension with one unresolved issue, the evidence that would resolve it, and the exact remaining lookup, or use one final evidence batch. After that batch, only submit_review is available.`
 
+type reviewContinuation struct {
+	target            string
+	budget            *ReviewBudget
+	checkpointPending bool
+	closed            bool
+}
+
 const (
-	defaultReviewBudget       = 4
-	minReviewBudget           = 5
-	maxReviewBudget           = 24
-	reviewExplorationHardMax  = 38
-	reviewLeaseRounds         = 4
-	maxReviewInventoryFiles   = 4096
-	maxReviewInventoryBytes   = 32 << 20
-	maxReviewFocusFiles       = 5
-	maxReviewAssessmentBytes  = 16 << 10
-	maxReviewAssessmentTokens = 256
+	defaultReviewBudget      = 4
+	minReviewBudget          = 5
+	maxReviewBudget          = 24
+	reviewExplorationHardMax = 38
+	reviewLeaseRounds        = 4
+	maxReviewInventoryFiles  = 4096
+	maxReviewInventoryBytes  = 32 << 20
+	maxReviewFocusFiles      = 5
 )
 
 // ReviewInventory is the bounded, deterministic scope summary used to size a
 // review. It intentionally contains metadata only; source contents never go
-// to the optional assessment call.
+// into the model request during preflight.
 type ReviewInventory struct {
-	Scope           []string `json:"scope"`
-	Files           []string `json:"files,omitempty"`
-	ProductionFiles int      `json:"production_files"`
-	TestFiles       int      `json:"test_files"`
-	ProductionLOC   int      `json:"production_loc"`
-	LargeFiles      []string `json:"large_files,omitempty"`
-	LargestFiles    []string `json:"largest_files,omitempty"`
-	Partial         bool     `json:"partial,omitempty"`
-	productionDirs  []string `json:"-"`
+	Scope           []string                      `json:"scope"`
+	Files           []string                      `json:"files,omitempty"`
+	ProductionFiles int                           `json:"production_files"`
+	TestFiles       int                           `json:"test_files"`
+	ProductionLOC   int                           `json:"production_loc"`
+	LanguageStats   map[string]ReviewLanguageStat `json:"language_stats,omitempty"`
+	LargeFiles      []string                      `json:"large_files,omitempty"`
+	LargestFiles    []string                      `json:"largest_files,omitempty"`
+	Partial         bool                          `json:"partial,omitempty"`
+	productionDirs  []string                      `json:"-"`
+	explicitScope   bool                          `json:"-"`
 }
 
-// ReviewBudget is the per-turn ReviewMode exploration state. Allocation is a
+type ReviewLanguageStat struct {
+	Files int `json:"files"`
+	LOC   int `json:"loc"`
+}
+
+// ReviewBudget is the ReviewMode exploration state. Allocation is a
 // renewable boundary; HardLimit is absolute and includes every exploration
 // lease, while the final evidence batch is separate.
 type ReviewBudget struct {
@@ -90,12 +103,6 @@ type ReviewProgress struct {
 	ToAllocation   int              `json:"to_allocation,omitempty"`
 }
 
-type reviewBudgetAssessment struct {
-	Budget    int      `json:"budget"`
-	Rationale string   `json:"rationale"`
-	Focus     []string `json:"focus"`
-}
-
 type reviewExtensionRequest struct {
 	UnresolvedIssue string `json:"unresolved_issue"`
 	Evidence        string `json:"evidence"`
@@ -111,10 +118,12 @@ func reviewInventoryAt(workspace, target string) ReviewInventory {
 	if workspace == "" {
 		return ReviewInventory{Partial: true}
 	}
-	scopes := reviewScopes(workspace, target)
-	inventory := ReviewInventory{Scope: make([]string, 0, len(scopes))}
+	scopes, explicitScope := reviewScopes(workspace, target)
+	inventory := ReviewInventory{Scope: make([]string, 0, len(scopes)), LanguageStats: make(map[string]ReviewLanguageStat)}
+	inventory.explicitScope = explicitScope
 	files := make([]string, 0)
 	seen := make(map[string]struct{})
+	var inventoryPathBytes int
 	for _, scope := range scopes {
 		rel, _ := filepath.Rel(workspace, scope)
 		if rel == "" {
@@ -128,31 +137,61 @@ func reviewInventoryAt(workspace, target string) ReviewInventory {
 		}
 		if !info.IsDir() {
 			if relPath, err := filepath.Rel(workspace, scope); err == nil {
-				files = append(files, filepath.ToSlash(relPath))
+				relPath = filepath.ToSlash(relPath)
+				if reviewExcludedGeneratedPath(relPath) || !reviewSourceLanguageKnown(relPath) {
+					continue
+				}
+				if _, ok := seen[relPath]; ok {
+					continue
+				}
+				if len(files) >= maxReviewInventoryFiles || inventoryPathBytes+len(relPath)+1 > maxReviewInventoryBytes {
+					inventory.Partial = true
+					continue
+				}
+				seen[relPath] = struct{}{}
+				files = append(files, relPath)
+				inventoryPathBytes += len(relPath) + 1
 			}
 			continue
 		}
-		for _, relPath := range search.FuzzyFiles(scope, "", 0) {
+		candidates := search.FuzzyFiles(scope, "", maxReviewInventoryFiles+1)
+		if len(candidates) > maxReviewInventoryFiles {
+			inventory.Partial = true
+		}
+		for _, relPath := range candidates {
+			if len(files) >= maxReviewInventoryFiles {
+				inventory.Partial = true
+				break
+			}
 			path := filepath.Join(scope, filepath.FromSlash(relPath))
 			workspaceRel, err := filepath.Rel(workspace, path)
 			if err != nil || workspaceRel == ".." || strings.HasPrefix(workspaceRel, ".."+string(filepath.Separator)) {
 				continue
 			}
 			workspaceRel = filepath.ToSlash(workspaceRel)
+			if reviewExcludedGeneratedPath(workspaceRel) || !reviewSourceLanguageKnown(workspaceRel) {
+				continue
+			}
 			if _, ok := seen[workspaceRel]; ok {
 				continue
 			}
+			if inventoryPathBytes+len(workspaceRel)+1 > maxReviewInventoryBytes {
+				inventory.Partial = true
+				break
+			}
 			seen[workspaceRel] = struct{}{}
 			files = append(files, workspaceRel)
+			inventoryPathBytes += len(workspaceRel) + 1
 		}
 	}
 	sort.Strings(files)
 	inventory.Files = files
 	stats := make([]reviewFileStat, 0, len(files))
+	readableFiles := make([]string, 0, len(files))
 	var totalBytes int64
 	for _, relPath := range files {
-		base := filepath.Base(relPath)
-		if !strings.HasSuffix(base, ".go") {
+		language, ok := reviewSourceLanguage(relPath)
+		if !ok {
 			continue
 		}
 		if len(stats) >= maxReviewInventoryFiles || totalBytes >= maxReviewInventoryBytes {
@@ -171,23 +210,32 @@ func reviewInventoryAt(workspace, target string) ReviewInventory {
 		}
 		lines, bytesRead, err := reviewFileLines(path)
 		if err != nil {
+			if errors.Is(err, errReviewBinary) {
+				continue
+			}
 			inventory.Partial = true
 			continue
 		}
 		totalBytes += bytesRead
-		stat := reviewFileStat{Path: relPath, Lines: lines}
+		readableFiles = append(readableFiles, relPath)
+		stat := reviewFileStat{Path: relPath, Lines: lines, Test: reviewIsTestFile(relPath)}
 		stats = append(stats, stat)
-		if strings.HasSuffix(base, "_test.go") {
+		if stat.Test {
 			inventory.TestFiles++
 			continue
 		}
 		inventory.ProductionFiles++
 		inventory.ProductionLOC += lines
+		languageStat := inventory.LanguageStats[language]
+		languageStat.Files++
+		languageStat.LOC += lines
+		inventory.LanguageStats[language] = languageStat
 		if lines > 500 {
 			inventory.LargeFiles = append(inventory.LargeFiles, relPath)
 		}
 		inventory.productionDirs = append(inventory.productionDirs, filepath.ToSlash(filepath.Dir(relPath)))
 	}
+	inventory.Files = readableFiles
 	sort.SliceStable(stats, func(i, j int) bool {
 		if stats[i].Lines != stats[j].Lines {
 			return stats[i].Lines > stats[j].Lines
@@ -195,7 +243,7 @@ func reviewInventoryAt(workspace, target string) ReviewInventory {
 		return stats[i].Path < stats[j].Path
 	})
 	for _, stat := range stats {
-		if strings.HasSuffix(filepath.Base(stat.Path), "_test.go") {
+		if stat.Test {
 			continue
 		}
 		inventory.LargestFiles = append(inventory.LargestFiles, stat.Path)
@@ -208,10 +256,98 @@ func reviewInventoryAt(workspace, target string) ReviewInventory {
 	return inventory
 }
 
+func reviewExcludedGeneratedPath(path string) bool {
+	parts := strings.Split(strings.ToLower(filepath.ToSlash(filepath.Clean(path))), "/")
+	for _, part := range parts[:max(0, len(parts)-1)] {
+		switch part {
+		case ".git", ".hg", ".svn", "node_modules", "vendor", "third_party", "third-party", "deps", "dependencies":
+			return true
+		case "doc", "docs", "documentation", "build", "dist", "gen", "generated", "out", "target", "coverage", "__pycache__", ".venv", "venv":
+			return true
+		}
+		if strings.HasPrefix(part, ".") {
+			return true
+		}
+	}
+	base := strings.ToLower(filepath.Base(path))
+	return strings.Contains(base, "generated") || strings.Contains(base, ".gen.")
+}
+
 type reviewFileStat struct {
 	Path  string
 	Lines int
+	Test  bool
 }
+
+func reviewSourceLanguageKnown(path string) bool {
+	_, ok := reviewSourceLanguage(path)
+	return ok
+}
+
+func reviewSourceLanguage(path string) (string, bool) {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".go":
+		return "Go", true
+	case ".js", ".jsx", ".mjs", ".cjs":
+		return "JavaScript", true
+	case ".ts", ".tsx", ".mts", ".cts":
+		return "TypeScript", true
+	case ".html", ".htm":
+		return "HTML", true
+	case ".css", ".scss", ".sass", ".less":
+		return "CSS", true
+	case ".m", ".mm":
+		return "Objective-C", true
+	case ".c":
+		return "C", true
+	case ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx":
+		return "C/C++", true
+	case ".py":
+		return "Python", true
+	case ".rs":
+		return "Rust", true
+	case ".java":
+		return "Java", true
+	case ".kt", ".kts":
+		return "Kotlin", true
+	case ".swift":
+		return "Swift", true
+	case ".cs":
+		return "C#", true
+	case ".rb":
+		return "Ruby", true
+	case ".php":
+		return "PHP", true
+	case ".vue":
+		return "Vue", true
+	case ".svelte":
+		return "Svelte", true
+	case ".sh", ".bash", ".zsh", ".fish":
+		return "Shell", true
+	case ".sql":
+		return "SQL", true
+	default:
+		return "", false
+	}
+}
+
+func reviewIsTestFile(path string) bool {
+	parts := strings.Split(strings.ToLower(filepath.ToSlash(path)), "/")
+	for _, part := range parts[:max(0, len(parts)-1)] {
+		switch part {
+		case "test", "tests", "testdata", "spec", "specs", "__tests__":
+			return true
+		}
+	}
+	base := parts[len(parts)-1]
+	return strings.HasPrefix(base, "test.") || strings.HasPrefix(base, "test_") ||
+		strings.HasPrefix(base, "test-") || strings.HasPrefix(base, "spec.") ||
+		strings.HasPrefix(base, "spec_") || strings.Contains(base, ".test.") ||
+		strings.Contains(base, ".spec.") || strings.Contains(base, "_test.") ||
+		strings.Contains(base, "_spec.")
+}
+
+var errReviewBinary = errors.New("binary review file")
 
 func reviewCanonicalDir(path string) string {
 	path = strings.TrimSpace(path)
@@ -233,7 +369,7 @@ func reviewCanonicalDir(path string) string {
 	return resolved
 }
 
-func reviewScopes(workspace, target string) []string {
+func reviewScopes(workspace, target string) ([]string, bool) {
 	var candidates []string
 	for _, token := range strings.Fields(target) {
 		for _, raw := range reviewPathCandidates(token) {
@@ -254,7 +390,7 @@ func reviewScopes(workspace, target string) []string {
 		}
 	}
 	if len(candidates) == 0 {
-		return []string{workspace}
+		return []string{workspace}, false
 	}
 	sort.Slice(candidates, func(i, j int) bool {
 		if len(candidates[i]) != len(candidates[j]) {
@@ -275,7 +411,7 @@ func reviewScopes(workspace, target string) []string {
 			scopes = append(scopes, candidate)
 		}
 	}
-	return scopes
+	return scopes, true
 }
 
 func reviewPathCandidates(token string) []string {
@@ -322,6 +458,9 @@ func reviewFileLines(path string) (int, int64, error) {
 		n, readErr := file.Read(buffer)
 		if n > 0 {
 			chunk := buffer[:n]
+			if bytes.IndexByte(chunk, 0) >= 0 {
+				return 0, 0, errReviewBinary
+			}
 			lines += bytes.Count(chunk, newline)
 			total += int64(n)
 			last = chunk[n-1]
@@ -354,8 +493,14 @@ func uniqueStrings(values []string) []string {
 }
 
 func reviewBudgetBaseline(target string, inventory ReviewInventory) int {
-	budget := defaultReviewBudget + inventory.ProductionFiles/5 + inventory.ProductionLOC/2000
+	budget := defaultReviewBudget + reviewCeilDiv(inventory.ProductionFiles, 5) + reviewCeilDiv(inventory.ProductionLOC, 2000)
 	if broadReviewRequest(target) {
+		budget += 2
+	}
+	if !inventory.explicitScope {
+		budget += 2
+	}
+	if len(inventory.LanguageStats) > 1 {
 		budget += 2
 	}
 	if len(inventory.productionDirs) > 1 {
@@ -372,10 +517,19 @@ func reviewBudgetBaseline(target string, inventory ReviewInventory) int {
 	return clampReviewBudget(budget)
 }
 
+func reviewCeilDiv(value, divisor int) int {
+	if value <= 0 {
+		return 0
+	}
+	return (value + divisor - 1) / divisor
+}
+
 func broadReviewRequest(target string) bool {
 	terms := map[string]struct{}{
 		"bug": {}, "bugs": {}, "performance": {}, "cleanup": {}, "security": {},
-		"quality": {}, "entire": {}, "codebase": {}, "all": {},
+		"quality": {}, "optimization": {}, "optimize": {}, "speed": {}, "efficiency": {},
+		"frontend": {}, "backend": {}, "ui": {}, "ux": {}, "desktop": {}, "authentication": {},
+		"entire": {}, "codebase": {}, "all": {},
 	}
 	count := 0
 	seen := make(map[string]struct{})
@@ -422,7 +576,7 @@ func reviewWorkspace(a *Agent) string {
 	return reviewCanonicalDir(workspace)
 }
 
-func (a *Agent) newReviewBudget(ctx context.Context, target string, ev Events) *ReviewBudget {
+func (a *Agent) newReviewBudget(_ context.Context, target string, ev Events) *ReviewBudget {
 	workspace := reviewWorkspace(a)
 	inventory := reviewInventoryAt(workspace, target)
 	baseline := reviewBudgetBaseline(target, inventory)
@@ -433,14 +587,6 @@ func (a *Agent) newReviewBudget(ctx context.Context, target string, ev Events) *
 		Rationale: fmt.Sprintf("deterministic scope baseline: %d production files, %d production LOC, %d large files", inventory.ProductionFiles, inventory.ProductionLOC, len(inventory.LargeFiles)),
 	}
 	a.emitReviewProgress(ev, budget, "inventory", "")
-	assessment, ok := a.assessReviewBudget(ctx, target, inventory, baseline, ev)
-	if ok {
-		budget.Allocation = clampReviewBudget(assessment.Budget)
-		budget.Rationale = assessment.Rationale
-		if len(assessment.Focus) > 0 {
-			budget.Focus = assessment.Focus
-		}
-	}
 	a.emitReviewProgress(ev, budget, "assessment", "")
 	return budget
 }
@@ -456,6 +602,13 @@ func (a *Agent) emitReviewProgress(ev Events, budget *ReviewBudget, phase, reaso
 		copyInventory.Files = append([]string(nil), copyInventory.Files...)
 		copyInventory.LargeFiles = append([]string(nil), copyInventory.LargeFiles...)
 		copyInventory.LargestFiles = append([]string(nil), copyInventory.LargestFiles...)
+		if copyInventory.LanguageStats != nil {
+			stats := make(map[string]ReviewLanguageStat, len(copyInventory.LanguageStats))
+			for language, stat := range copyInventory.LanguageStats {
+				stats[language] = stat
+			}
+			copyInventory.LanguageStats = stats
+		}
 		copyInventory.productionDirs = nil
 		inventory = &copyInventory
 	}
@@ -485,6 +638,18 @@ func reviewPreflightPrompt(budget *ReviewBudget) string {
 	if len(inventory.LargeFiles) > 0 {
 		fmt.Fprintf(&b, "large production files: %s\n", strings.Join(inventory.LargeFiles, ", "))
 	}
+	if len(inventory.LanguageStats) > 0 {
+		languages := make([]string, 0, len(inventory.LanguageStats))
+		for language := range inventory.LanguageStats {
+			languages = append(languages, language)
+		}
+		sort.Strings(languages)
+		b.WriteString("production by language:\n")
+		for _, language := range languages {
+			stat := inventory.LanguageStats[language]
+			fmt.Fprintf(&b, "- %s: %d files, %d LOC\n", language, stat.Files, stat.LOC)
+		}
+	}
 	b.WriteString("files:\n")
 	for _, file := range inventory.Files {
 		b.WriteString("- ")
@@ -512,93 +677,9 @@ func reviewBudgetCheckpointReminder(budget *ReviewBudget) string {
 		return ""
 	}
 	if budget.Allocation >= budget.HardLimit {
-		return fmt.Sprintf("<review_budget_checkpoint>\nYou have completed %d review exploration rounds, the absolute limit. Do not request an extension. Use one final evidence batch if one bounded lookup remains, or call submit_review.\n</review_budget_checkpoint>", budget.CurrentRound)
+		return fmt.Sprintf("<review_budget_checkpoint>\nYou have completed %d review exploration rounds, the absolute limit. Synthesis is mandatory now; disclose any explicitly requested area that remains unreviewed in the summary. Do not request an extension. Use one final evidence batch if one bounded lookup remains, or call submit_review.\n</review_budget_checkpoint>", budget.CurrentRound)
 	}
-	return fmt.Sprintf("<review_budget_checkpoint>\nYou have completed %d of %d allocated review exploration rounds (absolute limit %d). The pending navigation calls were withheld. Either call request_review_extension exactly once with one concrete unresolved issue, evidence already gathered, and the exact remaining lookup, or use one final evidence batch. Broader coverage, extra confidence, and speculative leads do not justify an extension. After that batch, only submit_review is available.\n</review_budget_checkpoint>", budget.CurrentRound, budget.Allocation, budget.HardLimit)
-}
-
-func (a *Agent) assessReviewBudget(ctx context.Context, target string, inventory ReviewInventory, baseline int, ev Events) (reviewBudgetAssessment, bool) {
-	if a == nil || len(a.CompactCandidates) == 0 {
-		return reviewBudgetAssessment{}, false
-	}
-	candidate := a.CompactCandidates[0]
-	if candidate == nil || candidate.Backend == nil || strings.TrimSpace(candidate.Model) == "" {
-		return reviewBudgetAssessment{}, false
-	}
-	assessmentCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	metadata := struct {
-		Scope           []string `json:"scope"`
-		ProductionFiles int      `json:"production_files"`
-		TestFiles       int      `json:"test_files"`
-		ProductionLOC   int      `json:"production_loc"`
-		LargeFiles      []string `json:"large_files"`
-		LargestFiles    []string `json:"largest_files"`
-	}{inventory.Scope, inventory.ProductionFiles, inventory.TestFiles, inventory.ProductionLOC, inventory.LargeFiles, inventory.LargestFiles}
-	payload, err := json.Marshal(metadata)
-	if err != nil {
-		return reviewBudgetAssessment{}, false
-	}
-	prompt := fmt.Sprintf("Review request:\n%s\n\nDeterministic inventory:\n%s\n\nSuggest a budget only from %d through %d. Return one JSON object with budget, concise rationale, and focus paths chosen from the inventory. Do not request or infer source contents.", truncateField(strings.TrimSpace(target), 4096), payload, max(minReviewBudget, baseline-2), min(maxReviewBudget, baseline+2))
-	msg, usage, err := a.CompleteWithRoutePurpose(assessmentCtx, candidate.Backend, candidate.Role, candidate.Provider, candidate.Protocol, "review-budget-assessment", models.Request{
-		Model: candidate.Model,
-		Messages: []models.Message{
-			{Role: "system", Content: "You are a bounded review-budget assessor. Return strict JSON only; do not use tools."},
-			{Role: "user", Content: prompt},
-		},
-		MaxTokens: maxReviewAssessmentTokens,
-	}, ev)
-	a.AddUsage(usage)
-	if ev.OnUsage != nil {
-		ev.OnUsage(usage)
-	}
-	if err != nil {
-		return reviewBudgetAssessment{}, false
-	}
-	assessment, err := parseReviewBudgetAssessment(msg.TextContent(), baseline, inventory)
-	return assessment, err == nil
-}
-
-func parseReviewBudgetAssessment(text string, baseline int, inventory ReviewInventory) (reviewBudgetAssessment, error) {
-	if len(text) == 0 || len(text) > maxReviewAssessmentBytes {
-		return reviewBudgetAssessment{}, errors.New("review budget assessment exceeded its output limit")
-	}
-	var assessment reviewBudgetAssessment
-	decoder := json.NewDecoder(strings.NewReader(strings.TrimSpace(text)))
-	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&assessment); err != nil {
-		return reviewBudgetAssessment{}, fmt.Errorf("malformed review budget assessment: %w", err)
-	}
-	var trailing any
-	if err := decoder.Decode(&trailing); err != io.EOF {
-		if err == nil {
-			return reviewBudgetAssessment{}, errors.New("review budget assessment contained more than one JSON value")
-		}
-		return reviewBudgetAssessment{}, fmt.Errorf("malformed trailing review budget assessment: %w", err)
-	}
-	if assessment.Budget < max(minReviewBudget, baseline-2) || assessment.Budget > min(maxReviewBudget, baseline+2) {
-		return reviewBudgetAssessment{}, fmt.Errorf("assessment budget %d is outside the allowed range", assessment.Budget)
-	}
-	assessment.Rationale = strings.TrimSpace(assessment.Rationale)
-	if assessment.Rationale == "" || len(assessment.Rationale) > 2048 {
-		return reviewBudgetAssessment{}, errors.New("assessment rationale must be non-empty and bounded")
-	}
-	if assessment.Focus == nil {
-		return reviewBudgetAssessment{}, errors.New("assessment focus is required")
-	}
-	valid := make(map[string]struct{}, len(inventory.Files))
-	for _, path := range inventory.Files {
-		valid[path] = struct{}{}
-	}
-	for i, path := range assessment.Focus {
-		path = filepath.ToSlash(strings.TrimSpace(path))
-		if _, ok := valid[path]; !ok {
-			return reviewBudgetAssessment{}, fmt.Errorf("assessment focus %d is outside the inventory", i+1)
-		}
-		assessment.Focus[i] = path
-	}
-	assessment.Focus = uniqueStrings(assessment.Focus)
-	return assessment, nil
+	return fmt.Sprintf("<review_budget_checkpoint>\nYou have completed %d of %d allocated review exploration rounds (absolute limit %d). The pending navigation calls were withheld. Either call request_review_extension exactly once with one concrete unresolved issue, evidence already gathered, and the exact remaining lookup, or use one final evidence batch. An explicitly requested but untouched area, such as frontend, backend, desktop, authentication, or UI, is a valid reason for an extension; name that area and the next files or entry points you will inspect. Use the final evidence batch only for one narrow confirmation after requested areas have been sampled; it does not replace missing requested coverage. After that batch, only submit_review is available.\n</review_budget_checkpoint>", budget.CurrentRound, budget.Allocation, budget.HardLimit)
 }
 
 // ReviewFinding describes one structured issue or observation in a code review.
@@ -704,51 +785,6 @@ func ParseReview(response string) (Review, error) {
 		r.ChecksPerformed[i] = strings.TrimSpace(r.ChecksPerformed[i])
 	}
 	return r, nil
-}
-
-// buildReviewCheckpoint constructs a deterministic markdown checkpoint containing
-// the review target, verdict, summary, findings, and checks performed.
-func buildReviewCheckpoint(target string, rev Review) string {
-	var b strings.Builder
-	b.WriteString("# Review Checkpoint\n\n")
-	if strings.TrimSpace(target) != "" {
-		b.WriteString("## Target / Instructions\n\n")
-		b.WriteString(strings.TrimSpace(target))
-		b.WriteString("\n\n")
-	}
-	b.WriteString(fmt.Sprintf("## Verdict: %s\n\n", rev.Verdict))
-	b.WriteString("### Summary\n\n")
-	b.WriteString(rev.Summary)
-	b.WriteString("\n\n")
-
-	if len(rev.Findings) > 0 {
-		b.WriteString("### Findings\n\n")
-		for _, f := range rev.Findings {
-			loc := ""
-			if f.File != "" {
-				if f.Line > 0 {
-					loc = fmt.Sprintf(" (%s:%d)", f.File, f.Line)
-				} else {
-					loc = fmt.Sprintf(" (%s)", f.File)
-				}
-			}
-			b.WriteString(fmt.Sprintf("- **[%s] %s%s**\n", strings.ToUpper(f.Severity), f.Title, loc))
-			if f.Evidence != "" {
-				b.WriteString(fmt.Sprintf("  - Evidence: %s\n", f.Evidence))
-			}
-			if f.Recommendation != "" {
-				b.WriteString(fmt.Sprintf("  - Recommendation: %s\n", f.Recommendation))
-			}
-		}
-		b.WriteString("\n")
-	}
-	if len(rev.ChecksPerformed) > 0 {
-		b.WriteString("### Checks Performed\n\n")
-		for _, c := range rev.ChecksPerformed {
-			b.WriteString(fmt.Sprintf("- %s\n", c))
-		}
-	}
-	return strings.TrimSpace(b.String())
 }
 
 func submitReviewTool() tools.Tool {

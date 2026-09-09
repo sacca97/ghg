@@ -25,24 +25,22 @@ func workerPSCLI() error {
 	if err != nil {
 		return err
 	}
-	if len(states) == 0 {
-		fmt.Println("no worker sessions")
-		return nil
-	}
+	liveCount := 0
 	for _, state := range states {
-		live := ""
 		runtimeFile, runtimeErr := workerwire.NewRuntime(dir, state.SessionID)
-		if runtimeErr == nil {
-			if runtimeFile.Live() {
-				live = " live"
-			} else if state.State == workerwire.StateRunning || state.State == workerwire.StateWaitingApproval || state.State == workerwire.StateWaitingQuestion || state.State == workerwire.StateStopping {
-				state.State = workerwire.StateInterrupted
-				state.Detached = false
-				state.Detail = "worker exited before clean shutdown"
-				_ = runtimeFile.WriteState(state)
+		if runtimeErr != nil || !runtimeFile.Live() {
+			// State files are process bookkeeping, not session history. A worker
+			// that no longer owns the lock cannot be attached to.
+			if runtimeErr == nil {
+				_ = runtimeFile.RemoveState()
 			}
+			continue
 		}
-		fmt.Printf("%s  %-19s  %s%s\n", state.SessionID, state.State, state.UpdatedAt.Local().Format("2006-01-02 15:04"), live)
+		liveCount++
+		fmt.Printf("%s  %-19s  %s live\n", state.SessionID, state.State, state.UpdatedAt.Local().Format("2006-01-02 15:04"))
+	}
+	if liveCount == 0 {
+		fmt.Println("no live workers")
 	}
 	return nil
 }
@@ -79,9 +77,8 @@ func workerAttachCLI(args []string) error {
 	if attachErr == nil {
 		return nil
 	}
-	// A detached worker may have completed its idle grace period. Reopen the
-	// durable session normally, which starts a fresh worker from its persisted
-	// state; a still-present socket keeps the original attach error visible.
+	// Reopen the durable session normally when no worker owns the lock. This
+	// starts a fresh worker from the persisted session state.
 	runtimeFile, runtimeErr := workerwire.NewRuntime(dir, meta.ID)
 	if runtimeErr == nil && !runtimeFile.Live() {
 		// The lock, not the socket pathname, establishes ownership. A crashed

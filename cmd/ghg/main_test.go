@@ -411,7 +411,7 @@ func TestWorkerHumanGateAndPermRules(t *testing.T) {
 	// 1. Uncovered command: humanGate starts flight in background
 	answered := make(chan struct{})
 	go func() {
-		dec, _ := w.humanGate(req)
+		dec, _ := w.humanGate(context.Background(), req)
 		if dec != tools.GateAllowAlways {
 			t.Errorf("expected GateAllowAlways, got %v", dec)
 		}
@@ -449,7 +449,7 @@ func TestWorkerHumanGateAndPermRules(t *testing.T) {
 	}
 
 	// 4. Calling humanGate again should return immediately without pending flight
-	dec, redirect := w.humanGate(req)
+	dec, redirect := w.humanGate(context.Background(), req)
 	if dec != tools.GateAllowOnce || redirect != "" {
 		t.Fatalf("expected GateAllowOnce, got %v redirect=%q", dec, redirect)
 	}
@@ -458,6 +458,39 @@ func TestWorkerHumanGateAndPermRules(t *testing.T) {
 	w.mu.Unlock()
 	if pendingLen != 0 {
 		t.Fatalf("expected 0 pending flights, got %d", pendingLen)
+	}
+}
+
+func TestWorkerHumanGateStopsOnContextCancel(t *testing.T) {
+	w := &workerProcessState{pending: make(map[string]*workerApprovalFlight)}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan tools.GateDecision, 1)
+	go func() {
+		decision, _ := w.humanGate(ctx, tools.GateRequest{Tool: "bash", Command: "git status", Rule: "git status"})
+		done <- decision
+	}()
+	deadline := time.Now().Add(time.Second)
+	for {
+		w.mu.Lock()
+		pending := len(w.pending)
+		w.mu.Unlock()
+		if pending != 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("approval did not become pending")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	select {
+	case decision := <-done:
+		if decision != tools.GateReject {
+			t.Fatalf("decision = %v, want reject", decision)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("context cancellation did not release approval")
 	}
 }
 

@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -435,6 +436,27 @@ func TestAuthKeyNeverLeaksIntoHistoryOrQueue(t *testing.T) {
 	}
 }
 
+func TestNotifyConfigPromptsWithoutEchoingToken(t *testing.T) {
+	m := authTestModel(t)
+	m.notifyConfigCommand()
+	if m.namePrompt == nil || !m.namePrompt.mask {
+		t.Fatal("Telegram setup should open a masked bot-token prompt")
+	}
+	secret := "123456:bot-secret"
+	m.input.SetValue(secret)
+	tm, _ := m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = tm.(*model)
+	if m.namePrompt == nil || m.namePrompt.mask {
+		t.Fatal("Telegram setup should switch to a visible chat-ID prompt")
+	}
+	m.input.SetValue("123456789")
+	tm, _ = m.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	m = tm.(*model)
+	if strings.Contains(m.transcriptText(), secret) || slices.Contains(m.hist, secret) {
+		t.Fatal("Telegram bot token was echoed or stored in input history")
+	}
+}
+
 func TestAuthCompletionUsesProfileIDs(t *testing.T) {
 	m := authTestModel(t)
 	_, cands := completions("/auth an", nil, nil, m.authProviderCands(), nil, nil)
@@ -594,6 +616,42 @@ func TestAskCommandSendsReadOnlyWorkerTurn(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for ask worker input")
+	}
+}
+
+func TestDetachCommandStopsWorkerBeforeExit(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	defer serverConn.Close()
+	defer clientConn.Close()
+
+	m := compactCmdModel()
+	m.workerClient = workerwire.NewClient(clientConn, "test-stop")
+	m.workerState = workerwire.StateRunning
+	m.workerLiveWork = true
+
+	frameCh := make(chan workerwire.Frame, 1)
+	go func() {
+		frame, err := workerwire.NewDecoder(serverConn).Read()
+		if err == nil {
+			frameCh <- frame
+		}
+	}()
+
+	m.command("/detach")
+	select {
+	case frame := <-frameCh:
+		var command workerwire.CommandRequest
+		if err := json.Unmarshal(frame.Payload, &command); err != nil {
+			t.Fatal(err)
+		}
+		if command.Name != workerwire.CommandStop {
+			t.Fatalf("detach command = %q, want %q", command.Name, workerwire.CommandStop)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for stop command")
+	}
+	if m.workerStopRequestID == "" {
+		t.Fatal("stop request should remain pending until the worker acknowledges it")
 	}
 }
 

@@ -100,6 +100,16 @@ func TestExportResultCommand(t *testing.T) {
 	if err := st.SaveWorkflowResult(ctx, reviewRes); err != nil {
 		t.Fatal(err)
 	}
+	if err := st.AppendTelemetry(ctx, sessionID, "model_call_end", map[string]string{"model": "failure-model"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SaveWorkflowResult(ctx, session.WorkflowResultRecord{
+		ResultID: "review-failure-1", SessionID: sessionID, Kind: "review_failure", Version: 1,
+		Payload: `{"error":"final submission failed: timeout"}`, Role: "smart", Provider: "failure-provider", Model: "failure-model",
+		CreatedAt: time.Now().UTC(),
+	}); err != nil {
+		t.Fatal(err)
+	}
 
 	// 3. Export latest review to a specified file
 	outFile := filepath.Join(tempDir, "my-review.md")
@@ -161,8 +171,12 @@ func TestExportResultCommand(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to read exported chat log: %v", err)
 	}
-	if !strings.Contains(string(chatData), "# Conversation") || !strings.Contains(string(chatData), "This is the last assistant response") {
+	if !strings.Contains(string(chatData), "# Conversation") || !strings.Contains(string(chatData), "This is the last assistant response") || !strings.Contains(string(chatData), "model_call_end") || !strings.Contains(string(chatData), "failure-model") || !strings.Contains(string(chatData), "failure-provider") || !strings.Contains(string(chatData), "timeout") {
 		t.Fatalf("unexpected content in exported chat log: %s", string(chatData))
+	}
+	record, ok, err := m.exportRecord("chat")
+	if err != nil || !ok || record.Model != "model-test" || record.Provider != "prov-test" || record.Version != 2 {
+		t.Fatalf("chat export metadata = %+v, ok=%v, err=%v", record, ok, err)
 	}
 }
 

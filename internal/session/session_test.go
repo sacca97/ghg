@@ -147,6 +147,43 @@ func TestStoreRoundTrip(t *testing.T) {
 	}
 }
 
+func TestNotifyFlagDefaultsOffAndPersists(t *testing.T) {
+	st, err := Open(filepath.Join(t.TempDir(), "s.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	id, err := st.Create("/tmp", "m", "p")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if enabled, err := st.NotifyEnabled(id); err != nil || enabled {
+		t.Fatalf("new session notifications = %v, %v; want false", enabled, err)
+	}
+	if err := st.SetNotify(id, true); err != nil {
+		t.Fatal(err)
+	}
+	meta, _, err := st.Load(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !meta.Notify {
+		t.Fatal("loaded session did not retain notification setting")
+	}
+	forkID, err := st.Fork(id, 0, "fork", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	forkMeta, _, err := st.Load(forkID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if forkMeta.Notify {
+		t.Fatal("fork should require its own notification consent")
+	}
+}
+
 func TestMostRecentForCWD(t *testing.T) {
 	st, err := Open(filepath.Join(t.TempDir(), "s.db"))
 	if err != nil {

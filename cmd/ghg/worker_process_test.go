@@ -6,6 +6,7 @@ import (
 	"github.com/sacca97/ghg/internal/agent"
 	"github.com/sacca97/ghg/internal/config"
 	"github.com/sacca97/ghg/internal/models"
+	"github.com/sacca97/ghg/internal/tools"
 )
 
 func TestConfigureWorkerCompactionFallsBackByRole(t *testing.T) {
@@ -77,5 +78,27 @@ func TestWorkerEffortForModelUsesAdvertisedEffort(t *testing.T) {
 	}
 	if got := workerEffortForModel("test", "model", "", false); got != "high" {
 		t.Fatalf("effort = %q, want high", got)
+	}
+}
+
+func TestWorkerApprovalModeChangesLive(t *testing.T) {
+	t.Setenv("GHG_HOME", t.TempDir())
+	cfg := config.Default()
+	runtime, err := tools.NewToolRuntime(nil, tools.ApprovalAsk, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := &workerProcessState{cfg: cfg, runtime: runtime}
+	if err := w.configure(workerConfigureRequest{Approval: "auto-review"}); err != nil {
+		t.Fatal(err)
+	}
+	if got := runtime.CurrentApprovalMode(); got != tools.ApprovalAutoReview {
+		t.Fatalf("live approval mode = %q, want %q", got, tools.ApprovalAutoReview)
+	}
+	if cfg.Execution == nil || cfg.Execution.Approval != string(tools.ApprovalAutoReview) {
+		t.Fatalf("saved approval mode = %+v", cfg.Execution)
+	}
+	if err := w.configure(workerConfigureRequest{Approval: "invalid"}); err == nil {
+		t.Fatal("invalid approval mode should fail")
 	}
 }

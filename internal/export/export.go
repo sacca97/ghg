@@ -31,8 +31,10 @@ const (
 // original []Message payload while allowing transient review diagnostics to
 // travel alongside it.
 type ChatPayload struct {
-	Messages       []models.Message       `json:"messages"`
-	ReviewProgress []agent.ReviewProgress `json:"review_progress,omitempty"`
+	Messages       []models.Message               `json:"messages"`
+	ReviewProgress []agent.ReviewProgress         `json:"review_progress,omitempty"`
+	Telemetry      []session.TelemetryEvent       `json:"telemetry,omitempty"`
+	ReviewFailures []session.WorkflowResultRecord `json:"review_failures,omitempty"`
 }
 
 // DefaultExportFilename derives a sanitized default file name for export.
@@ -138,12 +140,17 @@ func RenderReviewMarkdown(r agent.Review) string {
 
 // RenderChat formats a session conversation into clean Markdown / text.
 func RenderChat(sessionID string, msgs []models.Message) string {
-	return RenderChatWithProgress(sessionID, msgs, nil)
+	return RenderChatWithTelemetry(sessionID, msgs, nil, nil, nil)
 }
 
 // RenderChatWithProgress formats a conversation and optional transient review
 // progress for human inspection.
 func RenderChatWithProgress(sessionID string, msgs []models.Message, progress []agent.ReviewProgress) string {
+	return RenderChatWithTelemetry(sessionID, msgs, progress, nil, nil)
+}
+
+// RenderChatWithTelemetry formats a conversation and its persisted diagnostics.
+func RenderChatWithTelemetry(sessionID string, msgs []models.Message, progress []agent.ReviewProgress, telemetry []session.TelemetryEvent, failures []session.WorkflowResultRecord) string {
 	var b strings.Builder
 	if sessionID != "" {
 		b.WriteString("# Conversation: " + sessionID + "\n\n")
@@ -187,6 +194,28 @@ func RenderChatWithProgress(sessionID string, msgs []models.Message, progress []
 		b.WriteString("## Review progress\n\n```json\n")
 		for _, event := range progress {
 			data, err := json.Marshal(event)
+			if err == nil {
+				b.Write(data)
+				b.WriteByte('\n')
+			}
+		}
+		b.WriteString("```\n\n")
+	}
+	if len(telemetry) > 0 {
+		b.WriteString("## Telemetry\n\n```json\n")
+		for _, event := range telemetry {
+			data, err := json.Marshal(event)
+			if err == nil {
+				b.Write(data)
+				b.WriteByte('\n')
+			}
+		}
+		b.WriteString("```\n\n")
+	}
+	if len(failures) > 0 {
+		b.WriteString("## Review failures\n\n```json\n")
+		for _, failure := range failures {
+			data, err := json.Marshal(failure)
 			if err == nil {
 				b.Write(data)
 				b.WriteByte('\n')
@@ -263,7 +292,7 @@ func RenderResult(record session.WorkflowResultRecord, format string) ([]byte, e
 			if err != nil {
 				return nil, fmt.Errorf("parse chat payload: %w", err)
 			}
-			return []byte(RenderChatWithProgress(record.SessionID, chat.Messages, chat.ReviewProgress)), nil
+			return []byte(RenderChatWithTelemetry(record.SessionID, chat.Messages, chat.ReviewProgress, chat.Telemetry, chat.ReviewFailures)), nil
 		default:
 			return nil, fmt.Errorf("%w: %q", ErrUnsupportedKind, record.Kind)
 		}

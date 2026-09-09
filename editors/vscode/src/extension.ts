@@ -6,6 +6,7 @@ import * as vscode from "vscode";
 type Event = { type?: unknown; [key: string]: unknown };
 type Workspace = vscode.WorkspaceFolder | undefined;
 type Role = "default" | "smart" | "tiny" | "fast";
+const effortLevels = new Set(["", "low", "medium", "high"]);
 
 type SessionPick = vscode.QuickPickItem & { sessionId: string };
 type ReferenceSuggestion = { path: string; folder: boolean };
@@ -43,6 +44,11 @@ function promptWithReferences(prompt: string, paths: string[]): string {
 	return `${prompt}\n\nReferenced workspace paths:\n${paths.map((path) => `- ${path}`).join("\n")}`;
 }
 
+function commandMayRunDuringTurn(prompt: string): boolean {
+	const name = prompt.trim().split(/\s+/, 1)[0];
+	return ["/approval", "/commands", "/help", "/notify", "/pwd", "/rename"].includes(name);
+}
+
 function literalGlob(value: string): string {
 	return value.replace(/[\\{}()[\]*?]/g, (character) => `\\${character}`);
 }
@@ -77,25 +83,27 @@ async function referenceSuggestions(workspace: vscode.WorkspaceFolder, query: st
 }
 
 function parseSessions(output: string): SessionPick[] {
-	return output
-		.split(/\r?\n/)
-		.map((line) => line.trim())
-		.filter((line) => line && !line.startsWith("no sessions"))
-		.map((line) => {
-			const fields = line.split(/\s{2,}/);
-			const sessionId = fields[0].split(/\s+/, 1)[0];
-			return {
-				label: sessionId,
-				description: fields.slice(1).join(" · ") || "session",
-				sessionId,
-			};
-		})
-		.filter((pick) => pick.sessionId !== "");
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(output);
+	} catch {
+		return [];
+	}
+	if (!Array.isArray(parsed)) return [];
+	return parsed.flatMap((item): SessionPick[] => {
+		if (!item || typeof item !== "object") return [];
+		const value = item as Record<string, unknown>;
+		if (typeof value.id !== "string" || value.id === "") return [];
+		const title = typeof value.title === "string" && value.title !== "" ? value.title : "(untitled)";
+		const model = typeof value.model === "string" ? value.model : "";
+		const updated = typeof value.updated_at === "string" ? value.updated_at : "";
+		return [{ label: value.id, description: [title, model, updated].filter(Boolean).join(" · "), sessionId: value.id }];
+	});
 }
 
 function listSessions(binary: string, cwd: string | undefined): Promise<SessionPick[]> {
 	return new Promise((resolve, reject) => {
-		const child = spawn(binary, ["sessions"], { cwd, stdio: ["ignore", "pipe", "pipe"] });
+		const child = spawn(binary, ["sessions", "--format", "json"], { cwd, stdio: ["ignore", "pipe", "pipe"] });
 		if (!child.stdout || !child.stderr) {
 			reject(new Error("ghg did not expose piped output"));
 			return;
@@ -129,7 +137,7 @@ function runJSONCommand(binary: string, cwd: string | undefined, args: string[])
 		child.once("error", reject);
 		child.once("close", (code) => {
 			if (code !== 0) {
-				reject(new Error(error.trim() || `ghg models exited with code ${code ?? "unknown"}`));
+				reject(new Error(error.trim() || `ghg ${args.join(" ")} exited with code ${code ?? "unknown"}`));
 				return;
 			}
 			try { resolve(JSON.parse(output)); } catch (parseError) { reject(parseError); }
@@ -193,17 +201,20 @@ function htmlFor(webview: vscode.Webview, extensionUri: vscode.Uri): string {
   <form id="composer">
     <textarea id="prompt" rows="3" placeholder="Ask ghg anything…"></textarea>
     <div class="composer-row">
-      <div class="mode" role="group" aria-label="Mode">
-        <button type="button" id="chat-mode">Chat</button>
-        <button type="button" id="plan-mode">Plan</button>
-      </div>
+		<button type="button" id="mode-toggle" aria-label="Mode: Execute" title="Switch mode">Execute</button>
 			<select id="role" aria-label="Current model">
 			  <option value="default">Configured</option>
 			  <option value="smart">Configured</option>
 			  <option value="tiny">Configured</option>
 			  <option value="fast">Configured</option>
 			</select>
-      <button type="submit" id="send">Send</button>
+		<select id="effort" aria-label="Thinking effort">
+		  <option value="">Off</option>
+		  <option value="low">Low</option>
+		  <option value="medium">Medium</option>
+		  <option value="high">High</option>
+		</select>
+      <button type="submit" id="send" aria-label="Send" title="Send">↑</button>
     </div>
   </form>
 </main>
@@ -220,11 +231,19 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 	private bridgeReady?: Promise<void>;
 	private bridgeRequest = 0;
 	private active = false;
+	private webviewReady = false;
+	private bridgeWorkspace = "";
+	private bridgeSession = "";
+	private bridgeBinary = "";
+	private bufferedEvents: Event[] = [];
+	private lastSnapshot?: Event;
+	private promptIDs = new Set<string>();
 
 	constructor(private readonly extension: vscode.ExtensionContext) {}
 
 	resolveWebviewView(view: vscode.WebviewView): void {
 		this.view = view;
+		this.webviewReady = false;
 		view.webview.options = {
 			enableScripts: true,
 			localResourceRoots: [vscode.Uri.joinPath(this.extension.extensionUri, "media")],
@@ -237,6 +256,7 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 		view.onDidDispose(() => {
 			if (this.view === view) {
 				this.view = undefined;
+				this.webviewReady = false;
 			}
 		});
 	}
@@ -252,7 +272,24 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 	}
 
 	private post(message: unknown): void {
-		void this.view?.webview.postMessage(message);
+		const event = message && typeof message === "object" ? message as Event : undefined;
+		if (event?.type === "snapshot") {
+			this.lastSnapshot = event;
+			if (!this.view) this.bufferedEvents = [];
+		}
+		if (!this.view || !this.webviewReady) {
+			if (event?.type !== "snapshot") this.bufferedEvents.push(event || {});
+			return;
+		}
+		void this.view.webview.postMessage(message);
+	}
+
+	private flushBufferedEvents(): void {
+		if (!this.view || !this.webviewReady) return;
+		if (this.lastSnapshot) void this.view.webview.postMessage(this.lastSnapshot);
+		const events = this.bufferedEvents;
+		this.bufferedEvents = [];
+		for (const event of events) void this.view.webview.postMessage(event);
 	}
 
 	private async pickModel(mode: "chat" | "plan"): Promise<void> {
@@ -282,18 +319,21 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 			model: modelPick.item.model,
 			provider: modelPick.item.provider,
 			mode: mode === "plan" ? "plan" : "execute",
-		});
+		}, rolePick.role, mode === "plan" ? "plan" : "execute");
 		this.post({ type: "role_model", role: rolePick.role, model: modelPick.item.model });
 	}
 
-	private async ensureBridge(): Promise<void> {
-		if (this.bridge && this.bridgeReady) {
-			return this.bridgeReady;
-		}
+	private async ensureBridge(initialRole: Role = "fast", initialMode: "execute" | "plan" = "execute"): Promise<void> {
 		const workspace = currentWorkspace();
 		const binary = vscode.workspace.getConfiguration("ghg").get<string>("binaryPath", "ghg");
-		const args = ["bridge", "--role", "fast"];
-		const sessionId = this.extension.workspaceState.get<string>(sessionKey(workspace));
+		const sessionId = this.extension.workspaceState.get<string>(sessionKey(workspace)) || "";
+		const workspaceID = workspace?.uri.toString() || "global";
+		const sessionMatches = this.bridgeSession === sessionId || (sessionId === "" && this.bridgeSession !== "");
+		if (this.bridge && this.bridgeReady && this.bridgeWorkspace === workspaceID && sessionMatches && this.bridgeBinary === binary) {
+			return this.bridgeReady;
+		}
+		if (this.bridge) await this.stopBridge();
+		const args = ["bridge", "--role", initialRole, "--mode", initialMode];
 		if (sessionId) {
 			args.push("--session", sessionId);
 		}
@@ -306,6 +346,9 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 			throw new Error("ghg bridge did not expose piped streams");
 		}
 		this.bridge = child;
+		this.bridgeWorkspace = workspaceID;
+		this.bridgeSession = sessionId;
+		this.bridgeBinary = binary;
 		let ready = false;
 		let resolveReady!: () => void;
 		let rejectReady!: (error: Error) => void;
@@ -327,6 +370,7 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 			if (event.type === "bridge_ready") {
 				ready = true;
 				if (typeof event.session_id === "string" && event.session_id !== "") {
+					this.bridgeSession = event.session_id;
 					void this.extension.workspaceState.update(sessionKey(workspace), event.session_id);
 				}
 				resolveReady();
@@ -344,6 +388,11 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 			});
 			this.post(event);
 		});
+		child.stdin.on("error", (error: Error) => {
+			if (this.bridge === child) {
+				this.post({ type: "error", error: `ghg bridge input failed: ${error.message}` });
+			}
+		});
 		child.stderr.on("data", () => {});
 		child.once("error", (error) => {
 			if (!ready) rejectReady(error instanceof Error ? error : new Error(String(error)));
@@ -354,6 +403,10 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 			if (this.bridge === child) {
 				this.bridge = undefined;
 				this.bridgeReady = undefined;
+				this.bridgeWorkspace = "";
+				this.bridgeSession = "";
+				this.bridgeBinary = "";
+				this.lastSnapshot = undefined;
 			}
 			if (this.active) {
 				this.active = false;
@@ -363,56 +416,134 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 		return promise;
 	}
 
-	private async handleBridgeEvent(event: Event): Promise<void> {
-		if (event.type === "permission_request") {
-			const approval = event.approval as Record<string, unknown> | undefined;
-			if (!approval || typeof approval.id !== "string") return;
+	private async showApproval(approval: Record<string, unknown>): Promise<void> {
+		const id = typeof approval.id === "string" ? approval.id : "";
+		const child = this.bridge;
+		if (!id || !child || this.promptIDs.has(id)) return;
+		this.promptIDs.add(id);
+		try {
 			const choice = await vscode.window.showQuickPick(
 				["Allow once", "Allow always", "Deny"],
 				{ placeHolder: `${String(approval.tool || "tool")}: ${String(approval.command || "Allow operation?")}` },
 			);
+			if (this.bridge !== child) return;
 			const decision = choice === "Allow always" ? "allow_always" : choice === "Allow once" ? "allow_once" : "deny";
-			await this.bridgeCommand("approve", { id: approval.id, decision });
-			return;
-		}
-		if (event.type === "question_request" && Array.isArray(event.questions)) {
-			const answers: Array<{ id: string; value: string }> = [];
-			for (const item of event.questions as Array<Record<string, unknown>>) {
-				if (typeof item.id !== "string") continue;
-				const options = Array.isArray(item.options) ? item.options.map((option) => String((option as Record<string, unknown>).label || "")) : [];
-				const value = options.length > 0
-					? await vscode.window.showQuickPick(options, { placeHolder: String(item.question || "Choose an option") })
-					: await vscode.window.showInputBox({ prompt: String(item.question || "Answer") });
-				if (value === undefined) {
-					await this.bridgeCommand("answer_question", { id: event.id, cancelled: true });
-					return;
-				}
-				answers.push({ id: item.id, value });
-			}
-			await this.bridgeCommand("answer_question", { id: event.id, answers });
+			await this.writeBridgeCommand(child, "approve", { id, decision });
+		} finally {
+			this.promptIDs.delete(id);
 		}
 	}
 
-	private async bridgeCommand(name: string, payload: unknown = null): Promise<void> {
-		await this.ensureBridge();
-		if (!this.bridge?.stdin) {
-			throw new Error("ghg bridge is unavailable");
+	private async showQuestion(request: Record<string, unknown>): Promise<void> {
+		const id = typeof request.id === "string" ? request.id : "";
+		const child = this.bridge;
+		if (!id || !child || this.promptIDs.has(id)) return;
+		this.promptIDs.add(id);
+		try {
+			const answers: Array<{ id: string; value: string }> = [];
+			for (const item of Array.isArray(request.questions) ? request.questions : []) {
+				if (!item || typeof item !== "object") continue;
+				const question = item as Record<string, unknown>;
+				if (typeof question.id !== "string") continue;
+				const options = Array.isArray(question.options) ? question.options
+					.filter((option) => option && typeof option === "object")
+					.map((option) => String((option as Record<string, unknown>).label || "")) : [];
+				const value = options.length > 0
+					? await vscode.window.showQuickPick(options, { placeHolder: String(question.question || "Choose an option") })
+					: await vscode.window.showInputBox({ prompt: String(question.question || "Answer") });
+				if (value === undefined) {
+					if (this.bridge === child) await this.writeBridgeCommand(child, "answer_question", { id, cancelled: true });
+					return;
+				}
+				answers.push({ id: question.id, value });
+			}
+			if (this.bridge === child) await this.writeBridgeCommand(child, "answer_question", { id, answers });
+		} finally {
+			this.promptIDs.delete(id);
 		}
+	}
+
+	private async handleBridgeEvent(event: Event): Promise<void> {
+		if (event.type === "permission_request") {
+			const approval = event.approval as Record<string, unknown> | undefined;
+			if (approval) await this.showApproval(approval);
+			return;
+		}
+		if (event.type === "question_request") {
+			await this.showQuestion(event);
+			return;
+		}
+		if (event.type === "snapshot") {
+			const snapshot = event.snapshot as Record<string, unknown> | undefined;
+			if (!snapshot) return;
+			if (snapshot.pending_approval && typeof snapshot.pending_approval === "object") {
+				await this.showApproval(snapshot.pending_approval as Record<string, unknown>);
+			}
+			if (snapshot.pending_question && typeof snapshot.pending_question === "object") {
+				await this.showQuestion(snapshot.pending_question as Record<string, unknown>);
+			}
+		}
+	}
+
+	private writeBridgeCommand(child: ChildProcess, name: string, payload: unknown = null): Promise<void> {
+		const stdin = child.stdin;
+		if (!stdin || stdin.destroyed || stdin.writableEnded) return Promise.reject(new Error("ghg bridge input is unavailable"));
 		const request = {
 			type: "command",
 			request_id: `vscode-${++this.bridgeRequest}`,
 			name,
 			payload,
 		};
-		this.bridge.stdin.write(JSON.stringify(request) + "\n");
+		return new Promise((resolve, reject) => {
+			let settled = false;
+			const finish = (error?: Error) => {
+				if (settled) return;
+				settled = true;
+				stdin.removeListener("error", onError);
+				stdin.removeListener("drain", onDrain);
+				child.removeListener("close", onClose);
+				if (error) reject(error);
+				else resolve();
+			};
+			const onError = (error: Error) => finish(error);
+			const onDrain = () => finish();
+			const onClose = () => finish(new Error("ghg bridge closed before accepting the command"));
+			stdin.once("error", onError);
+			child.once("close", onClose);
+			let accepted = false;
+			try {
+				accepted = stdin.write(JSON.stringify(request) + "\n", "utf8", () => {
+					if (accepted) finish();
+				});
+				if (!accepted) stdin.once("drain", onDrain);
+			} catch (error) {
+				finish(error instanceof Error ? error : new Error(String(error)));
+			}
+		});
+	}
+
+	private async bridgeCommand(name: string, payload: unknown = null, initialRole: Role = "fast", initialMode: "execute" | "plan" = "execute"): Promise<void> {
+		await this.ensureBridge(initialRole, initialMode);
+		if (!this.bridge?.stdin) {
+			throw new Error("ghg bridge is unavailable");
+		}
+		const child = this.bridge;
+		if (!child) throw new Error("ghg bridge is unavailable");
+		await this.writeBridgeCommand(child, name, payload);
 	}
 
 	private stopBridge(): Promise<void> {
 		const child = this.bridge;
 		this.bridge = undefined;
 		this.bridgeReady = undefined;
+		this.bridgeWorkspace = "";
+		this.bridgeSession = "";
+		this.bridgeBinary = "";
+		this.lastSnapshot = undefined;
+		this.bufferedEvents = [];
 		this.active = false;
 		if (!child) return Promise.resolve();
+		if (child.exitCode !== null) return Promise.resolve();
 		const stopped = new Promise<void>((resolve) => child.once("close", () => resolve()));
 		child.stdin?.end();
 		const timer = setTimeout(() => interrupt(child), 2000);
@@ -420,8 +551,12 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 		return stopped;
 	}
 
+	async reloadBridge(): Promise<void> {
+		if (!this.active) await this.stopBridge();
+	}
+
 	private async submitInput(prompt: string, role: Role, mode: "execute" | "plan", flags: { ask?: boolean; review?: boolean }, references: string[]): Promise<void> {
-		await this.bridgeCommand("configure_role", { role, mode });
+		await this.bridgeCommand("configure_role", { role, mode }, role, mode);
 		await this.bridgeCommand("input", {
 			input: promptWithReferences(prompt, references),
 			authored: true,
@@ -450,7 +585,7 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 			await this.submitInput(args, role, "execute", { ask: true }, references);
 			return;
 		case "/plan":
-			await this.bridgeCommand("configure_role", { role, mode: "plan" });
+			await this.bridgeCommand("configure_role", { role, mode: "plan" }, role, "plan");
 			if (!args) {
 				this.post({ type: "notice", text: "switched to plan mode (read-only exploration)" });
 				return;
@@ -471,13 +606,47 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 			if (!args) throw new Error("usage: /review <target or instructions>");
 			this.active = true;
 			this.post({ type: "turn_start", mode: "chat" });
-			await this.submitInput(args, "smart", "execute", { review: true }, references);
+			await this.submitInput(args, role, "execute", { review: true }, references);
 			return;
+		case "/continue": {
+			if (args) throw new Error("usage: /continue");
+			if (this.active) throw new Error("A ghg turn is already running.");
+			const continueMode = message.mode === "plan" ? "plan" : "execute";
+			this.active = true;
+			this.post({ type: "turn_start", mode: continueMode });
+			await this.bridgeCommand("input", {
+				input: "continue",
+				authored: true,
+				plan_mode: continueMode === "plan",
+				review_mode: message.mode === "review",
+			});
+			return;
+		}
 		case "/compact":
 			if (args === "retry") return this.bridgeCommand("compact_retry");
 			if (args === "log") throw new Error("/compact log is not available in the extension yet");
 			if (args) throw new Error("usage: /compact [retry]");
 			return this.bridgeCommand("compact");
+		case "/approval":
+			if (args !== "ask" && args !== "auto-review" && args !== "never") throw new Error("usage: /approval <ask|auto-review|never>");
+			return this.bridgeCommand("configure", { approval: args });
+		case "/notify":
+			if (args === "config") {
+				const botToken = await vscode.window.showInputBox({
+					prompt: "Telegram bot token",
+					password: true,
+					ignoreFocusOut: true,
+				});
+				if (!botToken?.trim()) return;
+				const chatID = await vscode.window.showInputBox({
+					prompt: "Telegram chat ID",
+					ignoreFocusOut: true,
+				});
+				if (!chatID?.trim()) return;
+				return this.bridgeCommand("notify", { action: "config", bot_token: botToken.trim(), chat_id: chatID.trim() });
+			}
+			if (args !== "" && args !== "on" && args !== "off") throw new Error("usage: /notify [config|on|off]");
+			return this.bridgeCommand("notify", { action: args || "status" });
 		case "/lsp":
 			return this.bridgeCommand("lsp_status");
 		case "/context-doctor":
@@ -498,11 +667,17 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 			return this.bridgeCommand("rename", { title: args });
 		case "/effort":
 			if (!args) throw new Error("usage: /effort <off|low|medium|high>");
-			return this.bridgeCommand("configure_role", { role, mode: message.mode === "plan" ? "plan" : "execute", effort: args });
+			{
+				const effort = args.toLowerCase() === "off" ? "" : args.toLowerCase();
+				if (!effortLevels.has(effort)) throw new Error("usage: /effort <off|low|medium|high>");
+				const mode = message.mode === "plan" ? "plan" : "execute";
+				return this.bridgeCommand("configure_role", { role, mode, effort, update_effort: true }, role, mode);
+			}
 		case "/model": {
 			if (!args) return this.pickModel(message.mode === "plan" ? "plan" : "chat");
 			const [model, provider] = fields.slice(1);
-			await this.bridgeCommand("set_role_model", { model, provider, role, mode: message.mode === "plan" ? "plan" : "execute" });
+			const mode = message.mode === "plan" ? "plan" : "execute";
+			await this.bridgeCommand("set_role_model", { model, provider, role, mode }, role, mode);
 			this.post({ type: "role_model", role, model });
 			return;
 		}
@@ -518,7 +693,7 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 			return;
 		case "/commands":
 		case "/help":
-			this.post({ type: "notice", text: "Worker commands: /ask /plan /execute /review /compact /lsp /mcp /context-doctor /goal-from-context /cd /rename /effort /model /pwd /clear /resume /quit and !<command>" });
+			this.post({ type: "notice", text: "Worker commands: /ask /plan /execute /review /continue /compact /approval /notify /lsp /mcp /context-doctor /goal-from-context /cd /rename /effort /model /pwd /clear /resume /quit and !<command>" });
 			return;
 		default:
 			throw new Error(`${name} is not available in the extension yet`);
@@ -531,6 +706,10 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 		}
 		const message = raw as WebviewMessage;
 		switch (message.type) {
+			case "ready":
+				this.webviewReady = true;
+				this.flushBufferedEvents();
+				break;
 			case "send":
 				await this.send(message);
 				break;
@@ -544,10 +723,19 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 				}
 				break;
 			case "configureRole": {
+				if (this.active) {
+					break;
+				}
 				const role = message.role === "default" || message.role === "smart" || message.role === "tiny" || message.role === "fast" ? message.role : "fast";
 				const mode = message.mode === "plan" ? "plan" : "execute";
 				try {
-					await this.bridgeCommand("configure_role", { role, mode });
+					const updateEffort = message.updateEffort === true || typeof message.effort === "string";
+					const effort = typeof message.effort === "string" ? message.effort.trim().toLowerCase() : "";
+					const normalizedEffort = effort === "off" ? "" : effort;
+					if (updateEffort && !effortLevels.has(normalizedEffort)) {
+						throw new Error("unsupported thinking effort; choose off, low, medium, or high");
+					}
+					await this.bridgeCommand("configure_role", { role, mode, effort: normalizedEffort, update_effort: updateEffort }, role, mode);
 				} catch (error) {
 					this.post({ type: "error", error: error instanceof Error ? error.message : String(error) });
 				}
@@ -566,36 +754,53 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 				this.post({ type: "referenceSuggestions", requestId, items });
 				break;
 			}
+			case "openExternal": {
+				if (typeof message.uri !== "string") break;
+				const uri = vscode.Uri.parse(message.uri);
+				if (!(["http", "https", "file"] as string[]).includes(uri.scheme)) {
+					this.post({ type: "error", error: "Only http, https, and file links can be opened." });
+					break;
+				}
+				await vscode.env.openExternal(uri);
+				break;
+			}
 		}
 	}
 
 	private async send(message: WebviewMessage): Promise<void> {
-		if (this.active) {
-			this.post({ type: "error", error: "A ghg turn is already running." });
-			return;
-		}
 		if (typeof message.prompt !== "string" || !message.prompt.trim()) {
 			this.post({ type: "error", error: "Enter a prompt first." });
 			return;
 		}
-		const mode = message.mode === "plan" ? "plan" : message.mode === "chat" ? "chat" : undefined;
+		const prompt = message.prompt.trim();
+		const activeBefore = this.active;
+		if (activeBefore && !commandMayRunDuringTurn(prompt)) {
+			this.post({ type: "error", error: "A ghg turn is already running." });
+			return;
+		}
+		const mode = message.mode === "plan" ? "plan" : message.mode === "review" ? "review" : message.mode === "execute" || message.mode === "chat" ? "execute" : undefined;
 		if (!mode) {
 			return;
 		}
 		const role: Role = message.role === "default" || message.role === "smart" || message.role === "tiny" || message.role === "fast" ? message.role : "fast";
 		try {
-			const prompt = message.prompt.trim();
 			if (prompt.startsWith("/") || prompt.startsWith("!")) {
 				await this.sendCommand(prompt, message);
 				return;
 			}
 			this.active = true;
 			this.post({ type: "turn_start", mode });
-			await this.submitInput(prompt, role, mode === "plan" ? "plan" : "execute", {}, cleanReferences(message.references));
+			if (mode === "review") {
+				await this.submitInput(prompt, role, "execute", { review: true }, cleanReferences(message.references));
+			} else {
+				await this.submitInput(prompt, role, mode === "plan" ? "plan" : "execute", {}, cleanReferences(message.references));
+			}
 		} catch (error) {
-			this.active = false;
 			this.post({ type: "error", error: error instanceof Error ? error.message : String(error) });
-			this.post({ type: "turn_end" });
+			if (!activeBefore) {
+				this.active = false;
+				this.post({ type: "turn_end" });
+			}
 		}
 	}
 
@@ -656,7 +861,10 @@ export function activate(extension: vscode.ExtensionContext): void {
 	extension.subscriptions.push(
 		vscode.window.registerWebviewViewProvider("ghg.chatView", provider),
 		vscode.commands.registerCommand("ghg.newSession", () => provider.newSession()),
-		vscode.commands.registerCommand("ghg.resumeSession", () => provider.resumeSession()),
+	vscode.commands.registerCommand("ghg.resumeSession", () => provider.resumeSession()),
+		vscode.workspace.onDidChangeConfiguration((event) => {
+			if (event.affectsConfiguration("ghg.binaryPath")) void provider.reloadBridge();
+		}),
 		{ dispose: () => provider.dispose() },
 	);
 }

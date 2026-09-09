@@ -93,6 +93,14 @@ func (r Runtime) ReadState() (StateRecord, error) {
 	return record, nil
 }
 
+func (r Runtime) RemoveState() error {
+	err := os.Remove(r.StatePath)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
+}
+
 func (r Runtime) WritePrompt(prompt string) error {
 	tmp, err := os.CreateTemp(r.Dir, ".prompt-*")
 	if err != nil {

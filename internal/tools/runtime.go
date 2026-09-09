@@ -133,7 +133,7 @@ type ToolRuntime struct {
 	Reviewer          ApprovalReviewer
 	SecretNames       []string
 	TempDir           string
-	HumanGate         func(GateRequest) (GateDecision, string)
+	HumanGate         func(context.Context, GateRequest) (GateDecision, string)
 	Cautious          bool
 	InteractiveRunner InteractiveRunner
 	LanguageService   LanguageService
@@ -146,6 +146,7 @@ type ToolRuntime struct {
 
 	envOverrides map[string]string
 	state        *runtimeState
+	approvalMu   *sync.RWMutex
 }
 
 // PostEditHook is a trusted, direct-argv command run after a successful
@@ -189,7 +190,39 @@ func NewToolRuntime(policy *sandbox.Policy, mode ApprovalMode, headless bool) (*
 	if err != nil {
 		return nil, err
 	}
-	return &ToolRuntime{Policy: policy, ApprovalMode: parsed, Headless: headless, state: &runtimeState{approval: make(map[string]*approvalFlight)}}, nil
+	return &ToolRuntime{
+		Policy: policy, ApprovalMode: parsed, Headless: headless,
+		state: &runtimeState{approval: make(map[string]*approvalFlight)}, approvalMu: &sync.RWMutex{},
+	}, nil
+}
+
+// CurrentApprovalMode reads the live approval setting shared by delegated
+// runtimes.
+func (r *ToolRuntime) CurrentApprovalMode() ApprovalMode {
+	if r == nil {
+		return ""
+	}
+	if r.approvalMu == nil {
+		return r.ApprovalMode
+	}
+	r.approvalMu.RLock()
+	defer r.approvalMu.RUnlock()
+	return r.ApprovalMode
+}
+
+// SetApprovalMode changes the approval setting for the current worker and all
+// child runtimes without changing the execution policy.
+func (r *ToolRuntime) SetApprovalMode(mode ApprovalMode) {
+	if r == nil {
+		return
+	}
+	if r.approvalMu == nil {
+		r.ApprovalMode = mode
+		return
+	}
+	r.approvalMu.Lock()
+	r.ApprovalMode = mode
+	r.approvalMu.Unlock()
 }
 
 // Child returns the same policy and approval boundary for a delegated agent.
@@ -569,7 +602,7 @@ func (r *ToolRuntime) reviewOrHuman(ctx context.Context, request ApprovalRequest
 }
 
 func (r *ToolRuntime) reviewOrHumanOnce(ctx context.Context, request ApprovalRequest, allowAutoReview bool) (GateDecision, bool, error) {
-	approvalMode := r.ApprovalMode
+	approvalMode := r.CurrentApprovalMode()
 	if approvalMode == "" {
 		approvalMode = ApprovalAsk
 	}
@@ -604,7 +637,7 @@ func (r *ToolRuntime) reviewOrHumanOnce(ctx context.Context, request ApprovalReq
 		// never let their "always" choice collapse to a broad command prefix.
 		rule = normalizeShellText(request.Command)
 	}
-	decision, redirect := r.HumanGate(GateRequest{Tool: request.Tool, Command: request.Command, Rule: rule})
+	decision, redirect := r.HumanGate(ctx, GateRequest{Tool: request.Tool, Command: request.Command, Rule: rule})
 	if decision == GateReject {
 		if redirect == "" {
 			redirect = "the user rejected this action"

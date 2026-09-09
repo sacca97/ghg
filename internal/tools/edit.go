@@ -39,7 +39,7 @@ type editOperation struct {
 func editTool() Tool {
 	return resultTool(models.NewTool("edit",
 		"Apply one or more observed line-range edits atomically. Each primary edit references a read observation; use mode=exact only for temporary unique old_string compatibility.",
-		`{"type":"object","properties":{"mode":{"type":"string","enum":["observed","exact"],"description":"observed is the primary range-authorized mode; exact is compatibility mode"},"edits":{"type":"array","description":"Observed operations to apply atomically across one or more files","items":{"type":"object","properties":{"observation":{"type":"string"},"path":{"type":"string"},"start_line":{"type":"integer"},"end_line":{"type":"integer"},"operation":{"type":"string","enum":["replace","delete","insert_before","insert_after"]},"content":{"type":"string"}},"required":["observation","path","start_line","end_line","operation","content"]}},"path":{"type":"string","description":"Compatibility-mode file path"},"old_string":{"type":"string","description":"Compatibility-mode exact text"},"new_string":{"type":"string","description":"Compatibility-mode replacement"},"replace_all":{"type":"boolean","description":"Compatibility-mode replace every occurrence"}},"required":["mode"]}`),
+		`{"type":"object","properties":{"mode":{"type":"string","enum":["observed","exact"],"description":"observed is the primary range-authorized mode; exact is compatibility mode"},"edits":{"type":"array","description":"Observed operations to apply atomically across one or more files","items":{"type":"object","properties":{"observation":{"type":"string"},"path":{"type":"string"},"start_line":{"type":"integer"},"end_line":{"type":"integer"},"operation":{"type":"string","enum":["replace","delete","insert_before","insert_after"],"description":"Defaults to replace"},"content":{"type":"string"}},"required":["observation","path","start_line","end_line"]}},"path":{"type":"string","description":"Compatibility-mode file path"},"old_string":{"type":"string","description":"Compatibility-mode exact text"},"new_string":{"type":"string","description":"Compatibility-mode replacement"},"replace_all":{"type":"boolean","description":"Compatibility-mode replace every occurrence"}},"required":["mode"]}`),
 		runEdit)
 }
 
@@ -193,6 +193,7 @@ type observedEdit struct {
 	line      int
 	path      string
 	target    []byte
+	opIndex   int
 }
 
 type editFilePlan struct {
@@ -225,46 +226,56 @@ func runObservedEdit(ctx context.Context, request editRequest) (ToolResult, erro
 
 	plans := make(map[string]*editFilePlan)
 	canonicalPaths := make([]string, 0, len(request.Edits))
-	for _, operation := range request.Edits {
+	fail := func(index int, err error) (ToolResult, error) {
+		return ToolResult{}, fmt.Errorf("edit %d: %w", index+1, err)
+	}
+
+	for i, operation := range request.Edits {
 		if err := ctx.Err(); err != nil {
 			return ToolResult{}, err
 		}
 		if operation.Path == "" || operation.Observation == "" {
-			return ToolResult{}, errors.New("each observed edit needs observation and path")
+			return fail(i, errors.New("each observed edit needs observation and path"))
 		}
 		if operation.StartLine <= 0 || operation.EndLine < operation.StartLine {
-			return ToolResult{}, fmt.Errorf("invalid authorized line range %d-%d", operation.StartLine, operation.EndLine)
+			return fail(i, fmt.Errorf("invalid authorized line range %d-%d", operation.StartLine, operation.EndLine))
 		}
 		opName := strings.ToLower(strings.TrimSpace(operation.Operation))
+		if opName == "" {
+			opName = "replace"
+		}
 		switch opName {
 		case "replace", "delete", "insert_before", "insert_after":
 		default:
-			return ToolResult{}, fmt.Errorf("unsupported observed edit operation %q", operation.Operation)
+			return fail(i, fmt.Errorf("unsupported observed edit operation %q", operation.Operation))
 		}
 		canonical, err := authorizedObservationPath(ctx, operation.Path, sandbox.AccessWrite, false)
 		if err != nil {
-			return ToolResult{}, err
+			return fail(i, err)
 		}
 		var record observation.Record
 		if operation.Observation != "" {
 			var loadErr error
 			record, loadErr = store.Load(ctx, sessionID, operation.Observation)
 			if loadErr != nil || record.ID == "" {
-				return ToolResult{}, fmt.Errorf("observation %q not found for %s: read the file first to obtain a valid observation ID", operation.Observation, canonical)
+				return fail(i, fmt.Errorf("observation %q not found for %s: read the file first to obtain a valid observation ID", operation.Observation, canonical))
 			}
 			if record.SessionID != "" && record.SessionID != sessionID {
-				return ToolResult{}, errors.New("observation belongs to another session")
+				return fail(i, errors.New("observation belongs to another session"))
 			}
 		}
 		recordPath := ""
 		if record.Path != "" {
-			recordPath, _ = authorizedObservationPath(ctx, record.Path, sandbox.AccessRead, false)
+			recordPath, err = authorizedObservationPath(ctx, record.Path, sandbox.AccessRead, false)
+			if err != nil {
+				return fail(i, err)
+			}
 		}
 		if recordPath != canonical {
-			return ToolResult{}, fmt.Errorf("observation %q covers %s, not %s", operation.Observation, record.Path, canonical)
+			return fail(i, fmt.Errorf("observation %q covers %s, not %s", operation.Observation, record.Path, canonical))
 		}
 		if operation.StartLine < record.StartLine || operation.EndLine > record.EndLine {
-			return ToolResult{}, fmt.Errorf("observation %q covers lines %d-%d, but requested range is %d-%d", operation.Observation, record.StartLine, record.EndLine, operation.StartLine, operation.EndLine)
+			return fail(i, fmt.Errorf("observation %q covers lines %d-%d, but requested range is %d-%d", operation.Observation, record.StartLine, record.EndLine, operation.StartLine, operation.EndLine))
 		}
 		content := operation.Content
 		if content == "" && operation.NewContent != "" {
@@ -273,15 +284,15 @@ func runObservedEdit(ctx context.Context, request editRequest) (ToolResult, erro
 		plan := plans[canonical]
 		if plan == nil {
 			if deny := checkGate(ctx, "edit", canonical); deny != "" {
-				return ToolResult{}, errors.New(deny)
+				return fail(i, errors.New(deny))
 			}
 			original, err := os.ReadFile(canonical)
 			if err != nil {
-				return ToolResult{}, err
+				return fail(i, err)
 			}
 			info, err := os.Stat(canonical)
 			if err != nil {
-				return ToolResult{}, err
+				return fail(i, err)
 			}
 			plan = &editFilePlan{path: canonical, original: original, mode: info.Mode()}
 			plans[canonical] = plan
@@ -289,8 +300,9 @@ func runObservedEdit(ctx context.Context, request editRequest) (ToolResult, erro
 		}
 		resolved, err := resolveObservedEdit(operation, opName, content, record, plan.original)
 		if err != nil {
-			return ToolResult{}, err
+			return fail(i, err)
 		}
+		resolved.opIndex = i
 		plan.operations = append(plan.operations, resolved)
 	}
 	// The permission calls above intentionally happen before any staged or
@@ -298,9 +310,17 @@ func runObservedEdit(ctx context.Context, request editRequest) (ToolResult, erro
 	sort.Strings(canonicalPaths)
 	for _, path := range canonicalPaths {
 		plan := plans[path]
-		if err := validateEditIntersections(plan.operations); err != nil {
-			return ToolResult{}, fmt.Errorf("%s: %w", path, err)
+		for i := 0; i < len(plan.operations); i++ {
+			for j := i + 1; j < len(plan.operations); j++ {
+				if rangesIntersect(plan.operations[i].start, plan.operations[i].end, plan.operations[j].start, plan.operations[j].end) {
+					return fail(plan.operations[j].opIndex, fmt.Errorf("intersects edit %d in %s", plan.operations[i].opIndex+1, path))
+				}
+			}
 		}
+	}
+
+	for _, path := range canonicalPaths {
+		plan := plans[path]
 		updated, err := applyObservedOperations(plan.original, plan.operations)
 		if err != nil {
 			return ToolResult{}, fmt.Errorf("%s: %w", path, err)
@@ -511,17 +531,6 @@ func spanRange(spans []lineSpan, startLine, endLine int) (int, int, error) {
 		return 0, 0, fmt.Errorf("line range %d-%d is outside the issued content", startLine, endLine)
 	}
 	return spans[startLine-1].start, spans[endLine-1].end, nil
-}
-
-func validateEditIntersections(edits []observedEdit) error {
-	for i := 0; i < len(edits); i++ {
-		for j := i + 1; j < len(edits); j++ {
-			if rangesIntersect(edits[i].start, edits[i].end, edits[j].start, edits[j].end) {
-				return fmt.Errorf("operations %d and %d intersect", i+1, j+1)
-			}
-		}
-	}
-	return nil
 }
 
 func rangesIntersect(aStart, aEnd, bStart, bEnd int) bool {

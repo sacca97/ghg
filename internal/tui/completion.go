@@ -62,6 +62,12 @@ func completions(val string, models, providers, authProviders, skillCands, effor
 			{"retry", "undo the latest compaction and retry"},
 			{"log", "list recorded compactions"},
 		}, token)
+	case len(fields) == 1 && fields[0] == "/notify":
+		cands = filterPrefix([]cand{
+			{"config", "configure and verify Telegram"},
+			{"on", "enable Telegram for this session"},
+			{"off", "disable Telegram for this session"},
+		}, token)
 	case len(fields) == 1 && (fields[0] == "/export" || fields[0] == "/export-result"):
 		cands = filterPrefix(exportKindCands, token)
 	case strings.HasPrefix(token, "$"): // codex-style skill invocation

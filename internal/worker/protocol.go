@@ -66,6 +66,7 @@ const (
 	CommandAppend = "append"
 	CommandFork   = "fork"
 	CommandRename = "rename"
+	CommandNotify = "notify"
 )
 
 var (
@@ -262,7 +263,7 @@ func knownCommand(name string) bool {
 		CommandStop, CommandPing, CommandLSPStatus, CommandMCPStatus,
 		CommandMCPReconnect, CommandMCPEnable, CommandMCPDisable, CommandContextDoctor, CommandRewind,
 		CommandCompactRetry, CommandGoal, CommandGoalFromContext,
-		CommandChdir, CommandAppend, CommandShell, CommandFork, CommandRename:
+		CommandChdir, CommandAppend, CommandShell, CommandFork, CommandRename, CommandNotify:
 		return true
 	default:
 		return false

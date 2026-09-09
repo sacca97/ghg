@@ -1,8 +1,10 @@
 package tui
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -40,6 +42,85 @@ const toolPreviewLines = 5
 // those wrap with no floor, and a cached bad render persists until a width
 // *change* forces a reflow. Below this the layout is unreadable either way.
 const minRenderWidth = 8
+
+type toolDisplayRange struct {
+	Path   string `json:"path"`
+	Offset int    `json:"offset"`
+	Limit  int    `json:"limit"`
+}
+
+type toolDisplayArgs struct {
+	Path    string             `json:"path"`
+	Pattern string             `json:"pattern"`
+	Query   string             `json:"query"`
+	Command string             `json:"command"`
+	Offset  int                `json:"offset"`
+	Limit   int                `json:"limit"`
+	Ranges  []toolDisplayRange `json:"ranges"`
+}
+
+var toolDisplayHash = regexp.MustCompile(`(?i)sha256:[0-9a-f]{8,}`)
+
+// toolCallSummary keeps tool rows useful at a glance without changing the
+// original arguments stored in the session or emitted by the bridge.
+func toolCallSummary(name, args string) string {
+	var parsed toolDisplayArgs
+	if err := json.Unmarshal([]byte(args), &parsed); err != nil {
+		return hideToolDisplayHash(strings.TrimSpace(args))
+	}
+	if name == "read" {
+		ranges := parsed.Ranges
+		if len(ranges) == 0 && parsed.Path != "" {
+			ranges = []toolDisplayRange{{Path: parsed.Path, Offset: parsed.Offset, Limit: parsed.Limit}}
+		}
+		parts := make([]string, 0, len(ranges))
+		for _, r := range ranges {
+			if detail := formatToolRange(r.Path, r.Offset, r.Limit); detail != "" {
+				parts = append(parts, detail)
+			}
+		}
+		return hideToolDisplayHash(strings.Join(parts, ", "))
+	}
+	if parsed.Command != "" {
+		return hideToolDisplayHash(strings.TrimSpace(parsed.Command))
+	}
+	parts := make([]string, 0, 2)
+	if parsed.Path != "" {
+		parts = append(parts, parsed.Path)
+	}
+	if parsed.Pattern != "" {
+		parts = append(parts, parsed.Pattern)
+	} else if parsed.Query != "" {
+		parts = append(parts, parsed.Query)
+	}
+	if len(parts) > 0 {
+		return hideToolDisplayHash(strings.Join(parts, " "))
+	}
+	return hideToolDisplayHash(strings.TrimSpace(args))
+}
+
+func hideToolDisplayHash(value string) string {
+	return toolDisplayHash.ReplaceAllStringFunc(value, func(match string) string {
+		if len(match) <= len("sha256:")+8 {
+			return match
+		}
+		return match[:len("sha256:")+8] + "…"
+	})
+}
+
+func formatToolRange(path string, offset, limit int) string {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return ""
+	}
+	if offset <= 0 {
+		offset = 1
+	}
+	if limit > 0 {
+		return fmt.Sprintf("%s:%d-%d", path, offset, offset+limit-1)
+	}
+	return fmt.Sprintf("%s:%d", path, offset)
+}
 
 // block is one finalized transcript entry. Text holds raw markdown for
 // blockAssistant, raw tool output for blockTool, and styled content
@@ -421,7 +502,11 @@ func renderReviewScope(progress agent.ReviewProgress) string {
 	if focus == "" {
 		focus = "(largest production files)"
 	}
-	return fmt.Sprintf("◎ review scope\n  %d production · %d tests · %s LOC · %d large files\n  budget: %d exploration rounds · hard limit: %d\n  focus: %s", progress.Inventory.ProductionFiles, progress.Inventory.TestFiles, formatReviewLOC(progress.Inventory.ProductionLOC), len(progress.Inventory.LargeFiles), progress.Allocation, progress.HardLimit, focus)
+	scope := ""
+	if len(progress.Inventory.Scope) > 0 {
+		scope = "\n  scope: " + strings.Join(progress.Inventory.Scope, ", ")
+	}
+	return fmt.Sprintf("◎ review scope%s\n  %d production · %d tests · %s LOC · %d large files\n  budget: %d exploration rounds · hard limit: %d\n  focus: %s", scope, progress.Inventory.ProductionFiles, progress.Inventory.TestFiles, formatReviewLOC(progress.Inventory.ProductionLOC), len(progress.Inventory.LargeFiles), progress.Allocation, progress.HardLimit, focus)
 }
 
 func renderReviewExtension(progress agent.ReviewProgress) string {

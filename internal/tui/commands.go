@@ -11,6 +11,7 @@ import (
 	"github.com/sacca97/ghg/internal/agent"
 	"github.com/sacca97/ghg/internal/lsp"
 	"github.com/sacca97/ghg/internal/mcp"
+	"github.com/sacca97/ghg/internal/tools"
 	workerwire "github.com/sacca97/ghg/internal/worker"
 )
 
@@ -27,11 +28,13 @@ type registryEntry struct {
 var registry = []registryEntry{
 	{Name: "/auth", Hint: "[provider] [key] — connect any profile (bare lists profiles; provider-only opens a masked prompt; also: ghg auth <provider>)", Category: "Agent"},
 	{Name: "/ask", Hint: "<question> — answer directly; repository questions may be investigated read-only", Category: "Agent", Immediate: true},
+	{Name: "/approval", Hint: "[ask|auto-review|never] — switch capability approval live (bare shows the current mode)", Category: "Session", Immediate: true},
 	{Name: "/cd", Hint: "[dir] — change working directory (bare prints it)", Category: "Session"},
 	{Name: "/clear", Hint: "— reset conversation", Category: "Session", Immediate: true},
 	{Name: "/compact", Hint: "— compact now using tiny → fast → default → smart; retry undoes the last compaction, log lists them; compaction level: ctrl+p › Compaction level", Category: "Session", Immediate: true},
 	{Name: "/context-doctor", Hint: "— audit what a fresh session injects (skills, MCP, tool schemas) and its token cost", Category: "Session", Immediate: true},
-	{Name: "/detach", Hint: "— leave a running worker in the background (ctrl+d)", Keybind: "ctrl+d", Category: "Session", Immediate: true},
+	{Name: "/continue", Hint: "— continue the interrupted turn using the current session history", Category: "Session", Immediate: true},
+	{Name: "/detach", Hint: "— stop the worker and exit; resume later (ctrl+d)", Keybind: "ctrl+d", Category: "Session", Immediate: true},
 	{Name: "/effort", Hint: "[level] — reasoning effort: off·low·medium·high (bare opens selector)", Category: "Agent", Immediate: true},
 	{Name: "/export", Hint: "[chat|plan|review|last] [path] [--format json|markdown] [--force] — export chat log or structured result to a file", Category: "Session"},
 	{Name: "/export-result", Hint: "[chat|plan|review|last] [path] [--format json|markdown] [--force] — export chat log, structured result, or last message to a file", Category: "Session"},
@@ -43,6 +46,7 @@ var registry = []registryEntry{
 	{Name: "/me", Hint: "— edit your standing instructions (~/.ghg/me.md) in $EDITOR", Category: "Agent"},
 	{Name: "/memory", Hint: "[n] [session] — saved memories: list what's injected each turn, mark entry n done", Category: "Session"},
 	{Name: "/model", Hint: "<name> [provider] — switch model (any provider-catalog model works; refresh pulls new announcements)", Category: "Agent", Immediate: true},
+	{Name: "/notify", Hint: "[config|on|off] — configure or toggle Telegram completion notifications", Category: "Session", Immediate: true},
 	{Name: "/plan", Hint: "[goal] — enter read-only Plan mode or explore a goal with the smart model (run it with /execute)", Category: "Agent"},
 	{Name: "/pwd", Hint: "— print working directory", Category: "Session", Immediate: true},
 	{Name: "/quit", Hint: "— exit", Keybind: "ctrl+c ctrl+c", Category: "App", Immediate: true},
@@ -99,7 +103,7 @@ func helpText() string {
 	for _, hint := range []string{
 		"ctrl+k — clear the conversation",
 		"ctrl+t — focus the subagents dock (↑/↓ select, enter opens, esc backs out)",
-		"ctrl+d — detach a running turn",
+		"ctrl+d — stop the worker and exit (resume later)",
 		palHintThinking + " — toggle thinking timer",
 		"ctrl+e — expand the last tool result",
 		"ctrl+j / shift+enter — newline",
@@ -125,7 +129,7 @@ func busyCmd(text string) bool {
 		return false
 	}
 	switch fields[0] {
-	case "/help", "/effort", "/tasks", "/cd", "/pwd", "/report", "/detach":
+	case "/approval", "/continue", "/help", "/effort", "/tasks", "/cd", "/pwd", "/report", "/detach", "/notify", "/rename":
 		return true
 	case "/ask", "/plan", "/execute", "/review": // handled immediately so a slash command is not sent as chat text
 		return true
@@ -135,6 +139,16 @@ func busyCmd(text string) bool {
 		return len(fields) == 1 || fields[1] == "clear" || fields[1] == "rounds"
 	}
 	return false
+}
+
+func (m *model) currentApprovalMode() string {
+	if m.approval != "" {
+		return m.approval
+	}
+	if m.cfg != nil && m.cfg.Execution != nil && strings.TrimSpace(m.cfg.Execution.Approval) != "" {
+		return strings.TrimSpace(m.cfg.Execution.Approval)
+	}
+	return string(tools.ApprovalAsk)
 }
 
 func (m *model) command(text string) (tea.Model, tea.Cmd) {
@@ -148,18 +162,18 @@ func (m *model) command(text string) (tea.Model, tea.Cmd) {
 	case "/detach":
 		live := m.busy || m.workerState == workerwire.StateRunning || m.workerState == workerwire.StateWaitingApproval || m.workerState == workerwire.StateWaitingQuestion || m.workerLiveWork
 		if m.workerClient == nil || !live {
-			m.append(dimStyle.Render("(nothing running to detach)"))
+			m.append(dimStyle.Render("(nothing running to stop)"))
 			return m, nil
 		}
-		if m.detachRequestID != "" {
+		if m.workerStopRequestID != "" {
 			return m, nil
 		}
-		requestID := workerRequestID("detach")
-		if err := m.workerClient.Send(workerwire.CommandDetach, requestID, nil); err != nil {
-			m.append(errStyle.Render("detach failed: " + err.Error()))
+		requestID := workerRequestID("stop")
+		if err := m.workerClient.Send(workerwire.CommandStop, requestID, nil); err != nil {
+			m.append(errStyle.Render("stop failed: " + err.Error()))
 			return m, nil
 		}
-		m.detachRequestID = requestID
+		m.workerStopRequestID = requestID
 		return m, nil
 	case "/clear":
 		if m.busy {
@@ -171,6 +185,48 @@ func (m *model) command(text string) (tea.Model, tea.Cmd) {
 		}
 		m.resetSessionState()
 		m.append(dimStyle.Render("(conversation cleared)"))
+	case "/continue":
+		if m.busy {
+			m.append(dimStyle.Render("(busy — /continue after this turn)"))
+			return m, nil
+		}
+		return m.submit("continue")
+	case "/approval":
+		if len(fields) == 1 {
+			m.append(dimStyle.Render("approval mode: " + m.currentApprovalMode()))
+			return m, nil
+		}
+		if len(fields) != 2 {
+			m.append(errStyle.Render("usage: /approval [ask|auto-review|never]"))
+			return m, nil
+		}
+		mode, err := tools.ParseApprovalMode(fields[1])
+		if err != nil {
+			m.append(errStyle.Render(err.Error()))
+			return m, nil
+		}
+		if m.cfg == nil {
+			m.append(errStyle.Render("approval: config unavailable"))
+			return m, nil
+		}
+		if err := m.cfg.ApplyExecutionOverrides("", "", string(mode)); err != nil {
+			m.append(errStyle.Render("approval: " + err.Error()))
+			return m, nil
+		}
+		if err := m.saveConfig(); err != nil {
+			return m, nil
+		}
+		m.approval = string(mode)
+		if m.workerClient == nil {
+			m.append(dimStyle.Render("approval mode saved: " + string(mode) + " (applies to the next worker)"))
+			return m, nil
+		}
+		if err := m.workerClient.Send(workerwire.CommandConfigure, workerRequestID("approval"), workerwire.ConfigureRequest{Approval: string(mode)}); err != nil {
+			m.append(errStyle.Render("approval update failed: " + err.Error()))
+			return m, nil
+		}
+		m.append(dimStyle.Render("approval mode: " + string(mode)))
+		return m, nil
 	case "/memory":
 		m.memoryCommand(fields[1:])
 	case "/schedule":
@@ -218,6 +274,27 @@ func (m *model) command(text string) (tea.Model, tea.Cmd) {
 			m.append(errStyle.Render("/compact does not accept a model; it always uses tiny → fast → default → smart"))
 			return m, nil
 		}
+	case "/notify":
+		if len(fields) > 2 || (len(fields) == 2 && fields[1] != "on" && fields[1] != "off" && fields[1] != "config") {
+			m.append(errStyle.Render("usage: /notify [config|on|off]"))
+			return m, nil
+		}
+		if len(fields) == 2 && fields[1] == "config" {
+			m.notifyConfigCommand()
+			return m, nil
+		}
+		if m.workerClient == nil && !m.ensureWorker() {
+			m.append(errStyle.Render("notify: worker unavailable: " + m.workerStartError))
+			return m, nil
+		}
+		action := "status"
+		if len(fields) == 2 {
+			action = fields[1]
+		}
+		if err := m.workerClient.Send(workerwire.CommandNotify, workerRequestID("notify"), workerwire.NotifyRequest{Action: action}); err != nil {
+			m.append(errStyle.Render("notify failed: " + err.Error()))
+		}
+		return m, nil
 	case "/mcp":
 		return m.mcpCommand(fields)
 	case "/lsp":
@@ -353,10 +430,6 @@ func (m *model) command(text string) (tea.Model, tea.Cmd) {
 		m.forkCommand(strings.TrimSpace(strings.TrimPrefix(text, "/fork")))
 		return m, nil
 	case "/rename":
-		if m.busy {
-			m.append(dimStyle.Render("(busy — /rename after this turn)"))
-			return m, nil
-		}
 		m.renameCommand(strings.TrimSpace(strings.TrimPrefix(text, "/rename")))
 		return m, nil
 	case "/resume":

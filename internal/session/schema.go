@@ -14,7 +14,8 @@ CREATE TABLE IF NOT EXISTS sessions (
 	model      TEXT NOT NULL,
 	provider   TEXT NOT NULL,
 	title      TEXT NOT NULL DEFAULT '',
-	goal       TEXT NOT NULL DEFAULT ''
+	goal       TEXT NOT NULL DEFAULT '',
+	notify     INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS messages (
 	session_id TEXT NOT NULL REFERENCES sessions(id),
@@ -174,12 +175,24 @@ CREATE TABLE IF NOT EXISTS workflow_results (
 	PRIMARY KEY (session_id, result_id)
 );
 CREATE INDEX IF NOT EXISTS workflow_results_session_kind ON workflow_results(session_id, kind, created_at DESC);
+-- Append-only execution telemetry. It is separate from compactable messages so
+-- review progress and model/tool diagnostics survive prompt compaction.
+CREATE TABLE IF NOT EXISTS telemetry_events (
+	session_id TEXT NOT NULL REFERENCES sessions(id),
+	seq        INTEGER NOT NULL,
+	kind       TEXT NOT NULL,
+	payload    TEXT NOT NULL, -- JSON
+	created_at TEXT NOT NULL,
+	PRIMARY KEY (session_id, seq)
+);
+CREATE INDEX IF NOT EXISTS telemetry_events_session_created ON telemetry_events(session_id, created_at, seq);
 `
 
 // sessionColumns are added idempotently for databases created before the
 // current schema. Fresh databases already have these columns in schema.
 var sessionColumns = []struct{ name, def string }{
 	{"goal", "goal TEXT NOT NULL DEFAULT ''"},
+	{"notify", "notify INTEGER NOT NULL DEFAULT 0"},
 	{"forked_from", "forked_from TEXT NOT NULL DEFAULT ''"},     // source session id
 	{"fork_seq", "fork_seq INTEGER NOT NULL DEFAULT 0"},         // branch point in the source
 	{"tags", "tags TEXT NOT NULL DEFAULT ''"},                   // comma-separated labels

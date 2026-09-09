@@ -25,6 +25,7 @@ type Meta struct {
 	Provider    string
 	CWD         string
 	Goal        string
+	Notify      bool     // completion notifications enabled for this session
 	ForkedFrom  string   // source session id when created by /fork ("" = root)
 	ForkSeq     int      // conversation index the fork branched at
 	Tags        []string // freeform labels for caller-side filtering
@@ -36,7 +37,7 @@ type Meta struct {
 	UpdatedAt   time.Time
 }
 
-const sessionMetaColumns = `id, title, model, provider, cwd, goal, forked_from, fork_seq, tags, pinned, effort, usage_in, usage_cached, usage_out, updated_at`
+const sessionMetaColumns = `id, title, model, provider, cwd, goal, notify, forked_from, fork_seq, tags, pinned, effort, usage_in, usage_cached, usage_out, updated_at`
 
 type Store struct {
 	db      *sql.DB
@@ -121,6 +122,29 @@ func (s *Store) SetEffort(id, effort string) error {
 func (s *Store) SetUsage(id string, in, cached, out int) error {
 	_, err := s.db.Exec(`UPDATE sessions SET usage_in=?, usage_cached=?, usage_out=? WHERE id=?`, in, cached, out, id)
 	return err
+}
+
+// SetNotify records per-session consent for completion notifications.
+func (s *Store) SetNotify(id string, enabled bool) error {
+	value := 0
+	if enabled {
+		value = 1
+	}
+	_, err := s.db.Exec(`UPDATE sessions SET notify=? WHERE id=?`, value, id)
+	return err
+}
+
+// NotifyEnabled reports whether completion notifications are enabled for a
+// session. Missing sessions remain disabled.
+func (s *Store) NotifyEnabled(id string) (bool, error) {
+	var value int
+	if err := s.db.QueryRow(`SELECT notify FROM sessions WHERE id=?`, id).Scan(&value); err != nil {
+		if err == sql.ErrNoRows {
+			return false, nil
+		}
+		return false, err
+	}
+	return value != 0, nil
 }
 
 // SetRoute records the model/provider selected for an existing session even
@@ -305,7 +329,7 @@ func (s *Store) DeleteSession(id string) error {
 	if err := rows.Err(); err != nil {
 		return err
 	}
-	for _, table := range []string{"artifacts", "messages", "history_fts", "tasks", "snapshots", "schedules", "compactions", "goal_checkpoints", "goals", "observations", "search_snapshots", "workflow_results"} {
+	for _, table := range []string{"artifacts", "messages", "history_fts", "tasks", "snapshots", "schedules", "compactions", "goal_checkpoints", "goals", "observations", "search_snapshots", "workflow_results", "telemetry_events"} {
 		if _, err := tx.Exec(`DELETE FROM `+table+` WHERE session_id=?`, id); err != nil {
 			return err
 		}
@@ -609,8 +633,8 @@ func scanMetas(rows *sql.Rows) ([]Meta, error) {
 	for rows.Next() {
 		var m Meta
 		var updated, tags string
-		var pinned int
-		if err := rows.Scan(&m.ID, &m.Title, &m.Model, &m.Provider, &m.CWD, &m.Goal,
+		var notify, pinned int
+		if err := rows.Scan(&m.ID, &m.Title, &m.Model, &m.Provider, &m.CWD, &m.Goal, &notify,
 			&m.ForkedFrom, &m.ForkSeq, &tags, &pinned, &m.Effort,
 			&m.UsageIn, &m.UsageCached, &m.UsageOut, &updated); err != nil {
 			return nil, err
@@ -618,6 +642,7 @@ func scanMetas(rows *sql.Rows) ([]Meta, error) {
 		if tags != "" {
 			m.Tags = strings.Split(tags, ",")
 		}
+		m.Notify = notify != 0
 		m.Pinned = pinned != 0
 		m.UpdatedAt, _ = time.Parse(time.RFC3339, updated)
 		out = append(out, m)

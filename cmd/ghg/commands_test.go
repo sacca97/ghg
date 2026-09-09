@@ -59,7 +59,7 @@ func TestSessionsCLI(t *testing.T) {
 	st.Close()
 
 	out := captureStdout(t, func() {
-		if err := sessionsCLI(); err != nil {
+		if err := sessionsCLI(nil); err != nil {
 			t.Fatal(err)
 		}
 	})
@@ -68,6 +68,18 @@ func TestSessionsCLI(t *testing.T) {
 	}
 	if !strings.Contains(out, "just now") && !strings.Contains(out, time.Now().Format("2006-01-02")) {
 		t.Fatalf("age column should render, got:\n%s", out)
+	}
+	out = captureStdout(t, func() {
+		if err := sessionsCLI([]string{"--format", "json"}); err != nil {
+			t.Fatal(err)
+		}
+	})
+	var listed []sessionListItem
+	if err := json.Unmarshal([]byte(out), &listed); err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 1 || listed[0].ID != id || listed[0].Title != "how do I unstage a file" {
+		t.Fatalf("sessions JSON = %#v", listed)
 	}
 }
 

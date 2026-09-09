@@ -352,7 +352,7 @@ func (m *model) seedTranscript(msgs []models.Message, base int) {
 				m.blocks = append(m.blocks, block{kind: blockAssistant, text: strings.TrimRight(msg.TextContent(), "\n")})
 			}
 			for _, tc := range msg.ToolCalls {
-				m.blocks = append(m.blocks, block{kind: blockText, text: toolStyle.Render("⚒ "+tc.Function.Name+" ") + dimStyle.Render(tc.Function.Arguments)})
+				m.blocks = append(m.blocks, block{kind: blockText, text: toolStyle.Render("⚒ "+tc.Function.Name+" ") + dimStyle.Render(toolCallSummary(tc.Function.Name, tc.Function.Arguments))})
 			}
 		case "tool":
 			if strings.HasPrefix(msg.Content, "Error: tool call interrupted") {

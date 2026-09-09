@@ -70,20 +70,31 @@ func exportCLI(args []string) error {
 
 	if resultTarget == "" || resultTarget == "latest" {
 		if kind == "chat" || kind == "log" || kind == "transcript" {
-			_, msgs, err := st.Load(sessionID)
+			meta, msgs, err := st.Load(sessionID)
 			if err != nil {
 				return err
 			}
 			if len(msgs) == 0 {
 				return fmt.Errorf("no messages found in session %s", sessionID)
 			}
-			payload, _ := json.Marshal(msgs)
+			telemetry, err := st.ListTelemetry(ctx, sessionID)
+			if err != nil {
+				return fmt.Errorf("load session telemetry: %w", err)
+			}
+			failures, err := st.ListWorkflowResults(ctx, sessionID, "review_failure")
+			if err != nil {
+				return fmt.Errorf("load review failures: %w", err)
+			}
+			payload, _ := json.Marshal(export.ChatPayload{Messages: msgs, Telemetry: telemetry, ReviewFailures: failures})
 			record = session.WorkflowResultRecord{
 				ResultID:  "chat-latest",
 				SessionID: sessionID,
 				Kind:      "chat",
-				Version:   1,
+				Version:   2,
 				Payload:   string(payload),
+				Model:     meta.Model,
+				Provider:  meta.Provider,
+				CreatedAt: meta.UpdatedAt,
 			}
 		} else if kind == "message" || kind == "last" || kind == "response" {
 			_, msgs, err := st.Load(sessionID)

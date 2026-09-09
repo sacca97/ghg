@@ -78,7 +78,7 @@ func TestRuntimeExternalRedirectRequiresHumanAndGrantsOneCallRoot(t *testing.T) 
 		reviewerCalls++
 		return ApprovalResult{Decision: ApprovalApproveOnce, Reason: "reviewed", Confidence: 1}, nil
 	}
-	runtime.HumanGate = func(request GateRequest) (GateDecision, string) {
+	runtime.HumanGate = func(_ context.Context, request GateRequest) (GateDecision, string) {
 		humanCalls++
 		if !strings.Contains(request.Command, ">") || !strings.Contains(request.Command, target) {
 			t.Fatalf("human request lost the exact redirect: %+v", request)
@@ -112,7 +112,7 @@ func TestRuntimeExternalRemovalRequiresHumanAndGrantsOneCallRoot(t *testing.T) {
 		reviewerCalls++
 		return ApprovalResult{Decision: ApprovalApproveOnce, Reason: "not used for external removal", Confidence: 1}, nil
 	}
-	runtime.HumanGate = func(request GateRequest) (GateDecision, string) {
+	runtime.HumanGate = func(_ context.Context, request GateRequest) (GateDecision, string) {
 		humanCalls++
 		if request.Command != "rm -f "+target && request.Command != "env rm -f "+target {
 			t.Fatalf("human request command = %q", request.Command)
@@ -153,7 +153,7 @@ func TestRuntimeHardDeniedCompoundCannotBeWidenedByRemovalGrant(t *testing.T) {
 		reviewerCalls++
 		return ApprovalResult{Decision: ApprovalApproveOnce, Reason: "must not be called", Confidence: 1}, nil
 	}
-	runtime.HumanGate = func(GateRequest) (GateDecision, string) {
+	runtime.HumanGate = func(_ context.Context, _ GateRequest) (GateDecision, string) {
 		humanCalls++
 		return GateAllowOnce, ""
 	}
@@ -176,7 +176,7 @@ func TestRuntimeHumanOnlyGitMutationBypassesTinyReviewer(t *testing.T) {
 		reviewerCalls++
 		return ApprovalResult{Decision: ApprovalApproveOnce, Reason: "never use me for human-only work", Confidence: 1}, nil
 	}
-	runtime.HumanGate = func(request GateRequest) (GateDecision, string) {
+	runtime.HumanGate = func(_ context.Context, request GateRequest) (GateDecision, string) {
 		humanCalls++
 		if request.Rule != "git reset --hard HEAD" {
 			t.Fatalf("human gate rule = %q", request.Rule)
@@ -196,7 +196,7 @@ func TestRuntimeHumanOnlyGitMutationBypassesTinyReviewer(t *testing.T) {
 	if _, err := granted.Authorize(filepath.Join(gitRoot, "index"), sandbox.AccessWrite, true); err != nil {
 		t.Fatalf("human-approved git metadata was not granted: %v", err)
 	}
-	runtime.HumanGate = func(request GateRequest) (GateDecision, string) {
+	runtime.HumanGate = func(_ context.Context, request GateRequest) (GateDecision, string) {
 		humanCalls++
 		if request.Rule != "env git reset --hard HEAD" {
 			t.Fatalf("wrapped human gate rule = %q", request.Rule)

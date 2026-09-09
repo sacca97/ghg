@@ -143,6 +143,33 @@ func TestReadBatchKeepsSuccessfulSiblingsWhenOneRangeFails(t *testing.T) {
 	}
 }
 
+func TestReadBatchReportsUnprocessedRanges(t *testing.T) {
+	dir := t.TempDir()
+	paths := make([]string, 3)
+	content := strings.Repeat(strings.Repeat("x", 100)+"\n", 300)
+	for i := range paths {
+		paths[i] = filepath.Join(dir, fmt.Sprintf("large-%d.go", i))
+		if err := os.WriteFile(paths[i], []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	args := map[string]any{"ranges": []map[string]any{
+		{"path": paths[0], "offset": 1, "limit": 300},
+		{"path": paths[1], "offset": 41, "limit": 300},
+		{"path": paths[2], "offset": 81, "limit": 300},
+	}}
+	raw, err := json.Marshal(args)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := ExecuteResult(context.Background(), All(), "read", raw)
+	if !strings.Contains(result.Preview, "unprocessed ranges:") ||
+		!strings.Contains(result.Preview, "2:"+paths[1]+":41-340") ||
+		!strings.Contains(result.Preview, "3:"+paths[2]+":81-380") {
+		t.Fatalf("batched omission report = %q", result.Preview)
+	}
+}
+
 func TestWritePreservesExistingMode(t *testing.T) {
 	dir := t.TempDir()
 	existing := filepath.Join(dir, "existing.txt")

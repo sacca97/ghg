@@ -423,8 +423,8 @@ func TestThinkingDisplayEphemeralAndCollapsedTranscript(t *testing.T) {
 		t.Fatalf("expected finalized timer block '◌ Thinking 3s', got %q", timerBlock)
 	}
 	toolBlock := stripAll(m.blocks[len(m.blocks)-1].text)
-	if !strings.Contains(toolBlock, "⚒ grep") || !strings.Contains(toolBlock, `{"pattern":"secretKey","path":"."}`) {
-		t.Fatalf("expected tool row with name and full args, got %q", toolBlock)
+	if !strings.Contains(toolBlock, "⚒ grep") || !strings.Contains(toolBlock, ". secretKey") {
+		t.Fatalf("expected compact tool row, got %q", toolBlock)
 	}
 
 	// Send tool result
@@ -439,10 +439,10 @@ func TestThinkingDisplayEphemeralAndCollapsedTranscript(t *testing.T) {
 		}
 	}
 
-	// Tool name and full args remain visible after completion
+	// Tool name and compact details remain visible after completion
 	completedRow := stripAll(m.blocks[len(m.blocks)-1].render(m.width))
-	if !strings.Contains(completedRow, "⚒ grep") || !strings.Contains(completedRow, `{"pattern":"secretKey","path":"."}`) {
-		t.Fatalf("tool name and arguments must remain visible after completion, got %q", completedRow)
+	if !strings.Contains(completedRow, "⚒ grep") || !strings.Contains(completedRow, ". secretKey") {
+		t.Fatalf("tool name and details must remain visible after completion, got %q", completedRow)
 	}
 
 	// When thinking display is disabled, no timer line is appended
@@ -992,7 +992,7 @@ func TestToolCallLineWrapsNotTruncates(t *testing.T) {
 	}
 }
 
-// Regression: resumed sessions render full tool-call args too (no 120-char cut).
+// Regression: resumed sessions render full tool-call command details too.
 func TestResumedToolCallNotTruncated(t *testing.T) {
 	m := compactCmdModel()
 	m.Update(mkWinSize(50, 24))
@@ -1067,8 +1067,12 @@ func TestReviewProgressRendersScopeAndLease(t *testing.T) {
 	m.Update(mkWinSize(80, 30))
 	m.Update(reviewProgressMsg{progress: agent.ReviewProgress{
 		Phase: "inventory", Allocation: 16, HardLimit: 38,
-		Inventory: &agent.ReviewInventory{ProductionFiles: 20, TestFiles: 10, ProductionLOC: 8420, LargeFiles: []string{"a.go", "b.go", "c.go", "d.go", "e.go"}},
+		Inventory: &agent.ReviewInventory{Scope: []string{"internal/tui"}, ProductionFiles: 20, TestFiles: 10, ProductionLOC: 8420, LargeFiles: []string{"a.go", "b.go", "c.go", "d.go", "e.go"}},
 		Focus:     []string{"update.go", "view.go", "worker.go", "input.go", "palette.go"},
+	}})
+	m.Update(reviewProgressMsg{progress: agent.ReviewProgress{
+		Phase: "assessment", Allocation: 16, HardLimit: 38,
+		Inventory: &agent.ReviewInventory{Scope: []string{"internal/tui", "internal/worker"}},
 	}})
 	m.Update(reviewProgressMsg{progress: agent.ReviewProgress{
 		Phase: "extension", Allocation: 20, HardLimit: 38, FromAllocation: 16, ToAllocation: 20,
@@ -1080,7 +1084,7 @@ func TestReviewProgressRendersScopeAndLease(t *testing.T) {
 	}})
 	view := ansi.Strip(m.View())
 	for _, want := range []string{
-		"◎ review scope", "20 production · 10 tests · 8.4k LOC · 5 large files", "budget: 16 exploration rounds · hard limit: 38",
+		"◎ review scope", "scope: internal/tui", "◎ review scope resolved", "scope: internal/tui, internal/worker", "20 production · 10 tests · 8.4k LOC · 5 large files", "budget: 16 exploration rounds · hard limit: 38",
 		"◎ review budget extended · 16 → 20 · hard limit 38", "reason: trace fork/rewind history replacement",
 	} {
 		if !strings.Contains(view, want) {
@@ -1097,8 +1101,8 @@ func TestReviewProgressRendersScopeAndLease(t *testing.T) {
 	if m.reviewProgress != nil {
 		t.Fatal("review progress should clear when the turn finishes")
 	}
-	if len(m.reviewProgressHistory) != 3 {
-		t.Fatalf("review progress history = %d, want 3", len(m.reviewProgressHistory))
+	if len(m.reviewProgressHistory) != 4 {
+		t.Fatalf("review progress history = %d, want 4", len(m.reviewProgressHistory))
 	}
 }
 
@@ -1693,7 +1697,7 @@ func TestToolCallFullyVisibleInViewportAcrossResize(t *testing.T) {
 			}
 			return r
 		}, joined)
-		want := strings.ReplaceAll(cmd, " ", "")
+		want := strings.ReplaceAll(toolCallSummary("bash", cmd), " ", "")
 		if !strings.Contains(compact, want) {
 			t.Errorf("viewport at %d cols lost command bytes:\nwant fragment of %q\ngot %q", width, want, compact)
 		}
@@ -1804,13 +1808,13 @@ func BenchmarkAppendStream(b *testing.B) {
 	}
 }
 
-// A tool row renders the tool name and full arguments. On completion, it retains
-// the name and arguments without leaking stdout/result into the viewport.
+// A tool row renders the tool name and compact details. On completion, it
+// retains them without leaking stdout/result into the viewport.
 func TestToolRowDetailsOnly(t *testing.T) {
 	m := compactCmdModel()
 	m.Update(mkWinSize(80, 24))
 
-	m.Update(toolStartMsg{id: "c1", name: "read", args: `{"path":"internal/session/session.go","offset":700,"limit":100}`})
+	m.Update(toolStartMsg{id: "c1", name: "read", args: `{"ranges":[{"path":"internal/session/session.go","offset":700,"limit":100},{"path":"internal/tui/view.go","limit":4}]}`})
 	if len(m.blocks) == 0 || m.blocks[len(m.blocks)-1].kind != blockToolRun {
 		t.Fatal("toolStart should append a running row")
 	}
@@ -1819,8 +1823,8 @@ func TestToolRowDetailsOnly(t *testing.T) {
 		t.Fatal("row should be running")
 	}
 	got := ansi.Strip(row.render(m.width))
-	if !strings.Contains(got, "⚒ read") || !strings.Contains(got, `{"path":"internal/session/session.go","offset":700,"limit":100}`) {
-		t.Fatalf("running row should show tool name and full args, got %q", got)
+	if !strings.Contains(got, "⚒ read") || !strings.Contains(got, "internal/session/session.go:700-799") || !strings.Contains(got, "internal/tui/view.go:1-4") {
+		t.Fatalf("running row should show tool name and range, got %q", got)
 	}
 
 	m.Update(toolEndMsg{id: "c1", name: "read", result: "file body sensitive content\nline2\nline3"})
@@ -1829,11 +1833,19 @@ func TestToolRowDetailsOnly(t *testing.T) {
 		t.Fatal("completion should stop the run state")
 	}
 	got = ansi.Strip(row.render(m.width))
-	if !strings.Contains(got, "⚒ read") || !strings.Contains(got, `{"path":"internal/session/session.go","offset":700,"limit":100}`) {
-		t.Fatalf("completed row should retain tool name and arguments, got %q", got)
+	if !strings.Contains(got, "⚒ read") || !strings.Contains(got, "internal/session/session.go:700-799") || !strings.Contains(got, "internal/tui/view.go:1-4") {
+		t.Fatalf("completed row should retain tool name and range, got %q", got)
 	}
 	if strings.Contains(got, "file body") || strings.Contains(got, "sensitive") {
 		t.Fatalf("completed row must not leak tool output into viewport, got %q", got)
+	}
+}
+
+func TestToolCallSummaryHidesContentHash(t *testing.T) {
+	hash := strings.Repeat("a", 64)
+	summary := toolCallSummary("output_read", `{"id":"sha256:`+hash+`","offset":0}`)
+	if strings.Contains(summary, hash) || !strings.Contains(summary, "sha256:aaaaaaaa…") {
+		t.Fatalf("tool summary exposed content hash: %q", summary)
 	}
 }
 
@@ -1857,8 +1869,8 @@ func TestToolRowFailureHidesErrorBody(t *testing.T) {
 	if !strings.Contains(got, "— failed") {
 		t.Fatalf("failed row should contain '— failed', got %q", got)
 	}
-	if !strings.Contains(got, `{"command":"go test ./..."}`) {
-		t.Fatalf("failed row should retain command arguments, got %q", got)
+	if !strings.Contains(got, "go test ./...") {
+		t.Fatalf("failed row should retain command, got %q", got)
 	}
 	if strings.Contains(got, "exit status 1") || strings.Contains(got, "sensitive stderr") {
 		t.Fatalf("failed row must not display error body or stderr, got %q", got)

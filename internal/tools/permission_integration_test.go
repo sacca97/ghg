@@ -145,6 +145,7 @@ func TestObservedEditSupportsEveryOperation(t *testing.T) {
 		want      string
 	}{
 		{name: "replace", operation: "replace", content: "changed", want: "one\nchanged\nthree\n"},
+		{name: "implicit replace", operation: "", content: "changed", want: "one\nchanged\nthree\n"},
 		{name: "delete", operation: "delete", content: "", want: "one\nthree\n"},
 		{name: "insert before", operation: "insert_before", content: "before", want: "one\nbefore\ntwo\nthree\n"},
 		{name: "insert after", operation: "insert_after", content: "after", want: "one\ntwo\nafter\nthree\n"},
@@ -161,12 +162,16 @@ func TestObservedEditSupportsEveryOperation(t *testing.T) {
 			if read.ExitCode != 0 {
 				t.Fatalf("read = %+v", read)
 			}
+			editObj := map[string]any{
+				"observation": read.Metadata["observation_id"], "path": path,
+				"start_line": 2, "end_line": 2, "content": tt.content,
+			}
+			if tt.operation != "" {
+				editObj["operation"] = tt.operation
+			}
 			args := map[string]any{
-				"mode": "observed",
-				"edits": []any{map[string]any{
-					"observation": read.Metadata["observation_id"], "path": path,
-					"start_line": 2, "end_line": 2, "operation": tt.operation, "content": tt.content,
-				}},
+				"mode":  "observed",
+				"edits": []any{editObj},
 			}
 			data, _ := json.Marshal(args)
 			result := ExecuteResult(ctx, All(), "edit", data)
@@ -181,6 +186,58 @@ func TestObservedEditSupportsEveryOperation(t *testing.T) {
 				t.Fatalf("%s result = %q, want %q", tt.operation, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestObservedEditBatchValidationNamesFailingEntry(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "main.go")
+	original := "one\ntwo\nthree\n"
+	if err := os.WriteFile(path, []byte(original), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	registry := observation.NewRegistry()
+	ctx := WithObservationStore(context.Background(), "session-1", registry)
+	read := ExecuteResult(ctx, All(), "read", json.RawMessage(fmt.Sprintf(`{"path":%q,"offset":2,"limit":1}`, path)))
+	if read.ExitCode != 0 {
+		t.Fatalf("read = %+v", read)
+	}
+
+	args := map[string]any{
+		"mode": "observed",
+		"edits": []any{
+			map[string]any{
+				"observation": read.Metadata["observation_id"],
+				"path":        path,
+				"start_line":  2,
+				"end_line":    2,
+				"content":     "two changed\n",
+			},
+			map[string]any{
+				"observation": "stale-or-bogus-obs-id",
+				"path":        path,
+				"start_line":  1,
+				"end_line":    1,
+				"content":     "line 1 updated\n",
+			},
+		},
+	}
+	data, _ := json.Marshal(args)
+	result := ExecuteResult(ctx, All(), "edit", data)
+	if result.ExitCode == 0 {
+		t.Fatalf("expected batch validation failure, got success: %+v", result)
+	}
+
+	got, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != original {
+		t.Fatalf("file was modified despite batch validation failure: %q", string(got))
+	}
+
+	if !strings.Contains(result.Preview, "edit 2:") {
+		t.Fatalf("error did not identify the failing entry: %q", result.Preview)
 	}
 }
 
@@ -298,7 +355,7 @@ func TestObservedEditPermissionAndPreflightFailuresDoNotWrite(t *testing.T) {
 	}
 	var gate func(GateRequest) (GateDecision, string)
 	ctx := WithRuntime(WithObservationStore(context.Background(), "session-1", observation.NewRegistry()), &ToolRuntime{
-		HumanGate: func(req GateRequest) (GateDecision, string) { return gate(req) },
+		HumanGate: func(_ context.Context, req GateRequest) (GateDecision, string) { return gate(req) },
 	})
 	firstRead := ExecuteResult(ctx, All(), "read", json.RawMessage(fmt.Sprintf(`{"path":%q}`, first)))
 	secondRead := ExecuteResult(ctx, All(), "read", json.RawMessage(fmt.Sprintf(`{"path":%q}`, second)))

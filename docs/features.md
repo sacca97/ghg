@@ -192,6 +192,11 @@ Commands: `/compact` (compact now using the fallback chain), `/compact retry`
 (undo the latest compaction and retry), and `/compact log` (inspect recorded
 compaction events). "Compaction level" steps the threshold ←/→.
 
+Telegram completion notifications are disabled by default. Run `/notify config`
+inside ghg to enter and verify the bot token and chat ID; this saves the
+configuration and enables the current session. `/notify on` and `/notify off`
+toggle an already configured session.
+
 ### Plan runaway guard & per-turn tool lifecycle
 
 - **Tool Freezing**: `AllTools()` and tool definitions are computed once at the start
@@ -293,18 +298,19 @@ persistence: `session.TestTaskRoundTrip`, `TestRestoreTaskSettledAndVisible`,
 dock click hit-testing: `TestDockClickOpensClickedRow`,
 `TestDockClickIgnoredWhilePaletteOpen`.
 
-### Detachable live sessions (supervisor / worker)
+### Live sessions (supervisor / worker)
 
 `internal/worker/`, `cmd/ghg/worker_process.go` — interactive sessions run inside a
 dedicated local worker process communicating over a per-session Unix domain socket
 (`~/.ghg/run/<session-id>/worker.sock`) with an exclusive OS lifetime lock.
 
-- `/detach` — gracefully disconnects the TUI interface after an atomic request/acknowledgment
-  handshake. The worker process continues executing active model streams, tools, and background subagents.
-- `ghg ps` — lists all active and idle detached sessions with uptime, model, and status.
-- `ghg attach <id>` — reconnects to a running or idle detached session, reconstructing the full
+- `/detach` — requests graceful worker shutdown and exits after an atomic request/acknowledgment
+  handshake. The session remains durable and can be resumed later.
+- `ghg ps` — lists only workers that currently own their runtime lock; stopped state files are cleaned up.
+- `ghg attach <id>` — reconnects to a live worker or starts a fresh worker from the saved session,
+  reconstructing the full
   transcript snapshot, live output rings, active roles, and any pending permission approvals.
-- `ghg stop <id>` — requests graceful cancellation and shutdown of a detached session.
+- `ghg stop <id>` — requests graceful cancellation and shutdown of a live session.
 
 Tests: `internal/worker/server_test.go` and `internal/worker/state_test.go`.
 
@@ -597,7 +603,9 @@ message instead — one picker, two destinations. Forking while rewound pulls
 the redo stack up to the picked point into the copy. **`/rename [title]`**
 retitles the current session (`Store.SetTitle`); bare opens the same inline
 prompt prefilled with the current title. Both prompts stash and restore any
-in-progress draft. All three refuse to run mid-turn. settings entries:
+in-progress draft. Rename and notification commands remain available while a
+turn is running. `/continue` replays the last interrupted authored prompt
+after a stopped turn. settings entries:
 "Rewind conversation", "Fork session", "Rename session" under Session.
 
 Tests: `rewind_test.go` — double-esc opens/cancels, busy esc still
@@ -749,7 +757,9 @@ represented by a fingerprint rather than retained verbatim.
 
 The CLI accepts one-shot `--sandbox`, `--network`, and `--approval` overrides. Headless runs
 fail closed unless `--approval auto-review` (or the equivalent trusted execution config) is
-explicitly selected. See [the Phase 3 implementation plan](../.ai-docs/plans/phase-3-execution-policy/README.md).
+explicitly selected. Interactive TUI and VS Code workers can switch this live with
+`/approval ask|auto-review|never`; the setting is also persisted for future workers. See
+[the Phase 3 implementation plan](../.ai-docs/plans/phase-3-execution-policy/README.md).
 
 ## LSP diagnostics
 
