@@ -39,17 +39,16 @@ func TestBashExplorationRedirectsAndEscapes(t *testing.T) {
 	redirectCases := []struct {
 		command string
 		tool    string
-		want    string
 	}{
-		{"grep -r TODO .", "grep", "dedicated `grep`"},
-		{"grep -rn TODO .", "grep", "dedicated `grep`"},
-		{"cat internal/agent/agent.go", "read", "dedicated `read`"},
-		{"head internal/agent/agent.go", "read", "dedicated `read`"},
+		{"grep -r TODO .", "grep"},
+		{"grep -rn TODO .", "grep"},
+		{"cat internal/agent/agent.go", "read"},
+		{"head internal/agent/agent.go", "read"},
 	}
 	for _, tc := range redirectCases {
 		t.Run(tc.command, func(t *testing.T) {
 			got, ok := redirectBashInspection(tc.command)
-			if !ok || got.Tool != tc.tool || !strings.Contains(got.Message, tc.want) {
+			if !ok || got.Tool != tc.tool {
 				t.Fatalf("redirect = %#v, %v", got, ok)
 			}
 		})
@@ -57,12 +56,11 @@ func TestBashExplorationRedirectsAndEscapes(t *testing.T) {
 	for _, command := range []string{
 		"rg TODO internal | head",
 		"git grep TODO",
-		"grep TODO internal",
-		"grep -R TODO internal",
+		"grep -e TODO internal",
 		"find . -type f -name '*.go'",
 		"find .",
 		"ls -R",
-		"sed -n '1,20p' internal/agent/agent.go",
+		"sed -n '1,20p' internal/agent/agent.go | head",
 	} {
 		if _, ok := redirectBashInspection(command); ok {
 			t.Fatalf("advanced or outside command was redirected: %q", command)
@@ -70,14 +68,73 @@ func TestBashExplorationRedirectsAndEscapes(t *testing.T) {
 	}
 
 	result := ExecuteResult(context.Background(), All(), "bash", json.RawMessage(`{"command":"grep -r TODO ."}`))
-	if result.Metadata["bash_redirect"] != "true" || !strings.Contains(result.Preview, "dedicated `grep`") {
+	if result.Metadata["bash_redirect"] != "true" || result.Metadata["redirect_tool"] != "grep" {
 		t.Fatalf("redirect result = %+v", result)
+	}
+	readResult := ExecuteResult(context.Background(), All(), "bash", json.RawMessage(`{"command":"cat ../agent/agent.go"}`))
+	if readResult.Metadata["bash_redirect"] != "true" || readResult.Metadata["redirect_tool"] != "read" || readResult.Metadata["observation_id"] == "" {
+		t.Fatalf("read redirect result = %+v", readResult)
+	}
+	dir := t.TempDir()
+	path := filepath.Join(dir, "pipeline.txt")
+	if err := os.WriteFile(path, []byte("one\ntwo\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pipeline := ExecuteResult(context.Background(), All(), "bash", json.RawMessage(fmt.Sprintf(`{"command":%q}`, "cat "+path+" | sed -n '1,1p'")))
+	if pipeline.Metadata["bash_redirect"] == "true" || !IsUntrusted(pipeline) || pipeline.Metadata["observation_id"] != "" {
+		t.Fatalf("transformed pipeline was normalized or trusted: %+v", pipeline)
 	}
 	if got := bashPreviewLimit("rg TODO ."); got != 8<<10 {
 		t.Fatalf("search preview limit = %d, want %d", got, 8<<10)
 	}
 	if got := bashPreviewLimit("git status"); got != 14<<10 {
 		t.Fatalf("ordinary preview limit = %d, want %d", got, 14<<10)
+	}
+}
+
+func TestBashReadRedirectsPreserveLanguageNeutralObservations(t *testing.T) {
+	dir := t.TempDir()
+	cases := []struct {
+		name    string
+		file    string
+		command string
+		offset  int
+		limit   int
+	}{
+		{name: "markdown cat", file: "notes.md", command: "cat -- %s", offset: 1, limit: 1},
+		{name: "yaml head", file: "config.yaml", command: "head -n 2 %s", offset: 1, limit: 2},
+		{name: "json sed", file: "data.json", command: "sed -n '2,3p' %s", offset: 2, limit: 2},
+		{name: "extensionless cat", file: "README", command: "cat %s", offset: 1, limit: 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(dir, tc.file)
+			if err := os.WriteFile(path, []byte("one\ntwo\nthree\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			registry := observation.NewRegistry()
+			ctx := WithObservationStore(context.Background(), "", registry)
+			directArgs := json.RawMessage(fmt.Sprintf(`{"path":%q,"offset":%d,"limit":%d}`, path, tc.offset, tc.limit))
+			direct := ExecuteResult(ctx, All(), "read", directArgs)
+			redirect := ExecuteResult(ctx, All(), "bash", json.RawMessage(fmt.Sprintf(`{"command":%q}`, fmt.Sprintf(tc.command, path))))
+			if direct.ExitCode != 0 || redirect.ExitCode != 0 || redirect.Metadata["bash_redirect"] != "true" {
+				t.Fatalf("direct=%+v redirect=%+v", direct, redirect)
+			}
+			if redirect.Metadata["observation_id"] == "" {
+				t.Fatalf("redirect did not issue an observation: %+v", redirect.Metadata)
+			}
+			directRecord, err := registry.Load(ctx, "", direct.Metadata["observation_id"])
+			if err != nil {
+				t.Fatal(err)
+			}
+			redirectRecord, err := registry.Load(ctx, "", redirect.Metadata["observation_id"])
+			if err != nil {
+				t.Fatal(err)
+			}
+			if directRecord.Content != redirectRecord.Content || directRecord.StartLine != redirectRecord.StartLine || directRecord.EndLine != redirectRecord.EndLine {
+				t.Fatalf("observation mismatch: direct=%+v redirect=%+v", directRecord, redirectRecord)
+			}
+		})
 	}
 }
 

@@ -28,8 +28,12 @@
   let planDeltaSeen = false;
   let currentAssistant;
   let currentAssistantElement;
+  let currentThinking;
+  let currentThinkingElement;
   let assistantRenderFrame = 0;
+  let thinkingRenderFrame = 0;
   let assistantFollow = false;
+  let thinkingFollow = false;
   let model = "";
   let context = 0;
   let contextLimit = 0;
@@ -43,7 +47,7 @@
   const tools = new Map();
 
   function setSendButton(running) {
-    send.textContent = running ? "■" : "↑";
+    send.textContent = running ? "■" : "➤";
     send.setAttribute("aria-label", running ? "Stop" : "Send");
     send.title = running ? "Stop" : "Send";
   }
@@ -56,7 +60,7 @@
 	["/approval", "switch approval mode (ask|auto-review|never)"],
 	["/notify", "Telegram completion notifications (config|on|off)"],
 	["/continue", "continue an interrupted turn"],
-    ["/pwd", "print working directory"], ["/quit", "exit"], ["/rename", "rename session"],
+    ["/pwd", "print working directory"], ["/detach", "detach worker"], ["/quit", "exit"], ["/exit", "exit"], ["/q", "exit"], ["/rename", "rename session"],
     ["/resume", "resume a session"], ["/review", "review a target"], ["/commands", "show commands"],
   ].map(([name, hint]) => ({ name, hint }));
 
@@ -262,18 +266,12 @@
     const element = document.createElement("article");
     element.className = `block ${block.kind || "notice"}`;
     if (block.kind === "user") {
-    const label = document.createElement("div");
-      label.className = "label";
-      label.textContent = "You";
       const body = document.createElement("pre");
       body.textContent = text(block.text);
-      element.append(label, body);
+      element.append(body);
     } else if (block.kind === "assistant") {
       const header = document.createElement("div");
       header.className = "block-header";
-      const label = document.createElement("span");
-      label.className = "label";
-      label.textContent = "ghg";
       const copy = document.createElement("button");
       copy.type = "button";
       copy.className = "copy";
@@ -283,11 +281,22 @@
         copy.textContent = "Copied";
         setTimeout(() => { copy.textContent = "Copy"; }, 1200);
       });
-      header.append(label, copy);
+      header.append(copy);
       const body = document.createElement("div");
       body.className = "markdown";
       renderMarkdown(body, text(block.text));
       element.append(header, body);
+      element.body = body;
+    } else if (block.kind === "thinking") {
+      const details = document.createElement("details");
+      details.className = "thinking-details";
+      const summary = document.createElement("summary");
+      summary.textContent = "Reasoning";
+      const body = document.createElement("div");
+      body.className = "markdown";
+      renderMarkdown(body, text(block.text));
+      details.append(summary, body);
+      element.append(details);
       element.body = body;
     } else if (block.kind === "tool") {
       renderToolContent(element, block);
@@ -338,6 +347,22 @@
     });
   }
 
+  function appendThinking(delta) {
+    if (!currentThinking) {
+      thinkingFollow = nearBottom();
+      currentThinking = { kind: "thinking", text: "" };
+      state.blocks.push(currentThinking);
+      currentThinkingElement = renderBlock(currentThinking);
+    }
+    currentThinking.text += delta;
+    if (thinkingRenderFrame) return;
+    thinkingRenderFrame = requestAnimationFrame(() => {
+      thinkingRenderFrame = 0;
+      renderMarkdown(currentThinkingElement.body, currentThinking.text);
+      if (thinkingFollow) follow();
+    });
+  }
+
   function flushAssistantRender() {
     if (assistantRenderFrame) {
       cancelAnimationFrame(assistantRenderFrame);
@@ -348,6 +373,23 @@
       if (assistantFollow) follow();
     }
     assistantFollow = false;
+  }
+
+  function flushThinking() {
+    if (thinkingRenderFrame) {
+      cancelAnimationFrame(thinkingRenderFrame);
+      thinkingRenderFrame = 0;
+    }
+    if (currentThinking && currentThinkingElement) {
+      renderMarkdown(currentThinkingElement.body, currentThinking.text);
+      if (thinkingFollow) follow();
+    }
+    thinkingFollow = false;
+  }
+
+  function flushStreaming() {
+    flushAssistantRender();
+    flushThinking();
   }
 
   function formatCount(value) {
@@ -405,7 +447,7 @@
 
   function applySnapshot(snapshot) {
     if (!snapshot || typeof snapshot !== "object") return;
-    flushAssistantRender();
+    flushStreaming();
     const nextModel = snapshot.model_name || snapshot.model;
     if (typeof nextModel === "string") model = nextModel;
     if (typeof snapshot.context_tokens === "number") context = snapshot.context_tokens;
@@ -418,6 +460,7 @@
     active = busyStates.includes(snapshot.state);
     activity = snapshot.state === "waiting_approval" ? "Waiting for approval" : snapshot.state === "waiting_question" ? "Waiting for answer" : active ? "Thinking" : "Ready";
     let liveBlock;
+    let liveThinking;
     if (!pendingUser) {
       state.blocks = snapshotMessages(Array.isArray(snapshot.messages) ? snapshot.messages : []);
       if (snapshot.live_text) {
@@ -427,6 +470,10 @@
       if (snapshot.live_plan) {
         liveBlock = { kind: "assistant", text: text(snapshot.live_plan) };
         state.blocks.push(liveBlock);
+      }
+      if (snapshot.live_think) {
+        liveThinking = { kind: "thinking", text: text(snapshot.live_think) };
+        state.blocks.push(liveThinking);
       }
       if (snapshot.active_tool) state.blocks.push({ kind: "tool", name: text(snapshot.active_tool), args: "", failed: false });
       if (Array.isArray(snapshot.tasks)) {
@@ -446,6 +493,11 @@
       currentAssistant = liveBlock;
       currentAssistantElement = transcript.children[state.blocks.indexOf(liveBlock)];
       assistantFollow = true;
+    }
+    if (active && liveThinking) {
+      currentThinking = liveThinking;
+      currentThinkingElement = transcript.children[state.blocks.indexOf(liveThinking)];
+      thinkingFollow = true;
     }
     save();
     updateStatus();
@@ -608,6 +660,10 @@
       case "turn_start":
         active = true;
         planDeltaSeen = false;
+        currentAssistant = undefined;
+        currentAssistantElement = undefined;
+        currentThinking = undefined;
+        currentThinkingElement = undefined;
         activity = "Thinking";
         thinkingSince = Date.now();
         setSendButton(true);
@@ -615,12 +671,14 @@
         updateStatus();
         break;
       case "turn_end":
-        flushAssistantRender();
+        flushStreaming();
         pendingUser = false;
         planDeltaSeen = false;
         active = false;
         currentAssistant = undefined;
         currentAssistantElement = undefined;
+        currentThinking = undefined;
+        currentThinkingElement = undefined;
         activity = "Ready";
         setSendButton(false);
         send.classList.remove("stop");
@@ -658,6 +716,13 @@
           planDeltaSeen = true;
           appendText(raw.delta);
           activity = "Responding";
+          updateStatus();
+        }
+        break;
+      case "think":
+        if (typeof raw.delta === "string") {
+          appendThinking(raw.delta);
+          activity = "Thinking";
           updateStatus();
         }
         break;
@@ -789,7 +854,7 @@
         if (typeof raw.text === "string") append({ kind: "notice", text: raw.text });
         break;
       case "error":
-        flushAssistantRender();
+        flushStreaming();
         append({ kind: "error", text: text(raw.error) || "ghg failed" }, true);
         activity = "Error";
         if (active) {
@@ -819,12 +884,11 @@
 
   composer.addEventListener("submit", (event) => {
     event.preventDefault();
-    if (active || !prompt.value.trim()) {
-      if (active) vscode.postMessage({ type: "stop" });
-      return;
+    if (!prompt.value.trim()) return;
+    if (!active) {
+      append({ kind: "user", text: prompt.value.trim() }, true);
+      pendingUser = true;
     }
-    append({ kind: "user", text: prompt.value.trim() }, true);
-    pendingUser = true;
     const message = { type: "send", prompt: prompt.value, mode: state.mode, role: state.role, references: state.references, plan: state.proposedPlan };
     prompt.value = "";
     save();
@@ -871,6 +935,12 @@
     updateMode();
     save();
     vscode.postMessage({ type: "configureRole", role: state.role, mode: state.mode });
+  });
+  send.addEventListener("click", (event) => {
+    if (active) {
+      event.preventDefault();
+      vscode.postMessage({ type: "stop" });
+    }
   });
   role.addEventListener("change", () => {
     if (["default", "smart", "tiny", "fast"].includes(role.value)) {

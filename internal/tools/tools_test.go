@@ -42,6 +42,10 @@ func TestToolRoundTrip(t *testing.T) {
 	if readResult.Source != "read" || !IsUntrusted(readResult) {
 		t.Fatalf("read result should carry its untrusted source: %+v", readResult)
 	}
+	aliasResult := ExecuteResult(context.Background(), All(), "read_file", json.RawMessage(fmt.Sprintf(`{"path":%q}`, f)))
+	if aliasResult.ExitCode != 0 || !strings.Contains(aliasResult.Preview, "1\tone") {
+		t.Fatalf("read_file alias = %+v", aliasResult)
+	}
 	// ambiguous edit must fail without replace_all
 	run(t, "write", fmt.Sprintf(`{"path":%q,"content":"x x"}`, f))
 	out = run(t, "edit", fmt.Sprintf(`{"mode":"exact","path":%q,"old_string":"x","new_string":"y"}`, f))
@@ -89,6 +93,27 @@ func TestReadUsesBoundedDefaultLimit(t *testing.T) {
 	}
 	if result.Metadata["observation_end"] != "250" || result.Metadata["observation_next_offset"] != "251" {
 		t.Fatalf("default read metadata = %+v", result.Metadata)
+	}
+}
+
+func TestIntegerStringArguments(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "lines.go")
+	if err := os.WriteFile(path, []byte("one\ntwo\nthree\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	read := ExecuteResult(context.Background(), All(), "read", json.RawMessage(fmt.Sprintf(`{"ranges":[{"path":%q,"offset":"2","limit":"1"}]}`, path)))
+	if read.ExitCode != 0 || !strings.Contains(read.Preview, "2\ttwo") {
+		t.Fatalf("numeric read arguments = %+v", read)
+	}
+	grep := ExecuteResult(context.Background(), All(), "grep", json.RawMessage(fmt.Sprintf(`{"pattern":"two","path":%q,"max_results":"1"}`, path)))
+	if grep.ExitCode != 0 || !strings.Contains(grep.Preview, "two") {
+		t.Fatalf("numeric grep arguments = %+v", grep)
+	}
+	invalid := ExecuteResult(context.Background(), All(), "read", json.RawMessage(fmt.Sprintf(`{"path":%q,"limit":"many"}`, path)))
+	if invalid.ExitCode == 0 {
+		t.Fatalf("invalid numeric string unexpectedly succeeded: %+v", invalid)
 	}
 }
 

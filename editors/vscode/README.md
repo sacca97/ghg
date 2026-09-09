@@ -4,9 +4,10 @@ This extension adds a GHG view in the VS Code Activity Bar, backed by a
 persistent `ghg bridge` worker. It does not duplicate ghg's model, tool, or
 sandbox configuration.
 
-The view supports worker-backed streaming chat, plans, reviews, slash
-commands, basic Markdown with fenced code, session resume, stopping a turn,
-and adding workspace files or folders with `@`.
+The view supports worker-backed streaming chat, plans, reviews, a subset of
+slash commands, basic Markdown with fenced code, session resume, stopping or
+steering a turn, and adding workspace files or folders with `@`. It is not a
+full replacement for the terminal TUI; unsupported commands report an error.
 
 Install dependencies and compile during development:
 

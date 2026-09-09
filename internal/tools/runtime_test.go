@@ -58,6 +58,21 @@ func TestRuntimeApprovalReviewsAndGrantsOnlyNetworkForOneCall(t *testing.T) {
 	}
 }
 
+func TestRuntimeAutoReviewDenialIncludesReviewerReason(t *testing.T) {
+	runtime, workspace := testRuntime(t, ApprovalAutoReview)
+	runtime.Reviewer = func(_ context.Context, _ ApprovalRequest) (ApprovalResult, error) {
+		return ApprovalResult{
+			Decision:   ApprovalDeny,
+			Reason:     "network access is not needed for this request",
+			Confidence: 0.99,
+		}, nil
+	}
+	_, _, err := runtime.authorizeCommand(context.Background(), "bash", "curl https://example.test", workspace)
+	if err == nil || !strings.Contains(err.Error(), "network access is not needed") {
+		t.Fatalf("denial error = %v, want reviewer reason", err)
+	}
+}
+
 func TestRuntimeNeverFailsClosedAndChildDoesNotWiden(t *testing.T) {
 	runtime, workspace := testRuntime(t, ApprovalNever)
 	if _, _, err := runtime.authorizeCommand(context.Background(), "bash", "curl https://example.test", workspace); err == nil {

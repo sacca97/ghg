@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -36,6 +37,7 @@ type bridge struct {
 	profiles  models.Profiles
 	role      string
 	turnDone  bool
+	detached  atomic.Bool
 	outMu     sync.Mutex
 	pendingMu sync.Mutex
 	pending   map[string]string
@@ -178,7 +180,9 @@ func bridgeConnect(runtimeFile workerwire.Runtime) (*workerwire.Client, error) {
 
 func (b *bridge) close() {
 	if b.client != nil {
-		_ = b.client.Send(workerwire.CommandStop, "bridge-close", nil)
+		if !b.detached.Load() {
+			_ = b.client.Send(workerwire.CommandStop, "bridge-close", nil)
+		}
 		_ = b.client.Close()
 	}
 	if b.process != nil {
@@ -379,6 +383,7 @@ func (b *bridge) forwardFrame(frame workerwire.Frame) {
 		b.pendingMu.Unlock()
 		b.emit(map[string]any{"type": "ack", "request_id": frame.RequestID, "name": name, "payload": json.RawMessage(frame.Payload)})
 	case workerwire.TypeDetachAck:
+		b.detached.Store(true)
 		b.emit(map[string]any{"type": "detach_ack", "request_id": frame.RequestID})
 	case workerwire.TypeAlreadyControlled, workerwire.TypeError:
 		b.pendingMu.Lock()

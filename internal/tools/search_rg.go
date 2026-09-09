@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -41,8 +42,8 @@ type rgMatchEvent struct {
 	} `json:"data"`
 }
 
-func grepSnapshotRG(ctx context.Context, args grepArgs, scope *searchScope, matcher *grepMatcher, out *searchCollector) error {
-	bin, ok := rgAvailable()
+func grepSnapshotRG(ctx context.Context, args grepArgs, scope *searchScope, matcher *grepMatcher, include *searchPattern, out *searchCollector) error {
+	_, ok := rgAvailable()
 	if !ok {
 		return errors.New("rg not available")
 	}
@@ -54,7 +55,7 @@ func grepSnapshotRG(ctx context.Context, args grepArgs, scope *searchScope, matc
 		"--hidden",
 		"--no-follow",
 		"--no-require-git",
-		"--glob", "!.git/*",
+		"--glob", "!.git",
 	}
 
 	if args.CaseSensitive != nil && !*args.CaseSensitive {
@@ -68,41 +69,13 @@ func grepSnapshotRG(ctx context.Context, args grepArgs, scope *searchScope, matc
 		cmdArgs = append(cmdArgs, "-e", p)
 	}
 
-	if args.Include != "" {
-		includePattern := args.Include
-		if !strings.HasPrefix(includePattern, "*") && !strings.Contains(includePattern, "/") {
-			includePattern = "**/" + includePattern
-		}
-		cmdArgs = append(cmdArgs, "--glob", includePattern)
-	}
-
-	targetPath := scope.rootPath
-	if scope.single {
-		targetPath = filepath.Join(scope.rootPath, scope.start)
-	}
+	targetPath := searchTargetPath(scope)
 	cmdArgs = append(cmdArgs, "--", targetPath)
 
-	prog := bin
-	finalArgs := cmdArgs
-	dir := scope.cwdPath
-
-	if runtime := RuntimeFromContext(ctx); runtime != nil && runtime.Policy != nil {
-		wrapped, err := runtime.WrapCommand(sandbox.CommandSpec{
-			Program: bin,
-			Args:    cmdArgs,
-			Dir:     dir,
-			Env:     runtime.ChildEnv(nil),
-		})
-		if err != nil {
-			return err
-		}
-		prog = wrapped.Program
-		finalArgs = wrapped.Args
-		dir = wrapped.Dir
+	cmd, err := newRGCommand(ctx, scope, cmdArgs)
+	if err != nil {
+		return err
 	}
-
-	cmd := exec.CommandContext(ctx, prog, finalArgs...)
-	cmd.Dir = dir
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -135,6 +108,10 @@ func grepSnapshotRG(ctx context.Context, args grepArgs, scope *searchScope, matc
 		}
 
 		filePath := ev.Data.Path.Text
+		rel, relErr := rgRelativePath(scope, filePath)
+		if include != nil && (relErr != nil || !include.matches(scope.matchPath(rel))) {
+			continue
+		}
 		display := filePath
 		if rel, ok := relativePath(scope.cwdPath, filePath); ok {
 			display = rel
@@ -191,4 +168,132 @@ func grepSnapshotRG(ctx context.Context, args grepArgs, scope *searchScope, matc
 	}
 
 	return nil
+}
+
+func listFilesRG(ctx context.Context, scope *searchScope, visit func(string) error) error {
+	_, ok := rgAvailable()
+	if !ok {
+		return errors.New("rg not available")
+	}
+	args := []string{
+		"--files",
+		"--null",
+		"--hidden",
+		"--no-follow",
+		"--no-require-git",
+		"--glob", "!.git",
+		"--sort", "path",
+	}
+	args = append(args, "--", searchTargetPath(scope))
+	cmd, err := newRGCommand(ctx, scope, args)
+	if err != nil {
+		return err
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return fmt.Errorf("rg stdout pipe: %w", err)
+	}
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("rg start: %w", err)
+	}
+	stop := func() {
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+	}
+	reader := bufio.NewReaderSize(stdout, 64<<10)
+	var visitErr error
+	entries := 0
+	for {
+		name, readErr := reader.ReadString('\x00')
+		if len(name) > 0 {
+			name = strings.TrimSuffix(name, "\x00")
+			if visitErr == nil {
+				entries++
+				if entries > maxSearchEntries {
+					visitErr = errSearchLimit
+				} else {
+					visitErr = visit(name)
+				}
+				if visitErr != nil {
+					stop()
+				}
+			}
+		}
+		if readErr != nil {
+			if !errors.Is(readErr, io.EOF) && visitErr == nil {
+				visitErr = readErr
+				stop()
+			}
+			break
+		}
+		if visitErr != nil {
+			break
+		}
+	}
+	waitErr := cmd.Wait()
+	if visitErr != nil {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return ctxErr
+		}
+		return visitErr
+	}
+	if waitErr != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return fmt.Errorf("rg: %w", waitErr)
+	}
+	return nil
+}
+
+func newRGCommand(ctx context.Context, scope *searchScope, args []string) (*exec.Cmd, error) {
+	bin, ok := rgAvailable()
+	if !ok {
+		return nil, errors.New("rg not available")
+	}
+	prog := bin
+	finalArgs := args
+	dir := scope.cwdPath
+	var env []string
+	if runtime := RuntimeFromContext(ctx); runtime != nil && runtime.Policy != nil {
+		wrapped, err := runtime.WrapCommand(sandbox.CommandSpec{
+			Program: bin,
+			Args:    args,
+			Dir:     dir,
+			Env:     runtime.ChildEnv(nil),
+		})
+		if err != nil {
+			return nil, err
+		}
+		prog = wrapped.Program
+		finalArgs = wrapped.Args
+		dir = wrapped.Dir
+		env = wrapped.Env
+	}
+	cmd := exec.CommandContext(ctx, prog, finalArgs...)
+	cmd.Dir = dir
+	if env != nil {
+		cmd.Env = env
+	}
+	return cmd, nil
+}
+
+func searchTargetPath(scope *searchScope) string {
+	if scope.start == "." {
+		return scope.rootPath
+	}
+	return filepath.Join(scope.rootPath, filepath.FromSlash(scope.start))
+}
+
+func rgRelativePath(scope *searchScope, name string) (string, error) {
+	name = filepath.FromSlash(name)
+	if !filepath.IsAbs(name) {
+		name = filepath.Join(scope.rootPath, name)
+	}
+	rel, ok := relativePath(scope.rootPath, name)
+	if !ok || rel == "." {
+		return "", fmt.Errorf("rg returned path outside search scope: %q", name)
+	}
+	return filepath.ToSlash(rel), nil
 }

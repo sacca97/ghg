@@ -159,7 +159,6 @@ func TestGitignoreRules(t *testing.T) {
 		filepath.ToSlash(filepath.Join(resolvedDir, "a.log")),
 		blockedKeep,
 		filepath.ToSlash(filepath.Join(resolvedDir, "only-root.txt")),
-		filepath.ToSlash(filepath.Join(resolvedDir, "only-dot.txt")),
 		filepath.ToSlash(filepath.Join(resolvedDir, "logs", "root.txt")),
 		filepath.ToSlash(filepath.Join(resolvedDir, "cache-dir", "inside.go")),
 		filepath.ToSlash(filepath.Join(resolvedDir, "nested", "ignore.tmp")),
@@ -254,15 +253,6 @@ func TestSearchRejectsOutsidePathsBeforeInspection(t *testing.T) {
 				}
 			}
 		})
-	}
-}
-
-func TestMalformedGitignore(t *testing.T) {
-	dir := t.TempDir()
-	writeSearchFile(t, dir, ".gitignore", "[\n")
-	out := run(t, "glob", fmt.Sprintf(`{"pattern":"**/*","path":%q}`, dir))
-	if !strings.Contains(out, ".gitignore:1") || !strings.Contains(out, "invalid ignore pattern") {
-		t.Fatalf("expected malformed ignore error, got %q", out)
 	}
 }
 

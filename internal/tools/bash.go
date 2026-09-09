@@ -40,15 +40,7 @@ func runBashResult(ctx context.Context, args json.RawMessage) (ToolResult, error
 		a.Timeout = 120
 	}
 	if redirect, ok := redirectBashInspection(a.Command); ok {
-		result := textResult(redirect.Message, redirect.Message, 0)
-		result.Source = "bash"
-		result.Metadata = map[string]string{
-			"source":           "bash",
-			"bash_redirect":    "true",
-			"redirect_tool":    redirect.Tool,
-			"redirect_command": strings.Fields(a.Command)[0],
-		}
-		return result, nil
+		return runBashRedirect(ctx, redirect), nil
 	}
 	runtime := RuntimeFromContext(ctx)
 	var executionPolicy *sandbox.Policy
@@ -90,6 +82,35 @@ func runBashResult(ctx context.Context, args json.RawMessage) (ToolResult, error
 	}
 	res := bashrun.Run(commandCtx, opts)
 	return bashToolResult(a.Command, res, opts.Sandbox), nil
+}
+
+func runBashRedirect(ctx context.Context, redirect bashRedirect) ToolResult {
+	var (
+		result ToolResult
+		err    error
+	)
+	switch redirect.Tool {
+	case "read":
+		result, err = runReadResult(ctx, redirect.Args)
+	case "grep":
+		result, err = runGrepResult(ctx, redirect.Args)
+	case "glob":
+		result, err = runGlobResult(ctx, redirect.Args)
+	default:
+		err = fmt.Errorf("unsupported bash redirect tool %q", redirect.Tool)
+	}
+	if err != nil {
+		result = errorToolResult(err)
+	}
+	result.Source = "bash"
+	if result.Metadata == nil {
+		result.Metadata = make(map[string]string)
+	}
+	result.Metadata["source"] = "bash"
+	result.Metadata["bash_redirect"] = "true"
+	result.Metadata["redirect_tool"] = redirect.Tool
+	result.Metadata["redirect_command"] = redirect.Command
+	return result
 }
 
 func bashToolResult(command string, res bashrun.Result, sandboxPolicy *sandbox.Policy) ToolResult {

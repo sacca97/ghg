@@ -1,13 +1,10 @@
 package tools
 
 import (
-	"bufio"
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"os"
 	"os/exec"
@@ -34,8 +31,6 @@ const (
 	maxSearchPageSize       = 250
 	maxSearchResults        = 2000
 	maxSearchEntries        = 100000
-	maxBinaryProbeBytes     = 8 << 10
-	maxSearchLineBytes      = 1 << 20
 	maxMatchLineBytes       = 4 << 10
 	maxSearchPatternBytes   = 16 << 10
 	searchPreviewBytes      = 16 << 10
@@ -151,45 +146,38 @@ func runFindFilesResult(ctx context.Context, args json.RawMessage) (ToolResult, 
 	if len(a.Query) > maxSearchPatternBytes {
 		return ToolResult{}, fmt.Errorf("query exceeds %d-byte limit", maxSearchPatternBytes)
 	}
-	root := a.Path
-	if strings.TrimSpace(root) == "" {
-		root = "."
-	}
-	abs, err := filepath.Abs(root)
+	scope, err := openSearchScope(ctx, a.Path)
 	if err != nil {
-		return ToolResult{}, fmt.Errorf("resolve find_files path: %w", err)
+		return ToolResult{}, err
 	}
-	authorized := abs
-	if runtime := RuntimeFromContext(ctx); runtime != nil && runtime.Policy != nil {
-		authorized, err = runtime.Policy.Authorize(root, sandbox.AccessRead, true)
+	defer func() { _ = scope.Close() }()
+	paths := make(map[string]string)
+	err = listFilesRG(ctx, scope, func(name string) error {
+		rel, err := rgRelativePath(scope, name)
 		if err != nil {
-			return ToolResult{}, err
+			return err
 		}
+		paths[scope.matchPath(rel)] = scope.displayPath(rel)
+		return nil
+	})
+	incomplete := errors.Is(err, errSearchLimit)
+	if err != nil && !incomplete {
+		return ToolResult{}, err
 	}
-	info, err := os.Lstat(abs)
-	if err != nil {
-		return ToolResult{}, fmt.Errorf("find_files path %q: %w", root, err)
+	candidates := make([]string, 0, len(paths))
+	for name := range paths {
+		candidates = append(candidates, name)
 	}
-	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
-		return ToolResult{}, fmt.Errorf("find_files path %q is not a real directory", root)
-	}
-	abs = authorized
-	resolved, err := filepath.EvalSymlinks(abs)
-	if err != nil {
-		return ToolResult{}, fmt.Errorf("resolve find_files path %q: %w", root, err)
-	}
-	hits := search.FuzzyFiles(resolved, a.Query, maxSearchResults)
+	hits := search.FuzzyPaths(candidates, a.Query, maxSearchResults)
 	items := make([]search.Item, 0, len(hits))
 	for _, hit := range hits {
-		display := filepath.Join(resolved, filepath.FromSlash(hit))
-		cwd, _ := filepath.Abs(".")
-		if rel, ok := relativePath(cwd, display); ok {
-			display = rel
-		}
-		items = append(items, search.Item{Path: filepath.ToSlash(display)})
+		items = append(items, search.Item{Path: paths[hit]})
 	}
 	collector := newSearchCollector()
 	collector.items = items
+	if incomplete {
+		collector.stop(fmt.Sprintf("scan limited to %d entries", maxSearchEntries))
+	}
 	snapshot, err := finishSearchSnapshot(ctx, findFilesKind, collector, nil)
 	if err != nil {
 		return ToolResult{}, err
@@ -261,15 +249,12 @@ func collectGrepSnapshot(ctx context.Context, args grepArgs) (search.Snapshot, e
 	defer func() { _ = scope.Close() }()
 
 	collector := newSearchCollector()
-	if _, ok := rgAvailable(); ok {
-		err = grepSnapshotRG(ctx, args, scope, matcher, collector)
-	} else {
-		err = walkSearchFiles(ctx, scope, collector,
-			func(name string, entry fs.DirEntry) bool {
-				return include == nil || include.matches(scope.matchPath(name))
-			}, func(name string) error {
-				return grepSnapshotFile(ctx, scope.fsys, name, scope.displayPath(name), matcher, collector)
-			})
+	err = grepSnapshotRG(ctx, args, scope, matcher, include, collector)
+	if errors.Is(err, errSearchLimit) {
+		collector.stop(fmt.Sprintf("scan limited to %d entries", maxSearchEntries))
+	}
+	if errors.Is(err, errSearchLimit) {
+		collector.stop(fmt.Sprintf("scan limited to %d entries", maxSearchEntries))
 	}
 	if err != nil && !errors.Is(err, errSearchLimit) {
 		return search.Snapshot{}, err
@@ -353,12 +338,16 @@ func compileGlobSnapshot(ctx context.Context, args globArgs) (search.Snapshot, e
 	}
 	defer func() { _ = scope.Close() }()
 	collector := newSearchCollector()
-	err = walkSearchFiles(ctx, scope, collector,
-		func(name string, entry fs.DirEntry) bool {
-			return matcher.matches(scope.matchPath(name))
-		}, func(name string) error {
-			return collector.add(ctx, search.Item{Path: scope.displayPath(name)})
-		})
+	err = listFilesRG(ctx, scope, func(name string) error {
+		rel, err := rgRelativePath(scope, name)
+		if err != nil {
+			return err
+		}
+		if !matcher.matches(scope.matchPath(rel)) {
+			return nil
+		}
+		return collector.add(ctx, search.Item{Path: scope.displayPath(rel)})
+	})
 	if err != nil && !errors.Is(err, errSearchLimit) {
 		return search.Snapshot{}, err
 	}
@@ -683,48 +672,6 @@ func structuralRange(item search.Item) string {
 	return fmt.Sprintf("%d:%d-%d:%d", item.Line, item.StartColumn, item.EndLine, item.EndColumn)
 }
 
-func grepSnapshotFile(ctx context.Context, fsys fs.FS, name, display string, matcher *grepMatcher, out *searchCollector) error {
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	f, err := fsys.Open(name)
-	if err != nil {
-		return fmt.Errorf("open %s: %w", display, err)
-	}
-	defer func() { _ = f.Close() }()
-
-	reader := bufio.NewReaderSize(f, 64<<10)
-	probe, probeErr := reader.Peek(maxBinaryProbeBytes)
-	if probeErr != nil && !errors.Is(probeErr, io.EOF) {
-		return fmt.Errorf("inspect %s: %w", display, probeErr)
-	}
-	if bytes.IndexByte(probe, 0) >= 0 {
-		return nil
-	}
-
-	lineNumber := 0
-	for {
-		line, eof, lineTruncated, err := readSearchLine(reader)
-		if err != nil {
-			return fmt.Errorf("read %s: %w", display, err)
-		}
-		if line == nil && eof {
-			return nil
-		}
-		lineNumber++
-		matches := matcher.matches(line)
-		if len(matches) > 0 {
-			text := truncateMatchText(strings.TrimSuffix(string(line), "\r"), lineTruncated)
-			if err := appendGrepMatches(ctx, out, display, lineNumber, text, matcher, matches); err != nil {
-				return err
-			}
-		}
-		if eof {
-			return nil
-		}
-	}
-}
-
 func truncateMatchText(text string, lineWasTruncated bool) string {
 	if len(text) > maxMatchLineBytes {
 		return text[:maxMatchLineBytes] + "… [line truncated]"
@@ -992,13 +939,6 @@ func (p searchPattern) matches(name string) bool {
 	return p.regex.MatchString(name)
 }
 
-func compileInclude(pattern string) (*searchPattern, error) {
-	if pattern == "" {
-		return nil, nil
-	}
-	return compileSearchPattern(pattern, true)
-}
-
 func compileSearchPattern(pattern string, basenameWithoutSlash bool) (*searchPattern, error) {
 	pattern = filepath.ToSlash(pattern)
 	if pattern == "" {
@@ -1024,6 +964,13 @@ func compileSearchPattern(pattern string, basenameWithoutSlash bool) (*searchPat
 		regex:    regex,
 		basename: basenameWithoutSlash && !strings.Contains(pattern, "/"),
 	}, nil
+}
+
+func compileInclude(pattern string) (*searchPattern, error) {
+	if pattern == "" {
+		return nil, nil
+	}
+	return compileSearchPattern(pattern, true)
 }
 
 type searchScope struct {
@@ -1142,127 +1089,4 @@ func relativePath(root, target string) (string, bool) {
 		return "", false
 	}
 	return rel, true
-}
-
-type searchWalker struct {
-	scope       *searchScope
-	ignores     *ignoreTree
-	entries     int
-	scanLimited bool
-}
-
-func newSearchWalker(scope *searchScope) *searchWalker {
-	return &searchWalker{
-		scope:   scope,
-		ignores: newIgnoreTree(scope.fsys),
-	}
-}
-
-func walkSearchFiles(ctx context.Context, scope *searchScope, collector *searchCollector, accept func(name string, entry fs.DirEntry) bool, visit func(name string) error) error {
-	if scope.single {
-		info, err := fs.Stat(scope.fsys, scope.start)
-		if err != nil {
-			return fmt.Errorf("stat %s: %w", scope.displayPath(scope.start), err)
-		}
-		entry := fs.FileInfoToDirEntry(info)
-		if accept(scope.start, entry) {
-			return visit(scope.start)
-		}
-		return nil
-	}
-	walker := newSearchWalker(scope)
-	err := walker.walk(ctx, func(name string, entry fs.DirEntry, ignored bool) error {
-		if ignored || entry.IsDir() || !isRegularEntry(entry) || !accept(name, entry) {
-			return nil
-		}
-		return visit(name)
-	})
-	if walker.scanLimited {
-		collector.stop(fmt.Sprintf("scan limited to %d entries", maxSearchEntries))
-	}
-	return err
-}
-
-func (w *searchWalker) walk(ctx context.Context, visit func(name string, entry fs.DirEntry, ignored bool) error) error {
-	err := fs.WalkDir(w.scope.fsys, w.scope.start, func(name string, entry fs.DirEntry, walkErr error) error {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		if walkErr != nil {
-			return fmt.Errorf("walk %s: %w", w.scope.displayPath(name), walkErr)
-		}
-		if entry == nil {
-			return nil
-		}
-		if entry.Type()&fs.ModeSymlink != 0 {
-			if entry.IsDir() {
-				return fs.SkipDir
-			}
-			return nil
-		}
-		if entry.IsDir() && name != w.scope.start && path.Base(name) == ".git" {
-			return fs.SkipDir
-		}
-		ignored, err := w.ignores.ignored(name, entry.IsDir())
-		if err != nil {
-			return err
-		}
-		w.entries++
-		if w.entries > maxSearchEntries {
-			w.scanLimited = true
-			return errSearchLimit
-		}
-		if entry.IsDir() && ignored {
-			// A later rule could only re-include a descendant if this
-			// directory were itself re-included. ignored() has already
-			// applied every rule visible from its ancestors, so pruning is
-			// both safe and what keeps large ignored trees bounded.
-			return fs.SkipDir
-		}
-		if entry.IsDir() {
-			if err := w.ignores.ensureDir(name); err != nil {
-				return err
-			}
-		}
-		return visit(name, entry, ignored)
-	})
-	if errors.Is(err, errSearchLimit) {
-		return nil
-	}
-	return err
-}
-
-func isRegularEntry(entry fs.DirEntry) bool {
-	return entry.Type().IsRegular()
-}
-
-func readSearchLine(reader *bufio.Reader) (line []byte, eof, truncated bool, err error) {
-	for {
-		chunk, readErr := reader.ReadSlice('\n')
-		if len(chunk) > 0 && len(line) < maxSearchLineBytes {
-			remaining := maxSearchLineBytes - len(line)
-			if len(chunk) > remaining {
-				line = append(line, chunk[:remaining]...)
-				truncated = true
-			} else {
-				line = append(line, chunk...)
-			}
-		}
-		switch readErr {
-		case nil:
-			return bytes.TrimSuffix(line, []byte{'\n'}), false, truncated, nil
-		case bufio.ErrBufferFull:
-			if len(line) >= maxSearchLineBytes {
-				truncated = true
-			}
-			continue
-		case io.EOF:
-			if len(line) == 0 {
-				return nil, true, truncated, nil
-			}
-			return bytes.TrimSuffix(line, []byte{'\n'}), true, truncated, nil
-		default:
-			return nil, false, truncated, readErr
-		}
-	}
 }

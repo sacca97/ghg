@@ -46,7 +46,7 @@ function promptWithReferences(prompt: string, paths: string[]): string {
 
 function commandMayRunDuringTurn(prompt: string): boolean {
 	const name = prompt.trim().split(/\s+/, 1)[0];
-	return ["/approval", "/commands", "/help", "/notify", "/pwd", "/rename"].includes(name);
+	return ["/approval", "/commands", "/detach", "/help", "/notify", "/pwd", "/rename", "/q", "/quit", "/exit"].includes(name);
 }
 
 function literalGlob(value: string): string {
@@ -208,13 +208,13 @@ function htmlFor(webview: vscode.Webview, extensionUri: vscode.Uri): string {
 			  <option value="tiny">Configured</option>
 			  <option value="fast">Configured</option>
 			</select>
-		<select id="effort" aria-label="Thinking effort">
+			<select id="effort" aria-label="Thinking effort">
 		  <option value="">Off</option>
 		  <option value="low">Low</option>
 		  <option value="medium">Medium</option>
 		  <option value="high">High</option>
 		</select>
-      <button type="submit" id="send" aria-label="Send" title="Send">↑</button>
+      <button type="submit" id="send" aria-label="Send" title="Send">➤</button>
     </div>
   </form>
 </main>
@@ -238,6 +238,7 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 	private bufferedEvents: Event[] = [];
 	private lastSnapshot?: Event;
 	private promptIDs = new Set<string>();
+	private detachWaiters = new Map<string, { resolve: () => void; reject: (error: Error) => void }>();
 
 	constructor(private readonly extension: vscode.ExtensionContext) {}
 
@@ -266,8 +267,8 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 		const binary = vscode.workspace.getConfiguration("ghg").get<string>("binaryPath", "ghg");
 		try {
 			this.post({ type: "models", models: await listModels(binary, workspace?.uri.fsPath) });
-		} catch {
-			// Model discovery is optional until the configured binary is available.
+		} catch (error) {
+			this.post({ type: "notice", text: `model discovery unavailable: ${error instanceof Error ? error.message : String(error)}` });
 		}
 	}
 
@@ -376,6 +377,13 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 				resolveReady();
 				return;
 			}
+			if (event.type === "detach_ack" && typeof event.request_id === "string") {
+				const waiter = this.detachWaiters.get(event.request_id);
+				if (waiter) {
+					this.detachWaiters.delete(event.request_id);
+					waiter.resolve();
+				}
+			}
 			if (event.type === "turn_end") {
 				this.active = false;
 			}
@@ -400,6 +408,8 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 		});
 		child.once("close", (code) => {
 			if (!ready) rejectReady(new Error(`ghg bridge exited with code ${code ?? "unknown"}`));
+			for (const waiter of this.detachWaiters.values()) waiter.reject(new Error("ghg bridge closed before detaching"));
+			this.detachWaiters.clear();
 			if (this.bridge === child) {
 				this.bridge = undefined;
 				this.bridgeReady = undefined;
@@ -422,13 +432,27 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 		if (!id || !child || this.promptIDs.has(id)) return;
 		this.promptIDs.add(id);
 		try {
+			const tool = String(approval.tool || "tool");
+			const command = String(approval.command || "Allow operation?");
+			const rule = String(approval.rule || "");
 			const choice = await vscode.window.showQuickPick(
-				["Allow once", "Allow always", "Deny"],
-				{ placeHolder: `${String(approval.tool || "tool")}: ${String(approval.command || "Allow operation?")}` },
+				["Allow once", "Allow always", "Deny", "Deny with instruction"],
+				{ placeHolder: `${tool}: ${command}${rule ? ` · always: ${rule}` : ""}` },
 			);
 			if (this.bridge !== child) return;
-			const decision = choice === "Allow always" ? "allow_always" : choice === "Allow once" ? "allow_once" : "deny";
-			await this.writeBridgeCommand(child, "approve", { id, decision });
+			if (choice === "Deny with instruction") {
+				const redirect = await vscode.window.showInputBox({
+					prompt: "Tell ghg what to do instead",
+					ignoreFocusOut: true,
+					validateInput: (value) => value.length > 4096 ? "Instruction is limited to 4096 characters." : undefined,
+				});
+				await this.writeBridgeCommand(child, "approve", {
+					id, decision: "reject", redirect: redirect?.trim() || "approval instruction was dismissed",
+				});
+				return;
+			}
+			const decision = choice === "Allow always" ? "allow_always" : choice === "Allow once" ? "allow_once" : "reject";
+			await this.writeBridgeCommand(child, "approve", { id, decision, redirect: choice ? undefined : "approval prompt was dismissed" });
 		} finally {
 			this.promptIDs.delete(id);
 		}
@@ -447,15 +471,41 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 				if (typeof question.id !== "string") continue;
 				const options = Array.isArray(question.options) ? question.options
 					.filter((option) => option && typeof option === "object")
-					.map((option) => String((option as Record<string, unknown>).label || "")) : [];
-				const value = options.length > 0
-					? await vscode.window.showQuickPick(options, { placeHolder: String(question.question || "Choose an option") })
-					: await vscode.window.showInputBox({ prompt: String(question.question || "Answer") });
+					.map((option) => {
+						const value = option as Record<string, unknown>;
+						return {
+							label: String(value.label || ""),
+							description: typeof value.description === "string" ? value.description : undefined,
+							value: String(value.label || ""),
+						};
+					}) : [];
+				let value: string | undefined;
+				if (options.length > 0) {
+					const choice = await vscode.window.showQuickPick(
+						[...options, { label: "Other…", description: "Enter a custom answer", value: "__other__" }],
+						{ placeHolder: String(question.question || "Choose an option"), matchOnDescription: true },
+					);
+					if (choice?.value === "__other__") {
+						value = await vscode.window.showInputBox({
+							prompt: String(question.question || "Answer"),
+							ignoreFocusOut: true,
+							validateInput: (input) => input.length > 4096 ? "Answer is limited to 4096 characters." : undefined,
+						});
+					} else {
+						value = choice?.value;
+					}
+				} else {
+					value = await vscode.window.showInputBox({
+						prompt: String(question.question || "Answer"),
+						ignoreFocusOut: true,
+						validateInput: (input) => input.length > 4096 ? "Answer is limited to 4096 characters." : undefined,
+					});
+				}
 				if (value === undefined) {
 					if (this.bridge === child) await this.writeBridgeCommand(child, "answer_question", { id, cancelled: true });
 					return;
 				}
-				answers.push({ id: question.id, value });
+				answers.push({ id: question.id, value: value.trim() });
 			}
 			if (this.bridge === child) await this.writeBridgeCommand(child, "answer_question", { id, answers });
 		} finally {
@@ -485,12 +535,12 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 		}
 	}
 
-	private writeBridgeCommand(child: ChildProcess, name: string, payload: unknown = null): Promise<void> {
+	private writeBridgeCommand(child: ChildProcess, name: string, payload: unknown = null, requestID = `vscode-${++this.bridgeRequest}`): Promise<void> {
 		const stdin = child.stdin;
 		if (!stdin || stdin.destroyed || stdin.writableEnded) return Promise.reject(new Error("ghg bridge input is unavailable"));
 		const request = {
 			type: "command",
-			request_id: `vscode-${++this.bridgeRequest}`,
+			request_id: requestID,
 			name,
 			payload,
 		};
@@ -520,6 +570,21 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 				finish(error instanceof Error ? error : new Error(String(error)));
 			}
 		});
+	}
+
+	private async detachBridge(): Promise<void> {
+		const child = this.bridge;
+		if (!child) return;
+		const requestID = `vscode-${++this.bridgeRequest}`;
+		const detached = new Promise<void>((resolve, reject) => this.detachWaiters.set(requestID, { resolve, reject }));
+		try {
+			await this.writeBridgeCommand(child, "detach", null, requestID);
+			await detached;
+			this.active = false;
+			await this.stopBridge();
+		} finally {
+			this.detachWaiters.delete(requestID);
+		}
 	}
 
 	private async bridgeCommand(name: string, payload: unknown = null, initialRole: Role = "fast", initialMode: "execute" | "plan" = "execute"): Promise<void> {
@@ -684,16 +749,22 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 		case "/pwd":
 			this.post({ type: "notice", text: currentWorkspace()?.uri.fsPath || "" });
 			return;
+		case "/detach":
+			await this.detachBridge();
+			this.post({ type: "notice", text: "ghg worker detached; it will continue in the background." });
+			return;
 		case "/clear":
 			return this.newSession();
 		case "/resume":
 			return this.resumeSession(args || undefined);
 		case "/quit":
+		case "/exit":
+		case "/q":
 			void this.stopBridge();
 			return;
 		case "/commands":
 		case "/help":
-			this.post({ type: "notice", text: "Worker commands: /ask /plan /execute /review /continue /compact /approval /notify /lsp /mcp /context-doctor /goal-from-context /cd /rename /effort /model /pwd /clear /resume /quit and !<command>" });
+			this.post({ type: "notice", text: "Extension commands: /ask /plan /execute /review /continue /compact /approval /notify /lsp /mcp /context-doctor /goal-from-context /cd /detach /rename /effort /model /pwd /clear /resume /quit (/exit, /q) and !<command>" });
 			return;
 		default:
 			throw new Error(`${name} is not available in the extension yet`);
@@ -774,6 +845,14 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 		}
 		const prompt = message.prompt.trim();
 		const activeBefore = this.active;
+		if (activeBefore && !prompt.startsWith("/") && !prompt.startsWith("!")) {
+			try {
+				await this.bridgeCommand("append", { content: promptWithReferences(prompt, cleanReferences(message.references)) });
+			} catch (error) {
+				this.post({ type: "error", error: error instanceof Error ? error.message : String(error) });
+			}
+			return;
+		}
 		if (activeBefore && !commandMayRunDuringTurn(prompt)) {
 			this.post({ type: "error", error: "A ghg turn is already running." });
 			return;
@@ -839,7 +918,7 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 				matchOnDescription: true,
 			});
 			id = pick?.sessionId;
-		} else {
+		} else if (!id) {
 			id = await vscode.window.showInputBox({ prompt: "ghg session ID" });
 		}
 		if (!id?.trim()) {

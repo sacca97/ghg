@@ -23,6 +23,7 @@ type Input struct {
 	PlanMode     bool                 `json:"plan_mode,omitempty"`
 	ReviewMode   bool                 `json:"review_mode,omitempty"`
 	AskMode      bool                 `json:"ask_mode,omitempty"`
+	Continue     bool                 `json:"continue,omitempty"`
 }
 
 // TurnResult reports a finished turn.

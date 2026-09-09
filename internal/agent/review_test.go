@@ -411,7 +411,7 @@ func TestReviewFinalizationFailureRetainsEvidence(t *testing.T) {
 
 	ag.ReviewMode = true
 	var resumed ReviewProgress
-	final, err := ag.TurnAuthored(context.Background(), "continue", Events{OnReviewProgress: func(progress ReviewProgress) {
+	final, err := ag.Continue(context.Background(), Events{OnReviewProgress: func(progress ReviewProgress) {
 		if progress.Reason == "resumed" {
 			resumed = progress
 		}

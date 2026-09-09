@@ -376,7 +376,7 @@ func (w *workerProcessState) runTurn(ctx context.Context, input workerInput) {
 		w.ag.AskMode = true
 		w.ag.ReviewMode = false
 		w.ag.PlanMode = false
-	} else if input.ReviewMode || (strings.EqualFold(strings.TrimSpace(input.Input), "continue") && w.ag.ReviewPending()) {
+	} else if input.ReviewMode || (input.Continue && w.ag.ReviewPending()) {
 		w.ag.ReviewMode = true
 		w.ag.PlanMode = false
 		w.ag.AskMode = false
@@ -437,6 +437,8 @@ func (w *workerProcessState) runTurn(ctx context.Context, input workerInput) {
 	var final string
 	var err error
 	switch {
+	case input.Continue:
+		final, err = w.ag.Continue(ctx, ev)
 	case len(input.Parts) > 0 && input.Goal != nil:
 		final, err = w.ag.TurnWithImagesAndGoal(ctx, input.Input, input.Parts, *input.Goal, ev)
 	case len(input.Parts) > 0:

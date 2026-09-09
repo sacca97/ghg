@@ -190,7 +190,7 @@ func (m *model) command(text string) (tea.Model, tea.Cmd) {
 			m.append(dimStyle.Render("(busy — /continue after this turn)"))
 			return m, nil
 		}
-		return m.submit("continue")
+		return m.submitContinue()
 	case "/approval":
 		if len(fields) == 1 {
 			m.append(dimStyle.Render("approval mode: " + m.currentApprovalMode()))

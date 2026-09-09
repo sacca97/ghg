@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/sacca97/ghg/internal/models"
@@ -53,10 +54,13 @@ func FilterAvailable(ts []Tool, runtime *ToolRuntime) ([]Tool, []string) {
 
 	needBash := false
 	needLSP := false
+	needRG := false
 	for _, tool := range ts {
 		switch tool.Def.Function.Name {
 		case "bash":
 			needBash = true
+		case "grep", "glob", "find_files", "structural_search":
+			needRG = true
 		case "lsp", "lsp_rename":
 			needLSP = true
 		}
@@ -66,6 +70,13 @@ func FilterAvailable(ts []Tool, runtime *ToolRuntime) ([]Tool, []string) {
 	var notices []string
 	if needBash && !bashrun.Available() {
 		missing["bash"] = "bash unavailable: the selected shell is not on PATH"
+	}
+	_, rgOK := rgAvailable()
+	if needRG && !rgOK {
+		for _, name := range []string{"grep", "glob", "find_files", "structural_search"} {
+			missing[name] = "repository search unavailable: rg is not on PATH"
+		}
+		notices = append(notices, missing["grep"])
 	}
 	if needLSP {
 		lspAvailable := runtime.LanguageService != nil
@@ -118,6 +129,7 @@ func Execute(ctx context.Context, ts []Tool, name string, args json.RawMessage) 
 // available after the model preview is bounded.
 func ExecuteResult(ctx context.Context, ts []Tool, name string, args json.RawMessage) ToolResult {
 	name = canonicalToolName(name)
+	args = normalizeIntegerArgs(name, args)
 	for _, t := range ts {
 		if t.Def.Function.Name == name {
 			var result ToolResult
@@ -164,12 +176,99 @@ func ExecuteResult(ctx context.Context, ts []Tool, name string, args json.RawMes
 	return result
 }
 
+var integerToolArgs = map[string]map[string]struct{}{
+	"read":              {"offset": {}, "limit": {}},
+	"grep":              {"max_results": {}},
+	"glob":              {"max_results": {}},
+	"find_files":        {"max_results": {}},
+	"structural_search": {"max_results": {}},
+	"edit":              {"start_line": {}, "end_line": {}},
+}
+
+func normalizeIntegerArgs(name string, args json.RawMessage) json.RawMessage {
+	keys, ok := integerToolArgs[name]
+	if !ok {
+		return args
+	}
+	normalized, changed := normalizeIntegerJSON(args, keys)
+	if !changed {
+		return args
+	}
+	return normalized
+}
+
+func normalizeIntegerJSON(raw json.RawMessage, keys map[string]struct{}) (json.RawMessage, bool) {
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &object); err == nil && object != nil {
+		changed := false
+		for key, value := range object {
+			if _, ok := keys[key]; ok {
+				if number, ok := quotedInteger(value); ok {
+					object[key] = number
+					changed = true
+					continue
+				}
+			}
+			if nested, ok := normalizeIntegerJSON(value, keys); ok {
+				object[key] = nested
+				changed = true
+			}
+		}
+		if !changed {
+			return raw, false
+		}
+		normalized, err := json.Marshal(object)
+		if err != nil {
+			return raw, false
+		}
+		return normalized, true
+	}
+
+	var array []json.RawMessage
+	if err := json.Unmarshal(raw, &array); err != nil || array == nil {
+		return raw, false
+	}
+	changed := false
+	for i, value := range array {
+		if nested, ok := normalizeIntegerJSON(value, keys); ok {
+			array[i] = nested
+			changed = true
+		}
+	}
+	if !changed {
+		return raw, false
+	}
+	normalized, err := json.Marshal(array)
+	if err != nil {
+		return raw, false
+	}
+	return normalized, true
+}
+
+func quotedInteger(raw json.RawMessage) (json.RawMessage, bool) {
+	var value string
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return nil, false
+	}
+	number, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil {
+		return nil, false
+	}
+	return json.RawMessage(strconv.Itoa(number)), true
+}
+
 func canonicalToolName(name string) string {
 	switch name {
 	case "artifact_read":
 		return "output_read"
 	case "artifact_list":
 		return "output_list"
+	case "read_file":
+		return "read"
+	case "search", "search_text":
+		return "grep"
+	case "find", "find_file":
+		return "find_files"
 	default:
 		return name
 	}

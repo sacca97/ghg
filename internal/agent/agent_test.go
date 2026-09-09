@@ -860,7 +860,7 @@ func TestContinueReplaysOnlyAuthoredMessageParts(t *testing.T) {
 	ag.Messages = append(ag.Messages, models.Message{
 		Role: "user", Content: "inspect this image", Parts: []models.ContentPart{image}, Authored: true,
 	})
-	if _, err := ag.TurnAuthored(context.Background(), "continue", Events{}); err != nil {
+	if _, err := ag.Continue(context.Background(), Events{}); err != nil {
 		t.Fatal(err)
 	}
 	if got := ag.Messages[1]; got.Content != "inspect this image" || !got.Authored || len(got.Parts) != 1 {
@@ -887,7 +887,7 @@ func TestContinueReplaysOnlyAuthoredMessageParts(t *testing.T) {
 		models.Message{Role: "assistant", StopReason: "interrupted", ToolCalls: []models.ToolCall{call}},
 		models.Message{Role: "tool", Name: "read", ToolCallID: "call-1", Content: "Error: tool call interrupted — the turn was canceled by user before execution completed"},
 	)
-	if _, err := interrupted.TurnAuthored(context.Background(), "continue", Events{}); err != nil {
+	if _, err := interrupted.Continue(context.Background(), Events{}); err != nil {
 		t.Fatal(err)
 	}
 	if len(interrupted.Messages) != 3 || interrupted.Messages[1].Content != "retry this turn" || interrupted.Messages[2].Content != "done" {
@@ -1034,7 +1034,7 @@ func (b *checkpointBackend) Complete(_ context.Context, _ models.Request) (model
 
 func TestExplorationCheckpointsAreTransientAndBlockPendingTools(t *testing.T) {
 	const expectedFinalRound = 24
-	expectedCheckpointRounds := map[int]int{10: 1, 16: 2, expectedFinalRound: 3}
+	expectedCheckpointRounds := map[int]int{executionExplorationCheckpoint: 0, 10: 1, 16: 2, expectedFinalRound: 3}
 
 	call := func(id, name, args string) models.ToolCall {
 		return models.ToolCall{ID: id, Type: "function", Function: struct {
@@ -1083,13 +1083,16 @@ func TestExplorationCheckpointsAreTransientAndBlockPendingTools(t *testing.T) {
 		t.Fatalf("executed tool calls = %d, want %d", got, want)
 	}
 	baselineTools := backend.requests[0].Tools
-	if want := []string{"◎ exploration checkpoint · round 10", "◎ exploration checkpoint · round 16", "◎ exploration checkpoint · round 24"}; !reflect.DeepEqual(notices, want) {
+	if want := []string{"◎ execution checkpoint · round 8", "◎ exploration checkpoint · round 10", "◎ exploration checkpoint · round 16", "◎ exploration checkpoint · round 24"}; !reflect.DeepEqual(notices, want) {
 		t.Fatalf("notices = %v, want %v", notices, want)
 	}
 	for round, level := range expectedCheckpointRounds {
 		index := round + 2
-		if !requestContains(backend.requests[index], fmt.Sprintf(`level="%d"`, level)) {
+		if level > 0 && !requestContains(backend.requests[index], fmt.Sprintf(`level="%d"`, level)) {
 			t.Fatalf("request %d lacks checkpoint level %d", index+1, level)
+		}
+		if level == 0 && !requestContains(backend.requests[index], "<execution_checkpoint>") {
+			t.Fatalf("request %d lacks execution checkpoint reminder", index+1)
 		}
 		if ends[index].CheckpointLevel != level {
 			t.Fatalf("model call %d checkpoint level = %d, want %d", index+1, ends[index].CheckpointLevel, level)

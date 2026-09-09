@@ -42,6 +42,7 @@ const (
 	explorationCheckpointTwo        = 16
 	explorationCheckpointFinal      = 24
 	explorationCheckpointFinalLevel = 3
+	executionExplorationCheckpoint  = 8
 )
 
 // HistoryCatalog is the durable session boundary for bounded history recall.
@@ -866,6 +867,10 @@ func explorationCheckpointReminder(level, rounds int) string {
 	return fmt.Sprintf("<exploration_checkpoint level=\"%d\">\nYou have completed %d repository-exploration rounds in this turn.\n%s\n</exploration_checkpoint>", level, rounds, prompt)
 }
 
+func executionExplorationCheckpointReminder(rounds int) string {
+	return fmt.Sprintf("<execution_checkpoint>\nYou have completed %d repository-exploration rounds without a change. Choose the next concrete action: make the needed change, run targeted verification, or state the blocker. Continue broad exploration only when it resolves a specific unanswered question.\n</execution_checkpoint>", rounds)
+}
+
 // Turn sends user input and loops until the model stops calling tools.
 // It returns the final assistant text. When the latest successful request's
 // reported context size crosses the adaptive 80% compaction budget (or the
@@ -875,7 +880,7 @@ func explorationCheckpointReminder(level, rounds int) string {
 // exceeded its context window, Turn auto-compacts (summarizing old turns) and
 // retries once before surfacing the error to the caller.
 func (a *Agent) Turn(ctx context.Context, input string, ev Events) (string, error) {
-	return a.turn(ctx, input, nil, false, nil, ev)
+	return a.turn(ctx, input, nil, false, false, nil, ev)
 }
 
 // TurnAuthored is Turn for a message the human actually typed and submitted
@@ -883,32 +888,37 @@ func (a *Agent) Turn(ctx context.Context, input string, ev Events) (string, erro
 // The message is marked Authored so input-history recall cycles only real
 // submissions.
 func (a *Agent) TurnAuthored(ctx context.Context, input string, ev Events) (string, error) {
-	return a.turn(ctx, input, nil, true, nil, ev)
+	return a.turn(ctx, input, nil, true, false, nil, ev)
+}
+
+// Continue resumes the interrupted turn through an explicit command intent.
+func (a *Agent) Continue(ctx context.Context, ev Events) (string, error) {
+	return a.turn(ctx, "continue", nil, true, true, nil, ev)
 }
 
 // TurnWithImages is TurnAuthored for a submission that attaches images. Each
 // part is a vision ContentPart (see models.ImagePart); the model receives the
 // text and the images together as a multimodal content array.
 func (a *Agent) TurnWithImages(ctx context.Context, input string, parts []models.ContentPart, ev Events) (string, error) {
-	return a.turn(ctx, input, parts, true, nil, ev)
+	return a.turn(ctx, input, parts, true, false, nil, ev)
 }
 
 // TurnWithGoal runs a normal turn with a request-scoped active goal context.
 // The goal record is copied so model updates cannot mutate caller state; the
 // caller receives each validated update through Events.OnGoalUpdate.
 func (a *Agent) TurnWithGoal(ctx context.Context, input string, goal GoalRecord, ev Events) (string, error) {
-	return a.turn(ctx, input, nil, false, &goal, ev)
+	return a.turn(ctx, input, nil, false, false, &goal, ev)
 }
 
 // TurnAuthoredWithGoal is TurnWithGoal for a human-authored submission.
 func (a *Agent) TurnAuthoredWithGoal(ctx context.Context, input string, goal GoalRecord, ev Events) (string, error) {
-	return a.turn(ctx, input, nil, true, &goal, ev)
+	return a.turn(ctx, input, nil, true, false, &goal, ev)
 }
 
 // TurnWithImagesAndGoal combines an authored multimodal turn with a
 // request-scoped active goal context.
 func (a *Agent) TurnWithImagesAndGoal(ctx context.Context, input string, parts []models.ContentPart, goal GoalRecord, ev Events) (string, error) {
-	return a.turn(ctx, input, parts, true, &goal, ev)
+	return a.turn(ctx, input, parts, true, false, &goal, ev)
 }
 
 // ReviewPending reports whether a failed review turn can be resumed.
@@ -1013,9 +1023,9 @@ func (a *Agent) assembleRequestMessages(history []models.Message, todoContent, g
 	return reqMsgs
 }
 
-func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPart, authored bool, goalCtx *GoalRecord, ev Events) (string, error) {
+func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPart, authored, continuation bool, goalCtx *GoalRecord, ev Events) (string, error) {
 	a.compacted = false // compaction retry state is scoped to this turn
-	resumeReview := a.ReviewMode && authored && len(parts) == 0 && strings.EqualFold(strings.TrimSpace(input), "continue") && a.reviewContinuation != nil
+	resumeReview := a.ReviewMode && authored && continuation && a.reviewContinuation != nil
 	var activeGoal *GoalRecord
 	if goalCtx != nil {
 		goal := *goalCtx
@@ -1032,7 +1042,7 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 		msg.SentAt = &now
 	}
 	a.msgsMu.Lock()
-	if len(parts) == 0 && strings.EqualFold(strings.TrimSpace(input), "continue") {
+	if continuation {
 		// User is explicitly asking to continue the prior unanswered prompt.
 		// A canceled tool turn persists an interrupted assistant/tool tail, so
 		// remove that tail before replaying the authored prompt.
@@ -1406,7 +1416,10 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 				postEditVerification = false
 			} else {
 				explorationRounds++
-				if level := explorationCheckpointLevel(explorationRounds); level > 0 {
+				if explorationRounds == executionExplorationCheckpoint && !a.readOnlyCollaborationMode() {
+					explorationReminder = executionExplorationCheckpointReminder(explorationRounds)
+					checkpointTriggered = true
+				} else if level := explorationCheckpointLevel(explorationRounds); level > 0 {
 					checkpointLevel = level
 					explorationReminder = explorationCheckpointReminder(level, explorationRounds)
 					checkpointTriggered = true
@@ -1415,7 +1428,11 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 		}
 		if checkpointTriggered {
 			if ev.OnNotice != nil {
-				ev.OnNotice(fmt.Sprintf("◎ exploration checkpoint · round %d", explorationRounds))
+				label := "exploration"
+				if explorationRounds == executionExplorationCheckpoint && !a.readOnlyCollaborationMode() {
+					label = "execution"
+				}
+				ev.OnNotice(fmt.Sprintf("◎ %s checkpoint · round %d", label, explorationRounds))
 			}
 			if !a.readOnlyCollaborationMode() {
 				continue

@@ -414,7 +414,7 @@ func workerRequestID(prefix string) string {
 	return fmt.Sprintf("%s-%d", prefix, time.Now().UnixNano())
 }
 
-func (m *model) submitWorkerTurn(text string, authored bool, prepared string, parts []models.ContentPart, at int, snap string, goalCtx *agent.GoalRecord, ask bool) (tea.Model, tea.Cmd) {
+func (m *model) submitWorkerTurn(text string, authored bool, prepared string, parts []models.ContentPart, at int, snap string, goalCtx *agent.GoalRecord, ask, continuation bool) (tea.Model, tea.Cmd) {
 	if m.workerClient == nil {
 		return m, nil
 	}
@@ -437,6 +437,7 @@ func (m *model) submitWorkerTurn(text string, authored bool, prepared string, pa
 		PlanMode:   !ask && !m.reviewing && m.uiMode() == uiModePlan,
 		ReviewMode: !ask && m.reviewing,
 		AskMode:    ask,
+		Continue:   continuation,
 	}); err != nil {
 		m.cancel = nil
 		m.busy = false

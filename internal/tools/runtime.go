@@ -617,7 +617,11 @@ func (r *ToolRuntime) reviewOrHumanOnce(ctx context.Context, request ApprovalReq
 		}
 		r.audit(ExecutionAudit{Request: request, Disposition: "reviewer", Reviewer: sanitizeApprovalResult(result, r.SecretNames), Error: approvalError(result, err, r.SecretNames)})
 		if err == nil && result.Decision == ApprovalDeny {
-			return GateReject, true, errors.New("approval reviewer denied the capability")
+			reason := truncateApprovalText(strings.TrimSpace(redactFreeText(result.Reason, r.SecretNames)), 500)
+			if reason == "" {
+				reason = "no reason supplied"
+			}
+			return GateReject, true, fmt.Errorf("approval reviewer denied the capability: %s", reason)
 		}
 		// Malformed/failed/low-confidence output is a human fallback only in
 		// an interactive run. It is never converted into approval.

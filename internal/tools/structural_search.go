@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/fs"
 	"os"
 	"path"
 	"slices"
@@ -136,9 +135,16 @@ func collectStructuralSnapshot(ctx context.Context, args structuralSearchArgs, m
 		}
 	}
 
-	err = walkSearchFiles(workCtx, scope, collector,
-		func(name string, entry fs.DirEntry) bool { return path.Ext(name) == ".go" },
-		schedule)
+	err = listFilesRG(workCtx, scope, func(name string) error {
+		rel, err := rgRelativePath(scope, name)
+		if err != nil {
+			return err
+		}
+		if path.Ext(rel) != ".go" {
+			return nil
+		}
+		return schedule(rel)
+	})
 	close(jobs)
 	groupErr := group.Wait()
 	if err != nil && !errors.Is(err, errSearchLimit) && !errors.Is(err, context.Canceled) {

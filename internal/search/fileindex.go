@@ -108,7 +108,11 @@ func FuzzyFiles(root, query string, limit int) []string {
 	if root == "" {
 		return nil
 	}
-	files := indexedFiles(root)
+	return FuzzyPaths(indexedFiles(root), query, limit)
+}
+
+// FuzzyPaths ranks an already-discovered list of relative paths.
+func FuzzyPaths(files []string, query string, limit int) []string {
 	q := strings.ToLower(strings.TrimSpace(query))
 	if limit <= 0 {
 		hits := make([]fuzzyHit, 0, len(files))

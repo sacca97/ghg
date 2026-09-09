@@ -611,8 +611,12 @@ func (m *model) submit(text string) (tea.Model, tea.Cmd) {
 	return m.submitTurn(text, true)
 }
 
+func (m *model) submitContinue() (tea.Model, tea.Cmd) {
+	return m.submitTurnMode("continue", true, false, true)
+}
+
 func (m *model) submitAsk(text string) (tea.Model, tea.Cmd) {
-	return m.submitTurnMode(text, true, true)
+	return m.submitTurnMode(text, true, true, false)
 }
 
 // submitGoal sends a ghg-injected goal-continuation; not a typed submission,
@@ -622,16 +626,16 @@ func (m *model) submitGoal(text string) (tea.Model, tea.Cmd) {
 }
 
 func (m *model) submitTurn(text string, authored bool) (tea.Model, tea.Cmd) {
-	return m.submitTurnMode(text, authored, false)
+	return m.submitTurnMode(text, authored, false, false)
 }
 
-func (m *model) submitTurnMode(text string, authored, ask bool) (tea.Model, tea.Cmd) {
+func (m *model) submitTurnMode(text string, authored, ask, continuation bool) (tea.Model, tea.Cmd) {
 	if !m.requireAgent() {
 		return m, nil
 	}
 	if m.workerClient == nil && m.prog != nil && m.store != nil && !m.workerStartFailed {
 		return m.ensureWorkerAction(func() tea.Cmd {
-			_, cmd := m.submitTurnMode(text, authored, ask)
+			_, cmd := m.submitTurnMode(text, authored, ask, continuation)
 			return cmd
 		})
 	}
@@ -662,5 +666,5 @@ func (m *model) submitTurnMode(text string, authored, ask bool) (tea.Model, tea.
 		}
 		goalCopy := goalCtx
 		return &goalCopy
-	}(), ask)
+	}(), ask, continuation)
 }
