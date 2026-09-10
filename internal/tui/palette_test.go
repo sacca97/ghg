@@ -66,6 +66,18 @@ func TestPaletteFilter(t *testing.T) {
 	}
 }
 
+func TestPaletteFilterBackspaceRemovesWholeRune(t *testing.T) {
+	m := compactCmdModel()
+	m.openPalette()
+	m.settings.filter = "é"
+	m.settings.applyFilter(m)
+	tm, _ := m.paletteKey(tea.KeyMsg{Type: tea.KeyBackspace})
+	m = tm.(*model)
+	if m.settings.filter != "" {
+		t.Fatalf("backspace left an invalid partial rune: %q", m.settings.filter)
+	}
+}
+
 func TestPaletteNavigationWraps(t *testing.T) {
 	m := compactCmdModel()
 	m.openPalette()
@@ -176,6 +188,38 @@ func TestPaletteArrowsStepEffortInPlace(t *testing.T) {
 	m = tm.(*model)
 	if m.effort != "" {
 		t.Fatalf("← should step back to off, got %q", m.effort)
+	}
+}
+
+func TestDynamicReasoningArrowsAreDirectional(t *testing.T) {
+	m := compactCmdModel()
+	item := paletteItem{}
+	for _, candidate := range m.paletteItems() {
+		if candidate.title == "Dynamic reasoning" {
+			item = candidate
+			break
+		}
+	}
+	if item.stepBack == nil || item.stepFwd == nil {
+		t.Fatal("dynamic reasoning should expose both arrow actions")
+	}
+	on := true
+	m.cfg.DynamicReasoning = &on
+	item.stepBack(m)
+	if m.dynamicReasoningEnabled() {
+		t.Fatal("left arrow should disable dynamic reasoning")
+	}
+	item.stepFwd(m)
+	if !m.dynamicReasoningEnabled() {
+		t.Fatal("right arrow should enable dynamic reasoning")
+	}
+}
+
+func TestEmptyEffortPanelKeyDoesNotPanic(t *testing.T) {
+	m := compactCmdModel()
+	m.settings = &settings{stack: []*ppanel{{kind: panelEffort}}}
+	if _, _ = m.panelKey(tea.KeyMsg{Type: tea.KeyDown}, m.settings.top()); m.settings.top().lidx != 0 {
+		t.Fatal("empty effort panel should remain unchanged")
 	}
 }
 

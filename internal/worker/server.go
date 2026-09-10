@@ -260,20 +260,36 @@ func (s *Server) serveConnection(conn net.Conn) {
 	s.controller = p
 	s.detached = false
 	p.startWriter()
-	_ = p.enqueue(Frame{
+	snapshotFrame := Frame{
 		Version:   ProtocolVersion,
 		SessionID: s.runtime.SessionID,
 		Seq:       snapshotSeq,
 		Type:      TypeSnapshot,
 		Payload:   mustPayload(SnapshotEnvelope{State: state}),
-	}, true)
-	_ = p.enqueue(Frame{
+	}
+	attachedFrame := Frame{
 		Version:   ProtocolVersion,
 		SessionID: s.runtime.SessionID,
 		Seq:       snapshotSeq,
 		Type:      TypeAttached,
 		Payload:   mustPayload(map[string]any{"last_seq": snapshotSeq}),
-	}, true)
+	}
+	if _, err := encodeFrame(snapshotFrame); err != nil {
+		s.mu.Unlock()
+		_ = writeErrorWithDeadline(conn, s.runtime.SessionID, "worker snapshot exceeds protocol frame limit")
+		p.close()
+		s.handler.Disconnected(context.Background(), false)
+		return
+	}
+	if _, err := encodeFrame(attachedFrame); err != nil {
+		s.mu.Unlock()
+		_ = writeErrorWithDeadline(conn, s.runtime.SessionID, "worker attach response exceeds protocol frame limit")
+		p.close()
+		s.handler.Disconnected(context.Background(), false)
+		return
+	}
+	_ = p.enqueue(snapshotFrame, true)
+	_ = p.enqueue(attachedFrame, true)
 	s.mu.Unlock()
 
 	for {
@@ -342,7 +358,13 @@ func (s *Server) handleCommand(p *peer, frame Frame) {
 	if len(response.Payload) == 0 {
 		response.Payload = json.RawMessage("null")
 	}
-	if result.Detach {
+	detach := result.Detach
+	if _, err := encodeFrame(response); err != nil {
+		response = errorFrame(s.runtime.SessionID, "worker response exceeds protocol frame limit")
+		response.RequestID = frame.RequestID
+		detach = false
+	}
+	if detach {
 		if err := p.enqueueAndWait(response, true); err != nil {
 			p.close()
 			s.clearController(p, false)
@@ -366,9 +388,11 @@ func (s *Server) handleCommand(p *peer, frame Frame) {
 
 func (s *Server) clearController(p *peer, detached bool) {
 	s.mu.Lock()
-	if s.controller == p {
-		s.controller = nil
+	if s.controller != p {
+		s.mu.Unlock()
+		return
 	}
+	s.controller = nil
 	s.mu.Unlock()
 	s.handler.Disconnected(context.Background(), detached)
 }

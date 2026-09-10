@@ -173,6 +173,9 @@ func bridgeConnect(runtimeFile workerwire.Runtime) (*workerwire.Client, error) {
 		if err == nil {
 			return client, nil
 		}
+		if strings.Contains(err.Error(), "worker already has a controlling client") {
+			return nil, err
+		}
 		time.Sleep(20 * time.Millisecond)
 	}
 	return nil, err
@@ -285,13 +288,20 @@ func (b *bridge) handle(request bridgeRequest) error {
 	}
 	if request.Name == "configure_role" {
 		var payload struct {
-			Role         string `json:"role"`
-			Mode         string `json:"mode,omitempty"`
-			Effort       string `json:"effort,omitempty"`
-			UpdateEffort bool   `json:"update_effort,omitempty"`
+			Role             string `json:"role"`
+			Mode             string `json:"mode,omitempty"`
+			Effort           string `json:"effort,omitempty"`
+			UpdateEffort     bool   `json:"update_effort,omitempty"`
+			DynamicReasoning *bool  `json:"dynamic_reasoning,omitempty"`
 		}
 		if err := json.Unmarshal(request.Payload, &payload); err != nil || !config.IsRole(payload.Role) {
 			return errors.New("bridge role configuration is invalid")
+		}
+		if payload.DynamicReasoning != nil {
+			b.cfg.DynamicReasoning = payload.DynamicReasoning
+			if err := b.cfg.Save(); err != nil {
+				return err
+			}
 		}
 		_, modelName, providerName, err := agent.NewConfiguredForRole(b.cfg, b.profiles, payload.Role, systemPrompt(), false)
 		if err != nil {
@@ -300,7 +310,7 @@ func (b *bridge) handle(request bridgeRequest) error {
 		request.Name = workerwire.CommandConfigure
 		request.Payload, err = json.Marshal(workerwire.ConfigureRequest{
 			Model: modelName, Provider: providerName, Role: payload.Role,
-			Effort: strings.TrimSpace(payload.Effort), UpdateEffort: payload.UpdateEffort || payload.Effort != "", Mode: payload.Mode,
+			Effort: strings.TrimSpace(payload.Effort), UpdateEffort: payload.UpdateEffort || payload.Effort != "", DynamicReasoning: payload.DynamicReasoning, Mode: payload.Mode,
 		})
 		if err != nil {
 			return err

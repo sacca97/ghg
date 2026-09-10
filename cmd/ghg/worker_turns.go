@@ -380,7 +380,7 @@ func (w *workerProcessState) runTurn(ctx context.Context, input workerInput) {
 		w.ag.ReviewMode = true
 		w.ag.PlanMode = false
 		w.ag.AskMode = false
-	} else if input.PlanMode || w.mode == "plan" {
+	} else if input.PlanMode || w.mode == "plan" || (input.Continue && w.ag.PlanPending()) {
 		w.ag.PlanMode = true
 		w.ag.ReviewMode = false
 		w.ag.AskMode = false
@@ -474,12 +474,12 @@ func (w *workerProcessState) runTurn(ctx context.Context, input workerInput) {
 	}
 	var reviewPayload string
 	var reviewMarkdown string
-	if w.ag.ReviewMode && w.store != nil && w.sessionID != "" {
-		msgSeq := len(w.ag.MessagesSnapshot())
-		if err == nil && final != "" {
-			if review, parseErr := agent.ParseReview(final); parseErr == nil {
-				reviewPayload = final
-				reviewMarkdown = export.RenderReviewMarkdown(review)
+	if w.ag.ReviewMode && err == nil && final != "" {
+		if review, parseErr := agent.ParseReview(final); parseErr == nil {
+			reviewPayload = final
+			reviewMarkdown = export.RenderReviewMarkdown(review)
+			if w.store != nil && w.sessionID != "" {
+				msgSeq := len(w.ag.MessagesSnapshot())
 				_ = w.store.SaveWorkflowResult(context.Background(), session.WorkflowResultRecord{
 					ResultID:   fmt.Sprintf("review-%x", time.Now().UnixNano()),
 					SessionID:  w.sessionID,
@@ -493,21 +493,22 @@ func (w *workerProcessState) runTurn(ctx context.Context, input workerInput) {
 					CreatedAt:  time.Now().UTC(),
 				})
 			}
-		} else if err != nil && strings.Contains(err.Error(), "review evidence was retained but final submission failed") {
-			failurePayload, _ := json.Marshal(map[string]string{"error": err.Error()})
-			_ = w.store.SaveWorkflowResult(context.Background(), session.WorkflowResultRecord{
-				ResultID:   fmt.Sprintf("review-failure-%x", time.Now().UnixNano()),
-				SessionID:  w.sessionID,
-				Kind:       "review_failure",
-				Version:    1,
-				Payload:    string(failurePayload),
-				Role:       w.ag.Role,
-				Provider:   w.provider,
-				Model:      w.ag.Model,
-				MessageSeq: msgSeq,
-				CreatedAt:  time.Now().UTC(),
-			})
 		}
+	} else if w.ag.ReviewMode && err != nil && w.store != nil && w.sessionID != "" && strings.Contains(err.Error(), "review evidence was retained but final submission failed") {
+		msgSeq := len(w.ag.MessagesSnapshot())
+		failurePayload, _ := json.Marshal(map[string]string{"error": err.Error()})
+		_ = w.store.SaveWorkflowResult(context.Background(), session.WorkflowResultRecord{
+			ResultID:   fmt.Sprintf("review-failure-%x", time.Now().UnixNano()),
+			SessionID:  w.sessionID,
+			Kind:       "review_failure",
+			Version:    1,
+			Payload:    string(failurePayload),
+			Role:       w.ag.Role,
+			Provider:   w.provider,
+			Model:      w.ag.Model,
+			MessageSeq: msgSeq,
+			CreatedAt:  time.Now().UTC(),
+		})
 	}
 	var goalRecord *agent.GoalRecord
 	goalContinue := false
@@ -677,28 +678,12 @@ func (w *workerProcessState) persistGoalTurn(input *agent.GoalRecord, usage mode
 		record.Status = agent.GoalStatusPaused
 		record.Blocker = truncateWorkerGoalNote(turnErr.Error())
 	}
-	if record.Status == agent.GoalStatusActive && record.Rounds >= w.goalMaxRounds() {
-		record.Status = agent.GoalStatusBudgetLimited
-		record.Blocker = fmt.Sprintf("goal round circuit breaker reached (%d rounds)", record.Rounds)
-	}
 	record.UpdatedAt = time.Now().UTC()
 	if record.Status == agent.GoalStatusActive {
 		_ = w.store.SaveGoal(w.sessionID, record)
 	} else {
 		_ = w.store.CheckpointGoal(w.sessionID, record)
 	}
-}
-
-func (w *workerProcessState) goalMaxRounds() int {
-	if wd, err := os.Getwd(); err == nil {
-		if n := config.ProjectGoalMaxRounds(wd); n > 0 {
-			return n
-		}
-	}
-	if w.cfg != nil && w.cfg.GoalMaxRounds > 0 {
-		return w.cfg.GoalMaxRounds
-	}
-	return config.DefaultGoalMaxRounds
 }
 
 // appendContent lands local context (a `!` shell escape's output) on the

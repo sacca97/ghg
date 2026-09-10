@@ -32,6 +32,24 @@ func TestUpdateValidationRequiresMeaningfulNotes(t *testing.T) {
 	}
 }
 
+func TestApplyUpdateNormalizesAndReportsNoOp(t *testing.T) {
+	record := GoalRecord{ID: "goal-1", Status: GoalStatusActive, Progress: "made progress"}
+	changed, err := ApplyUpdate(&record, GoalUpdate{
+		GoalID:   "goal-1",
+		Status:   GoalStatusActive,
+		Progress: "  made progress  ",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed {
+		t.Fatal("whitespace-only goal update should be a no-op")
+	}
+	if record.Progress != "made progress" {
+		t.Fatalf("progress changed on no-op: %q", record.Progress)
+	}
+}
+
 func TestRecordValidation(t *testing.T) {
 	record := NewGoal("ship it")
 	if err := record.Validate(); err != nil {

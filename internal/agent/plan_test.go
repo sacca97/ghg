@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -283,7 +284,7 @@ func TestReadOnlyModesKeepExploringAfterCheckpoints(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			responses := readOnlyCheckpointResponses(tc.final)
-			wantCalls := 26
+			wantCalls := explorationCheckpointFinal + 1
 			if tc.name == "review" {
 				// ReviewMode has its own scope-aware boundary coordinator; this
 				// table only checks the immediate terminal handoff for that mode.
@@ -309,8 +310,8 @@ func TestReadOnlyModesKeepExploringAfterCheckpoints(t *testing.T) {
 				t.Fatalf("model calls = %d, want %d", len(backend.requests), wantCalls)
 			}
 			if tc.name == "review" {
-				if len(backend.requests[0].Tools) != 3 || backend.requests[0].Tools[0].Function.Name != "read" || backend.requests[0].Tools[1].Function.Name != "grep" || backend.requests[0].Tools[2].Function.Name != "submit_review" {
-					t.Fatalf("review tools = %+v, want read, grep, submit_review", backend.requests[0].Tools)
+				if len(backend.requests[0].Tools) != 4 || backend.requests[0].Tools[0].Function.Name != "read" || backend.requests[0].Tools[1].Function.Name != "grep" || backend.requests[0].Tools[2].Function.Name != "submit_review" || backend.requests[0].Tools[3].Function.Name != "request_review_extension" {
+					t.Fatalf("review tools = %+v, want stable read, grep, submit_review, request_review_extension", backend.requests[0].Tools)
 				}
 				return
 			}
@@ -318,9 +319,9 @@ func TestReadOnlyModesKeepExploringAfterCheckpoints(t *testing.T) {
 				request int
 				level   int
 			}{
-				{request: 10, level: 1},
-				{request: 16, level: 2},
-				{request: 24, level: 3},
+				{request: explorationCheckpointOne, level: 1},
+				{request: explorationCheckpointTwo, level: 2},
+				{request: explorationCheckpointFinal, level: 3},
 			} {
 				if !requestContains(backend.requests[checkpoint.request], fmt.Sprintf(`level="%d"`, checkpoint.level)) {
 					t.Fatalf("request %d lacks checkpoint level %d reminder", checkpoint.request+1, checkpoint.level)
@@ -335,8 +336,8 @@ func TestReadOnlyModesKeepExploringAfterCheckpoints(t *testing.T) {
 					toolResults++
 				}
 			}
-			if toolResults != 25 {
-				t.Fatalf("executed tool calls = %d, want 25", toolResults)
+			if toolResults != explorationCheckpointFinal {
+				t.Fatalf("executed tool calls = %d, want %d", toolResults, explorationCheckpointFinal)
 			}
 		})
 	}
@@ -349,8 +350,8 @@ func readOnlyCheckpointResponses(final models.Message) []models.Message {
 			Arguments string `json:"arguments"`
 		}{Name: "read", Arguments: fmt.Sprintf(`{"path":"file-%d.go"}`, n)}}
 	}
-	responses := make([]models.Message, 0, 26)
-	for i := 0; i < 25; i++ {
+	responses := make([]models.Message, 0, explorationCheckpointFinal+1)
+	for i := 0; i < explorationCheckpointFinal; i++ {
 		responses = append(responses, models.Message{Role: "assistant", ToolCalls: []models.ToolCall{read(fmt.Sprintf("read-%d", i), i)}})
 	}
 	return append(responses, final)
@@ -433,6 +434,40 @@ func TestAssembleRequestMessagesStablePrefix(t *testing.T) {
 	}
 	if assembled[2].Content != "user prompt" || assembled[3].Content != "assistant thought" || assembled[4].Content != "tool result" || assembled[6].Content != "todo block" {
 		t.Fatalf("unexpected assembled messages: %+v", assembled)
+	}
+}
+
+func TestAssembleRequestMessagesPlacesChangingCapabilityGuidanceAfterHistory(t *testing.T) {
+	ag := New(nil, "m", 100, "base system")
+	ag.ReviewMode = true
+
+	history := []models.Message{
+		{Role: "system", Content: "base system"},
+		{Role: "user", Content: "review request"},
+		{Role: "tool", Content: "bounded evidence"},
+	}
+	assembled := ag.assembleRequestMessages(history, "", "", "", "<capabilities>read only</capabilities>", "<review_checkpoint>decide</review_checkpoint>", "<review_preflight>scope</review_preflight>")
+
+	historyEnd := -1
+	capabilityAt := -1
+	checkpointAt := -1
+	for i, message := range assembled {
+		switch message.Content {
+		case "bounded evidence":
+			historyEnd = i
+		case "<capabilities>read only</capabilities>":
+			capabilityAt = i
+		case "<review_checkpoint>decide</review_checkpoint>":
+			checkpointAt = i
+		}
+	}
+	if historyEnd < 0 || capabilityAt < 0 || checkpointAt < 0 || historyEnd >= capabilityAt || capabilityAt >= checkpointAt {
+		t.Fatalf("transient messages broke the stable history prefix: %+v", assembled)
+	}
+	for i := historyEnd + 1; i < len(assembled); i++ {
+		if !assembled[i].Transient {
+			t.Fatalf("message %d after history is not transient: %+v", i, assembled[i])
+		}
 	}
 }
 
@@ -537,17 +572,14 @@ func TestPlanModeTerminatesOnBudgetReserve(t *testing.T) {
 		if len(requests[0].Tools) == 0 {
 			t.Fatal("the request crossing the weighted reserve must expose exploration tools")
 		}
-		if len(requests[1].Tools) != 1 || requests[1].Tools[0].Function.Name != "submit_review" {
-			t.Fatalf("review finalization tools = %+v, want only submit_review", requests[1].Tools)
-		}
-		if !requestContains(requests[1], "reached the review budget reserve") {
-			t.Fatal("review finalization request is missing the terminal budget reminder")
+		if !reflect.DeepEqual(requests[1].Tools, requests[0].Tools) {
+			t.Fatalf("review finalization changed tool schema: %+v, baseline %+v", requests[1].Tools, requests[0].Tools)
 		}
 		if !requestContains(requests[2], reviewFinalizationToolError) {
 			t.Fatal("stale read result is missing the review finalization error")
 		}
-		if len(requests[2].Tools) != 1 || requests[2].Tools[0].Function.Name != "submit_review" {
-			t.Fatalf("valid review request tools = %+v, want only submit_review", requests[2].Tools)
+		if !reflect.DeepEqual(requests[2].Tools, requests[0].Tools) {
+			t.Fatalf("valid review request changed tool schema: %+v, baseline %+v", requests[2].Tools, requests[0].Tools)
 		}
 	})
 }

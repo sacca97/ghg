@@ -73,9 +73,6 @@ func (m *model) scrollTranscriptWheel(msg tea.MouseMsg) tea.Cmd {
 	default:
 		return nil
 	}
-	if m.selection != nil {
-		m.selection = nil
-	}
 	now := m.nowFn()
 	elapsed := now.Sub(m.wheel.last)
 	if m.wheel.last.IsZero() || elapsed < 0 || elapsed > wheelIdle || dir != m.wheel.dir {
@@ -126,6 +123,9 @@ func (m *model) finishTurnState() {
 	m.cancel = nil
 	m.interrupt1 = false
 	m.turnStart = time.Time{}
+	if m.thinkStart.IsZero() {
+		m.thinkEffort = ""
+	}
 	m.reviewProgress = nil
 	m.reviewScopeShown = false
 	m.reviewLastExtensionTo = 0
@@ -326,6 +326,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		isCurrentClient := msg.client != nil && msg.client == m.workerClient
 		isCurrentProc := msg.process != nil && msg.process == m.workerProcess
 		if isCurrentClient || isCurrentProc {
+			m.clearPendingRewind()
 			m.workerGeneration++
 			if m.workerClient != nil {
 				_ = m.workerClient.Close()
@@ -401,6 +402,13 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case toolStartMsg:
 		m.flushStreaming()
+		if msg.name == "request_review_extension" {
+			if markdown := reviewExtensionMarkdown(msg.args); markdown != "" {
+				m.appendAssistantBlock(markdown)
+				m.inMsg = false
+				return m, nil
+			}
+		}
 		row := toolStyle.Render("⚒ "+msg.name+" ") + dimStyle.Render(toolCallSummary(msg.name, msg.args))
 		m.blocks = append(m.blocks, block{kind: blockToolRun, text: row, toolID: msg.id, toolRunning: true})
 		m.transcriptDirty = true
@@ -540,8 +548,8 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.flushStreaming()
 		m.finishTurnState()
 		m.future = nil
-		m.msgBlock = nil
 		m.usage = msg.usage
+		m.rebuildTranscript()
 		if msg.contextTokens > 0 {
 			m.workerContextTokens = msg.contextTokens
 		}

@@ -28,13 +28,13 @@ func TestProtocolRoundTripAndLimits(t *testing.T) {
 	}
 
 	tooLarge := strings.Repeat("x", 32)
-	_, err = NewDecoderWithLimits(strings.NewReader(tooLarge), 16, 64).Read()
+	_, err = NewDecoderWithLimits(strings.NewReader(tooLarge), 16).Read()
 	if !errors.Is(err, ErrFrameTooLarge) {
 		t.Fatalf("oversized frame error = %v, want ErrFrameTooLarge", err)
 	}
 }
 
-func TestProtocolRejectsUnknownTypeAndAggregateOverflow(t *testing.T) {
+func TestProtocolRejectsUnknownTypeAndAllowsLongStreams(t *testing.T) {
 	unknown := `{"version":1,"session_id":"session-1","type":"future"}` + "\n"
 	_, err := NewDecoder(strings.NewReader(unknown)).Read()
 	if !errors.Is(err, ErrUnknownType) {
@@ -42,11 +42,10 @@ func TestProtocolRejectsUnknownTypeAndAggregateOverflow(t *testing.T) {
 	}
 
 	frames := `{"version":1,"session_id":"session-1","type":"attach"}` + "\n"
-	decoder := NewDecoderWithLimits(strings.NewReader(frames+frames), 128, int64(len(frames)+1))
-	if _, err := decoder.Read(); err != nil {
-		t.Fatalf("aggregate setup frame error = %v", err)
-	}
-	if _, err := decoder.Read(); !errors.Is(err, ErrAggregateTooLarge) {
-		t.Fatalf("aggregate overflow error = %v, want ErrAggregateTooLarge", err)
+	decoder := NewDecoderWithLimits(strings.NewReader(strings.Repeat(frames, 1024)), 128)
+	for i := 0; i < 1024; i++ {
+		if _, err := decoder.Read(); err != nil {
+			t.Fatalf("long stream frame %d error = %v", i, err)
+		}
 	}
 }

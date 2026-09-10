@@ -9,30 +9,29 @@
 * { box-sizing: border-box; }
 body { margin: 0; height: 100vh; overflow: hidden; background: var(--vscode-sideBar-background); }
 #app { display: flex; flex-direction: column; height: 100vh; min-height: 0; }
-#transcript { display: flex; flex-direction: column; flex: 1; min-height: 0; gap: 10px; overflow: auto; padding: 16px 12px 12px; }
-.block { width: fit-content; max-width: 94%; margin: 0; padding: 10px 12px; border-radius: 16px; overflow-wrap: anywhere; box-shadow: 0 1px 2px color-mix(in srgb, var(--vscode-widget-shadow) 30%, transparent); }
-.block pre { margin: 5px 0 0; white-space: pre-wrap; word-break: break-word; font: inherit; user-select: text; }
-.markdown p { margin: 0 0 9px; }
+#transcript { display: flex; flex-direction: column; flex: 1 1 auto; min-height: 0; gap: 6px; overflow-x: hidden; overflow-y: auto; padding: 8px 8px 6px; }
+.block { flex: 0 0 auto; width: fit-content; max-width: 94%; margin: 0; padding: 6px 8px; border-radius: 10px; overflow-wrap: anywhere; box-shadow: 0 1px 2px color-mix(in srgb, var(--vscode-widget-shadow) 30%, transparent); }
+.block pre { margin: 2px 0 0; white-space: pre-wrap; word-break: break-word; font: inherit; user-select: text; }
+.markdown p { margin: 0 0 5px; }
 .markdown p:last-child { margin-bottom: 0; }
-.markdown h1, .markdown h2, .markdown h3, .markdown h4, .markdown h5, .markdown h6 { margin: 0 0 8px; line-height: 1.25; }
-.markdown ul, .markdown ol { margin: 5px 0 9px; padding-left: 22px; }
-.markdown blockquote { margin: 7px 0; padding-left: 10px; color: var(--vscode-descriptionForeground); border-left: 3px solid var(--vscode-textLink-foreground); }
+.markdown h1, .markdown h2, .markdown h3, .markdown h4, .markdown h5, .markdown h6 { margin: 0 0 5px; line-height: 1.2; }
+.markdown ul, .markdown ol { margin: 3px 0 5px; padding-left: 18px; }
+.markdown blockquote { margin: 5px 0; padding-left: 8px; color: var(--vscode-descriptionForeground); border-left: 3px solid var(--vscode-textLink-foreground); }
 .markdown hr { border: 0; border-top: 1px solid var(--vscode-panel-border); }
-.markdown pre { padding: 9px; overflow: auto; border-radius: 7px; background: var(--vscode-textCodeBlock-background); font-family: var(--vscode-editor-font-family); }
-.markdown code { padding: 1px 4px; border-radius: 4px; background: var(--vscode-textCodeBlock-background); font-family: var(--vscode-editor-font-family); }
+.markdown pre { padding: 7px; overflow: auto; border-radius: 6px; background: var(--vscode-textCodeBlock-background); font-family: var(--vscode-editor-font-family); }
+.markdown code { padding: 1px 3px; border-radius: 3px; background: var(--vscode-textCodeBlock-background); font-family: var(--vscode-editor-font-family); }
 .markdown pre code { padding: 0; background: transparent; }
 .markdown a { color: var(--vscode-textLink-foreground); }
-.user { align-self: flex-end; max-width: 86%; color: var(--vscode-editor-foreground); background: var(--vscode-textBlockQuote-background); border: 1px solid var(--vscode-textBlockQuote-border, var(--vscode-panel-border)); border-radius: 16px 16px 4px 16px; }
-.assistant { align-self: flex-start; color: var(--vscode-editor-foreground); background: var(--vscode-editor-background); border: 1px solid var(--vscode-panel-border); border-radius: 16px 16px 16px 4px; }
+.user { align-self: flex-end; max-width: 86%; color: var(--vscode-editor-foreground); background: var(--vscode-textBlockQuote-background); border: 1px solid var(--vscode-textBlockQuote-border, var(--vscode-panel-border)); border-radius: 12px 12px 3px 12px; }
+.assistant { align-self: flex-start; color: var(--vscode-editor-foreground); background: var(--vscode-editor-background); border: 1px solid var(--vscode-panel-border); border-radius: 12px 12px 12px 3px; }
 .thinking { align-self: flex-start; max-width: 94%; padding: 0; color: var(--vscode-descriptionForeground); background: transparent; box-shadow: none; }
-.thinking-details { padding: 7px 10px; border-left: 2px solid var(--vscode-charts-yellow); border-radius: 8px; background: var(--vscode-textCodeBlock-background); }
+.thinking-details { padding: 5px 7px; border-left: 2px solid var(--vscode-charts-yellow); border-radius: 6px; background: var(--vscode-textCodeBlock-background); }
 .thinking-details summary { cursor: pointer; font-weight: 600; }
-.tool { align-self: flex-start; color: var(--vscode-descriptionForeground); background: var(--vscode-textCodeBlock-background); border-radius: 10px; font-family: var(--vscode-editor-font-family); font-size: 0.9em; }
+.tool { align-self: flex-start; color: var(--vscode-descriptionForeground); background: var(--vscode-textCodeBlock-background); border-radius: 7px; font-family: var(--vscode-editor-font-family); font-size: 0.88em; }
 .notice { width: 100%; color: var(--vscode-descriptionForeground); font-size: 0.9em; }
 .error { width: 100%; color: var(--vscode-errorForeground); background: var(--vscode-inputValidation-errorBackground); }
-.label { font-weight: 600; }
-.block-header { display: flex; justify-content: flex-end; align-items: center; gap: 8px; }
-.copy { padding: 2px 7px; border-radius: 5px; color: var(--vscode-button-foreground); background: var(--vscode-button-background); border: 0; cursor: pointer; }
+.block-header { display: flex; justify-content: flex-end; align-items: center; gap: 5px; }
+.copy { padding: 1px 5px; border-radius: 4px; color: var(--vscode-button-foreground); background: var(--vscode-button-background); border: 0; cursor: pointer; }
 .failed { color: var(--vscode-errorForeground); }
 #status { min-height: 22px; padding: 3px 10px; color: var(--vscode-descriptionForeground); font-size: 0.85em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 #references { display: flex; flex-wrap: wrap; gap: 5px; padding: 0 10px 6px; }
@@ -50,7 +49,6 @@ body { margin: 0; height: 100vh; overflow: hidden; background: var(--vscode-side
 .composer-row #send.stop { background: var(--vscode-testing-iconFailed); }
 #send { display: grid; place-items: center; width: 30px; height: 30px; padding: 0; border-radius: 50%; font-size: 1.15em; line-height: 1; }
 #role, #effort { flex: 0 0 auto; width: max-content; max-width: 100%; padding: 4px 7px; border-radius: 7px; color: var(--vscode-dropdown-foreground); background: var(--vscode-dropdown-background); border: 1px solid var(--vscode-dropdown-border); }
-#role:disabled, #effort:disabled { opacity: 0.7; }
 #completion-menu { max-height: 180px; overflow: auto; margin: 0 9px 5px; padding: 3px; border: 1px solid var(--vscode-focusBorder); border-radius: 8px; background: var(--vscode-editorWidget-background); box-shadow: 0 4px 12px var(--vscode-widget-shadow); }
 #completion-menu[hidden] { display: none; }
 .completion { display: block; width: 100%; padding: 5px 8px; color: var(--vscode-editorWidget-foreground); background: transparent; border: 0; border-radius: 5px; text-align: left; cursor: pointer; }

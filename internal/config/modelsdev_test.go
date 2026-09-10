@@ -107,6 +107,10 @@ func TestParseModelsDevContext(t *testing.T) {
 	if !cache.HasModel("toggle-only") || cache.HasModel("not-wanted") {
 		t.Fatal("model presence tracking")
 	}
+	all, err := parseModelsDev(data, nil)
+	if err != nil || !all.HasModel("ignored") || len(all.ModelIDs("opencode")) != 10 {
+		t.Fatalf("full catalog parse = err=%v models=%v", err, all.ModelIDs("opencode"))
+	}
 	if !cache.FetchedAt.After(time.Time{}) {
 		t.Fatal("parsed cache should carry a fetch timestamp")
 	}

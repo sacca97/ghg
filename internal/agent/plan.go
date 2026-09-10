@@ -278,19 +278,6 @@ func filterPlanTools(all []tools.Tool) []tools.Tool {
 	return out
 }
 
-func filterReviewDiscoveryTools(all []tools.Tool) []tools.Tool {
-	var out []tools.Tool
-	for _, t := range all {
-		switch t.Def.Function.Name {
-		case "glob", "find_files":
-			continue
-		default:
-			out = append(out, t)
-		}
-	}
-	return out
-}
-
 // planStreamParser is a small stateful parser for the exact, line-delimited
 // proposed-plan block, tolerant of tags divided across provider chunks. Normal
 // text is forwarded to visible; the block body is forwarded to onPlan; wrapper
@@ -444,6 +431,14 @@ type rolloutBudget struct {
 	cachedInput  int
 	outputTokens int
 	calls        int
+}
+
+type planContinuation struct {
+	target            string
+	budget            *rolloutBudget
+	explorationRounds int
+	checkpointPending bool
+	checkpointLevel   int
 }
 
 func newPlanRolloutBudget() *rolloutBudget {

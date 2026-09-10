@@ -8,24 +8,25 @@ import (
 
 // Events receives streaming callbacks during a turn. All fields are optional.
 type Events struct {
-	OnText           func(delta string)               // assistant text as it streams
-	OnThink          func(delta string)               // reasoning/thinking tokens as they stream
-	OnToolStart      func(id, name, args string)      // a tool call is about to run
-	OnToolOutput     func(id, output string)          // accumulated output while a tool call runs
-	OnToolEnd        func(id, name, result string)    // a tool call finished
-	OnSteer          func(text string)                // a steered message was injected
-	OnNotice         func(text string)                // a transient status message for the user
-	OnCompact        func(took, kept int)             // context was auto-compacted (messages removed/kept)
-	OnCompacted      func(summary string, cutoff int) // a durable compaction completed
-	OnUsage          func(u models.Usage)             // a request reported its token usage
-	OnRetry          func(ev models.RetryEvent)       // a transient request failure is being retried
-	OnGoalUpdate     func(GoalUpdate)                 // structured active-goal checkpoint
-	OnReviewProgress func(ReviewProgress)             // scope-aware ReviewMode budget state
-	OnToolTelemetry  func(ToolTelemetry)              // bounded-output accounting for one tool call
-	OnModelCallStart func(ModelCallStart)
-	OnPromptView     func(PromptView)
-	OnModelCallEnd   func(ModelCallEnd)
-	OnQuestion       func(context.Context, QuestionRequest) (QuestionResult, error)
+	OnText               func(delta string)               // assistant text as it streams
+	OnThink              func(delta string)               // reasoning/thinking tokens as they stream
+	OnToolStart          func(id, name, args string)      // a tool call is about to run
+	OnToolOutput         func(id, output string)          // accumulated output while a tool call runs
+	OnToolEnd            func(id, name, result string)    // a tool call finished
+	OnSteer              func(text string)                // a steered message was injected
+	OnNotice             func(text string)                // a transient status message for the user
+	OnCompact            func(took, kept int)             // context was auto-compacted (messages removed/kept)
+	OnCompacted          func(summary string, cutoff int) // a durable compaction completed
+	OnUsage              func(u models.Usage)             // a request reported its token usage
+	OnRetry              func(ev models.RetryEvent)       // a transient request failure is being retried
+	OnGoalUpdate         func(GoalUpdate)                 // structured active-goal checkpoint
+	OnReviewProgress     func(ReviewProgress)             // scope-aware ReviewMode budget state
+	OnToolTelemetry      func(ToolTelemetry)              // bounded-output accounting for one tool call
+	OnModelCallStart     func(ModelCallStart)
+	OnPromptView         func(PromptView)
+	OnModelCallEnd       func(ModelCallEnd)
+	OnReasoningSelection func(ReasoningSelection)
+	OnQuestion           func(context.Context, QuestionRequest) (QuestionResult, error)
 	// OnPlanDelta receives the streamed body of the <proposed_plan> block while
 	// the agent is in Plan mode, as it is generated. The surrounding normal text
 	// continues to stream through OnText.
@@ -61,11 +62,18 @@ type ToolTelemetry struct {
 // It is deliberately independent of agent-definition loading so callers can
 // use the same telemetry for ordinary turns, planning, and compaction.
 type ModelCallStart struct {
-	Role     string `json:"role,omitempty"`
-	Provider string `json:"provider,omitempty"`
-	Model    string `json:"model"`
-	Protocol string `json:"protocol,omitempty"`
-	Purpose  string `json:"purpose,omitempty"`
+	Role             string `json:"role,omitempty"`
+	Provider         string `json:"provider,omitempty"`
+	Model            string `json:"model"`
+	Protocol         string `json:"protocol,omitempty"`
+	Purpose          string `json:"purpose,omitempty"`
+	ReasoningEffort  string `json:"reasoning_effort,omitempty"`
+	ReasoningEnabled *bool  `json:"reasoning_enabled,omitempty"`
+	ConfiguredEffort string `json:"configured_effort,omitempty"`
+	DynamicReasoning bool   `json:"dynamic_reasoning"`
+	EffortRequested  string `json:"effort_requested_for_call,omitempty"`
+	EffortApplied    string `json:"effort_applied,omitempty"`
+	SelectionReason  string `json:"selection_reason,omitempty"`
 }
 
 // ModelCallEnd completes a ModelCallStart with request timing, provider
@@ -81,6 +89,17 @@ type ModelCallEnd struct {
 	CheckpointLevel          int          `json:"checkpoint_level"`
 	ContinuedAfterCheckpoint bool         `json:"continued_after_checkpoint"`
 	Error                    string       `json:"error,omitempty"`
+}
+
+// ReasoningSelection records the optional one-call effort override after the
+// selector tool has run. It is separate from ModelCallEnd because the next
+// effort is known only after the current response's tool calls execute.
+type ReasoningSelection struct {
+	Current   string `json:"current_effort,omitempty"`
+	Requested string `json:"requested_effort,omitempty"`
+	Next      string `json:"next_effort,omitempty"`
+	Applied   bool   `json:"applied"`
+	Reason    string `json:"reason,omitempty"`
 }
 
 // PromptView records bounded request-shape telemetry without retaining the
@@ -106,7 +125,7 @@ func FanIn(evs ...Events) Events {
 	var out Events
 	var hasText, hasThink, hasToolStart, hasToolOutput, hasToolEnd, hasTelemetry, hasSteer bool
 	var hasCompact, hasCompacted, hasCompactionReady, hasUsage, hasGoalUpdate, hasNotice, hasReviewProgress bool
-	var hasModelCallStart, hasPromptView, hasModelCallEnd, hasPlanDelta, hasRetry bool
+	var hasModelCallStart, hasPromptView, hasModelCallEnd, hasReasoningSelection, hasPlanDelta, hasRetry bool
 	var question func(context.Context, QuestionRequest) (QuestionResult, error)
 
 	for _, e := range evs {
@@ -163,6 +182,9 @@ func FanIn(evs ...Events) Events {
 		}
 		if e.OnModelCallEnd != nil {
 			hasModelCallEnd = true
+		}
+		if e.OnReasoningSelection != nil {
+			hasReasoningSelection = true
 		}
 		if e.OnPlanDelta != nil {
 			hasPlanDelta = true
@@ -333,6 +355,15 @@ func FanIn(evs ...Events) Events {
 			for _, e := range evs {
 				if e.OnModelCallEnd != nil {
 					e.OnModelCallEnd(call)
+				}
+			}
+		}
+	}
+	if hasReasoningSelection {
+		out.OnReasoningSelection = func(selection ReasoningSelection) {
+			for _, e := range evs {
+				if e.OnReasoningSelection != nil {
+					e.OnReasoningSelection(selection)
 				}
 			}
 		}

@@ -9,11 +9,6 @@
     "vscode": "^1.95.0"
   },
   "categories": ["Other"],
-  "activationEvents": [
-    "onView:ghg.chatView",
-    "onCommand:ghg.newSession",
-    "onCommand:ghg.resumeSession"
-  ],
   "main": "./out/extension.js",
   "contributes": {
     "viewsContainers": {
@@ -74,7 +69,8 @@
     }
   },
   "scripts": {
-    "compile": "tsc -p ."
+    "compile": "tsc -p .",
+    "vscode:prepublish": "npm run compile"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",

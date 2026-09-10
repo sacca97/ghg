@@ -21,8 +21,11 @@ import (
 // image Parts (multimodal/vision) — when Parts is non-empty it is sent as the
 // content array and Content is mirrored as a text part so both stay in sync.
 type Message struct {
-	Role       string        `json:"role"`
-	Content    string        `json:"content"`
+	Role    string `json:"role"`
+	Content string `json:"content"`
+	// Transient marks request-only context that must follow the stable
+	// conversation prefix. It is never persisted or sent as metadata.
+	Transient  bool          `json:"-"`
 	Parts      []ContentPart `json:"-"`
 	ToolCalls  []ToolCall    `json:"tool_calls,omitempty"`
 	ToolCallID string        `json:"tool_call_id,omitempty"`
@@ -407,6 +410,11 @@ type Request struct {
 	// ReasoningEnabled is an internal capability signal. Adapters lower it to
 	// their protocol-specific toggle field; it must never be sent verbatim.
 	ReasoningEnabled *bool `json:"-"`
+	// The remaining fields are internal telemetry context for the selected
+	// foreground call. They never cross the provider boundary.
+	ConfiguredReasoningEffort string `json:"-"`
+	DynamicReasoning          bool   `json:"-"`
+	ReasoningSelectionReason  string `json:"-"`
 }
 
 // openAIRequest is the OpenAI wire shape for a provider-neutral Request.
@@ -670,9 +678,10 @@ func (c *Client) stream(ctx context.Context, req Request, sink EventSink) (Messa
 			return msg, usage, nil
 		}
 		last = err
-		// Retry transient failures before answer text. A GOAWAY after reasoning
-		// is also safe: no answer or tool call has completed yet.
-		replayReasoning := isHTTP2GoAway(err) && !textEmitted
+		// Retry transient failures before answer text. HTTP/2 connection
+		// failures after reasoning are also safe: no answer or tool call has
+		// completed yet.
+		replayReasoning := isHTTP2Replayable(err) && !textEmitted
 		if (emitted && !replayReasoning) || !retryable(err) {
 			break
 		}

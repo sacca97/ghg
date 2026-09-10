@@ -137,8 +137,11 @@ func (m *model) activateRoute(modelName, providerName, role string) error {
 	}
 	m.modelName, m.provName, m.modelID = route.ModelName, route.ProviderName, route.APIID
 	m.role, m.contextLimit = role, route.ContextLimit
-	m.effort = m.maxEffort()
+	m.effort = route.Effort
 	m.modelSlotW = m.statusModelSlotWidth()
+	// The configured baseline is not a manual effort update. Let the worker
+	// reconcile it with the new model's advertised capabilities without
+	// promoting it to that model's maximum.
 	m.syncWorkerConfiguration(true)
 	return nil
 }
@@ -297,6 +300,10 @@ func (m *model) currentEffort() string {
 	return m.effort
 }
 
+func (m *model) dynamicReasoningEnabled() bool {
+	return config.DynamicReasoningEnabled(m.cfg)
+}
+
 // effortsFor returns the cycle of effort levels available for the current
 // model. A known models.dev/provider surface is authoritative: its effort
 // values are returned verbatim (with "none" folded into off), a toggle-only
@@ -329,17 +336,6 @@ func (m *model) effortsFor() []string {
 		}
 	}
 	return defaultEfforts
-}
-
-// maxEffort returns the highest supported reasoning effort for the current model.
-// effortsFor orders levels ascending with "" (off) first, so the last element
-// is always the maximum supported effort.
-func (m *model) maxEffort() string {
-	levels := m.effortsFor()
-	if len(levels) == 0 {
-		return ""
-	}
-	return levels[len(levels)-1]
 }
 
 // nextEffort cycles cur to the following level in levels, wrapping; an
@@ -409,6 +405,22 @@ func (m *model) setEffort(lv string) {
 	m.cfg.DefaultEffort = lv
 	_ = m.saveConfig()
 	m.syncWorkerConfiguration(true)
+}
+
+func (m *model) setDynamicReasoning(on bool) {
+	if m.workerClient != nil && m.workerLiveWork {
+		m.append(dimStyle.Render("(worker is busy — change dynamic reasoning after this work finishes)"))
+		return
+	}
+	if m.cfg == nil {
+		m.append(errStyle.Render("dynamic reasoning: config unavailable"))
+		return
+	}
+	m.cfg.DynamicReasoning = &on
+	if err := m.saveConfig(); err != nil {
+		return
+	}
+	m.syncWorkerConfiguration(false)
 }
 
 // resetEffort applies a level without touching the global default.

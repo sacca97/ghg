@@ -82,6 +82,12 @@ func workerStateBusy(state workerwire.State) bool {
 	return state == workerwire.StateRunning || state == workerwire.StateWaitingApproval || state == workerwire.StateWaitingQuestion
 }
 
+func (m *model) cancelAttachedWorker() {
+	if m.workerClient != nil {
+		_ = m.workerClient.Send(workerwire.CommandCancel, workerRequestID("cancel"), nil)
+	}
+}
+
 func (m *model) attachWorkerClient(client *workerwire.Client, runtimeFile workerwire.Runtime) uint64 {
 	m.workerRuntime = runtimeFile
 	m.workerClient = client
@@ -276,8 +282,8 @@ func (m *model) monitorWorker(proc *workerwire.Process, runtimeFile workerwire.R
 				})
 			}
 		}
-		if p != nil && err != nil {
-			p.Send(workerErrorMsg{err: fmt.Errorf("worker exited: %w", err), process: proc, generation: generation})
+		if err != nil {
+			sendProg(p, workerErrorMsg{err: fmt.Errorf("worker exited: %w", err), process: proc, generation: generation})
 		}
 	}()
 }
@@ -321,9 +327,10 @@ func (m *model) syncWorkerConfiguration(updateEffort bool) {
 	if m.workerClient == nil {
 		return
 	}
+	dynamicReasoning := config.DynamicReasoningEnabled(m.cfg)
 	if err := m.workerClient.Send(workerwire.CommandConfigure, workerRequestID("configure"), workerwire.ConfigureRequest{
 		Model: m.modelName, Provider: m.provName, Role: m.currentRole(),
-		Effort: m.currentEffort(), UpdateEffort: updateEffort,
+		Effort: m.currentEffort(), UpdateEffort: updateEffort, DynamicReasoning: &dynamicReasoning,
 		Mode: m.uiMode(),
 	}); err != nil {
 		m.append(errStyle.Render("worker configuration failed: " + err.Error()))
@@ -353,26 +360,23 @@ func (m *model) pumpWorker(client *workerwire.Client, generation uint64) {
 					frames = nil
 					continue
 				}
-				if p != nil {
-					p.Send(workerFrameMsg{frame: frame, client: client, generation: generation})
-				}
+				sendProg(p, workerFrameMsg{frame: frame, client: client, generation: generation})
 			case err, ok := <-errs:
 				if !ok {
 					errs = nil
 					continue
 				}
-				if err != nil && p != nil {
-					p.Send(workerErrorMsg{err: err, client: client, generation: generation})
+				if err != nil {
+					sendProg(p, workerErrorMsg{err: err, client: client, generation: generation})
 				}
 			}
 		}
-		if p != nil {
-			p.Send(workerErrorMsg{err: errors.New("worker connection closed"), client: client, generation: generation})
-		}
+		sendProg(p, workerErrorMsg{err: errors.New("worker connection closed"), client: client, generation: generation})
 	}()
 }
 
 func (m *model) stopWorker() {
+	m.clearPendingRewind()
 	client, proc := m.workerClient, m.workerProcess
 	m.workerGeneration++
 	m.workerClient, m.workerProcess = nil, nil
@@ -508,7 +512,11 @@ func (m *model) handleWorkerFrame(frame workerwire.Frame) (tea.Model, tea.Cmd) {
 					m.growInput()
 					m.workerRewindRestore = ""
 				}
+				if m.workerRewindPending {
+					m.future = m.workerRewindFuture
+				}
 			}
+			m.clearPendingRewind()
 			m.workerHistoryRequest = ""
 		}
 		if frame.RequestID == m.workerChdirRequest {
@@ -529,7 +537,7 @@ func (m *model) handleWorkerFrame(frame workerwire.Frame) (tea.Model, tea.Cmd) {
 				m.stopWorker()
 				m.forkNotice = fmt.Sprintf("⑂ forked %q → %q (%s) — the original is under /resume", result.OldTitle, result.Title, result.NewSessionID)
 				if m.prog == nil {
-					if err := m.resumeDisplay(result.NewSessionID); err != nil {
+					if err := m.resume(result.NewSessionID); err != nil {
 						m.append(errStyle.Render("fork resume failed: " + err.Error()))
 					} else {
 						m.append(dimStyle.Render(m.forkNotice))
@@ -564,6 +572,7 @@ func (m *model) handleWorkerFrame(frame workerwire.Frame) (tea.Model, tea.Cmd) {
 		if frame.RequestID == m.workerHistoryRequest {
 			m.workerHistoryRequest = ""
 			m.workerRewindRestore = ""
+			m.clearPendingRewind()
 		}
 		if frame.RequestID == m.workerChdirRequest {
 			m.workerChdirRequest = ""
@@ -612,6 +621,11 @@ func (m *model) applyWorkerSnapshot(snapshot workerwire.Snapshot) {
 		m.workerLiveWork = m.workerLiveWork || task.Status == "running"
 	}
 	m.busy = workerStateBusy(snapshot.State)
+	if m.busy && m.cancel == nil {
+		// A resumed worker has no local submitTurn closure, but it is still
+		// cancellable through the worker protocol.
+		m.cancel = m.cancelAttachedWorker
+	}
 	if m.busy {
 		if snapshot.LiveText != "" {
 			m.current = snapshot.LiveText
@@ -678,6 +692,9 @@ func (m *model) workerEvent(event workerEvent) tea.Cmd {
 				m.mode = value.Mode
 			}
 			m.busy = workerStateBusy(value.State)
+			if m.busy && m.cancel == nil {
+				m.cancel = m.cancelAttachedWorker
+			}
 			m.workerLiveWork = m.busy || m.workerHasLiveTask()
 		}
 		return nil
@@ -722,6 +739,32 @@ func (m *model) workerEvent(event workerEvent) tea.Cmd {
 		if value, ok := decodeEvent[string](event.Data); ok {
 			return func() tea.Msg { return noticeMsg(value) }
 		}
+	case "model_call_start":
+		if value, ok := decodeEvent[agent.ModelCallStart](event.Data); ok {
+			effort := strings.TrimSpace(value.ReasoningEffort)
+			if value.Purpose == "" && (value.ConfiguredEffort != "" || value.EffortApplied != "" || value.SelectionReason != "") {
+				effort = strings.TrimSpace(value.EffortApplied)
+			}
+			if effort == "" && value.ReasoningEnabled != nil {
+				if *value.ReasoningEnabled {
+					effort = "on"
+				} else {
+					effort = "off"
+				}
+			}
+			if effort == "" {
+				effort = "default"
+			}
+			m.thinkEffort = effort
+			if value.Purpose == "" && (value.ConfiguredEffort != "" || value.EffortApplied != "" || value.SelectionReason != "") {
+				if effort == "default" || effort == "off" {
+					m.effort = ""
+				} else {
+					m.effort = effort
+				}
+			}
+		}
+		return nil
 	case "review_progress":
 		var envelope struct {
 			Progress agent.ReviewProgress `json:"progress"`

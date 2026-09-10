@@ -2,11 +2,13 @@ package worker
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"sync"
+	"time"
 )
 
 type Client struct {
@@ -40,7 +42,6 @@ func Dial(ctx context.Context, runtime Runtime) (*Client, error) {
 		return nil, fmt.Errorf("dial worker: %w", err)
 	}
 	c := NewClient(conn, runtime.SessionID)
-	go c.readLoop()
 	if err := c.write(Frame{
 		Version:   ProtocolVersion,
 		SessionID: runtime.SessionID,
@@ -49,6 +50,47 @@ func Dial(ctx context.Context, runtime Runtime) (*Client, error) {
 		c.Close()
 		return nil, err
 	}
+	// Do not report a successful dial until the worker has accepted this
+	// client. In particular, a live worker may already have another
+	// controller; treating the socket connection as success makes callers
+	// believe they are attached when the server has already rejected them.
+	deadline := time.Now().Add(10 * time.Second)
+	if ctxDeadline, ok := ctx.Deadline(); ok && ctxDeadline.Before(deadline) {
+		deadline = ctxDeadline
+	}
+	_ = conn.SetReadDeadline(deadline)
+	decoder := NewDecoder(conn)
+	initial := make([]Frame, 0, 2)
+	for len(initial) < 2 {
+		frame, readErr := decoder.Read()
+		if readErr != nil {
+			_ = c.Close()
+			return nil, fmt.Errorf("worker attach: %w", readErr)
+		}
+		switch frame.Type {
+		case TypeAlreadyControlled, TypeError:
+			_ = c.Close()
+			var payload ErrorPayload
+			if json.Unmarshal(frame.Payload, &payload) == nil && payload.Message != "" {
+				return nil, errors.New(payload.Message)
+			}
+			return nil, errors.New("worker rejected attach")
+		case TypeSnapshot, TypeAttached:
+			initial = append(initial, frame)
+		default:
+			_ = c.Close()
+			return nil, fmt.Errorf("worker attach: unexpected frame %q", frame.Type)
+		}
+	}
+	if initial[0].Type != TypeSnapshot || initial[1].Type != TypeAttached {
+		_ = c.Close()
+		return nil, errors.New("worker attach: invalid handshake")
+	}
+	_ = conn.SetReadDeadline(time.Time{})
+	for _, frame := range initial {
+		c.frames <- frame
+	}
+	go c.readLoop(decoder)
 	return c, nil
 }
 
@@ -96,10 +138,9 @@ func (c *Client) write(frame Frame) error {
 	return WriteFrame(c.conn, frame)
 }
 
-func (c *Client) readLoop() {
+func (c *Client) readLoop(decoder *Decoder) {
 	defer close(c.frames)
 	defer close(c.errs)
-	decoder := NewDecoder(c.conn)
 	for {
 		frame, err := decoder.Read()
 		if err != nil {

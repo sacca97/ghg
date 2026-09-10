@@ -142,6 +142,7 @@ type model struct {
 
 	showThinking bool      // ctrl+o: render reasoning timer
 	thinkStart   time.Time // timestamp when reasoning began for current segment
+	thinkEffort  string    // effective effort for the current model call
 	menu         *menu
 	picker       *picker
 	settings     *settings // ctrl+p settings
@@ -244,6 +245,8 @@ type model struct {
 	workerContextTokens  int
 	workerHistoryRequest string
 	workerRewindRestore  string
+	workerRewindFuture   []models.Message
+	workerRewindPending  bool
 	workerChdirRequest   string
 	forkNotice           string
 	workerMCPStatuses    []workerwire.MCPStatus

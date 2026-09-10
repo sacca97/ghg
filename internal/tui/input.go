@@ -473,7 +473,7 @@ func (m *model) key(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		// while busy with a queue and an empty input, ↓ moves the queue
 		// selection toward newer messages (and off the end to deselect)
-		if m.busy && len(m.queue) > 0 && m.input.Value() == "" {
+		if len(m.queue) > 0 && m.input.Value() == "" {
 			if m.queueSel >= 0 {
 				m.queueSel++
 				if m.queueSel >= len(m.queue) {
@@ -509,7 +509,7 @@ func (m *model) key(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		// while busy with a queue and an empty input, ↑ selects queued messages
-		if m.busy && len(m.queue) > 0 && m.input.Value() == "" && msg.Type == tea.KeyUp {
+		if len(m.queue) > 0 && m.input.Value() == "" && msg.Type == tea.KeyUp {
 			if m.queueSel < 0 {
 				m.queueSel = len(m.queue) - 1 // start at the newest
 			} else if m.queueSel > 0 {
@@ -543,7 +543,7 @@ func (m *model) key(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case tea.KeyDelete, tea.KeyBackspace:
 		// delete the selected queued message (only when navigating the queue)
-		if m.busy && m.queueSel >= 0 && m.queueSel < len(m.queue) {
+		if m.queueSel >= 0 && m.queueSel < len(m.queue) && m.input.Value() == "" {
 			m.queue = append(m.queue[:m.queueSel], m.queue[m.queueSel+1:]...)
 			if m.queueSel >= len(m.queue) {
 				m.queueSel = len(m.queue) - 1

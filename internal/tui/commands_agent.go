@@ -238,7 +238,7 @@ func (m *model) applyAuthResult(res authResultMsg) {
 	}
 	m.modelName, m.provName, m.modelID = route.ModelName, route.ProviderName, route.APIID
 	m.role, m.contextLimit = route.Role, route.ContextLimit
-	m.effort = m.maxEffort()
+	m.effort = route.Effort
 	m.modelSlotW = m.statusModelSlotWidth()
 	if m.workerClient != nil {
 		m.syncWorkerConfiguration(true)
@@ -388,22 +388,6 @@ func (m *model) applyOAuthResult(res authOAuthResultMsg) {
 	m.refreshMenu()
 }
 
-// goalMaxRounds resolves the goal-loop round cap: per-project override
-// (~/.ghg/projects.json, keyed by cwd) beats the global default
-// (goalMaxRounds in ~/.ghg/config.json), which falls back to
-// config.DefaultGoalMaxRounds. Set either with /goal rounds.
-func (m *model) goalMaxRounds() int {
-	if wd, err := os.Getwd(); err == nil {
-		if n := config.ProjectGoalMaxRounds(wd); n > 0 {
-			return n
-		}
-	}
-	if m.cfg != nil && m.cfg.GoalMaxRounds > 0 {
-		return m.cfg.GoalMaxRounds
-	}
-	return config.DefaultGoalMaxRounds
-}
-
 // currentGoalRecord returns the authoritative in-memory goal.
 func (m *model) currentGoalRecord() (agent.GoalRecord, bool) {
 	if m.goalRecord == nil {
@@ -447,7 +431,6 @@ func (m *model) applyGoalUpdate(update agent.GoalUpdate) bool {
 	if !ok || record.Status != agent.GoalStatusActive {
 		return false
 	}
-	before := record
 	accepted, err := agent.ApplyUpdate(&record, update)
 	if err != nil {
 		m.append(errStyle.Render("invalid goal update: " + err.Error()))
@@ -456,95 +439,9 @@ func (m *model) applyGoalUpdate(update agent.GoalUpdate) bool {
 	if !accepted {
 		return false
 	}
-	if record.Status == before.Status && record.Progress == before.Progress && record.Blocker == before.Blocker {
-		return true
-	}
 	record.UpdatedAt = m.nowFn().UTC()
 	m.applyGoalRecord(record)
 	return true
-}
-
-// goalRoundsCommand implements /goal rounds: bare reports the effective cap
-// and where it comes from, a number sets the per-project override (--global
-// sets the config default instead), and "default" clears the override.
-func (m *model) goalRoundsCommand(args []string) {
-	global := false
-	var num string
-	for _, a := range args {
-		if a == "--global" || a == "-g" {
-			global = true
-		} else if num == "" {
-			num = a
-		} else {
-			m.append(errStyle.Render("usage: /goal rounds [n|default] [--global]"))
-			return
-		}
-	}
-	wd, _ := os.Getwd()
-	proj := config.ProjectGoalMaxRounds(wd)
-	cfgN := 0
-	if m.cfg != nil {
-		cfgN = m.cfg.GoalMaxRounds
-	}
-
-	switch num {
-	case "":
-		src := fmt.Sprintf("built-in default (%d)", config.DefaultGoalMaxRounds)
-		if proj > 0 {
-			src = "project override"
-		} else if cfgN > 0 {
-			src = "global config"
-		}
-		m.append(dimStyle.Render(fmt.Sprintf("◎ goal rounds: %d (%s) — /goal rounds <n>|default [--global]", m.goalMaxRounds(), src)))
-		return
-	case "default":
-		// clear
-	default:
-		n := 0
-		if _, err := fmt.Sscan(num, &n); err != nil || n <= 0 {
-			m.append(errStyle.Render("rounds must be a positive number (or \"default\")"))
-			return
-		}
-		if global {
-			m.cfg.GoalMaxRounds = n
-			if err := m.cfg.Save(); err != nil {
-				m.append(errStyle.Render("couldn't save config: " + err.Error()))
-				return
-			}
-			m.append(dimStyle.Render(fmt.Sprintf("◎ global goal rounds: %d%s", n, overriddenNote(proj))))
-			return
-		}
-		if err := config.SetProjectGoalMaxRounds(wd, n); err != nil {
-			m.append(errStyle.Render("couldn't save project override: " + err.Error()))
-			return
-		}
-		m.append(dimStyle.Render(fmt.Sprintf("◎ goal rounds for this project: %d", n)))
-		return
-	}
-
-	// "default": clear the override at the chosen scope
-	if global {
-		m.cfg.GoalMaxRounds = 0
-		if err := m.cfg.Save(); err != nil {
-			m.append(errStyle.Render("couldn't save config: " + err.Error()))
-			return
-		}
-		m.append(dimStyle.Render(fmt.Sprintf("◎ global goal rounds reset to %d%s", config.DefaultGoalMaxRounds, overriddenNote(proj))))
-		return
-	}
-	if err := config.SetProjectGoalMaxRounds(wd, 0); err != nil {
-		m.append(errStyle.Render("couldn't save project override: " + err.Error()))
-		return
-	}
-	m.append(dimStyle.Render(fmt.Sprintf("◎ project goal rounds cleared — using %d", m.goalMaxRounds())))
-}
-
-// overriddenNote flags when a project override still wins over a global change.
-func overriddenNote(proj int) string {
-	if proj > 0 {
-		return fmt.Sprintf(" (this project overrides it with %d)", proj)
-	}
-	return ""
 }
 
 // planCommand switches to Plan mode and submits the goal as an ordinary turn.

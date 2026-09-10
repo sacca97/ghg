@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -61,6 +62,10 @@ func TestParseReviewValid(t *testing.T) {
 	if len(review.ChecksPerformed) != 3 {
 		t.Errorf("got %d checks, want 3", len(review.ChecksPerformed))
 	}
+	stringified, err := ParseReview(`{"summary":"ok","verdict":"approve","findings":[],"checks_performed":"[\"read tests\",\"ran go test\"]"}`)
+	if err != nil || !slices.Equal(stringified.ChecksPerformed, []string{"read tests", "ran go test"}) {
+		t.Fatalf("stringified checks = %v, err=%v", stringified.ChecksPerformed, err)
+	}
 }
 
 func TestParseReviewRejectsInvalid(t *testing.T) {
@@ -76,6 +81,9 @@ func TestParseReviewRejectsInvalid(t *testing.T) {
 		{"finding invalid severity", `{"summary":"sum","verdict":"approve","findings":[{"title":"t","severity":"extreme"}]}`},
 		{"negative line number", `{"summary":"sum","verdict":"approve","findings":[{"title":"t","severity":"low","line":-5}]}`},
 		{"empty check", `{"summary":"sum","verdict":"approve","findings":[],"checks_performed":[""]}`},
+		{"prose checks", `{"summary":"sum","verdict":"approve","findings":[],"checks_performed":"ran tests"}`},
+		{"stringified non-array", `{"summary":"sum","verdict":"approve","findings":[],"checks_performed":"null"}`},
+		{"non-string check", `{"summary":"sum","verdict":"approve","findings":[],"checks_performed":[1]}`},
 	}
 
 	for _, tc := range cases {
@@ -121,8 +129,9 @@ func TestReviewBudgetInventoryAndBaseline(t *testing.T) {
 	}{
 		{name: "minimum", target: "review a.go", inventory: reviewInventoryAt(workspace, "a.go"), wantBudget: 6},
 		{name: "broad scope", target: "review bugs optimization frontend backend", inventory: reviewInventoryAt(workspace, ""), wantBudget: 15},
-		{name: "large-file bonus", target: "review", inventory: ReviewInventory{ProductionFiles: 15, ProductionLOC: 6000, LargeFiles: []string{"a.go", "b.go", "c.go"}, explicitScope: true}, wantBudget: 11},
-		{name: "partial uses maximum", target: "review", inventory: ReviewInventory{Partial: true}, wantBudget: 24},
+		{name: "large-file bonus", target: "review", inventory: ReviewInventory{ProductionFiles: 15, ProductionLOC: 6000, LargeFiles: []string{"a.go", "b.go", "c.go"}, explicitScope: true}, wantBudget: 15},
+		{name: "listed files set the floor", target: "review", inventory: ReviewInventory{Files: []string{"a.go", "a_test.go", "b.go", "b_test.go", "c.go", "c_test.go", "d.go", "d_test.go"}, ProductionFiles: 4, TestFiles: 4}, wantBudget: 8},
+		{name: "partial stays bounded by inventory", target: "review", inventory: ReviewInventory{Partial: true}, wantBudget: 6},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -153,24 +162,43 @@ func TestReviewBudgetInventoryAndBaseline(t *testing.T) {
 			t.Errorf("excluded file %q was inventoried", excluded)
 		}
 	}
-	if got := reviewExtensionAllocation(36, reviewExplorationHardMax); got != 2 {
-		t.Fatalf("36-round lease = %d, want 2", got)
+	if got := reviewExtensionAllocation(38, 40, 20); got != 2 {
+		t.Fatalf("capped lease = %d, want 2", got)
 	}
-	if got := reviewExtensionAllocation(reviewExplorationHardMax, reviewExplorationHardMax); got != 0 {
+	if got := reviewExtensionAllocation(20, 40, 20); got != 5 {
+		t.Fatalf("quarter-budget lease = %d, want 5", got)
+	}
+	if got := reviewExtensionAllocation(20, 40, 5); got != 2 {
+		t.Fatalf("rounded quarter-budget lease = %d, want 2", got)
+	}
+	if got := reviewExtensionAllocation(40, 40, 20); got != 0 {
 		t.Fatalf("hard-limit lease = %d, want 0", got)
 	}
 }
 
 func TestReviewBudgetCheckpointAllowsUntouchedRequestedArea(t *testing.T) {
-	prompt := reviewBudgetCheckpointReminder(&ReviewBudget{CurrentRound: 10, Allocation: 10, HardLimit: reviewExplorationHardMax})
+	prompt := reviewBudgetCheckpointReminder(&ReviewBudget{CurrentRound: 10, Allocation: 10, HardLimit: 20})
 	for _, phrase := range []string{
-		"explicitly requested but untouched area",
-		"frontend, backend, desktop, authentication, or UI",
-		"name that area and the next files or entry points",
-		"final evidence batch only for one narrow confirmation after requested areas have been sampled",
+		"Budget is an estimate; sufficient semantic coverage is the completion criterion",
+		"For a broad review, request an extension when a meaningful requested area remains unreviewed",
+		"For a focused review, request one mainly when unresolved evidence could change a finding",
+		"Do not extend merely for line-by-line completeness",
+		"reason (incomplete_coverage or unresolved_finding)",
+		"one concise why_it_matters sentence",
+		"The final evidence batch is only for one narrow confirmation after requested areas have been sampled",
 	} {
 		if !strings.Contains(prompt, phrase) {
 			t.Errorf("checkpoint prompt missing %q: %s", phrase, prompt)
+		}
+	}
+	for _, phrase := range []string{
+		"Budget is an estimate; sufficient semantic coverage is the completion criterion",
+		"Broad reviews may extend when meaningful requested areas remain unreviewed",
+		"Focused reviews should extend mainly when unresolved evidence could change a finding",
+		"Do not extend merely because the remaining code is unread if it adds no meaningful semantic coverage",
+	} {
+		if !strings.Contains(reviewModePrompt, phrase) {
+			t.Errorf("review prompt missing %q: %s", phrase, reviewModePrompt)
 		}
 	}
 }
@@ -222,17 +250,19 @@ func TestReviewBudgetUsesLeasesAndFinalEvidence(t *testing.T) {
 	read := func(i int) models.Message {
 		return models.Message{Role: "assistant", ToolCalls: []models.ToolCall{call(fmt.Sprintf("read-%d", i), "read", fmt.Sprintf(`{"path":"file-%d.go"}`, i%5))}}
 	}
-	initialAllocation := 19
+	initialAllocation := 20
+	hardLimit := 2 * initialAllocation
 	responses := make([]models.Message, 0, 47)
 	for i := 0; i < initialAllocation; i++ {
 		responses = append(responses, read(i))
 	}
-	for allocation := initialAllocation; allocation < reviewExplorationHardMax; allocation += reviewLeaseRounds {
-		responses = append(responses, models.Message{Role: "assistant", ToolCalls: []models.ToolCall{call(fmt.Sprintf("extend-%d", allocation), "request_review_extension", `{"unresolved_issue":"trace the boundary","evidence":"the rewind caller and persisted cutoff","remaining_lookup":"read the rewind path and compaction mapping","rounds":4}`)}})
-		lease := reviewExtensionAllocation(allocation, reviewExplorationHardMax)
+	for allocation := initialAllocation; allocation < hardLimit; {
+		responses = append(responses, models.Message{Role: "assistant", ToolCalls: []models.ToolCall{call(fmt.Sprintf("extend-%d", allocation), "request_review_extension", `{"reason":"unresolved_finding","remaining_area":"rewind and compaction boundary","why_it_matters":"the persisted cutoff may affect which history is retained","remaining_lookup":"read the rewind path and compaction mapping"}`)}})
+		lease := reviewExtensionAllocation(allocation, hardLimit, initialAllocation)
 		for i := 0; i < lease; i++ {
 			responses = append(responses, read(200+allocation+i))
 		}
+		allocation += lease
 	}
 	responses = append(responses,
 		models.Message{Role: "assistant", ToolCalls: []models.ToolCall{call("pending-final", "read", `{"path":"file-0.go"}`)}},
@@ -240,7 +270,9 @@ func TestReviewBudgetUsesLeasesAndFinalEvidence(t *testing.T) {
 		models.Message{Role: "assistant", ToolCalls: []models.ToolCall{call("submit", "submit_review", `{"summary":"done","verdict":"approve","findings":[]}`)}},
 	)
 	backend := &checkpointBackend{responses: responses}
-	ag := New(backend, "model", 100, "system")
+	// Keep enough stable prompt weight to cross the generic Plan reserve if
+	// ReviewMode accidentally creates that unrelated budget.
+	ag := New(backend, "model", 100, strings.Repeat("system ", 10000))
 	ag.ReviewMode = true
 	ag.Tools = []tools.Tool{{
 		Def: models.NewTool("read", "read", `{"type":"object"}`),
@@ -268,25 +300,43 @@ func TestReviewBudgetUsesLeasesAndFinalEvidence(t *testing.T) {
 	if !requestContains(backend.requests[0], "<review_preflight>") || !requestContains(backend.requests[0], "file-0.go") {
 		t.Fatalf("first request omitted deterministic review preflight: %+v", backend.requests[0].Messages)
 	}
-	for _, tool := range backend.requests[0].Tools {
-		if tool.Function.Name == "glob" || tool.Function.Name == "find_files" {
-			t.Fatalf("review discovery tool exposed: %s", tool.Function.Name)
+	preflight := func(request models.Request) string {
+		for _, message := range request.Messages {
+			if strings.Contains(message.Content, "<review_preflight>") {
+				return message.Content
+			}
 		}
+		return ""
+	}
+	if got := preflight(backend.requests[0]); got == "" || got != preflight(backend.requests[initialAllocation]) {
+		t.Fatalf("review preflight changed after extension")
+	}
+	var sawGlob, sawFind bool
+	for _, tool := range backend.requests[0].Tools {
+		sawGlob = sawGlob || tool.Function.Name == "glob"
+		sawFind = sawFind || tool.Function.Name == "find_files"
+	}
+	if !sawGlob || !sawFind {
+		t.Fatalf("review discovery tools missing: glob=%t find_files=%t", sawGlob, sawFind)
 	}
 	if len(progress) < 2 || progress[0].Phase != "inventory" || progress[0].Allocation != initialAllocation || len(progress[0].Focus) != 5 || progress[1].Phase != "assessment" || progress[1].Allocation != initialAllocation {
 		t.Fatalf("malformed deterministic budget progress = %+v", progress[:min(len(progress), 2)])
 	}
-	if got := backend.requests[initialAllocation].Tools[len(backend.requests[initialAllocation].Tools)-1].Function.Name; got != "request_review_extension" {
-		t.Fatalf("checkpoint tools end with %q", got)
+	for i, request := range backend.requests {
+		if !reflect.DeepEqual(request.Tools, backend.requests[0].Tools) {
+			t.Fatalf("review tool schema changed at request %d: got %+v, baseline %+v", i, request.Tools, backend.requests[0].Tools)
+		}
 	}
 	finalEvidenceIndex := len(responses) - 3
-	if got := backend.requests[finalEvidenceIndex].Tools; len(got) != 2 || got[0].Function.Name != "read" || got[1].Function.Name != "submit_review" || !requestContains(backend.requests[finalEvidenceIndex], "review_budget_checkpoint") {
-		t.Fatalf("final evidence tools = %+v", got)
+	if !requestContains(backend.requests[finalEvidenceIndex], "review_budget_checkpoint") {
+		t.Fatalf("final evidence request omitted checkpoint reminder: %+v", backend.requests[finalEvidenceIndex].Messages)
 	}
-	for _, index := range []int{finalEvidenceIndex + 1, finalEvidenceIndex + 2} {
-		if got := backend.requests[index].Tools; len(got) != 1 || got[0].Function.Name != "submit_review" {
-			t.Fatalf("post-evidence tools at %d = %+v", index, got)
-		}
+	hasExtension := false
+	for _, tool := range backend.requests[0].Tools {
+		hasExtension = hasExtension || tool.Function.Name == "request_review_extension"
+	}
+	if !hasExtension {
+		t.Fatal("stable review schema omitted request_review_extension")
 	}
 	if !requestContains(backend.requests[finalEvidenceIndex+2], reviewFinalizationToolError) {
 		t.Fatalf("post-close navigation did not receive finalization error: %+v", backend.requests[finalEvidenceIndex+2].Messages)
@@ -308,7 +358,7 @@ func TestReviewBudgetUsesLeasesAndFinalEvidence(t *testing.T) {
 			closedAt = index
 		}
 	}
-	if extensions != 5 || lastAllocation != 38 || boundaries != 6 || finals != 1 || closed != 1 {
+	if extensions != 4 || lastAllocation != 40 || boundaries != 5 || finals != 1 || closed != 1 {
 		t.Fatalf("progress leases/boundaries/final/closed = %d/%d/%d/%d/%d", extensions, boundaries, lastAllocation, finals, closed)
 	}
 	for _, event := range progress[closedAt+1:] {
@@ -317,7 +367,7 @@ func TestReviewBudgetUsesLeasesAndFinalEvidence(t *testing.T) {
 		}
 	}
 	for _, event := range progress {
-		if event.CurrentRound > reviewExplorationHardMax {
+		if event.CurrentRound > hardLimit {
 			t.Fatalf("exploration exceeded hard limit: %+v", event)
 		}
 	}
@@ -426,11 +476,44 @@ func TestReviewFinalizationFailureRetainsEvidence(t *testing.T) {
 		t.Fatal("continued review restarted at round zero")
 	}
 	last := backend.requests[len(backend.requests)-1]
-	if len(last.Tools) != 1 || last.Tools[0].Function.Name != "submit_review" {
-		t.Fatalf("continued finalization tools = %+v, want submit_review only", last.Tools)
+	if !reflect.DeepEqual(last.Tools, backend.requests[0].Tools) {
+		t.Fatalf("continued review changed tool schema: %+v, baseline %+v", last.Tools, backend.requests[0].Tools)
 	}
 	if ag.ReviewPending() {
 		t.Fatal("successful review retained stale continuation state")
+	}
+}
+
+func TestRestoreReviewContinuationKeepsCheckpointState(t *testing.T) {
+	ag := New(nil, "review-model", 4096, "sys")
+	targetHash := reviewTargetHash("review target")
+	if !ag.RestoreReviewContinuation("review target", []ReviewProgress{
+		{TargetHash: targetHash, Phase: "inventory", Baseline: 8, Allocation: 8, HardLimit: 38, Inventory: &ReviewInventory{Scope: []string{"."}}},
+		{TargetHash: targetHash, Phase: "exploration", CurrentRound: 7, Allocation: 8, HardLimit: 38},
+		{TargetHash: targetHash, Phase: "budget_boundary", CurrentRound: 8, Allocation: 8, HardLimit: 38},
+	}) {
+		t.Fatal("failed to restore review continuation")
+	}
+	if !ag.ReviewPending() {
+		t.Fatal("restored review is not pending")
+	}
+	state := ag.reviewContinuation
+	if state.target != "review target" || state.budget.CurrentRound != 8 || state.budget.Allocation != 8 || !state.checkpointPending || state.closed {
+		t.Fatalf("restored review state = %+v", state)
+	}
+	if ag.RestoreReviewContinuation("completed", []ReviewProgress{{Phase: "completed", CurrentRound: 8, Allocation: 8, HardLimit: 38}}) {
+		t.Fatal("completed review should not be restored")
+	}
+	if ag.RestoreReviewContinuation("another target", []ReviewProgress{{TargetHash: targetHash, Phase: "budget_boundary", CurrentRound: 8, Allocation: 8, HardLimit: 38}}) {
+		t.Fatal("review progress for another target should not be restored")
+	}
+	completed := New(nil, "review-model", 4096, "sys")
+	completed.Messages = []models.Message{
+		{Role: "user", Authored: true, Content: "review target"},
+		{Role: "tool", Name: "submit_review", Content: "Review accepted."},
+	}
+	if completed.RestoreReviewContinuation("review target", []ReviewProgress{{Phase: "exploration_closed", CurrentRound: 8, Allocation: 8, HardLimit: 38}}) {
+		t.Fatal("accepted legacy review should not be restored")
 	}
 }
 

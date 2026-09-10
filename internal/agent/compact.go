@@ -319,7 +319,7 @@ func cloneCompactionRequest(request models.Request) models.Request {
 }
 
 func (a *Agent) completeCompactionRequest(ctx context.Context, candidate *Agent, request models.Request, ev Events) (models.Message, models.Usage, error) {
-	msg, usage, err := a.CompleteWithRoute(ctx, candidate.Backend, candidate.Role, candidate.Provider, candidate.Protocol, request, ev)
+	msg, usage, err := a.CompleteWithRoutePurpose(ctx, candidate.Backend, candidate.Role, candidate.Provider, candidate.Protocol, "compaction", request, ev)
 	if err != nil || !compactionSummaryTruncated(msg) {
 		return msg, usage, err
 	}
@@ -335,7 +335,7 @@ The previous checkpoint was cut off. Rewrite the same history as one complete,
 terse checkpoint in no more than %d estimated tokens. Drop low-value detail
 first, preserve the objective, decisions, changed files, verification, blockers,
 and next action. Output only the checkpoint.`, target)
-	retryMsg, retryUsage, retryErr := a.CompleteWithRoute(ctx, candidate.Backend, candidate.Role, candidate.Provider, candidate.Protocol, retry, ev)
+	retryMsg, retryUsage, retryErr := a.CompleteWithRoutePurpose(ctx, candidate.Backend, candidate.Role, candidate.Provider, candidate.Protocol, "compaction", retry, ev)
 	usage.Add(retryUsage)
 	if retryErr != nil {
 		return retryMsg, usage, retryErr

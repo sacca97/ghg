@@ -495,22 +495,43 @@ func setupWireEvents(ev *agent.Events, emit func(any)) {
 		emit(map[string]any{
 			"type": "model_call_start", "role": call.Role, "provider": call.Provider,
 			"model": call.Model, "protocol": call.Protocol, "purpose": call.Purpose,
+			"reasoning_effort": call.ReasoningEffort, "reasoning_enabled": call.ReasoningEnabled,
+			"configured_effort": call.ConfiguredEffort, "dynamic_reasoning": call.DynamicReasoning,
+			"effort_requested_for_call": call.EffortRequested, "effort_applied": call.EffortApplied,
+			"selection_reason": call.SelectionReason,
 		})
 	}
 	ev.OnModelCallEnd = func(call agent.ModelCallEnd) {
 		emit(map[string]any{
 			"type": "model_call_end", "role": call.Role, "provider": call.Provider,
 			"model": call.Model, "protocol": call.Protocol, "latency_ms": call.LatencyMS,
+			"reasoning_effort":           call.ReasoningEffort,
+			"reasoning_enabled":          call.ReasoningEnabled,
+			"configured_effort":          call.ConfiguredEffort,
+			"dynamic_reasoning":          call.DynamicReasoning,
+			"effort_requested_for_call":  call.EffortRequested,
+			"effort_applied":             call.EffortApplied,
+			"selection_reason":           call.SelectionReason,
 			"checkpoint_level":           call.CheckpointLevel,
 			"continued_after_checkpoint": call.ContinuedAfterCheckpoint,
 			"purpose":                    call.Purpose, "finish_reason": call.FinishReason, "usage": call.Usage, "error": call.Error,
+		})
+	}
+	ev.OnReasoningSelection = func(selection agent.ReasoningSelection) {
+		emit(map[string]any{
+			"type": "reasoning_selection", "current_effort": selection.Current,
+			"requested_effort": selection.Requested, "next_effort": selection.Next,
+			"applied": selection.Applied, "reason": selection.Reason,
 		})
 	}
 	ev.OnPromptView = func(view agent.PromptView) {
 		emit(map[string]any{
 			"type": "prompt_view", "role": view.Role, "provider": view.Provider,
 			"model": view.Model, "protocol": view.Protocol, "purpose": view.Purpose,
-			"message_count": view.MessageCount, "estimated_tokens": view.EstimatedTokens,
+			"configured_effort": view.ConfiguredEffort, "dynamic_reasoning": view.DynamicReasoning,
+			"effort_requested_for_call": view.EffortRequested, "effort_applied": view.EffortApplied,
+			"selection_reason": view.SelectionReason,
+			"message_count":    view.MessageCount, "estimated_tokens": view.EstimatedTokens,
 			"serialized_bytes": view.SerializedBytes, "context_limit": view.ContextLimit,
 		})
 	}
@@ -553,5 +574,11 @@ func appendTelemetryCallbacks(ev *agent.Events, store *session.Store, sessionID 
 			previous.OnModelCallEnd(value)
 		}
 		appendEvent("model_call_end", value)
+	}
+	ev.OnReasoningSelection = func(value agent.ReasoningSelection) {
+		if previous.OnReasoningSelection != nil {
+			previous.OnReasoningSelection(value)
+		}
+		appendEvent("reasoning_selection", value)
 	}
 }

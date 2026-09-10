@@ -1143,9 +1143,10 @@ func TestUpdateCatalogsResetsUnsupportedEffort(t *testing.T) {
 	}
 }
 
-func TestModelSwitchDefaultsToMaxEffort(t *testing.T) {
+func TestModelSwitchUsesConfiguredEffort(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	m := compactCmdModel()
+	m.cfg.DefaultEffort = "medium"
 	m.catalogs = map[string]config.Catalog{
 		"inference": {Models: []config.ModelInfoLite{
 			{ID: "deepseek-v4-flash", ReasoningEfforts: []string{"low", "high", "max"}},
@@ -1158,18 +1159,18 @@ func TestModelSwitchDefaultsToMaxEffort(t *testing.T) {
 	m.cfg.Models["no-controls"] = config.Model{Providers: []string{"inference"}}
 
 	m.switchModel("deepseek-v4-flash", "inference")
-	if m.effort != "max" {
-		t.Fatalf("expected max effort for deepseek-v4-flash, got %q", m.effort)
+	if m.effort != "medium" {
+		t.Fatalf("expected configured effort for deepseek-v4-flash, got %q", m.effort)
 	}
 
 	m.switchModel("toggle-only", "inference")
-	if m.effort != "on" {
-		t.Fatalf("expected on effort for toggle-only, got %q", m.effort)
+	if m.effort != "medium" {
+		t.Fatalf("expected configured effort for toggle-only, got %q", m.effort)
 	}
 
 	m.switchModel("no-controls", "inference")
-	if m.effort != "" {
-		t.Fatalf("expected empty effort for no-controls, got %q", m.effort)
+	if m.effort != "medium" {
+		t.Fatalf("expected configured effort for no-controls, got %q", m.effort)
 	}
 }
 
@@ -1193,75 +1194,6 @@ func lastBlock(m *model) string {
 		return ""
 	}
 	return m.blocks[len(m.blocks)-1].text
-}
-
-func TestGoalMaxRoundsResolution(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
-	m := modelCmdModel()
-
-	if n := m.goalMaxRounds(); n != config.DefaultGoalMaxRounds {
-		t.Fatalf("default should be %d, got %d", config.DefaultGoalMaxRounds, n)
-	}
-	m.cfg.GoalMaxRounds = 250
-	if n := m.goalMaxRounds(); n != 250 {
-		t.Fatalf("global config should win, got %d", n)
-	}
-	// project override beats the global default
-	wd, _ := os.Getwd()
-	if err := config.SetProjectGoalMaxRounds(wd, 42); err != nil {
-		t.Fatal(err)
-	}
-	if n := m.goalMaxRounds(); n != 42 {
-		t.Fatalf("project override should win, got %d", n)
-	}
-	if err := config.SetProjectGoalMaxRounds(wd, 0); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestGoalRoundsCommand(t *testing.T) {
-	t.Setenv("HOME", t.TempDir())
-	m := modelCmdModel()
-
-	// bare reports the effective cap and source
-	m.command("/goal rounds")
-	if out := lastBlock(m); !strings.Contains(out, "100") || !strings.Contains(out, "built-in default") {
-		t.Fatalf("bare report: %q", out)
-	}
-	// project override
-	m.command("/goal rounds 42")
-	if n := m.goalMaxRounds(); n != 42 {
-		t.Fatalf("project override: %d", n)
-	}
-	if out := lastBlock(m); !strings.Contains(out, "this project") {
-		t.Fatalf("project set message: %q", out)
-	}
-	// global default is set, but the project override still wins and says so
-	m.command("/goal rounds 250 --global")
-	if m.cfg.GoalMaxRounds != 250 {
-		t.Fatalf("global not saved on cfg: %d", m.cfg.GoalMaxRounds)
-	}
-	if n := m.goalMaxRounds(); n != 42 {
-		t.Fatalf("project should still win: %d", n)
-	}
-	if out := lastBlock(m); !strings.Contains(out, "overrides it with 42") {
-		t.Fatalf("override note: %q", out)
-	}
-	// clearing the project override falls back to the global value
-	m.command("/goal rounds default")
-	if n := m.goalMaxRounds(); n != 250 {
-		t.Fatalf("after clearing override should be 250, got %d", n)
-	}
-	// clearing the global falls back to the built-in
-	m.command("/goal rounds default --global")
-	if n := m.goalMaxRounds(); n != config.DefaultGoalMaxRounds {
-		t.Fatalf("after clearing global should be %d, got %d", config.DefaultGoalMaxRounds, n)
-	}
-	// garbage is rejected without changing anything
-	m.command("/goal rounds nope")
-	if out := lastBlock(m); !strings.Contains(out, "positive number") {
-		t.Fatalf("bad input: %q", out)
-	}
 }
 
 func TestGoalFromContextMsgHandler(t *testing.T) {
@@ -1459,7 +1391,7 @@ func TestBottomStatusEffortIsSeparateAndClickable(t *testing.T) {
 	m.width, m.height = 100, 30
 	m.effort = "high"
 	_ = m.View()
-	if got := m.statusView(); !strings.Contains(got, "│ kimi-k3-fast │ (high) │ execute │") {
+	if got := m.statusView(); !strings.Contains(got, "│ kimi-k3-fast │ high (dynamic) │ execute │") {
 		t.Fatalf("status should render effort as a separate segment: %q", got)
 	}
 
@@ -1480,6 +1412,24 @@ func TestBottomStatusEffortIsSeparateAndClickable(t *testing.T) {
 	m = tm.(*model)
 	if m.effort != "low" {
 		t.Fatalf("effort click should cycle off → low, got %q", m.effort)
+	}
+}
+
+func TestDynamicReasoningCommandTogglesAndUpdatesStatus(t *testing.T) {
+	m := compactCmdModel()
+	m.effort = "high"
+	if !m.dynamicReasoningEnabled() {
+		t.Fatal("dynamic reasoning should default to enabled")
+	}
+
+	m.command("/dynamic-reasoning")
+	if m.dynamicReasoningEnabled() || strings.Contains(ansi.Strip(m.statusView()), "high (dynamic)") {
+		t.Fatalf("toggle off did not update state/status: enabled=%v view=%q", m.dynamicReasoningEnabled(), m.statusView())
+	}
+
+	m.command("/dynamic-reasoning")
+	if !m.dynamicReasoningEnabled() || !strings.Contains(ansi.Strip(m.statusView()), "high (dynamic)") {
+		t.Fatalf("toggle on did not update state/status: enabled=%v view=%q", m.dynamicReasoningEnabled(), m.statusView())
 	}
 }
 

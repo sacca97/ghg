@@ -7,6 +7,8 @@ type Event = { type?: unknown; [key: string]: unknown };
 type Workspace = vscode.WorkspaceFolder | undefined;
 type Role = "default" | "smart" | "tiny" | "fast";
 const effortLevels = new Set(["", "low", "medium", "high"]);
+const maxChildOutput = 1024 * 1024;
+const busyStates = new Set(["running", "waiting_approval", "waiting_question", "stopping"]);
 
 type SessionPick = vscode.QuickPickItem & { sessionId: string };
 type ReferenceSuggestion = { path: string; folder: boolean };
@@ -28,13 +30,24 @@ function cleanReferences(value: unknown): string[] {
 		if (typeof item !== "string") {
 			continue;
 		}
-		const path = item.trim();
-		if (!path || path === ".." || path.startsWith("../") || path.startsWith("/") || /[\r\n\0]/.test(path)) {
+		const path = cleanWorkspacePath(item);
+		if (!path) {
 			continue;
 		}
 		paths.add(path);
 	}
 	return [...paths].slice(0, 32);
+}
+
+function cleanWorkspacePath(value: string): string | undefined {
+	const path = value.trim().replace(/\\/g, "/");
+	if (!path || path.startsWith("/") || /^[A-Za-z]:/.test(path) || /[\r\n\0]/.test(path)) {
+		return undefined;
+	}
+	if (path.split("/").some((segment) => segment === "..")) {
+		return undefined;
+	}
+	return path;
 }
 
 function promptWithReferences(prompt: string, paths: string[]): string {
@@ -54,11 +67,11 @@ function literalGlob(value: string): string {
 }
 
 async function referenceSuggestions(workspace: vscode.WorkspaceFolder, query: string): Promise<ReferenceSuggestion[]> {
-	const normalized = query.replace(/\\/g, "/").trim();
-	if (normalized.startsWith("/") || normalized === ".." || normalized.startsWith("../") || /[\r\n\0]/.test(normalized)) {
+	const normalized = cleanWorkspacePath(query) ?? (query.trim() === "" ? "" : undefined);
+	if (normalized === undefined) {
 		return [];
 	}
-	const pattern = normalized ? `${literalGlob(normalized)}**` : "**/*";
+	const pattern = normalized ? `**/*${literalGlob(normalized)}*` : "**/*";
 	const files = await vscode.workspace.findFiles(
 		new vscode.RelativePattern(workspace, pattern),
 		"{**/.git/**,**/.ghg/**,**/node_modules/**}",
@@ -68,7 +81,13 @@ async function referenceSuggestions(workspace: vscode.WorkspaceFolder, query: st
 	const candidates = new Map<string, boolean>();
 	for (const uri of files) {
 		const path = vscode.workspace.asRelativePath(uri, false).replace(/\\/g, "/");
-		if (!path.toLowerCase().startsWith(prefix)) {
+		const lowerPath = path.toLowerCase();
+		const basename = path.slice(path.lastIndexOf("/") + 1).toLowerCase();
+		if (!lowerPath.startsWith(prefix) && (normalized.includes("/") || !basename.startsWith(prefix))) {
+			continue;
+		}
+		if (!lowerPath.startsWith(prefix)) {
+			candidates.set(path, false);
 			continue;
 		}
 		const remainder = path.slice(normalized.length);
@@ -101,6 +120,11 @@ function parseSessions(output: string): SessionPick[] {
 	});
 }
 
+function appendChildOutput(current: string, chunk: Buffer, keepTail = false): string {
+	const next = current + chunk.toString();
+	return next.length <= maxChildOutput ? next : keepTail ? next.slice(-maxChildOutput) : next.slice(0, maxChildOutput);
+}
+
 function listSessions(binary: string, cwd: string | undefined): Promise<SessionPick[]> {
 	return new Promise((resolve, reject) => {
 		const child = spawn(binary, ["sessions", "--format", "json"], { cwd, stdio: ["ignore", "pipe", "pipe"] });
@@ -110,8 +134,8 @@ function listSessions(binary: string, cwd: string | undefined): Promise<SessionP
 		}
 		let output = "";
 		let error = "";
-		child.stdout.on("data", (chunk: Buffer) => { output += chunk.toString(); });
-		child.stderr.on("data", (chunk: Buffer) => { error += chunk.toString(); });
+		child.stdout.on("data", (chunk: Buffer) => { output = appendChildOutput(output, chunk); });
+		child.stderr.on("data", (chunk: Buffer) => { error = appendChildOutput(error, chunk, true); });
 		child.once("error", reject);
 		child.once("close", (code) => {
 			if (code !== 0) {
@@ -132,8 +156,8 @@ function runJSONCommand(binary: string, cwd: string | undefined, args: string[])
 		}
 		let output = "";
 		let error = "";
-		child.stdout.on("data", (chunk: Buffer) => { output += chunk.toString(); });
-		child.stderr.on("data", (chunk: Buffer) => { error += chunk.toString(); });
+		child.stdout.on("data", (chunk: Buffer) => { output = appendChildOutput(output, chunk); });
+		child.stderr.on("data", (chunk: Buffer) => { error = appendChildOutput(error, chunk, true); });
 		child.once("error", reject);
 		child.once("close", (code) => {
 			if (code !== 0) {
@@ -359,6 +383,7 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 		});
 		this.bridgeReady = promise;
 		const lines = readline.createInterface({ input: child.stdout });
+		let stderr = "";
 		lines.on("line", (line) => {
 			if (!line.trim()) return;
 			let event: Event;
@@ -384,6 +409,13 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 					waiter.resolve();
 				}
 			}
+			if (event.type === "error" && typeof event.request_id === "string") {
+				const waiter = this.detachWaiters.get(event.request_id);
+				if (waiter) {
+					this.detachWaiters.delete(event.request_id);
+					waiter.reject(new Error(typeof event.error === "string" ? event.error : "ghg detach failed"));
+				}
+			}
 			if (event.type === "turn_end") {
 				this.active = false;
 			}
@@ -401,13 +433,18 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 				this.post({ type: "error", error: `ghg bridge input failed: ${error.message}` });
 			}
 		});
-		child.stderr.on("data", () => {});
+		child.stderr.on("data", (chunk: Buffer) => {
+			stderr = (stderr + chunk.toString()).slice(-4096);
+		});
 		child.once("error", (error) => {
 			if (!ready) rejectReady(error instanceof Error ? error : new Error(String(error)));
 			this.post({ type: "error", error: error.message });
 		});
 		child.once("close", (code) => {
-			if (!ready) rejectReady(new Error(`ghg bridge exited with code ${code ?? "unknown"}`));
+			if (!ready) {
+				const detail = stderr.trim() || `ghg bridge exited with code ${code ?? "unknown"}`;
+				rejectReady(new Error(detail.replace(/^ghg:\s*/, "")));
+			}
 			for (const waiter of this.detachWaiters.values()) waiter.reject(new Error("ghg bridge closed before detaching"));
 			this.detachWaiters.clear();
 			if (this.bridge === child) {
@@ -526,12 +563,16 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 		if (event.type === "snapshot") {
 			const snapshot = event.snapshot as Record<string, unknown> | undefined;
 			if (!snapshot) return;
+			this.active = typeof snapshot.state === "string" && busyStates.has(snapshot.state);
 			if (snapshot.pending_approval && typeof snapshot.pending_approval === "object") {
 				await this.showApproval(snapshot.pending_approval as Record<string, unknown>);
 			}
 			if (snapshot.pending_question && typeof snapshot.pending_question === "object") {
 				await this.showQuestion(snapshot.pending_question as Record<string, unknown>);
 			}
+		}
+		if (event.type === "state") {
+			this.active = typeof event.state === "string" && busyStates.has(event.state);
 		}
 	}
 
@@ -592,9 +633,7 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 		if (!this.bridge?.stdin) {
 			throw new Error("ghg bridge is unavailable");
 		}
-		const child = this.bridge;
-		if (!child) throw new Error("ghg bridge is unavailable");
-		await this.writeBridgeCommand(child, name, payload);
+		await this.writeBridgeCommand(this.bridge, name, payload);
 	}
 
 	private stopBridge(): Promise<void> {
@@ -682,6 +721,7 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 			await this.bridgeCommand("input", {
 				input: "continue",
 				authored: true,
+				continue: true,
 				plan_mode: continueMode === "plan",
 				review_mode: message.mode === "review",
 			});
@@ -738,6 +778,11 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 				const mode = message.mode === "plan" ? "plan" : "execute";
 				return this.bridgeCommand("configure_role", { role, mode, effort, update_effort: true }, role, mode);
 			}
+		case "/dynamic-reasoning": {
+			if (args !== "on" && args !== "off") throw new Error("usage: /dynamic-reasoning <on|off>");
+			const mode = message.mode === "plan" ? "plan" : "execute";
+			return this.bridgeCommand("configure_role", { role, mode, dynamic_reasoning: args === "on" }, role, mode);
+		}
 		case "/model": {
 			if (!args) return this.pickModel(message.mode === "plan" ? "plan" : "chat");
 			const [model, provider] = fields.slice(1);
@@ -764,7 +809,7 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 			return;
 		case "/commands":
 		case "/help":
-			this.post({ type: "notice", text: "Extension commands: /ask /plan /execute /review /continue /compact /approval /notify /lsp /mcp /context-doctor /goal-from-context /cd /detach /rename /effort /model /pwd /clear /resume /quit (/exit, /q) and !<command>" });
+			this.post({ type: "notice", text: "Extension commands: /ask /plan /execute /review /continue /compact /approval /notify /lsp /mcp /context-doctor /goal-from-context /cd /detach /rename /effort /dynamic-reasoning /model /pwd /clear /resume /quit (/exit, /q) and !<command>" });
 			return;
 		default:
 			throw new Error(`${name} is not available in the extension yet`);
@@ -828,8 +873,8 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 			case "openExternal": {
 				if (typeof message.uri !== "string") break;
 				const uri = vscode.Uri.parse(message.uri);
-				if (!(["http", "https", "file"] as string[]).includes(uri.scheme)) {
-					this.post({ type: "error", error: "Only http, https, and file links can be opened." });
+				if (!(["http", "https"] as string[]).includes(uri.scheme)) {
+					this.post({ type: "error", error: "Only http and https links can be opened." });
 					break;
 				}
 				await vscode.env.openExternal(uri);
@@ -859,6 +904,7 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 		}
 		const mode = message.mode === "plan" ? "plan" : message.mode === "review" ? "review" : message.mode === "execute" || message.mode === "chat" ? "execute" : undefined;
 		if (!mode) {
+			this.post({ type: "error", error: "Choose Execute, Plan, or Review before sending." });
 			return;
 		}
 		const role: Role = message.role === "default" || message.role === "smart" || message.role === "tiny" || message.role === "fast" ? message.role : "fast";

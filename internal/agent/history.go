@@ -199,7 +199,7 @@ func runHistoryRead(ctx context.Context, store HistoryCatalog, sessionID string,
 	if *in.Start < 0 || *in.End < *in.Start {
 		return tools.ToolResult{}, errors.New("history range is invalid")
 	}
-	if *in.End-*in.Start+1 > historyReadRangeLimit {
+	if *in.End-*in.Start >= historyReadRangeLimit {
 		return tools.ToolResult{}, errors.New("history range is too broad; read a narrower range")
 	}
 	messages, diagnostics, err := store.ReadHistory(ctx, sessionID, *in.Start, *in.End, in.Epoch, historyReadSnapshotLimit)

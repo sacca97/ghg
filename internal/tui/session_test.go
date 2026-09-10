@@ -747,6 +747,25 @@ func TestRewindPickerOrderAndArrows(t *testing.T) {
 	}
 }
 
+func TestRewindSendFailureKeepsFuture(t *testing.T) {
+	m := rewindModel(t,
+		models.Message{Role: "user", Content: "q1", Authored: true},
+		models.Message{Role: "assistant", Content: "a1"},
+		models.Message{Role: "user", Content: "q2", Authored: true},
+		models.Message{Role: "assistant", Content: "a2"},
+	)
+	m.future = []models.Message{{Role: "user", Content: "future", Authored: true}}
+	server, client := net.Pipe()
+	server.Close()
+	t.Cleanup(func() { _ = client.Close() })
+	m.workerClient = workerwire.NewClient(client, m.sessionID)
+
+	m.requestWorkerRewind(3)
+	if len(m.future) != 1 || m.future[0].Content != "future" {
+		t.Fatalf("failed rewind corrupted future: %+v", m.future)
+	}
+}
+
 // Each entry renders its submission timestamp dimmed on the line below the
 // preview. Messages predating SentAt show an em dash, never a wrong time.
 func TestRewindPickerShowsTimestamps(t *testing.T) {
@@ -953,7 +972,7 @@ func TestResumeRestoresProposedPlan(t *testing.T) {
 
 	m := compactCmdModel()
 	m.store = st
-	if err := m.resumeDisplay(id); err != nil {
+	if err := m.resume(id); err != nil {
 		t.Fatal(err)
 	}
 	if m.proposedPlanMD != "# My Saved Plan\n\n1. Do this" {

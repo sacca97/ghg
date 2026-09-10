@@ -12,13 +12,14 @@
   const modeToggle = document.getElementById("mode-toggle");
   const modeLabels = { execute: "Execute", plan: "Plan", review: "Review" };
   const effortLevels = ["", "low", "medium", "high"];
+  const busyStates = new Set(["running", "waiting_approval", "waiting_question", "stopping"]);
   const saved = vscode.getState() || {};
   const state = {
     blocks: Array.isArray(saved.blocks) ? saved.blocks : [],
     draft: typeof saved.draft === "string" ? saved.draft : "",
     mode: saved.mode === "plan" ? "plan" : saved.mode === "review" ? "review" : "execute",
     role: ["default", "smart", "tiny", "fast"].includes(saved.role) ? saved.role : "fast",
-    effort: effortLevels.includes(saved.effort) ? saved.effort : "medium",
+    effort: effortLevels.includes(saved.effort) ? saved.effort : "",
     models: saved.models && typeof saved.models === "object" ? saved.models : {},
     references: Array.isArray(saved.references) ? saved.references.filter((path) => typeof path === "string") : [],
     proposedPlan: typeof saved.proposedPlan === "string" ? saved.proposedPlan : "",
@@ -39,12 +40,14 @@
   let contextLimit = 0;
   let activity = "Ready";
   let thinkingSince = 0;
+  let turnConfiguredEffort;
   let completionRequest = 0;
   let completionToken;
   let completionItems = [];
   let completionIndex = 0;
   let completionKind = "reference";
   const tools = new Map();
+  let anonymousTool = 0;
 
   function setSendButton(running) {
     send.textContent = running ? "■" : "➤";
@@ -259,7 +262,28 @@
   }
 
   function isInternalReviewTool(name) {
-    return name === "submit_review" || name === "request_review_extension";
+    return name === "submit_review";
+  }
+
+  function reviewExtensionMarkdown(args) {
+    let parsed;
+    try {
+      parsed = JSON.parse(args);
+    } catch (_) {
+      return "";
+    }
+    if (!parsed || typeof parsed !== "object") return "";
+    let reason = text(parsed.reason).trim().toLowerCase();
+    let area = text(parsed.remaining_area).trim();
+    let why = text(parsed.why_it_matters).trim();
+    const lookup = text(parsed.remaining_lookup).trim();
+    if (!reason && !area && !why) {
+      reason = "unresolved_finding";
+      area = text(parsed.unresolved_issue).trim();
+      why = text(parsed.evidence).trim();
+    }
+    if (!["incomplete_coverage", "unresolved_finding"].includes(reason) || !area || !why || !lookup) return "";
+    return `### Review extension · ${reason.replaceAll("_", " ")}\n\n**Area:** ${area}\n\n**Why:** ${why}\n\n**Next:** ${lookup}`;
   }
 
   function renderBlock(block) {
@@ -308,16 +332,23 @@
   }
 
   function rerender() {
+    const followNow = nearBottom();
+    const scrollTop = transcript.scrollTop;
     transcript.replaceChildren();
     for (const block of state.blocks) {
       renderBlock(block);
     }
     renderReferences();
     updateMode();
+    if (followNow) follow();
+    else transcript.scrollTop = scrollTop;
+    return followNow;
   }
 
   function append(block, force = false) {
-    const followNow = force || nearBottom();
+    // New user input should be visible immediately; background events must
+    // respect a user who is reading older messages.
+    const followNow = (force && block.kind === "user") || nearBottom();
     state.blocks.push(block);
     renderBlock(block);
     save();
@@ -435,6 +466,11 @@
         for (const call of Array.isArray(message.tool_calls) ? message.tool_calls : []) {
           if (!call || typeof call !== "object" || !call.function || typeof call.function !== "object") continue;
           const name = text(call.function.name);
+          if (name === "request_review_extension") {
+            const markdown = reviewExtensionMarkdown(text(call.function.arguments));
+            if (markdown) blocks.push({ kind: "assistant", text: markdown });
+            continue;
+          }
           if (!isInternalReviewTool(name)) {
             blocks.push({ kind: "tool", name, args: text(call.function.arguments), failed: false });
           }
@@ -456,8 +492,7 @@
     if (["default", "smart", "tiny", "fast"].includes(snapshot.role) && typeof nextModel === "string") state.models[snapshot.role] = nextModel;
     if (snapshot.mode === "plan") state.mode = "plan";
     if (snapshot.mode === "execute" && state.mode !== "review") state.mode = "execute";
-    const busyStates = ["running", "waiting_approval", "waiting_question", "stopping"];
-    active = busyStates.includes(snapshot.state);
+    active = busyStates.has(snapshot.state);
     activity = snapshot.state === "waiting_approval" ? "Waiting for approval" : snapshot.state === "waiting_question" ? "Waiting for answer" : active ? "Thinking" : "Ready";
     let liveBlock;
     let liveThinking;
@@ -486,18 +521,18 @@
     }
     currentAssistant = undefined;
     currentAssistantElement = undefined;
-    rerender();
+    const followNow = rerender();
     setSendButton(active);
     send.classList.toggle("stop", active);
     if (active && liveBlock) {
       currentAssistant = liveBlock;
       currentAssistantElement = transcript.children[state.blocks.indexOf(liveBlock)];
-      assistantFollow = true;
+      assistantFollow = followNow;
     }
     if (active && liveThinking) {
       currentThinking = liveThinking;
       currentThinkingElement = transcript.children[state.blocks.indexOf(liveThinking)];
-      thinkingFollow = true;
+      thinkingFollow = followNow;
     }
     save();
     updateStatus();
@@ -672,8 +707,14 @@
         break;
       case "turn_end":
         flushStreaming();
+        if (typeof turnConfiguredEffort === "string") {
+          state.effort = turnConfiguredEffort;
+          turnConfiguredEffort = undefined;
+          updateMode();
+        }
         pendingUser = false;
         planDeltaSeen = false;
+        tools.clear();
         active = false;
         currentAssistant = undefined;
         currentAssistantElement = undefined;
@@ -711,6 +752,12 @@
         }
         break;
       case "text":
+        if (typeof raw.delta === "string") {
+          appendText(raw.delta);
+          activity = "Responding";
+          updateStatus();
+        }
+        break;
       case "plan_delta":
         if (typeof raw.delta === "string") {
           planDeltaSeen = true;
@@ -734,10 +781,19 @@
           updateStatus();
           break;
         }
+        if (name === "request_review_extension") {
+          const markdown = reviewExtensionMarkdown(text(raw.args));
+          if (markdown) append({ kind: "assistant", text: markdown }, true);
+          else append({ kind: "tool", name, args: text(raw.args), failed: false });
+          activity = "Thinking";
+          updateStatus();
+          break;
+        }
         const block = { kind: "tool", name, args: text(raw.args), failed: false };
         append(block);
         const element = transcript.lastElementChild;
-        tools.set(typeof raw.id === "string" ? raw.id : String(tools.size), { block, element });
+        const id = typeof raw.id === "string" && raw.id ? raw.id : `anonymous-${++anonymousTool}`;
+        tools.set(id, { block, element });
         activity = `Using ${block.name || "tool"}`;
         updateStatus();
         break;
@@ -757,7 +813,7 @@
         break;
       }
       case "state":
-        active = ["running", "waiting_approval", "waiting_question", "stopping"].includes(raw.state);
+        active = busyStates.has(raw.state);
         activity = raw.state === "waiting_approval" ? "Waiting for approval" : raw.state === "waiting_question" ? "Waiting for answer" : active ? "Thinking" : "Ready";
         updateStatus();
         break;
@@ -803,6 +859,18 @@
         break;
       case "model_call_start":
         if (typeof raw.model === "string") model = raw.model;
+        if (!raw.purpose && (typeof raw.configured_effort === "string" || typeof raw.effort_applied === "string" || typeof raw.selection_reason === "string")) {
+          if (turnConfiguredEffort === undefined && typeof raw.configured_effort === "string") {
+            turnConfiguredEffort = raw.configured_effort;
+          }
+          let applied = typeof raw.effort_applied === "string" ? raw.effort_applied : text(raw.reasoning_effort);
+          if (!applied && raw.reasoning_enabled === true) applied = "on";
+          if (applied === "off" || applied === "default") applied = "";
+          if (effortLevels.includes(applied)) {
+            state.effort = applied;
+            updateMode();
+          }
+        }
         updateStatus();
         break;
       case "models":
@@ -833,6 +901,13 @@
           save();
         }
         if (typeof raw.error === "string" && raw.error) append({ kind: "error", text: raw.error }, true);
+        if (typeof raw.effort === "string" && effortLevels.includes(raw.effort)) {
+          state.effort = raw.effort;
+          updateMode();
+        } else if (typeof turnConfiguredEffort === "string") {
+          state.effort = turnConfiguredEffort;
+          updateMode();
+        }
         break;
       case "compact_done":
         if (typeof raw.error === "string" && raw.error) append({ kind: "error", text: raw.error }, true);
@@ -855,6 +930,7 @@
         break;
       case "error":
         flushStreaming();
+        pendingUser = false;
         append({ kind: "error", text: text(raw.error) || "ghg failed" }, true);
         activity = "Error";
         if (active) {
@@ -968,6 +1044,15 @@
     event.preventDefault();
     vscode.postMessage({ type: "openExternal", uri: anchor.href });
   });
+  transcript.addEventListener("scroll", () => {
+    if (!nearBottom()) {
+      assistantFollow = false;
+      thinkingFollow = false;
+      return;
+    }
+    if (currentAssistant) assistantFollow = true;
+    if (currentThinking) thinkingFollow = true;
+  }, { passive: true });
   window.addEventListener("message", (event) => handleEvent(event.data));
   setInterval(() => { if (active && activity === "Thinking") updateStatus(); }, 1000);
 

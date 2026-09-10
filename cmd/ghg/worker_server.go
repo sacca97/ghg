@@ -72,6 +72,9 @@ func (w *workerProcessState) Command(ctx context.Context, command workerwire.Com
 		if err := json.Unmarshal(command.Payload, &input); err != nil || strings.TrimSpace(input.Input) == "" {
 			return workerwire.CommandResult{}, errors.New("worker input is invalid")
 		}
+		if w.ag != nil && w.ag.ReviewPending() && !input.Continue && !input.ReviewMode {
+			return workerwire.CommandResult{}, errors.New("review is interrupted; use continue to resume it or review to start a new review")
+		}
 		if !w.startTurn(input) {
 			return workerwire.CommandResult{}, errors.New("worker is busy or stopping")
 		}
@@ -417,9 +420,10 @@ func (w *workerProcessState) configure(request workerConfigureRequest) error {
 		return err
 	}
 	effort := w.ag.Effort
-	if !request.UpdateEffort {
-		effort = workerEffortForModel(resolvedProvider, candidate.Model, effort, candidate.ReasoningToggle)
+	if request.UpdateEffort {
+		effort = request.Effort
 	}
+	effort = workerEffortForModel(resolvedProvider, candidate.Model, effort, candidate.ReasoningToggle)
 	effortChanged := effort != w.ag.Effort
 	w.ag.Backend = candidate.Backend
 	w.ag.Model = candidate.Model
@@ -429,10 +433,12 @@ func (w *workerProcessState) configure(request workerConfigureRequest) error {
 	w.ag.MaxTokens = candidate.MaxTokens
 	w.ag.ContextLimit = candidate.ContextLimit
 	w.ag.ReasoningToggle = candidate.ReasoningToggle
+	w.ag.ReasoningEfforts = append([]string(nil), candidate.ReasoningEfforts...)
 	w.ag.SubagentFactory = candidate.SubagentFactory
 	w.ag.Role = role
-	if request.UpdateEffort {
-		effort = request.Effort
+	if request.DynamicReasoning != nil {
+		dynamicReasoning := *request.DynamicReasoning
+		w.ag.DynamicReasoning = &dynamicReasoning
 	}
 	w.ag.Effort = effort
 	if request.Mode != "" {
@@ -525,7 +531,13 @@ func workerEffortForModel(provider, model, current string, toggle bool) string {
 			return level
 		}
 	}
-	return levels[len(levels)-1]
+	// An explicit off setting stays off. For a configured level the model does
+	// not advertise, use its least expensive advertised level; never silently
+	// escalate a session to the maximum.
+	if current == "" || len(levels) == 1 {
+		return ""
+	}
+	return levels[1]
 }
 
 func (w *workerProcessState) Attached(context.Context) {

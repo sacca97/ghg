@@ -2,8 +2,10 @@ package tui
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"os"
 	"strings"
 	"testing"
@@ -34,6 +36,28 @@ func TestInteractiveDoneUsesToolPreview(t *testing.T) {
 	}
 }
 
+func TestCompactionDoneRebuildsTranscript(t *testing.T) {
+	m := compactCmdModel()
+	m.messages = []models.Message{
+		{Role: "system", Content: "sys"},
+		{Role: "user", Content: "old history", Authored: true},
+	}
+	m.rebuildTranscript()
+	m.setMessages([]models.Message{
+		{Role: "system", Content: "sys"},
+		{Role: "assistant", Content: "compacted summary"},
+		{Role: "user", Content: "recent tail", Authored: true},
+	})
+	m.Update(workerCompactDoneMsg{usage: models.Usage{PromptTokens: 10}})
+	text := m.transcriptText()
+	if strings.Contains(text, "old history") || !strings.Contains(text, "compacted summary") || !strings.Contains(text, "recent tail") {
+		t.Fatalf("compaction left stale transcript: %q", text)
+	}
+	if len(m.msgBlock) != len(m.messages) {
+		t.Fatalf("compaction did not rebuild message mapping: %d/%d", len(m.msgBlock), len(m.messages))
+	}
+}
+
 func TestAttachedToolRowClosesOnCompletion(t *testing.T) {
 	m := compactCmdModel()
 	m.busy = true
@@ -44,6 +68,41 @@ func TestAttachedToolRowClosesOnCompletion(t *testing.T) {
 	m.Update(toolEndMsg{id: "real-tool-id", name: "read"})
 	if m.blocks[len(m.blocks)-1].toolRunning {
 		t.Fatal("attached tool row stayed running after its completion")
+	}
+}
+
+func TestReattachedBusyWorkerCanBeInterrupted(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	defer serverConn.Close()
+	defer clientConn.Close()
+
+	m := compactCmdModel()
+	m.workerClient = workerwire.NewClient(clientConn, "attached")
+	m.applyWorkerSnapshot(workerwire.Snapshot{State: workerwire.StateRunning})
+	if m.cancel == nil {
+		t.Fatal("reattached busy worker should install a cancel callback")
+	}
+
+	frameCh := make(chan workerwire.Frame, 1)
+	go func() {
+		frame, err := workerwire.NewDecoder(serverConn).Read()
+		if err == nil {
+			frameCh <- frame
+		}
+	}()
+	m.key(tea.KeyMsg{Type: tea.KeyEsc})
+
+	select {
+	case frame := <-frameCh:
+		var command workerwire.CommandRequest
+		if err := json.Unmarshal(frame.Payload, &command); err != nil {
+			t.Fatal(err)
+		}
+		if command.Name != workerwire.CommandCancel {
+			t.Fatalf("command = %q, want %q", command.Name, workerwire.CommandCancel)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for reattached cancellation")
 	}
 }
 

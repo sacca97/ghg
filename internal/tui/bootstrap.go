@@ -186,7 +186,7 @@ func forwardSignals(p *tea.Program) func() {
 						return
 					}
 					lastInterrupt = now
-					p.Send(tea.KeyMsg{Type: tea.KeyCtrlC})
+					sendProg(p, tea.KeyMsg{Type: tea.KeyCtrlC})
 				} else {
 					p.Quit()
 				}

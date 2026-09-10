@@ -93,6 +93,8 @@ func NewConfigured(opts BuildOptions) (*Agent, string, string, error) {
 		return nil, "", "", err
 	}
 	ag := New(backend, route.APIID, maxOut, opts.SystemPrompt)
+	dynamicReasoning := config.DynamicReasoningEnabled(cfg)
+	ag.DynamicReasoning = &dynamicReasoning
 	ag.ModelName, ag.Provider = modelName, providerName
 	ag.Role = opts.Role
 	if ag.Role == "" {
@@ -102,10 +104,14 @@ func NewConfigured(opts BuildOptions) (*Agent, string, string, error) {
 	if hasCatalog {
 		if info := cat.Find(route.APIID); info != nil {
 			ag.ReasoningToggle = info.ReasoningToggle
+			ag.ReasoningEfforts = append([]string(nil), info.ReasoningEfforts...)
 		}
 	}
-	if !ag.ReasoningToggle {
-		if info, ok := config.LoadModelsDev().ReasoningFor(route.APIID, modelProviderIDs(resolved, providerName)...); ok {
+	if info, ok := config.LoadModelsDev().ReasoningFor(route.APIID, modelProviderIDs(resolved, providerName)...); ok {
+		if len(ag.ReasoningEfforts) == 0 {
+			ag.ReasoningEfforts = append([]string(nil), info.Efforts...)
+		}
+		if !ag.ReasoningToggle {
 			ag.ReasoningToggle = info.Toggle
 		}
 	}

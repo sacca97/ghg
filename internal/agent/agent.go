@@ -38,11 +38,12 @@ const (
 	// duplicate history becomes a product requirement.
 	maxSeenOperations = 4096
 
-	explorationCheckpointOne        = 10
-	explorationCheckpointTwo        = 16
-	explorationCheckpointFinal      = 24
+	explorationCheckpointOne        = 15
+	explorationCheckpointTwo        = 30
+	explorationCheckpointFinal      = 45
 	explorationCheckpointFinalLevel = 3
 	executionExplorationCheckpoint  = 8
+	goalAttentionCheckpoint         = 50
 )
 
 // HistoryCatalog is the durable session boundary for bounded history recall.
@@ -74,6 +75,15 @@ type Agent struct {
 	// on/off reasoning control from models.dev. Graded efforts still travel in
 	// Effort; the neutral request carries the enable/disable bit separately.
 	ReasoningToggle bool
+	// ReasoningEfforts contains the provider-advertised graded values. It is
+	// capability metadata only; Effort remains the configured baseline.
+	ReasoningEfforts []string
+	// Subagents and internal model calls never expose the foreground-only
+	// one-shot effort selector.
+	reasoningSelectorDisabled bool
+	// DynamicReasoning is nil/on by default. A false value disables the model's
+	// one-call effort selector while preserving the configured Effort.
+	DynamicReasoning *bool
 	// SubagentFactory is optional. When set, delegated foreground and
 	// background tasks use it to build their role-specific agent; nil preserves
 	// the legacy behavior of cloning the parent backend.
@@ -126,14 +136,16 @@ type Agent struct {
 	// mode that terminates upon successful review submission.
 	ReviewMode         bool
 	reviewContinuation *reviewContinuation
+	planContinuation   *planContinuation
 
 	// AskMode restricts one turn to read-only tools and injects a direct
 	// question-answering prompt.
 	AskMode bool
 
-	mu        sync.Mutex
-	pending   []pendingSteer // steered user messages awaiting injection
-	compacted bool           // a compaction already happened this turn — don't retry-loop
+	mu             sync.Mutex
+	pending        []pendingSteer // steered user messages awaiting injection
+	reviewFinalize bool           // an explicit live steering request closes review exploration
+	compacted      bool           // a compaction already happened this turn — don't retry-loop
 
 	// msgsMu guards Messages for concurrent READERS: the turn goroutine
 	// mutates Messages freely, but a test/UI reader taking msgsMu sees a
@@ -185,6 +197,17 @@ type Agent struct {
 func (a *Agent) Steer(text string) {
 	a.mu.Lock()
 	a.pending = append(a.pending, pendingSteer{text: text})
+	if reviewFinalizeInstruction(text) {
+		a.reviewFinalize = true
+	}
+	a.mu.Unlock()
+}
+
+// steerNotice queues an internal result without treating its model-generated
+// text as an operator request to finalize review exploration.
+func (a *Agent) steerNotice(text string) {
+	a.mu.Lock()
+	a.pending = append(a.pending, pendingSteer{text: text})
 	a.mu.Unlock()
 }
 
@@ -199,7 +222,31 @@ type pendingSteer struct {
 func (a *Agent) SteerImages(text string, parts []models.ContentPart) {
 	a.mu.Lock()
 	a.pending = append(a.pending, pendingSteer{text: text, parts: parts})
+	if reviewFinalizeInstruction(text) {
+		a.reviewFinalize = true
+	}
 	a.mu.Unlock()
+}
+
+func (a *Agent) consumeReviewFinalize() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	requested := a.reviewFinalize
+	a.reviewFinalize = false
+	return requested
+}
+
+func reviewFinalizeInstruction(text string) bool {
+	text = strings.ToLower(strings.TrimSpace(text))
+	if text == "" || strings.Contains(text, "do not provide") || strings.Contains(text, "don't provide") || strings.Contains(text, "do not give") || strings.Contains(text, "don't give") {
+		return false
+	}
+	for _, phrase := range []string{"provide the report", "provide a report", "give me the report", "stop exploring", "synthesize the review"} {
+		if strings.Contains(text, phrase) {
+			return true
+		}
+	}
+	return false
 }
 
 // AppendUser adds a non-authored user message to the conversation outside a
@@ -351,6 +398,7 @@ func (a *Agent) newSubagent(ctx context.Context, role string) (*Agent, error) {
 	if sub == nil {
 		return nil, fmt.Errorf("subagent factory returned no agent for role %q", role)
 	}
+	sub.reasoningSelectorDisabled = true
 	observations, searchState, observationStore, searchStore := a.stateSnapshot()
 	sub.stateMu.Lock()
 	sub.observations = observations
@@ -361,6 +409,7 @@ func (a *Agent) newSubagent(ctx context.Context, role string) (*Agent, error) {
 	sub.Checkpointing = a.Checkpointing
 	sub.HistoryRecall = a.HistoryRecall
 	sub.Effort = a.Effort
+	sub.ReasoningEfforts = append([]string(nil), a.ReasoningEfforts...)
 	if a.SubagentFactory == nil {
 		sub.ReasoningToggle = a.ReasoningToggle
 	} else if strings.EqualFold(sub.Effort, "on") && !sub.ReasoningToggle {
@@ -426,7 +475,11 @@ func (a *Agent) ResetState() {
 	if a == nil {
 		return
 	}
+	a.mu.Lock()
+	a.reviewFinalize = false
+	a.mu.Unlock()
 	a.reviewContinuation = nil
+	a.planContinuation = nil
 	a.stateMu.Lock()
 	observations := observation.NewRegistry()
 	observations.SetPersistent(a.observationStore)
@@ -463,6 +516,7 @@ func (a *Agent) ShareState(other *Agent) {
 	other.touched = touched
 	other.touchedMu.Unlock()
 	other.reviewContinuation = a.reviewContinuation
+	other.planContinuation = a.planContinuation
 }
 
 // BindState persists observations and search snapshots collected before the
@@ -758,6 +812,12 @@ func (a *Agent) callStream(ctx context.Context, backend models.Backend, role, pr
 	}
 	start := time.Now()
 	call := a.callInfo(backend, role, provider, protocol, req.Model)
+	call.ReasoningEffort, call.ReasoningEnabled = requestReasoningTelemetry(req)
+	call.ConfiguredEffort = req.ConfiguredReasoningEffort
+	call.DynamicReasoning = req.DynamicReasoning
+	call.EffortRequested = req.ReasoningEffort
+	call.EffortApplied = req.ReasoningEffort
+	call.SelectionReason = req.ReasoningSelectionReason
 	a.emitPromptView(ev, call, req)
 	if ev.OnModelCallStart != nil {
 		ev.OnModelCallStart(call)
@@ -779,6 +839,12 @@ func (a *Agent) callCompletePurpose(ctx context.Context, backend models.Backend,
 	start := time.Now()
 	call := a.callInfo(backend, role, provider, protocol, req.Model)
 	call.Purpose = purpose
+	call.ReasoningEffort, call.ReasoningEnabled = requestReasoningTelemetry(req)
+	call.ConfiguredEffort = req.ConfiguredReasoningEffort
+	call.DynamicReasoning = req.DynamicReasoning
+	call.EffortRequested = req.ReasoningEffort
+	call.EffortApplied = req.ReasoningEffort
+	call.SelectionReason = req.ReasoningSelectionReason
 	a.emitPromptView(ev, call, req)
 	if ev.OnModelCallStart != nil {
 		ev.OnModelCallStart(call)
@@ -791,6 +857,14 @@ func (a *Agent) callCompletePurpose(ctx context.Context, backend models.Backend,
 	msg, usage, err := backend.Complete(ctx, req)
 	a.emitCallEnd(ev, call, start, msg, usage, err, 0)
 	return msg, usage, err
+}
+
+func requestReasoningTelemetry(req models.Request) (string, *bool) {
+	if req.ReasoningEnabled == nil {
+		return req.ReasoningEffort, nil
+	}
+	enabled := *req.ReasoningEnabled
+	return req.ReasoningEffort, &enabled
 }
 
 func (a *Agent) emitPromptView(ev Events, call ModelCallStart, req models.Request) {
@@ -871,6 +945,10 @@ func executionExplorationCheckpointReminder(rounds int) string {
 	return fmt.Sprintf("<execution_checkpoint>\nYou have completed %d repository-exploration rounds without a change. Choose the next concrete action: make the needed change, run targeted verification, or state the blocker. Continue broad exploration only when it resolves a specific unanswered question.\n</execution_checkpoint>", rounds)
 }
 
+func goalAttentionCheckpointReminder(rounds int) string {
+	return fmt.Sprintf("<goal_attention_checkpoint>\nYou have completed %d goal model/tool rounds. Pause and assess the active goal: what concrete progress has been made since the last checkpoint? Confirm that the current work still advances the goal. If it has drifted, realign before continuing. Record a concise progress update with update_goal, then continue with the next necessary action. Do not stop merely because this checkpoint appeared.\n</goal_attention_checkpoint>", rounds)
+}
+
 // Turn sends user input and loops until the model stops calling tools.
 // It returns the final assistant text. When the latest successful request's
 // reported context size crosses the adaptive 80% compaction budget (or the
@@ -924,6 +1002,11 @@ func (a *Agent) TurnWithImagesAndGoal(ctx context.Context, input string, parts [
 // ReviewPending reports whether a failed review turn can be resumed.
 func (a *Agent) ReviewPending() bool {
 	return a != nil && a.reviewContinuation != nil
+}
+
+// PlanPending reports whether a failed plan turn can be resumed.
+func (a *Agent) PlanPending() bool {
+	return a != nil && a.planContinuation != nil
 }
 
 func (a *Agent) readOnlyCollaborationMode() bool {
@@ -983,10 +1066,9 @@ func currentToolGuidance(ts []tools.Tool, notices []string) string {
 //  1. Base system prompt (history[0])
 //  2. Stable collaboration-mode prompt (planModePrompt / reviewModePrompt)
 //  3. Scope preflight (if non-empty)
-//  4. Current capability guidance (if non-empty)
-//  5. Conversation history (history[1:])
-//  6. Changing transient blocks (exploration/budget reminders)
-//  7. Trailing transient blocks (todoContent, goalContent)
+//  4. Conversation history (history[1:])
+//  5. Changing transient blocks (capability/exploration/budget reminders)
+//  6. Trailing transient blocks (todoContent, goalContent)
 func (a *Agent) assembleRequestMessages(history []models.Message, todoContent, goalContent, budgetReminder, capabilityGuidance, explorationReminder, reviewPreflight string) []models.Message {
 	if len(history) == 0 {
 		return history
@@ -1002,30 +1084,35 @@ func (a *Agent) assembleRequestMessages(history []models.Message, todoContent, g
 	if reviewPreflight != "" {
 		reqMsgs = append(reqMsgs, models.Message{Role: "system", Content: reviewPreflight})
 	}
-	if capabilityGuidance != "" {
-		reqMsgs = append(reqMsgs, models.Message{Role: "system", Content: capabilityGuidance})
-	}
 	if len(history) > 1 {
 		reqMsgs = append(reqMsgs, history[1:]...)
 	}
+	if capabilityGuidance != "" {
+		reqMsgs = append(reqMsgs, models.Message{Role: "system", Content: capabilityGuidance, Transient: true})
+	}
 	if explorationReminder != "" {
-		reqMsgs = append(reqMsgs, models.Message{Role: "system", Content: explorationReminder})
+		reqMsgs = append(reqMsgs, models.Message{Role: "system", Content: explorationReminder, Transient: true})
 	}
 	if budgetReminder != "" {
-		reqMsgs = append(reqMsgs, models.Message{Role: "system", Content: budgetReminder})
+		reqMsgs = append(reqMsgs, models.Message{Role: "system", Content: budgetReminder, Transient: true})
 	}
 	if todoContent != "" {
-		reqMsgs = append(reqMsgs, models.Message{Role: "system", Content: todoContent})
+		reqMsgs = append(reqMsgs, models.Message{Role: "system", Content: todoContent, Transient: true})
 	}
 	if goalContent != "" {
-		reqMsgs = append(reqMsgs, models.Message{Role: "system", Content: goalContent})
+		reqMsgs = append(reqMsgs, models.Message{Role: "system", Content: goalContent, Transient: true})
 	}
 	return reqMsgs
 }
 
 func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPart, authored, continuation bool, goalCtx *GoalRecord, ev Events) (string, error) {
 	a.compacted = false // compaction retry state is scoped to this turn
+	// A live steering flag belongs to the turn that was already running. Clear
+	// leftovers before starting a new turn; steering during this turn sets it
+	// again at the next loop boundary.
+	a.consumeReviewFinalize()
 	resumeReview := a.ReviewMode && authored && continuation && a.reviewContinuation != nil
+	resumePlan := a.PlanMode && authored && continuation && a.planContinuation != nil
 	var activeGoal *GoalRecord
 	if goalCtx != nil {
 		goal := *goalCtx
@@ -1069,8 +1156,13 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 	reviewTarget := msg.Content
 
 	var planBudget *rolloutBudget
-	if (a.PlanMode || a.ReviewMode) && authored {
-		planBudget = newPlanRolloutBudget()
+	if a.PlanMode && authored {
+		if a.PlanMode && resumePlan {
+			reviewTarget = a.planContinuation.target
+			planBudget = a.planContinuation.budget
+		} else {
+			planBudget = newPlanRolloutBudget()
+		}
 	}
 	var reviewBudget *ReviewBudget
 	if a.ReviewMode && authored {
@@ -1084,6 +1176,9 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 			reviewBudget = a.newReviewBudget(ctx, reviewTarget, ev)
 			a.reviewContinuation = &reviewContinuation{target: reviewTarget, budget: reviewBudget}
 		}
+	}
+	if a.PlanMode && authored && !resumePlan {
+		a.planContinuation = &planContinuation{target: reviewTarget, budget: planBudget}
 	}
 	readGuard := newReadCoverageTracker()
 	compactionEvents := ev
@@ -1102,8 +1197,9 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 	if a.readOnlyCollaborationMode() {
 		turnTools = filterPlanTools(turnTools)
 		if a.ReviewMode {
-			turnTools = filterReviewDiscoveryTools(turnTools)
-			turnTools = append(turnTools, submitReviewTool())
+			extension := requestReviewExtensionTool()
+			knownTools = append(knownTools, extension)
+			turnTools = append(turnTools, submitReviewTool(), extension)
 		}
 	}
 	var askUserMu sync.Mutex
@@ -1124,11 +1220,13 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 	if activeGoal != nil && !a.readOnlyCollaborationMode() {
 		turnTools = append(turnTools, GoalTool(*activeGoal))
 	}
-	var capabilityGuidance string
+	var capabilityNotices []string
 	if a.Runtime != nil {
-		var capabilityNotices []string
 		turnTools, capabilityNotices = tools.FilterAvailable(turnTools, a.Runtime)
-		capabilityGuidance = currentToolGuidance(turnTools, capabilityNotices)
+	}
+	if selector, ok := a.reasoningSelectorTool(); ok {
+		knownTools = append(knownTools, selector)
+		turnTools = append(turnTools, selector)
 	}
 	turnDefs := tools.Defs(turnTools)
 
@@ -1137,6 +1235,9 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 	rounds := 0
 	explorationRounds := 0
 	explorationReminder := ""
+	goalAttentionReminder := ""
+	baselineEffort := a.Effort
+	nextEffort := ""
 	checkpointLevel := 0
 	postEditVerification := false
 	reviewFinalEvidenceRetryUsed := false
@@ -1144,6 +1245,23 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 	reviewCheckpointPending := false
 	reviewClosed := false
 	scopePreflight := ""
+	planState := a.planContinuation
+	if a.PlanMode && authored && planState != nil {
+		explorationRounds = planState.explorationRounds
+		checkpointLevel = planState.checkpointLevel
+		if planState.checkpointPending {
+			explorationReminder = explorationCheckpointReminder(checkpointLevel, explorationRounds)
+		}
+		defer func() {
+			if a.planContinuation == planState {
+				planState.explorationRounds = explorationRounds
+				planState.checkpointPending = planState.checkpointPending || explorationReminder != ""
+				if checkpointLevel > 0 {
+					planState.checkpointLevel = checkpointLevel
+				}
+			}
+		}()
+	}
 	if reviewBudget != nil {
 		state := a.reviewContinuation
 		if state != nil {
@@ -1176,10 +1294,14 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 		a.emitReviewProgress(ev, reviewBudget, "exploration_closed", "")
 	}
 	for {
-		if a.MaxTurns > 0 && rounds >= a.MaxTurns {
+		if activeGoal == nil && a.MaxTurns > 0 && rounds >= a.MaxTurns {
 			return "", fmt.Errorf("max turns (%d) reached — the model kept calling tools; re-run with a higher -max-turns or a more specific prompt", a.MaxTurns)
 		}
 		rounds++
+		goalAttentionReminder = ""
+		if activeGoal != nil && rounds%goalAttentionCheckpoint == 0 {
+			goalAttentionReminder = goalAttentionCheckpointReminder(rounds)
+		}
 		if err := a.maybeCompact(ctx, compactionEvents); err != nil {
 			return "", err
 		}
@@ -1188,11 +1310,17 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 			// malformed post-finalization response cannot reopen its boundary.
 			reviewCheckpointPending = false
 			reviewBudget.checkpointOpen = false
+		} else if reviewBudget != nil && a.consumeReviewFinalize() {
+			closeReviewExploration()
 		}
 		requestCheckpointLevel := checkpointLevel
 		checkpointLevel = 0
 		requestExplorationReminder := explorationReminder
 		explorationReminder = ""
+		if a.PlanMode && planState != nil && planState.checkpointPending {
+			requestCheckpointLevel = planState.checkpointLevel
+			requestExplorationReminder = explorationCheckpointReminder(requestCheckpointLevel, explorationRounds)
+		}
 		reviewCheckpointRequest := reviewBudget != nil && reviewCheckpointPending && !reviewClosed
 		if reviewCheckpointRequest {
 			requestExplorationReminder = reviewBudgetCheckpointReminder(reviewBudget)
@@ -1208,35 +1336,48 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 		var goalContent string
 		if activeGoal != nil {
 			goalContent = GoalContextBlock(*activeGoal)
+			if goalAttentionReminder != "" {
+				goalContent += "\n\n" + goalAttentionReminder
+			}
 		}
-		msgs := a.assembleRequestMessages(a.Messages, todoContent, goalContent, budgetReminder, capabilityGuidance, requestExplorationReminder, scopePreflight)
-
-		// Checkpoint reminders only add transient context; this snapshot keeps
-		// the plan, review, or execute tool set unchanged for ordinary requests.
+		// Checkpoint reminders only add transient context. Review keeps the
+		// request schema stable; phase restrictions are enforced below.
 		reqDefs := turnDefs
 		available := turnTools
 		if reviewCheckpointRequest && !budgetFinalizing {
 			available = append([]tools.Tool(nil), turnTools...)
-			if reviewBudget.Allocation < reviewBudget.HardLimit {
-				available = append(available, requestReviewExtensionTool())
+			available = withoutReasoningSelector(available)
+			if reviewBudget.Allocation >= reviewBudget.HardLimit {
+				available = withoutReviewExtension(available)
 			}
-			reqDefs = tools.Defs(available)
 		} else if reviewBudget != nil && reviewClosed {
 			available = []tools.Tool{submitReviewTool()}
-			reqDefs = tools.Defs(available)
 		} else if a.readOnlyCollaborationMode() && finalizing {
 			if a.ReviewMode {
 				available = []tools.Tool{submitReviewTool()}
-				reqDefs = tools.Defs(available)
 			} else {
 				reqDefs = nil
 				available = nil // Reserve crossed: disable tools for final synthesis request
 			}
+		} else if a.ReviewMode {
+			available = withoutReviewExtension(available)
+		}
+		requestCapabilityGuidance := ""
+		if a.Runtime != nil {
+			requestCapabilityGuidance = currentToolGuidance(available, capabilityNotices)
+		}
+		msgs := a.assembleRequestMessages(a.Messages, todoContent, goalContent, budgetReminder, requestCapabilityGuidance, requestExplorationReminder, scopePreflight)
+		if reviewClosed && reviewFinalizationRetryUsed {
+			msgs = append(msgs, models.Message{Role: "system", Content: "<review_finalization_retry> Only submit_review is available. Submit the complete review now; do not describe what you would do next. </review_finalization_retry>", Transient: true})
 		}
 		// Surface transient-request retries through the event hook so the UI
 		// shows "retrying" instead of looking hung. The sink is request-local;
 		// the backend remains safe to share with foreground and background turns.
-		reasoningEffort, reasoningEnabled := a.ReasoningRequest()
+		reasoningEffort, reasoningReason := baselineEffort, "configured"
+		if nextEffort != "" {
+			reasoningEffort, reasoningReason = nextEffort, "model_requested"
+		}
+		reasoningEffort, reasoningEnabled := a.reasoningRequest(reasoningEffort)
 		var parser *planStreamParser
 		sink := models.EventSink{
 			OnThink: ev.OnThink,
@@ -1254,12 +1395,15 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 			sink.OnText = ev.OnText
 		}
 		msg, usage, err := a.streamForTurn(ctx, models.Request{
-			Model:            a.Model,
-			Messages:         msgs,
-			Tools:            reqDefs,
-			ReasoningEffort:  reasoningEffort,
-			ReasoningEnabled: reasoningEnabled,
-			SessionID:        a.currentSessionID(),
+			Model:                     a.Model,
+			Messages:                  msgs,
+			Tools:                     reqDefs,
+			ReasoningEffort:           reasoningEffort,
+			ReasoningEnabled:          reasoningEnabled,
+			ConfiguredReasoningEffort: baselineEffort,
+			DynamicReasoning:          a.DynamicReasoning == nil || *a.DynamicReasoning,
+			ReasoningSelectionReason:  reasoningReason,
+			SessionID:                 a.currentSessionID(),
 		}, sink, ev, requestCheckpointLevel)
 		if a.PlanMode && parser != nil {
 			parser.close()
@@ -1341,6 +1485,10 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 			}
 			return "", err
 		}
+		if a.PlanMode && planState != nil && planState.checkpointPending {
+			planState.checkpointPending = false
+			planState.checkpointLevel = 0
+		}
 		hasNavigation, hasMutation := explorationBatch(msg.ToolCalls)
 		reviewNavigationBatch := reviewBudget != nil && !reviewClosed && !reviewCheckpointRequest && hasNavigation && !hasMutation
 		reviewFinalEvidenceBatch := false
@@ -1408,7 +1556,7 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 		checkpointTriggered := false
 		if hasMutation {
 			postEditVerification = true
-		} else if hasNavigation && reviewBudget == nil {
+		} else if hasNavigation && reviewBudget == nil && activeGoal == nil {
 			if postEditVerification {
 				// ponytail: skip only the first navigation-only response after a
 				// mutation; distinguishing later exploration from verification
@@ -1422,6 +1570,10 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 				} else if level := explorationCheckpointLevel(explorationRounds); level > 0 {
 					checkpointLevel = level
 					explorationReminder = explorationCheckpointReminder(level, explorationRounds)
+					if a.PlanMode && planState != nil {
+						planState.checkpointPending = true
+						planState.checkpointLevel = level
+					}
 					checkpointTriggered = true
 				}
 			}
@@ -1528,7 +1680,32 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 					finalizationError = askFinalizationToolError
 				}
 			}
+			if a.ReviewMode && finalizationError == "" {
+				finalizationError = "Error: this tool is unavailable in the current review phase. Use the tools currently allowed by the review checkpoint."
+			}
 			results := a.runToolResultsWithPolicy(ctx, msg.ToolCalls, ev, available, knownTools, finalizationError, readGuard)
+			nextEffort = ""
+			selected, requestedEffort, selectionErr := a.selectedReasoningEffort(msg.ToolCalls, results)
+			selectionReason := ""
+			if selectionErr != nil {
+				selectionReason = "invalid_multiple_requests"
+				for i, call := range msg.ToolCalls {
+					if call.Function.Name == nextReasoningEffortToolName {
+						results[i] = tools.ToolResult{Preview: "Error: " + selectionErr.Error(), ExitCode: 1, Source: call.Function.Name}
+					}
+				}
+			} else if selected != "" {
+				nextEffort = selected
+				selectionReason = "applied_next_foreground_call"
+			} else if requestedEffort != "" {
+				selectionReason = "unsupported_or_failed_request"
+			}
+			if requestedEffort != "" && ev.OnReasoningSelection != nil {
+				ev.OnReasoningSelection(ReasoningSelection{
+					Current: baselineEffort, Requested: requestedEffort, Next: nextEffort,
+					Applied: selected != "", Reason: selectionReason,
+				})
+			}
 			a.msgsMu.Lock()
 			for i, tc := range msg.ToolCalls {
 				a.Messages = append(a.Messages, models.Message{
@@ -1551,13 +1728,12 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 			if reviewExtension != nil && len(results) == 1 {
 				if _, failed := toolResultError(results[0]); !failed {
 					from := reviewBudget.Allocation
-					grant := reviewExtensionAllocation(from, reviewBudget.HardLimit)
+					grant := reviewExtensionAllocation(from, reviewBudget.HardLimit, reviewBudget.Baseline)
 					if grant > 0 {
 						reviewBudget.Allocation += grant
-						scopePreflight = reviewPreflightPrompt(reviewBudget)
 						reviewBudget.checkpointOpen = false
 						reviewCheckpointPending = false
-						a.emitReviewExtensionProgress(ev, reviewBudget, from, reviewBudget.Allocation, reviewExtension.UnresolvedIssue)
+						a.emitReviewExtensionProgress(ev, reviewBudget, from, reviewBudget.Allocation, reviewExtension.displayReason())
 					}
 				}
 			}
@@ -1586,6 +1762,7 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 			}
 			if a.ReviewMode {
 				if reviewArgs, ok := a.reviewTerminal(msg, results); ok {
+					a.emitReviewProgress(ev, reviewBudget, "completed", "")
 					a.reviewContinuation = nil
 					return reviewArgs, nil
 				}
@@ -1612,10 +1789,20 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 			}
 		}
 		if len(msg.ToolCalls) == 0 && len(steered) == 0 {
-			if reviewCheckpointRequest || (reviewBudget != nil && reviewClosed) {
+			if reviewBudget != nil && reviewClosed {
+				if reviewFinalizationRetryUsed {
+					return "", errors.New("review did not submit_review after the finalization correction")
+				}
+				reviewFinalizationRetryUsed = true
+				continue
+			}
+			if reviewCheckpointRequest {
 				continue
 			}
 			a.compacted = false // reset for the next Turn
+			if a.PlanMode {
+				a.planContinuation = nil
+			}
 			return msg.Content, nil
 		}
 	}
@@ -1679,7 +1866,11 @@ func (a *Agent) goalTerminal(goal *GoalRecord, results []tools.ToolResult, ev Ev
 // with both a toggle and graded efforts, the bit follows whether an effort is
 // selected. Models without a toggle keep the legacy effort-only request.
 func (a *Agent) ReasoningRequest() (string, *bool) {
-	effort := strings.TrimSpace(a.Effort)
+	return a.reasoningRequest(a.Effort)
+}
+
+func (a *Agent) reasoningRequest(selected string) (string, *bool) {
+	effort := strings.TrimSpace(selected)
 	if !a.ReasoningToggle {
 		if strings.EqualFold(effort, "on") {
 			return "", nil

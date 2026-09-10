@@ -2,7 +2,6 @@ package worker
 
 import (
 	"bufio"
-	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,7 +11,6 @@ import (
 const (
 	ProtocolVersion   = 1
 	MaxFrameBytes     = 1 << 20
-	MaxAggregateBytes = 64 << 20
 	MaxRequestIDBytes = 128
 	MaxSessionIDBytes = 64
 )
@@ -70,11 +68,10 @@ const (
 )
 
 var (
-	ErrFrameTooLarge     = errors.New("worker protocol frame exceeds limit")
-	ErrAggregateTooLarge = errors.New("worker protocol aggregate exceeds limit")
-	ErrProtocol          = errors.New("invalid worker protocol frame")
-	ErrUnknownVersion    = errors.New("unknown worker protocol version")
-	ErrUnknownType       = errors.New("unknown worker protocol type")
+	ErrFrameTooLarge  = errors.New("worker protocol frame exceeds limit")
+	ErrProtocol       = errors.New("invalid worker protocol frame")
+	ErrUnknownVersion = errors.New("unknown worker protocol version")
+	ErrUnknownType    = errors.New("unknown worker protocol type")
 )
 
 // Frame is the complete wire envelope. Payload is JSON so strings can contain
@@ -108,31 +105,24 @@ type ErrorPayload struct {
 	Message string `json:"message"`
 }
 
-// Decoder applies both the per-frame and lifetime input limits. The lifetime
-// limit is intentionally generous for a long-lived stream, while still
-// bounding an abusive connection that never sends useful commands.
+// Decoder applies the per-frame input limit. Worker connections are long-lived
+// streams, so a lifetime byte cap would eventually disconnect healthy clients.
 type Decoder struct {
-	reader         *bufio.Reader
-	frameLimit     int
-	aggregateLimit int64
-	total          int64
+	reader     *bufio.Reader
+	frameLimit int
 }
 
 func NewDecoder(r io.Reader) *Decoder {
-	return NewDecoderWithLimits(r, MaxFrameBytes, MaxAggregateBytes)
+	return NewDecoderWithLimits(r, MaxFrameBytes)
 }
 
-func NewDecoderWithLimits(r io.Reader, frameLimit int, aggregateLimit int64) *Decoder {
+func NewDecoderWithLimits(r io.Reader, frameLimit int) *Decoder {
 	if frameLimit <= 0 {
 		frameLimit = MaxFrameBytes
 	}
-	if aggregateLimit <= 0 {
-		aggregateLimit = MaxAggregateBytes
-	}
 	return &Decoder{
-		reader:         bufio.NewReaderSize(r, 32<<10),
-		frameLimit:     frameLimit,
-		aggregateLimit: aggregateLimit,
+		reader:     bufio.NewReaderSize(r, 32<<10),
+		frameLimit: frameLimit,
 	}
 }
 
@@ -141,11 +131,6 @@ func (d *Decoder) Read() (Frame, error) {
 	if err != nil {
 		return Frame{}, err
 	}
-	d.total += int64(len(line))
-	if d.total > d.aggregateLimit {
-		return Frame{}, ErrAggregateTooLarge
-	}
-
 	var frame Frame
 	if err := json.Unmarshal(line, &frame); err != nil {
 		return Frame{}, fmt.Errorf("%w: %v", ErrProtocol, err)
@@ -160,6 +145,15 @@ func (d *Decoder) readLine() ([]byte, error) {
 	var line []byte
 	for {
 		part, err := d.reader.ReadSlice('\n')
+		if err == nil && len(line) == 0 {
+			if len(part) > d.frameLimit {
+				return nil, ErrFrameTooLarge
+			}
+			if len(part) == 1 {
+				return nil, ErrProtocol
+			}
+			return part[:len(part)-1], nil
+		}
 		line = append(line, part...)
 		if len(line) > d.frameLimit {
 			return nil, ErrFrameTooLarge
@@ -168,7 +162,7 @@ func (d *Decoder) readLine() ([]byte, error) {
 			if len(line) == 1 {
 				return nil, ErrProtocol
 			}
-			return bytes.TrimSuffix(line, []byte{'\n'}), nil
+			return line[:len(line)-1], nil
 		}
 		if errors.Is(err, bufio.ErrBufferFull) {
 			continue

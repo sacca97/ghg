@@ -152,6 +152,39 @@ func TestAnthropicRequestTranslation(t *testing.T) {
 	}
 }
 
+func TestAnthropicTransientSystemFollowsStableHistory(t *testing.T) {
+	wire, err := newAnthropicRequest(Request{
+		Model: "claude-test",
+		Messages: []Message{
+			{Role: "system", Content: "stable instructions"},
+			{Role: "user", Content: "history"},
+			{Role: "system", Content: "checkpoint", Transient: true},
+		},
+	}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(wire.System) != 1 || wire.System[0].Text != "stable instructions" {
+		t.Fatalf("system blocks = %+v", wire.System)
+	}
+	if len(wire.Messages) != 2 || wire.Messages[1].Role != "user" {
+		t.Fatalf("messages = %+v", wire.Messages)
+	}
+	var stable, transient map[string]any
+	if err := json.Unmarshal(wire.Messages[0].Content[0], &stable); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(wire.Messages[1].Content[0], &transient); err != nil {
+		t.Fatal(err)
+	}
+	if stable["cache_control"] == nil {
+		t.Fatalf("stable history lost cache breakpoint: %+v", stable)
+	}
+	if transient["cache_control"] != nil {
+		t.Fatalf("transient block became cache breakpoint: %+v", transient)
+	}
+}
+
 func TestAnthropicReasoningToggle(t *testing.T) {
 	for _, tc := range []struct {
 		name    string

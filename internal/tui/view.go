@@ -59,6 +59,15 @@ type toolDisplayArgs struct {
 	Ranges  []toolDisplayRange `json:"ranges"`
 }
 
+type reviewExtensionDisplay struct {
+	Reason          string `json:"reason"`
+	RemainingArea   string `json:"remaining_area"`
+	WhyItMatters    string `json:"why_it_matters"`
+	Remaining       string `json:"remaining_lookup"`
+	UnresolvedIssue string `json:"unresolved_issue"` // legacy
+	Evidence        string `json:"evidence"`         // legacy
+}
+
 var toolDisplayHash = regexp.MustCompile(`(?i)sha256:[0-9a-f]{8,}`)
 
 // toolCallSummary keeps tool rows useful at a glance without changing the
@@ -97,6 +106,23 @@ func toolCallSummary(name, args string) string {
 		return hideToolDisplayHash(strings.Join(parts, " "))
 	}
 	return hideToolDisplayHash(strings.TrimSpace(args))
+}
+
+func reviewExtensionMarkdown(args string) string {
+	var request reviewExtensionDisplay
+	if err := json.Unmarshal([]byte(args), &request); err != nil {
+		return ""
+	}
+	reason := strings.TrimSpace(request.Reason)
+	area := strings.TrimSpace(request.RemainingArea)
+	why := strings.TrimSpace(request.WhyItMatters)
+	if reason == "" && area == "" && why == "" {
+		reason, area, why = "unresolved_finding", strings.TrimSpace(request.UnresolvedIssue), strings.TrimSpace(request.Evidence)
+	}
+	if reason != "incomplete_coverage" && reason != "unresolved_finding" || area == "" || why == "" || strings.TrimSpace(request.Remaining) == "" {
+		return ""
+	}
+	return fmt.Sprintf("### Review extension · %s\n\n**Area:** %s\n\n**Why:** %s\n\n**Next:** %s", strings.ReplaceAll(reason, "_", " "), area, why, strings.TrimSpace(request.Remaining))
 }
 
 func hideToolDisplayHash(value string) string {
@@ -712,13 +738,15 @@ func formatThinkingDuration(dur time.Duration) string {
 
 func (m *model) flushThink() {
 	hadReasoning := !m.thinkStart.IsZero()
+	effort := m.thinkEffort
 	dur := m.nowFn().Sub(m.thinkStart)
 	if dur < 0 {
 		dur = 0
 	}
 	m.thinkStart = time.Time{}
+	m.thinkEffort = ""
 	if hadReasoning && m.showThinking {
-		m.append(thinkingStyle.Render("◌ Thinking " + formatThinkingDuration(dur)))
+		m.append(thinkingStyle.Render(thinkingLabel(formatThinkingDuration(dur), effort)))
 	}
 }
 
@@ -731,8 +759,16 @@ func (m *model) thinkView() string {
 	if dur < 0 {
 		dur = 0
 	}
-	s := "◌ Thinking " + formatThinkingDuration(dur)
+	s := thinkingLabel(formatThinkingDuration(dur), m.thinkEffort)
 	return thinkingStyle.Render(wrap(s, m.width))
+}
+
+func thinkingLabel(duration, effort string) string {
+	label := "◌ Thinking " + duration
+	if strings.TrimSpace(effort) != "" {
+		label += " · " + effort
+	}
+	return label
 }
 
 // flushCurrent moves any in-flight partial line into the transcript and ends
@@ -852,7 +888,7 @@ func (m *model) View() string {
 	}
 	if len(m.queue) > 0 {
 		nav := ""
-		if m.busy && m.input.Value() == "" {
+		if m.input.Value() == "" {
 			nav = " · ↑/↓ select · del removes"
 		}
 		b.WriteString(dimStyle.Render(fmt.Sprintf(" ⧗ queued (%d) — enter on empty input to steer into this turn%s", len(m.queue), nav)) + "\n")
@@ -934,7 +970,10 @@ func (m *model) statusView() string {
 		contextSize += " · " + fmtCost(cost)
 	}
 	mode := m.uiMode()
-	effort := "(" + effortLabel(m.currentEffort()) + ")"
+	effort := effortLabel(m.currentEffort())
+	if m.dynamicReasoningEnabled() {
+		effort += " (dynamic)"
+	}
 	folder := m.shortCWD
 	if folder == "" {
 		folder = shortCWD()

@@ -36,10 +36,11 @@ var registry = []registryEntry{
 	{Name: "/continue", Hint: "— continue the interrupted turn using the current session history", Category: "Session", Immediate: true},
 	{Name: "/detach", Hint: "— stop the worker and exit; resume later (ctrl+d)", Keybind: "ctrl+d", Category: "Session", Immediate: true},
 	{Name: "/effort", Hint: "[level] — reasoning effort: off·low·medium·high (bare opens selector)", Category: "Agent", Immediate: true},
+	{Name: "/dynamic-reasoning", Hint: "— toggle model per-call reasoning effort selection (default on)", Category: "Agent", Immediate: true},
 	{Name: "/export", Hint: "[chat|plan|review|last] [path] [--format json|markdown] [--force] — export chat log or structured result to a file", Category: "Session"},
 	{Name: "/export-result", Hint: "[chat|plan|review|last] [path] [--format json|markdown] [--force] — export chat log, structured result, or last message to a file", Category: "Session"},
 	{Name: "/fork", Hint: "[name] — copy the conversation into a new session (pick a point in the rewind picker with f)", Category: "Session"},
-	{Name: "/goal", Hint: "<text> — keep working until the goal is met (resume | clear | rounds <n>|default [--global])", Category: "Session", Immediate: true},
+	{Name: "/goal", Hint: "<text> — keep working until the goal is met (unbounded; resume | clear)", Category: "Session", Immediate: true},
 	{Name: "/goal-from-context", Hint: "[n] — formulate a goal from the last n messages (default 8) and work until it's met", Category: "Session", Immediate: true},
 	{Name: "/help", Hint: "— show all commands and keybindings", Category: "App", Immediate: true},
 	{Name: "/mcp", Hint: "[name] [reconnect|enable|disable] — MCP servers: status, reconnect, toggle", Category: "Session", Immediate: true},
@@ -129,13 +130,13 @@ func busyCmd(text string) bool {
 		return false
 	}
 	switch fields[0] {
-	case "/approval", "/continue", "/help", "/effort", "/tasks", "/cd", "/pwd", "/report", "/detach", "/notify", "/rename":
+	case "/approval", "/continue", "/help", "/effort", "/dynamic-reasoning", "/tasks", "/cd", "/pwd", "/report", "/detach", "/notify", "/rename":
 		return true
 	case "/ask", "/plan", "/execute", "/review": // handled immediately so a slash command is not sent as chat text
 		return true
 	case "/auth": // must run now even while busy: an inline key queued as a chat message would be sent to the model
 		return true
-	case "/goal": // status, clear, and rounds are settings; resume/<text> submit turns
+	case "/goal": // status and clear are settings; resume/<text> submit turns
 		return len(fields) == 1 || fields[1] == "clear" || fields[1] == "rounds"
 	}
 	return false
@@ -337,6 +338,12 @@ func (m *model) command(text string) (tea.Model, tea.Cmd) {
 		} else {
 			m.openPaletteOn("reasoning effort") // bare: open the level selector
 		}
+	case "/dynamic-reasoning":
+		if len(fields) != 1 {
+			m.append(errStyle.Render("usage: /dynamic-reasoning"))
+			return m, nil
+		}
+		m.setDynamicReasoning(!m.dynamicReasoningEnabled())
 	case "/goal-from-context":
 		if !m.requireAgent() {
 			return m, nil
@@ -391,7 +398,7 @@ func (m *model) command(text string) (tea.Model, tea.Cmd) {
 			if !ok {
 				m.append(dimStyle.Render("no goal set — /goal <text> to set one"))
 			} else {
-				m.append(dimStyle.Render(fmt.Sprintf("◎ goal %s (%s, round %d/%d): %s", record.ID, record.Status, record.Rounds, m.goalMaxRounds(), record.Objective)))
+				m.append(dimStyle.Render(fmt.Sprintf("◎ goal %s (%s, round %d, unbounded): %s", record.ID, record.Status, record.Rounds, record.Objective)))
 				if record.Progress != "" {
 					m.append(dimStyle.Render("  progress: " + record.Progress))
 				}
@@ -403,7 +410,7 @@ func (m *model) command(text string) (tea.Model, tea.Cmd) {
 			m.setGoal("")
 			m.append(dimStyle.Render("(goal cleared)"))
 		case fields[1] == "rounds":
-			m.goalRoundsCommand(fields[2:])
+			m.append(dimStyle.Render("goal runs are unbounded; /goal rounds is no longer used"))
 		case fields[1] == "resume":
 			if !m.requireAgent() {
 				break

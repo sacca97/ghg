@@ -394,6 +394,7 @@ func TestThinkingDisplayEphemeralAndCollapsedTranscript(t *testing.T) {
 	t0 := time.Date(2026, 8, 31, 12, 0, 0, 0, time.UTC)
 	currTime := t0
 	m.now = func() time.Time { return currTime }
+	m.workerEvent(workerEvent{Kind: "model_call_start", Data: json.RawMessage(`{"reasoning_effort":"high"}`)})
 
 	// Stream multiple lines of reasoning containing sensitive text
 	um, _ := m.Update(thinkMsg("secret reasoning tokens\ninternal model deliberation"))
@@ -404,8 +405,8 @@ func TestThinkingDisplayEphemeralAndCollapsedTranscript(t *testing.T) {
 
 	// Live thinkView should only show the timer, never raw reasoning tokens
 	tv := stripAll(m.thinkView())
-	if tv != "◌ Thinking 3s" {
-		t.Fatalf("live thinkView should be timer '◌ Thinking 3s', got %q", tv)
+	if tv != "◌ Thinking 3s · high" {
+		t.Fatalf("live thinkView should include the effective effort, got %q", tv)
 	}
 	if strings.Contains(tv, "secret") || strings.Contains(tv, "deliberation") {
 		t.Fatalf("live thinkView leaked reasoning tokens: %q", tv)
@@ -419,8 +420,8 @@ func TestThinkingDisplayEphemeralAndCollapsedTranscript(t *testing.T) {
 		t.Fatalf("expected at least 2 blocks (timer + tool), got %d", len(m.blocks))
 	}
 	timerBlock := stripAll(m.blocks[len(m.blocks)-2].text)
-	if timerBlock != "◌ Thinking 3s" {
-		t.Fatalf("expected finalized timer block '◌ Thinking 3s', got %q", timerBlock)
+	if timerBlock != "◌ Thinking 3s · high" {
+		t.Fatalf("expected finalized timer block with effort, got %q", timerBlock)
 	}
 	toolBlock := stripAll(m.blocks[len(m.blocks)-1].text)
 	if !strings.Contains(toolBlock, "⚒ grep") || !strings.Contains(toolBlock, ". secretKey") {
@@ -458,6 +459,19 @@ func TestThinkingDisplayEphemeralAndCollapsedTranscript(t *testing.T) {
 		if strings.Contains(stripped, "Thinking") || strings.Contains(stripped, "invisible reasoning") {
 			t.Fatalf("disabled thinking should not add thought line to transcript: %q", stripped)
 		}
+	}
+}
+
+func TestDynamicEffortUpdatesAndRestoresTUIIndicator(t *testing.T) {
+	m := compactCmdModel()
+	m.effort = "high"
+	m.workerEvent(workerEvent{Kind: "model_call_start", Data: json.RawMessage(`{"purpose":"","configured_effort":"high","dynamic_reasoning":true,"effort_requested_for_call":"low","effort_applied":"low","selection_reason":"model_requested"}`)})
+	if m.effort != "low" {
+		t.Fatalf("live effort = %q, want low", m.effort)
+	}
+	m.workerEvent(workerEvent{Kind: "turn_done", Data: json.RawMessage(`{"effort":"high"}`)})
+	if m.effort != "high" {
+		t.Fatalf("restored effort = %q, want high", m.effort)
 	}
 }
 
@@ -1047,7 +1061,7 @@ func TestStatusLineAlwaysShown(t *testing.T) {
 	m.messages = []models.Message{{Role: "system", Content: "system prompt"}}
 
 	v := m.View()
-	for _, want := range []string{"kimi-k3-fast", "(high)", "execute", "inference", "ctx 0/128.0k"} {
+	for _, want := range []string{"kimi-k3-fast", "high (dynamic)", "execute", "inference", "ctx 0/128.0k"} {
 		if !strings.Contains(v, want) {
 			t.Errorf("status box should show %q\n--- view tail ---\n%s", want, tailLines(v, 8))
 		}
@@ -1144,10 +1158,10 @@ func TestStatusLineDefaults(t *testing.T) {
 	if !strings.Contains(v, "ctx 0") {
 		t.Errorf("empty session should read ctx 0\n%s", tailLines(v, 6))
 	}
-	if !strings.Contains(v, "│ m │ (off) │ execute │") {
+	if !strings.Contains(v, "│ m │ off (dynamic) │ execute │") {
 		t.Errorf("effort off should remain a separate indicator\n%s", tailLines(v, 6))
 	}
-	if !strings.Contains(v, "│ m │ (off) │ execute │ p │") {
+	if !strings.Contains(v, "│ m │ off (dynamic) │ execute │ p │") {
 		t.Errorf("model, mode, and provider should appear\n%s", tailLines(v, 6))
 	}
 }
@@ -1846,6 +1860,23 @@ func TestToolCallSummaryHidesContentHash(t *testing.T) {
 	summary := toolCallSummary("output_read", `{"id":"sha256:`+hash+`","offset":0}`)
 	if strings.Contains(summary, hash) || !strings.Contains(summary, "sha256:aaaaaaaa…") {
 		t.Fatalf("tool summary exposed content hash: %q", summary)
+	}
+}
+
+func TestReviewExtensionRendersAsMarkdown(t *testing.T) {
+	args := `{"reason":"incomplete_coverage","remaining_area":"background task/event propagation","why_it_matters":"FanIn is only partially inspected","remaining_lookup":"read events.go:131-end"}`
+	if got := reviewExtensionMarkdown(args); strings.Contains(got, `{"reason"`) || !strings.Contains(got, "### Review extension · incomplete coverage") || !strings.Contains(got, "**Why:** FanIn is only partially inspected") {
+		t.Fatalf("review extension was not formatted as markdown: %q", got)
+	}
+	legacy := `{"unresolved_issue":"trace the cutoff mapping","evidence":"the persisted raw sequence","remaining_lookup":"read session/compaction.go","rounds":3}`
+	if got := reviewExtensionMarkdown(legacy); strings.Contains(got, `{"unresolved_issue"`) || !strings.Contains(got, "**Why:** the persisted raw sequence") {
+		t.Fatalf("legacy review extension was not formatted as markdown: %q", got)
+	}
+
+	m := compactCmdModel()
+	m.Update(toolStartMsg{id: "review-ext", name: "request_review_extension", args: args})
+	if len(m.blocks) == 0 || m.blocks[len(m.blocks)-1].kind != blockAssistant {
+		t.Fatalf("review extension should render as an assistant markdown block: %+v", m.blocks)
 	}
 }
 

@@ -1,8 +1,12 @@
 package config
 
 import (
+	"context"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/sacca97/ghg/internal/models"
 )
 
 // catalogFixture isolates GHG_HOME and seeds one cached provider catalog.
@@ -176,5 +180,34 @@ func TestCatalogPricingRoundTrip(t *testing.T) {
 	in, out, cr, ok := got["p"].Pricing("m")
 	if !ok || in != 1e-6 || out != 5e-6 || cr != 1e-7 {
 		t.Fatalf("round-trip: %v %v %v ok=%v", in, out, cr, ok)
+	}
+}
+
+func TestFetchCatalogsSeedsProviderFromModelsDev(t *testing.T) {
+	t.Setenv("GHG_HOME", t.TempDir())
+	if err := SaveModelsDev(ModelsDevCache{
+		Version:   modelsDevCacheVersion,
+		FetchedAt: time.Now(),
+		Providers: map[string]map[string]int{"opencode-go": {"mimo-v2.5-pro": 262144}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	profiles, err := models.Load(models.LoadOptions{UserDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := &Config{Providers: map[string]Provider{
+		"opencode": {Profile: "opencode"},
+	}}
+	cats, err := FetchCatalogs(context.Background(), cfg, profiles, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cat, ok := cats["opencode"]
+	if !ok || cat.Find("mimo-v2.5-pro") == nil {
+		t.Fatalf("models.dev model was not seeded into provider catalog: %+v", cats)
+	}
+	if cat.ContextLength("mimo-v2.5-pro") != 262144 {
+		t.Fatalf("seeded model metadata was not applied: %+v", cat.Find("mimo-v2.5-pro"))
 	}
 }

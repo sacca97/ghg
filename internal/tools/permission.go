@@ -100,6 +100,15 @@ func SegmentShell(command string) ([]CommandSegment, error) {
 	for i := 0; i < len(command); i++ {
 		c := command[i]
 		if quote != 0 {
+			if quote == '"' && c == '\\' {
+				if i+1 < len(command) {
+					i++
+				}
+				continue
+			}
+			if quote == '"' && (c == '`' || (c == '$' && i+1 < len(command) && command[i+1] == '(')) {
+				return nil, errors.New("command substitution is opaque")
+			}
 			if c == quote {
 				quote = 0
 			}

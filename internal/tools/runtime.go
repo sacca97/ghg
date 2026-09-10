@@ -488,8 +488,9 @@ const (
 
 // authorizeCommand decides whether a Bash call needs an additional
 // capability approval. It returns the policy to use for the exact call and a
-// bool indicating that an approval decision already covered the legacy TUI
-// gate, preventing duplicate prompts.
+// bool indicating that the legacy TUI gate is already covered. Routine
+// commands need no approval; approved escalations also set it to avoid a
+// duplicate prompt.
 func (r *ToolRuntime) authorizeCommand(ctx context.Context, tool, command, cwd string) (*sandbox.Policy, bool, error) {
 	if r == nil || r.Policy == nil {
 		return nil, false, nil
@@ -520,7 +521,7 @@ func (r *ToolRuntime) authorizeCommand(ctx context.Context, tool, command, cwd s
 	request := r.approvalRequest(tool, command, cwd, segments, disposition, network, reason, requestedReadRoots, requestedWriteRoots)
 	switch disposition {
 	case dispositionRoutine:
-		return r.Policy, false, nil
+		return r.Policy, true, nil
 	case dispositionHardDeny:
 		return r.denyApproval(ctx, request, reason)
 	}

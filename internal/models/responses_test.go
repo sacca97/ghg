@@ -51,6 +51,7 @@ func TestOpenAIResponsesRequestTranslation(t *testing.T) {
 				json.RawMessage(`{"type":"function_call","id":"fc_1","call_id":"call-1","name":"read","arguments":"{\"path\":\"README.md\"}","status":"completed"}`),
 			}},
 			{Role: "tool", Content: "file contents", ToolCallID: "call-1"},
+			{Role: "system", Content: "checkpoint", Transient: true},
 		},
 		Tools:           []Tool{tool},
 		MaxTokens:       123,
@@ -90,8 +91,8 @@ func TestOpenAIResponsesRequestTranslation(t *testing.T) {
 	if got.Reasoning["effort"] != "high" {
 		t.Fatalf("reasoning effort: %+v", got.Reasoning)
 	}
-	if len(got.Input) != 4 {
-		t.Fatalf("input should contain user, preserved reasoning/function call, and tool output: %+v", got.Input)
+	if len(got.Input) != 5 {
+		t.Fatalf("input should contain user, preserved reasoning/function call, tool output, and transient checkpoint: %+v", got.Input)
 	}
 	if got.Input[0]["type"] != "message" || got.Input[0]["role"] != "user" {
 		t.Fatalf("user input item: %+v", got.Input[0])
@@ -100,7 +101,7 @@ func TestOpenAIResponsesRequestTranslation(t *testing.T) {
 	if !ok || len(content) != 2 || content[0].(map[string]any)["type"] != "input_text" || content[1].(map[string]any)["type"] != "input_image" {
 		t.Fatalf("multimodal input: %+v", got.Input[0]["content"])
 	}
-	if got.Input[1]["type"] != "reasoning" || got.Input[2]["type"] != "function_call" || got.Input[3]["type"] != "function_call_output" {
+	if got.Input[1]["type"] != "reasoning" || got.Input[2]["type"] != "function_call" || got.Input[3]["type"] != "function_call_output" || got.Input[4]["type"] != "message" || got.Input[4]["role"] != "user" {
 		t.Fatalf("preserved response history: %+v", got.Input)
 	}
 	if len(got.Tools) != 1 || got.Tools[0]["type"] != "function" || got.Tools[0]["name"] != "read" || got.Tools[0]["function"] != nil {

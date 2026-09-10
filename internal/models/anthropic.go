@@ -150,6 +150,7 @@ func newAnthropicRequest(req Request, stream bool) (anthropicRequest, error) {
 		wire.MaxTokens = defaultAnthropicMaxTokens
 	}
 
+	stableMessageIndex := -1
 	for _, msg := range msgs {
 		switch msg.Role {
 		case "system":
@@ -157,23 +158,38 @@ func newAnthropicRequest(req Request, stream bool) (anthropicRequest, error) {
 			if err != nil {
 				return anthropicRequest{}, err
 			}
-			wire.System = append(wire.System, blocks...)
+			if msg.Transient {
+				raw := make([]json.RawMessage, 0, len(blocks))
+				for _, block := range blocks {
+					encoded, err := marshalAnthropicBlock(block)
+					if err != nil {
+						return anthropicRequest{}, err
+					}
+					raw = append(raw, encoded)
+				}
+				appendAnthropicTransientMessage(&wire.Messages, raw)
+			} else {
+				wire.System = append(wire.System, blocks...)
+			}
 		case "user":
 			blocks, err := anthropicUserBlocks(msg)
 			if err != nil {
 				return anthropicRequest{}, err
 			}
 			appendAnthropicMessage(&wire.Messages, "user", blocks)
+			stableMessageIndex = len(wire.Messages) - 1
 		case "assistant":
 			blocks, err := anthropicAssistantBlocks(msg)
 			if err != nil {
 				return anthropicRequest{}, err
 			}
 			appendAnthropicMessage(&wire.Messages, "assistant", blocks)
+			stableMessageIndex = len(wire.Messages) - 1
 		case "tool":
 			if err := appendAnthropicToolResult(&wire.Messages, msg); err != nil {
 				return anthropicRequest{}, err
 			}
+			stableMessageIndex = len(wire.Messages) - 1
 		default:
 			return anthropicRequest{}, fmt.Errorf("models: anthropic cannot translate message role %q", msg.Role)
 		}
@@ -188,8 +204,15 @@ func newAnthropicRequest(req Request, stream bool) (anthropicRequest, error) {
 		return anthropicRequest{}, err
 	}
 	wire.Thinking, wire.OutputConfig = anthropicReasoningRequest(req)
-	applyAnthropicCachePolicy(&wire)
+	applyAnthropicCachePolicy(&wire, stableMessageIndex)
 	return wire, nil
+}
+
+func appendAnthropicTransientMessage(messages *[]anthropicMessage, blocks []json.RawMessage) {
+	if len(blocks) == 0 {
+		return
+	}
+	*messages = append(*messages, anthropicMessage{Role: "user", Content: blocks})
 }
 
 func anthropicSystemBlocks(msg Message) ([]anthropicBlock, error) {
@@ -423,7 +446,7 @@ func anthropicReasoningRequest(req Request) (*anthropicThinking, *anthropicOutpu
 	return anthropicReasoning(effort)
 }
 
-func applyAnthropicCachePolicy(req *anthropicRequest) {
+func applyAnthropicCachePolicy(req *anthropicRequest, stableMessageIndex int) {
 	// Tools and the first system block are the stable prompt prefix in the
 	// ghg. Per-round todo/summary/output blocks are appended later and
 	// intentionally remain after these breakpoints. The final conversation
@@ -434,13 +457,9 @@ func applyAnthropicCachePolicy(req *anthropicRequest) {
 	if len(req.System) > 0 {
 		req.System[0].CacheControl = &anthropicCacheControl{Type: "ephemeral"}
 	}
-	for i := len(req.Messages) - 1; i >= 0; i-- {
-		if len(req.Messages[i].Content) == 0 {
-			continue
-		}
-		last := &req.Messages[i].Content
+	if stableMessageIndex >= 0 && stableMessageIndex < len(req.Messages) && len(req.Messages[stableMessageIndex].Content) > 0 {
+		last := &req.Messages[stableMessageIndex].Content
 		(*last)[len(*last)-1] = addAnthropicCacheControl((*last)[len(*last)-1])
-		break
 	}
 }
 
@@ -537,7 +556,7 @@ func (c *AnthropicClient) stream(ctx context.Context, req Request, sink EventSin
 			return msg, usage, nil
 		}
 		last = err
-		replayReasoning := isHTTP2GoAway(err) && !textEmitted
+		replayReasoning := isHTTP2Replayable(err) && !textEmitted
 		if (emitted && !replayReasoning) || !retryable(err) {
 			break
 		}

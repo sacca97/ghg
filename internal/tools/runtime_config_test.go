@@ -322,14 +322,22 @@ func containsPath(paths []string, want string) bool {
 	return false
 }
 
-func TestCachedGoTestStaysWithinTheRoutinePolicy(t *testing.T) {
+func TestRoutineCommandsStayWithinTheRoutinePolicy(t *testing.T) {
 	runtime, workspace := testRuntime(t, ApprovalNever)
-	policy, covered, err := runtime.authorizeCommand(context.Background(), "bash", "go test ./...", workspace)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if covered || policy != runtime.Policy {
-		t.Fatalf("cached go test policy=%p covered=%v, want session policy and no approval", policy, covered)
+	for _, command := range []string{
+		"go test ./...",
+		"git diff",
+		`cd /home/sacca/Projects/ghg && sed -n '1,120p' internal/agent/plan.go && echo ====== && grep -rn 'PlanDelta\\|plan_delta\\|OnPlanDelta' internal/agent/*.go cmd/ghg/run.go | head -40`,
+		`cd /home/sacca/Projects/ghg && grep -rn "updated_at\|\"title\"\|json:\"id\"" internal/session/*.go cmd/ghg/sessions.go 2>/dev/null | head -20; echo "-----"; ls cmd/ghg | head -40`,
+		`cd /home/sacca/Projects/ghg && grep -rn "case \"/model\"" -A 40 internal/tui/commands_models.go 2>/dev/null | head -60 || grep -rln "\"/model\"" internal/tui`,
+	} {
+		policy, covered, err := runtime.authorizeCommand(context.Background(), "bash", command, workspace)
+		if err != nil {
+			t.Fatalf("%q: %v", command, err)
+		}
+		if !covered || policy != runtime.Policy {
+			t.Fatalf("%q: policy=%p covered=%v, want session policy and no approval", command, policy, covered)
+		}
 	}
 }
 

@@ -365,6 +365,35 @@ func TestTranscriptSelectionUsesDisplayCells(t *testing.T) {
 	}
 }
 
+func TestTranscriptSelectionSurvivesWheelScroll(t *testing.T) {
+	m := compactCmdModel()
+	m.Update(mkWinSize(80, 20))
+	for i := 0; i < 40; i++ {
+		m.appendAssistant(fmt.Sprintf("transcript line %d", i))
+	}
+	m.vp.GotoBottom()
+	m.refreshVP()
+
+	y := transcriptTopRows + 2
+	tm, _ := m.Update(tea.MouseMsg{Action: tea.MouseActionPress, Button: tea.MouseButtonLeft, X: 0, Y: y})
+	m = tm.(*model)
+	tm, _ = m.Update(tea.MouseMsg{Action: tea.MouseActionMotion, Button: tea.MouseButtonLeft, X: 8, Y: y})
+	m = tm.(*model)
+	before := m.selectedText()
+	if before == "" {
+		t.Fatal("setup: expected a non-empty selection")
+	}
+
+	tm, _ = m.Update(tea.MouseMsg{Action: tea.MouseActionPress, Button: tea.MouseButtonWheelUp, X: 40, Y: y})
+	m = tm.(*model)
+	if m.selection == nil || !m.selection.hasRange() {
+		t.Fatal("wheel scrolling must preserve the active selection")
+	}
+	if got := m.selectedText(); got != before {
+		t.Fatalf("wheel scrolling changed the logical selection: got %q, want %q", got, before)
+	}
+}
+
 // A drag over a tool row is a selection, not a click. Only a stationary
 // release toggles the tool block.
 func TestTranscriptDragDoesNotToggleTool(t *testing.T) {

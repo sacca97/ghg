@@ -153,6 +153,23 @@ func TestReadBatchesIndependentRanges(t *testing.T) {
 	}
 }
 
+func TestReadRangesWinOverLegacyFields(t *testing.T) {
+	dir := t.TempDir()
+	first := filepath.Join(dir, "first.go")
+	second := filepath.Join(dir, "second.go")
+	if err := os.WriteFile(first, []byte("package first\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(second, []byte("package second\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	args := fmt.Sprintf(`{"path":%q,"offset":1,"limit":1,"ranges":[{"path":%q},{"path":%q}]}`, first, first, second)
+	result := ExecuteResult(context.Background(), All(), "read", json.RawMessage(args))
+	if result.ExitCode != 0 || result.Metadata["observation_count"] != "2" {
+		t.Fatalf("mixed legacy and batched read = %+v", result)
+	}
+}
+
 func TestReadBatchKeepsSuccessfulSiblingsWhenOneRangeFails(t *testing.T) {
 	dir := t.TempDir()
 	first := writeSearchFile(t, dir, "first.go", "package first\n")

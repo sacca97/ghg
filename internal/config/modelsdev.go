@@ -14,10 +14,10 @@ import (
 )
 
 const (
-	modelsDevAPIURL = "https://models.opencode.ai/api.json"
+	modelsDevAPIURL = "https://models.dev/api.json"
 	// Bump when the cache shape or matching rules change so an existing cache
 	// is rebuilt with the exact provider/model IDs from models.dev.
-	modelsDevCacheVersion = 5
+	modelsDevCacheVersion = 6
 	modelsDevCacheTTL     = 24 * time.Hour
 	// The current models.dev catalog is small, but keep a hard ceiling so a
 	// broken endpoint cannot make a TUI startup retain an unbounded response.
@@ -35,10 +35,9 @@ type ModelsDevReasoning struct {
 	Toggle  bool     `json:"toggle,omitempty"`
 }
 
-// ModelsDevCache contains the model metadata fetched from models.dev. The
-// complete upstream catalog is intentionally not retained: ghg only needs
-// this provider/model mapping for the status bar, compaction, and reasoning
-// effort picker.
+// ModelsDevCache contains the model metadata fetched from models.dev. It keeps
+// model IDs as zero-valued context entries too, so the catalog can seed a
+// provider whose own /models endpoint is unavailable.
 type ModelsDevCache struct {
 	Version   int                                      `json:"version,omitempty"`
 	FetchedAt time.Time                                `json:"fetchedAt"`
@@ -157,6 +156,36 @@ func (c ModelsDevCache) HasModel(modelID string) bool {
 	return false
 }
 
+// ModelIDs returns the models advertised by the exact provider IDs supplied by
+// the profile. Provider IDs are not merged here: the caller may use a
+// provider-specific model list without guessing across ambiguous providers.
+func (c ModelsDevCache) ModelIDs(providerIDs ...string) []string {
+	seenProviders := make(map[string]struct{}, len(providerIDs))
+	seenModels := make(map[string]struct{})
+	for _, providerID := range providerIDs {
+		providerID = strings.TrimSpace(providerID)
+		if providerID == "" {
+			continue
+		}
+		if _, ok := seenProviders[providerID]; ok {
+			continue
+		}
+		seenProviders[providerID] = struct{}{}
+		for modelID := range c.Providers[providerID] {
+			seenModels[modelID] = struct{}{}
+		}
+		for modelID := range c.Reasoning[providerID] {
+			seenModels[modelID] = struct{}{}
+		}
+	}
+	ids := make([]string, 0, len(seenModels))
+	for modelID := range seenModels {
+		ids = append(ids, modelID)
+	}
+	slices.Sort(ids)
+	return ids
+}
+
 func cloneModelsDevReasoning(info ModelsDevReasoning) ModelsDevReasoning {
 	info.Efforts = append([]string(nil), info.Efforts...)
 	return info
@@ -265,12 +294,10 @@ func parseModelsDev(data []byte, wanted map[string]struct{}) (ModelsDevCache, er
 				continue
 			}
 			for _, id := range ids {
-				if model.Limit.Context > 0 {
-					if cache.Providers[providerID] == nil {
-						cache.Providers[providerID] = map[string]int{}
-					}
-					cache.Providers[providerID][id] = model.Limit.Context
+				if cache.Providers[providerID] == nil {
+					cache.Providers[providerID] = map[string]int{}
 				}
+				cache.Providers[providerID][id] = model.Limit.Context
 				if cache.Reasoning[providerID] == nil {
 					cache.Reasoning[providerID] = map[string]ModelsDevReasoning{}
 				}
@@ -289,7 +316,7 @@ func parseModelsDev(data []byte, wanted map[string]struct{}) (ModelsDevCache, er
 }
 
 func wantedModelIDs(wanted map[string]struct{}, ids ...string) []string {
-	if len(wanted) == 0 {
+	if wanted != nil && len(wanted) == 0 {
 		return nil
 	}
 	out := make([]string, 0, len(ids))
@@ -299,8 +326,10 @@ func wantedModelIDs(wanted map[string]struct{}, ids ...string) []string {
 		if id == "" {
 			continue
 		}
-		if _, ok := wanted[id]; !ok {
-			continue
+		if wanted != nil {
+			if _, ok := wanted[id]; !ok {
+				continue
+			}
 		}
 		if _, ok := seen[id]; ok {
 			continue
@@ -335,9 +364,9 @@ func normalizeModelsDevReasoning(options []modelsDevReasoningOption) ModelsDevRe
 	return out
 }
 
-// FetchModelsDev retrieves and normalizes the wanted models from the public
-// models.dev catalog. The caller owns the timeout through ctx; the TUI uses a
-// ten-second deadline.
+// FetchModelsDev retrieves and normalizes the public models.dev catalog. A
+// non-nil wanted set retains only those model IDs; nil retains all IDs so a
+// refresh can seed provider catalogs before any local model cache exists.
 func FetchModelsDev(ctx context.Context, wanted map[string]struct{}) (ModelsDevCache, error) {
 	return fetchModelsDev(ctx, http.DefaultClient, modelsDevAPIURL, wanted)
 }

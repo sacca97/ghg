@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/x/ansi"
@@ -167,6 +168,11 @@ func (m *model) paletteItems() []paletteItem {
 			},
 			stepBack: func(m *model) { m.setEffort(prevEffort(m.effortsFor(), m.currentEffort())) },
 			stepFwd:  func(m *model) { m.setEffort(nextEffort(m.effortsFor(), m.currentEffort())) }},
+		{title: "Dynamic reasoning", category: "Agent",
+			dynDesc:  func(m *model) string { return slashHint(m, "/dynamic-reasoning") },
+			dynHint:  func(m *model) string { return "/dynamic-reasoning" },
+			stepBack: func(m *model) { m.setDynamicReasoning(false) },
+			stepFwd:  func(m *model) { m.setDynamicReasoning(true) }},
 		{title: "Plan", category: "Agent", suggested: true,
 			dynDesc: func(m *model) string { return slashHint(m, "/plan") },
 			dynHint: func(m *model) string { return "/plan <goal>" },
@@ -258,7 +264,7 @@ func (m *model) paletteItems() []paletteItem {
 		{title: "Goal", category: "Session",
 			dynDesc: func(m *model) string {
 				if g := m.currentGoal(); g == "" {
-					return fmt.Sprintf("keep working until the goal is met (max %d rounds)", m.goalMaxRounds())
+					return "keep working until the goal is met (unbounded)"
 				} else {
 					return truncLine(g, 40)
 				}
@@ -453,7 +459,8 @@ func (m *model) paletteKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.activatePaletteSelection()
 	case tea.KeyBackspace, tea.KeyDelete:
 		if len(p.filter) > 0 {
-			p.filter = p.filter[:len(p.filter)-1]
+			_, size := utf8.DecodeLastRuneInString(p.filter)
+			p.filter = p.filter[:len(p.filter)-size]
 			p.applyFilter(m)
 		}
 	case tea.KeyRunes:
@@ -756,6 +763,12 @@ func (m *model) panelKey(msg tea.KeyMsg, pp *ppanel) (tea.Model, tea.Cmd) {
 		}
 
 	case panelEffort:
+		if len(pp.levels) == 0 {
+			if msg.Type == tea.KeyEsc || msg.Type == tea.KeyCtrlC {
+				pop()
+			}
+			break
+		}
 		switch msg.Type {
 		case tea.KeyEsc, tea.KeyCtrlC:
 			pop()
@@ -801,7 +814,7 @@ func (m *model) previewModel(it modelItem) {
 	if err == nil {
 		m.modelName, m.provName, m.modelID = route.ModelName, route.ProviderName, route.APIID
 		m.role, m.contextLimit = route.Role, route.ContextLimit
-		m.effort = m.maxEffort()
+		m.effort = route.Effort
 		m.modelSlotW = m.statusModelSlotWidth()
 	}
 }
@@ -1012,6 +1025,8 @@ func paletteState(m *model, it paletteItem) string {
 	switch it.title {
 	case "Reasoning effort":
 		return dimStyle.Render("  [" + effortLabel(m.currentEffort()) + "]")
+	case "Dynamic reasoning":
+		return dimStyle.Render("  [" + onOff(m.dynamicReasoningEnabled()) + "]")
 	case "Thinking timer":
 		return dimStyle.Render("  [" + onOff(m.showThinking) + "]")
 	case "Goal":
@@ -1136,7 +1151,7 @@ func (m *model) panelContent(pp *ppanel) (rows []string, selected int, footer []
 
 	case panelGoal:
 		rows = []string{" " + youStyle.Render("❯ ") + pp.prepare + dimStyle.Render("█")}
-		footer = []string{"", dimStyle.Render(fmt.Sprintf("  type the goal · empty clears · enter/esc apply · max %d rounds (/goal rounds)", m.goalMaxRounds()))}
+		footer = []string{"", dimStyle.Render("  type the goal · empty clears · enter/esc apply · unbounded")}
 	}
 	return rows, selected, footer
 }

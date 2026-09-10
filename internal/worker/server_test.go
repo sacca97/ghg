@@ -20,6 +20,15 @@ type testHandler struct {
 	onAttached   func()
 }
 
+type oversizedResponseHandler struct {
+	testHandler
+	payload json.RawMessage
+}
+
+func (h *oversizedResponseHandler) Command(_ context.Context, _ Command) (CommandResult, error) {
+	return CommandResult{Payload: h.payload}, nil
+}
+
 func (h *testHandler) Snapshot(context.Context) (any, error) {
 	return map[string]string{"state": "running"}, nil
 }
@@ -84,13 +93,12 @@ func TestServerAttachControllerAndDetach(t *testing.T) {
 	}
 
 	second, err := Dial(context.Background(), rt)
-	if err != nil {
-		t.Fatal(err)
+	if err == nil || !strings.Contains(err.Error(), "worker already has a controlling client") {
+		if second != nil {
+			second.Close()
+		}
+		t.Fatalf("second controller error = %v, want already controlled", err)
 	}
-	if frame := nextFrame(t, second); frame.Type != TypeAlreadyControlled {
-		t.Fatalf("second controller frame = %+v, want already controlled", frame)
-	}
-	second.Close()
 
 	if _, err := server.Publish("text", map[string]string{"value": "hello"}, true); err != nil {
 		t.Fatal(err)
@@ -183,5 +191,44 @@ func TestWriteErrorWithDeadlineTimesOutOnUnreadConn(t *testing.T) {
 	}
 	if elapsed < 800*time.Millisecond || elapsed > 3*time.Second {
 		t.Fatalf("expected write error to time out around 1s, took %v", elapsed)
+	}
+}
+
+func TestClearControllerNotifiesOnlyOnce(t *testing.T) {
+	h := &testHandler{disconnected: make(chan bool, 2)}
+	s := &Server{handler: h}
+	p := newPeer(nil)
+	s.controller = p
+
+	s.clearController(p, false)
+	s.clearController(p, false)
+
+	if got := len(h.disconnected); got != 1 {
+		t.Fatalf("disconnect notifications = %d, want 1", got)
+	}
+}
+
+func TestOversizedCommandResponseBecomesErrorFrame(t *testing.T) {
+	h := &oversizedResponseHandler{
+		testHandler: testHandler{disconnected: make(chan bool, 1)},
+		payload:     json.RawMessage(`"` + strings.Repeat("x", MaxFrameBytes) + `"`),
+	}
+	s := &Server{
+		runtime:  Runtime{SessionID: "s1"},
+		handler:  h,
+		requests: make(map[string]Frame),
+	}
+	p := newPeer(nil)
+	s.handleCommand(p, Frame{
+		Version:   ProtocolVersion,
+		SessionID: "s1",
+		Type:      TypeCommand,
+		RequestID: "req-1",
+		Payload:   mustPayload(CommandRequest{Name: CommandPing}),
+	})
+
+	response := <-p.send
+	if response.frame.Type != TypeError || response.frame.RequestID != "req-1" {
+		t.Fatalf("response = %+v, want request-correlated error", response.frame)
 	}
 }

@@ -3,6 +3,8 @@ package agent
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,15 +25,13 @@ const reviewModePrompt = `You are reviewing in a read-only collaboration mode. I
 
 Report only actionable, evidence-backed findings. Order findings by severity and expected impact. Distinguish confirmed defects from opportunities that require measurement. Do not invent findings to fill categories. If no material problems are found, say so in the summary and submit an empty findings list.
 
-Before submitting, sample every area explicitly requested by the user. If the hard limit prevents that, disclose the unreviewed area in the summary.
+Budget is an estimate; sufficient semantic coverage is the completion criterion, not line-by-line completeness. Broad reviews may extend when meaningful requested areas remain unreviewed. Focused reviews should extend mainly when unresolved evidence could change a finding. Do not extend merely because the remaining code is unread if it adds no meaningful semantic coverage; disclose any material requested area that remains unreviewed in the summary.
 
 When finished, call submit_review exactly once. Do not implement fixes or return an implementation plan.
 
-The first request includes a deterministic <review_preflight> inventory with the authoritative scope and file list. Start from it; do not call glob or find_files to rediscover the scope. Use read.ranges as the default shape even for one range. Never construct or infer an opaque pagination cursor: pass cursor only when that same tool explicitly returned one, copied exactly.
+The first request includes a deterministic <review_preflight> inventory with the authoritative scope and file list. Use it as scope context and choose the currently exposed read-only tools that best answer the remaining questions.
 
-For files over 500 lines, locate the relevant symbol or range with structural_search, lsp, or grep before reading. Do not paginate sequentially through an entire large file; if broad inspection is genuinely necessary, batch independent ranges in one read.ranges call.
-
-At a review budget checkpoint, either call request_review_extension with one unresolved issue, the evidence that would resolve it, and the exact remaining lookup, or use one final evidence batch. After that batch, only submit_review is available.`
+At a review budget checkpoint, either call request_review_extension with reason (incomplete_coverage or unresolved_finding), one meaningful remaining area, one concise sentence explaining why it matters, and the exact remaining lookup, or use one final evidence batch. Do not request an extension merely because some lines remain unread. After that batch, only submit_review is available.`
 
 type reviewContinuation struct {
 	target            string
@@ -41,14 +41,11 @@ type reviewContinuation struct {
 }
 
 const (
-	defaultReviewBudget      = 4
-	minReviewBudget          = 5
-	maxReviewBudget          = 24
-	reviewExplorationHardMax = 38
-	reviewLeaseRounds        = 4
-	maxReviewInventoryFiles  = 4096
-	maxReviewInventoryBytes  = 32 << 20
-	maxReviewFocusFiles      = 5
+	defaultReviewBudget     = 4
+	minReviewBudget         = 5
+	maxReviewInventoryFiles = 4096
+	maxReviewInventoryBytes = 32 << 20
+	maxReviewFocusFiles     = 5
 )
 
 // ReviewInventory is the bounded, deterministic scope summary used to size a
@@ -81,6 +78,7 @@ type ReviewBudget struct {
 	Allocation     int
 	CurrentRound   int
 	HardLimit      int
+	TargetHash     string
 	Focus          []string
 	Rationale      string
 	Inventory      ReviewInventory
@@ -90,6 +88,7 @@ type ReviewBudget struct {
 // ReviewProgress is emitted for the TUI and headless telemetry. The payload
 // is deliberately small and safe to send over the worker wire.
 type ReviewProgress struct {
+	TargetHash     string           `json:"target_hash,omitempty"`
 	Phase          string           `json:"phase"`
 	CurrentRound   int              `json:"current_round"`
 	Allocation     int              `json:"allocation"`
@@ -103,11 +102,115 @@ type ReviewProgress struct {
 	ToAllocation   int              `json:"to_allocation,omitempty"`
 }
 
+// RestoreReviewContinuation rebuilds an interrupted review from its persisted
+// progress events. A worker restart must not turn an existing review into a
+// fresh lease with a fresh tool budget.
+func (a *Agent) RestoreReviewContinuation(target string, progress []ReviewProgress) bool {
+	if a == nil || strings.TrimSpace(target) == "" || len(progress) == 0 {
+		return false
+	}
+	targetHash := reviewTargetHash(target)
+	var budget ReviewBudget
+	phase := ""
+	seen := false
+	for _, value := range progress {
+		// Progress without an identity predates resumable reviews. Do not
+		// attach it to a later prompt: stale telemetry is safer to discard than
+		// to resume under the wrong user request.
+		if value.TargetHash != targetHash {
+			continue
+		}
+		// This is an informational event emitted when an in-memory continuation
+		// resumes; it must not erase the durable phase that preceded it.
+		if value.Reason == "resumed" {
+			continue
+		}
+		seen = true
+		phase = value.Phase
+		if value.Baseline > 0 {
+			budget.Baseline = value.Baseline
+		}
+		if value.Allocation > 0 {
+			budget.Allocation = value.Allocation
+		}
+		if value.CurrentRound >= 0 {
+			budget.CurrentRound = value.CurrentRound
+		}
+		if value.HardLimit > 0 {
+			budget.HardLimit = value.HardLimit
+		}
+		if value.Inventory != nil {
+			budget.Inventory = *value.Inventory
+		}
+		if value.Focus != nil {
+			budget.Focus = append([]string(nil), value.Focus...)
+		}
+		if value.Rationale != "" {
+			budget.Rationale = value.Rationale
+		}
+	}
+	if !seen || phase == "completed" {
+		return false
+	}
+	if (phase == "final_evidence" || phase == "exploration_closed") && a.reviewWasAcceptedAfterLatestPrompt() {
+		return false
+	}
+	if budget.Baseline <= 0 {
+		budget.Baseline = defaultReviewBudget
+	}
+	if budget.Allocation <= 0 {
+		budget.Allocation = budget.Baseline
+	}
+	if budget.HardLimit <= 0 {
+		budget.HardLimit = 2 * max(budget.Baseline, minReviewBudget)
+	}
+	budget.TargetHash = targetHash
+	a.reviewContinuation = &reviewContinuation{
+		target:            target,
+		budget:            &budget,
+		checkpointPending: phase == "budget_boundary",
+		closed:            phase == "final_evidence" || phase == "exploration_closed",
+	}
+	return true
+}
+
+func reviewTargetHash(target string) string {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(target)))
+	return hex.EncodeToString(sum[:])
+}
+
+func (a *Agent) reviewWasAcceptedAfterLatestPrompt() bool {
+	messages := a.MessagesSnapshot()
+	start := 0
+	for i := len(messages) - 1; i >= 0; i-- {
+		if messages[i].Role == "user" && messages[i].Authored {
+			start = i + 1
+			break
+		}
+	}
+	for _, message := range messages[start:] {
+		if message.Role == "tool" && message.Name == "submit_review" && strings.TrimSpace(message.Content) == "Review accepted." {
+			return true
+		}
+	}
+	return false
+}
+
 type reviewExtensionRequest struct {
+	Reason          string `json:"reason"`
+	RemainingArea   string `json:"remaining_area"`
+	WhyItMatters    string `json:"why_it_matters"`
+	RemainingLookup string `json:"remaining_lookup"`
+
+	// Legacy fields keep persisted requests and older model responses readable.
 	UnresolvedIssue string `json:"unresolved_issue"`
 	Evidence        string `json:"evidence"`
-	RemainingLookup string `json:"remaining_lookup"`
 	Rounds          int    `json:"rounds"`
+}
+
+func (r reviewExtensionRequest) displayReason() string {
+	label := strings.ReplaceAll(strings.TrimSpace(r.Reason), "_", " ")
+	return fmt.Sprintf("%s: %s — %s", label, r.RemainingArea, r.WhyItMatters)
 }
 
 // reviewInventoryAt resolves only existing paths below workspace. A review
@@ -511,9 +614,11 @@ func reviewBudgetBaseline(target string, inventory ReviewInventory) int {
 		largeBonus = 2
 	}
 	budget += largeBonus
-	if inventory.Partial {
-		budget = maxReviewBudget
+	fileCount := len(inventory.Files)
+	if fileCount == 0 {
+		fileCount = inventory.ProductionFiles + inventory.TestFiles
 	}
+	budget = max(budget, fileCount)
 	return clampReviewBudget(budget)
 }
 
@@ -550,17 +655,15 @@ func clampReviewBudget(value int) int {
 	if value < minReviewBudget {
 		return minReviewBudget
 	}
-	if value > maxReviewBudget {
-		return maxReviewBudget
-	}
 	return value
 }
 
-func reviewExtensionAllocation(current, hardLimit int) int {
+func reviewExtensionAllocation(current, hardLimit, baseline int) int {
 	if current >= hardLimit {
 		return 0
 	}
-	return min(reviewLeaseRounds, hardLimit-current)
+	grant := reviewCeilDiv(max(baseline, 1), 4)
+	return min(max(grant, 1), hardLimit-current)
 }
 
 func reviewWorkspace(a *Agent) string {
@@ -582,8 +685,9 @@ func (a *Agent) newReviewBudget(_ context.Context, target string, ev Events) *Re
 	baseline := reviewBudgetBaseline(target, inventory)
 	focus := append([]string(nil), inventory.LargestFiles...)
 	budget := &ReviewBudget{
-		Baseline: baseline, Allocation: baseline, HardLimit: reviewExplorationHardMax,
-		Focus: focus, Inventory: inventory,
+		Baseline: baseline, Allocation: baseline, HardLimit: 2 * baseline,
+		TargetHash: reviewTargetHash(target),
+		Focus:      focus, Inventory: inventory,
 		Rationale: fmt.Sprintf("deterministic scope baseline: %d production files, %d production LOC, %d large files", inventory.ProductionFiles, inventory.ProductionLOC, len(inventory.LargeFiles)),
 	}
 	a.emitReviewProgress(ev, budget, "inventory", "")
@@ -613,7 +717,8 @@ func (a *Agent) emitReviewProgress(ev Events, budget *ReviewBudget, phase, reaso
 		inventory = &copyInventory
 	}
 	progress := ReviewProgress{
-		Phase: phase, CurrentRound: budget.CurrentRound, Allocation: budget.Allocation,
+		TargetHash: budget.TargetHash,
+		Phase:      phase, CurrentRound: budget.CurrentRound, Allocation: budget.Allocation,
 		HardLimit: budget.HardLimit, Baseline: budget.Baseline,
 		Inventory: inventory, Focus: append([]string(nil), budget.Focus...), Rationale: budget.Rationale, Reason: reason,
 	}
@@ -627,8 +732,9 @@ func reviewPreflightPrompt(budget *ReviewBudget) string {
 	inventory := budget.Inventory
 	var b strings.Builder
 	b.WriteString("<review_preflight>\n")
-	b.WriteString("This deterministic inventory is authoritative for the review scope. Do not use glob or find_files to rediscover these files; inspect the listed paths directly.\n")
-	fmt.Fprintf(&b, "scope: %s\nproduction files: %d\ntest files: %d\nproduction LOC: %d\nallocated exploration rounds: %d\nhard limit: %d\n", strings.Join(inventory.Scope, ", "), inventory.ProductionFiles, inventory.TestFiles, inventory.ProductionLOC, budget.Allocation, budget.HardLimit)
+	b.WriteString("This deterministic inventory is authoritative for the review scope. Treat it as scope context; it does not prescribe an inspection workflow.\n")
+	b.WriteString("review policy: budget is an estimate; finish when semantic coverage is sufficient, not when every line is read.\n")
+	fmt.Fprintf(&b, "scope: %s\nproduction files: %d\ntest files: %d\nproduction LOC: %d\n", strings.Join(inventory.Scope, ", "), inventory.ProductionFiles, inventory.TestFiles, inventory.ProductionLOC)
 	if inventory.Partial {
 		b.WriteString("inventory: partial; the scope ceiling was reached\n")
 	}
@@ -665,7 +771,8 @@ func (a *Agent) emitReviewExtensionProgress(ev Events, budget *ReviewBudget, fro
 		return
 	}
 	ev.OnReviewProgress(ReviewProgress{
-		Phase: "extension", CurrentRound: budget.CurrentRound, Allocation: budget.Allocation,
+		TargetHash: budget.TargetHash,
+		Phase:      "extension", CurrentRound: budget.CurrentRound, Allocation: budget.Allocation,
 		HardLimit: budget.HardLimit, Baseline: budget.Baseline,
 		Focus: append([]string(nil), budget.Focus...), Rationale: budget.Rationale, Reason: reason,
 		FromAllocation: from, ToAllocation: to,
@@ -679,7 +786,7 @@ func reviewBudgetCheckpointReminder(budget *ReviewBudget) string {
 	if budget.Allocation >= budget.HardLimit {
 		return fmt.Sprintf("<review_budget_checkpoint>\nYou have completed %d review exploration rounds, the absolute limit. Synthesis is mandatory now; disclose any explicitly requested area that remains unreviewed in the summary. Do not request an extension. Use one final evidence batch if one bounded lookup remains, or call submit_review.\n</review_budget_checkpoint>", budget.CurrentRound)
 	}
-	return fmt.Sprintf("<review_budget_checkpoint>\nYou have completed %d of %d allocated review exploration rounds (absolute limit %d). The pending navigation calls were withheld. Either call request_review_extension exactly once with one concrete unresolved issue, evidence already gathered, and the exact remaining lookup, or use one final evidence batch. An explicitly requested but untouched area, such as frontend, backend, desktop, authentication, or UI, is a valid reason for an extension; name that area and the next files or entry points you will inspect. Use the final evidence batch only for one narrow confirmation after requested areas have been sampled; it does not replace missing requested coverage. After that batch, only submit_review is available.\n</review_budget_checkpoint>", budget.CurrentRound, budget.Allocation, budget.HardLimit)
+	return fmt.Sprintf("<review_budget_checkpoint>\nYou have completed %d of %d allocated review exploration rounds (absolute limit %d). Budget is an estimate; sufficient semantic coverage is the completion criterion. For a broad review, request an extension when a meaningful requested area remains unreviewed. For a focused review, request one mainly when unresolved evidence could change a finding. Do not extend merely for line-by-line completeness when the remaining code adds no meaningful semantic coverage. If requesting one, call request_review_extension exactly once with reason (incomplete_coverage or unresolved_finding), one meaningful remaining area, one concise why_it_matters sentence, and the exact remaining lookup; otherwise use one final evidence batch. An explicitly requested but material area may justify an extension when you name the area and next files or entry points. The final evidence batch is only for one narrow confirmation after requested areas have been sampled; it does not replace missing meaningful coverage. After that batch, only submit_review is available.\n</review_budget_checkpoint>", budget.CurrentRound, budget.Allocation, budget.HardLimit)
 }
 
 // ReviewFinding describes one structured issue or observation in a code review.
@@ -698,6 +805,46 @@ type Review struct {
 	Verdict         string          `json:"verdict"` // "approve" | "request_changes" | "comment"
 	Findings        []ReviewFinding `json:"findings"`
 	ChecksPerformed []string        `json:"checks_performed,omitempty"`
+}
+
+// UnmarshalJSON accepts the two encodings emitted by review models for the
+// optional checks list: an array, or a JSON string containing that array.
+// Keeping this normalization on Review avoids a general-purpose JSON repair
+// path and leaves Validate responsible for the existing content limits.
+func (r *Review) UnmarshalJSON(data []byte) error {
+	type reviewWire struct {
+		Summary         string          `json:"summary"`
+		Verdict         string          `json:"verdict"`
+		Findings        []ReviewFinding `json:"findings"`
+		ChecksPerformed json.RawMessage `json:"checks_performed"`
+	}
+	var wire reviewWire
+	if err := json.Unmarshal(data, &wire); err != nil {
+		return err
+	}
+	*r = Review{Summary: wire.Summary, Verdict: wire.Verdict, Findings: wire.Findings}
+	raw := bytes.TrimSpace(wire.ChecksPerformed)
+	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
+		return nil
+	}
+	var checks []string
+	if raw[0] == '"' {
+		var encoded string
+		if err := json.Unmarshal(raw, &encoded); err != nil {
+			return fmt.Errorf("checks_performed must be an array or JSON-encoded array: %w", err)
+		}
+		encodedJSON := bytes.TrimSpace([]byte(encoded))
+		if len(encodedJSON) == 0 || encodedJSON[0] != '[' {
+			return errors.New("checks_performed string is not a JSON array")
+		}
+		if err := json.Unmarshal(encodedJSON, &checks); err != nil {
+			return fmt.Errorf("checks_performed string is not a JSON array: %w", err)
+		}
+	} else if err := json.Unmarshal(raw, &checks); err != nil {
+		return fmt.Errorf("checks_performed must contain only strings: %w", err)
+	}
+	r.ChecksPerformed = checks
+	return nil
 }
 
 const (
@@ -791,7 +938,7 @@ func submitReviewTool() tools.Tool {
 	return tools.Tool{
 		Def: models.NewTool("submit_review",
 			"Submit the validated code review. This is the reviewer's terminal tool; call it once when inspection is complete.",
-			`{"type":"object","properties":{"summary":{"type":"string","description":"Executive summary of the review"},"verdict":{"type":"string","enum":["approve","request_changes","comment"],"description":"Review verdict"},"findings":{"type":"array","description":"Structured findings","items":{"type":"object","properties":{"title":{"type":"string"},"severity":{"type":"string","enum":["critical","high","medium","low","info"]},"file":{"type":"string"},"line":{"type":"integer"},"evidence":{"type":"string"},"recommendation":{"type":"string"}},"required":["title","severity"]}},"checks_performed":{"type":"array","items":{"type":"string"}}},"required":["summary","verdict","findings"]}`),
+			`{"type":"object","properties":{"summary":{"type":"string","description":"Executive summary of the review"},"verdict":{"type":"string","enum":["approve","request_changes","comment"],"description":"Review verdict"},"findings":{"type":"array","description":"Structured findings","items":{"type":"object","properties":{"title":{"type":"string"},"severity":{"type":"string","enum":["critical","high","medium","low","info"]},"file":{"type":"string"},"line":{"type":"integer"},"evidence":{"type":"string"},"recommendation":{"type":"string"}},"required":["title","severity"]}},"checks_performed":{"oneOf":[{"type":"array","items":{"type":"string"}},{"type":"string","description":"JSON-encoded array of check strings"}]}},"required":["summary","verdict","findings"]}`),
 		Run: func(_ context.Context, args json.RawMessage) (string, error) {
 			if _, err := ParseReview(string(args)); err != nil {
 				return "", err
@@ -804,8 +951,8 @@ func submitReviewTool() tools.Tool {
 func requestReviewExtensionTool() tools.Tool {
 	return tools.Tool{
 		Def: models.NewTool("request_review_extension",
-			"At a review budget checkpoint, request up to four more exploration rounds. Name the unresolved issue, evidence needed, and exact remaining lookup.",
-			`{"type":"object","properties":{"unresolved_issue":{"type":"string"},"evidence":{"type":"string"},"remaining_lookup":{"type":"string"},"rounds":{"type":"integer","minimum":1,"maximum":4}},"required":["unresolved_issue","evidence","remaining_lookup","rounds"],"additionalProperties":false}`),
+			"At a review budget checkpoint, request the next exploration lease of one quarter of the initial review allocation, capped by the absolute limit. Give a meaningful remaining area, why it matters, and the exact lookup; unread lines alone are not sufficient.",
+			`{"type":"object","properties":{"reason":{"type":"string","enum":["incomplete_coverage","unresolved_finding"]},"remaining_area":{"type":"string"},"why_it_matters":{"type":"string"},"remaining_lookup":{"type":"string"}},"required":["reason","remaining_area","why_it_matters","remaining_lookup"],"additionalProperties":false}`),
 		Run: func(_ context.Context, args json.RawMessage) (string, error) {
 			if _, err := parseReviewExtension(args); err != nil {
 				return "", err
@@ -829,17 +976,25 @@ func parseReviewExtension(args json.RawMessage) (reviewExtensionRequest, error) 
 		}
 		return reviewExtensionRequest{}, fmt.Errorf("invalid review extension: %w", err)
 	}
+	request.Reason = strings.ToLower(strings.TrimSpace(request.Reason))
+	request.RemainingArea = strings.TrimSpace(request.RemainingArea)
+	request.WhyItMatters = strings.TrimSpace(request.WhyItMatters)
+	request.RemainingLookup = strings.TrimSpace(request.RemainingLookup)
 	request.UnresolvedIssue = strings.TrimSpace(request.UnresolvedIssue)
 	request.Evidence = strings.TrimSpace(request.Evidence)
-	request.RemainingLookup = strings.TrimSpace(request.RemainingLookup)
-	if request.UnresolvedIssue == "" || request.Evidence == "" || request.RemainingLookup == "" {
-		return reviewExtensionRequest{}, errors.New("review extension requires unresolved_issue, evidence, and remaining_lookup")
+	if request.Reason == "" && request.RemainingArea == "" && request.WhyItMatters == "" && request.UnresolvedIssue != "" && request.Evidence != "" {
+		request.Reason = "unresolved_finding"
+		request.RemainingArea = request.UnresolvedIssue
+		request.WhyItMatters = request.Evidence
 	}
-	if len(request.UnresolvedIssue) > maxFindingFieldLen || len(request.Evidence) > maxFindingFieldLen || len(request.RemainingLookup) > maxFindingFieldLen {
+	if request.Reason != "incomplete_coverage" && request.Reason != "unresolved_finding" {
+		return reviewExtensionRequest{}, errors.New("review extension reason must be incomplete_coverage or unresolved_finding")
+	}
+	if request.RemainingArea == "" || request.WhyItMatters == "" || request.RemainingLookup == "" {
+		return reviewExtensionRequest{}, errors.New("review extension requires reason, remaining_area, why_it_matters, and remaining_lookup")
+	}
+	if len(request.RemainingArea) > maxFindingFieldLen || len(request.WhyItMatters) > maxFindingFieldLen || len(request.RemainingLookup) > maxFindingFieldLen {
 		return reviewExtensionRequest{}, errors.New("review extension fields are too long")
-	}
-	if request.Rounds < 1 || request.Rounds > reviewLeaseRounds {
-		return reviewExtensionRequest{}, fmt.Errorf("review extension rounds must be between 1 and %d", reviewLeaseRounds)
 	}
 	return request, nil
 }

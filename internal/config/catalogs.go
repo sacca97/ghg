@@ -31,6 +31,18 @@ func FetchCatalogs(ctx context.Context, cfg *Config, profiles models.Profiles, f
 		factory = factories[0]
 	}
 
+	metadata := LoadModelsDev()
+	needsMetadata := force || metadata.Stale() || metadata.Version < modelsDevCacheVersion
+	if needsMetadata {
+		requestCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+		fresh, fetchErr := FetchModelsDev(requestCtx, nil)
+		cancel()
+		if fetchErr == nil {
+			metadata = fresh
+			_ = SaveModelsDev(metadata)
+		}
+	}
+
 	dirty := false
 	for name, provider := range cfg.Providers {
 		if err := ctx.Err(); err != nil {
@@ -74,28 +86,16 @@ func FetchCatalogs(ctx context.Context, cfg *Config, profiles models.Profiles, f
 		dirty = true
 	}
 
-	metadata := LoadModelsDev()
-	wanted := cfg.CatalogWantedModels(cats)
-	needsMetadata := force || metadata.Stale() || metadata.Version < modelsDevCacheVersion
-	if !needsMetadata {
-		for id := range wanted {
-			if !metadata.HasModel(id) {
-				needsMetadata = true
-				break
-			}
+	for name, provider := range cfg.Providers {
+		resolved, err := profiles.Resolve(ProviderInstance(name, provider))
+		if err != nil {
+			continue
 		}
-	}
-	if len(wanted) > 0 && needsMetadata {
-		requestCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		fresh, fetchErr := FetchModelsDev(requestCtx, wanted)
-		cancel()
-		if fetchErr == nil {
-			metadata = fresh
-			_ = SaveModelsDev(metadata)
-		}
-	}
-	for name, catalog := range cats {
-		enriched, changed := EnrichCatalogMetadata(catalog, metadata, ModelsDevProviderIDs(profiles, name, cfg.Providers[name]))
+		providerIDs := ModelsDevProviderIDs(profiles, name, provider)
+		catalog := cats[name]
+		catalog, seeded := seedCatalogFromModelsDev(catalog, metadata, resolved.BaseURL, providerIDs)
+		enriched, changed := EnrichCatalogMetadata(catalog, metadata, providerIDs)
+		changed = changed || seeded
 		if changed {
 			cats[name] = enriched
 			dirty = true
@@ -107,6 +107,35 @@ func FetchCatalogs(ctx context.Context, cfg *Config, profiles models.Profiles, f
 		}
 	}
 	return cats, nil
+}
+
+func seedCatalogFromModelsDev(cat Catalog, metadata ModelsDevCache, baseURL string, providerIDs []string) (Catalog, bool) {
+	ids := metadata.ModelIDs(providerIDs...)
+	if len(ids) == 0 {
+		return cat, false
+	}
+	changed := false
+	if cat.FetchedAt.IsZero() {
+		cat.FetchedAt = metadata.FetchedAt
+		changed = true
+	}
+	if cat.BaseURL == "" {
+		cat.BaseURL = baseURL
+		changed = true
+	}
+	known := make(map[string]struct{}, len(cat.Models)+len(ids))
+	for _, model := range cat.Models {
+		known[model.ID] = struct{}{}
+	}
+	for _, id := range ids {
+		if _, ok := known[id]; ok {
+			continue
+		}
+		cat.Models = append(cat.Models, ModelInfoLite{ID: id})
+		known[id] = struct{}{}
+		changed = true
+	}
+	return cat, changed
 }
 
 // ProviderInstance converts a JSONC provider into the profile resolver input.

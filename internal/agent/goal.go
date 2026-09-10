@@ -82,8 +82,8 @@ func (u GoalUpdate) Validate(currentID string) error {
 }
 
 // ApplyUpdate validates and applies one model-authored goal checkpoint, and
-// reports whether the record changed. Progress and blocker notes are truncated
-// to MaxNoteBytes so model-authored data cannot bloat the goal ledger.
+// reports whether the record changed. Validation bounds model-authored notes;
+// application trims their surrounding whitespace before persisting them.
 func ApplyUpdate(record *GoalRecord, update GoalUpdate) (bool, error) {
 	if record == nil {
 		return false, fmt.Errorf("goal record is nil")
@@ -91,21 +91,15 @@ func ApplyUpdate(record *GoalRecord, update GoalUpdate) (bool, error) {
 	if err := update.Validate(record.ID); err != nil {
 		return false, err
 	}
-	if record.Status == update.Status && record.Progress == update.Progress && record.Blocker == update.Blocker {
-		return true, nil
+	progress := strings.TrimSpace(update.Progress)
+	blocker := strings.TrimSpace(update.Blocker)
+	if record.Status == update.Status && record.Progress == progress && record.Blocker == blocker {
+		return false, nil
 	}
 	record.Status = update.Status
-	record.Progress = truncateNote(update.Progress)
-	record.Blocker = truncateNote(update.Blocker)
+	record.Progress = progress
+	record.Blocker = blocker
 	return true, nil
-}
-
-func truncateNote(value string) string {
-	value = strings.TrimSpace(value)
-	if len(value) <= MaxNoteBytes {
-		return value
-	}
-	return value[:utf8Prefix(value, MaxNoteBytes)]
 }
 
 const GoalToolName = "update_goal"

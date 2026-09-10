@@ -194,17 +194,32 @@ func retryable(err error) bool {
 }
 
 // isHTTP2GoAway identifies the graceful connection close returned by Go's
-// HTTP/2 transport when a provider retires a connection. It is safe to replay
-// an unfinished request because no completed model message was returned.
+// HTTP/2 transport when a provider retires a connection.
 func isHTTP2GoAway(err error) bool {
 	return err != nil && strings.Contains(strings.ToLower(err.Error()), "http2: server sent goaway")
+}
+
+// isHTTP2Replayable identifies HTTP/2 connection failures that can safely
+// replay an unfinished reasoning-only request. No visible answer or tool call
+// has completed at this point.
+func isHTTP2Replayable(err error) bool {
+	if isHTTP2GoAway(err) {
+		return true
+	}
+	if err == nil {
+		return false
+	}
+	low := strings.ToLower(err.Error())
+	return strings.Contains(low, "stream error: stream id") &&
+		strings.Contains(low, "internal_error") &&
+		strings.Contains(low, "received from peer")
 }
 
 // extendRetryLimit gives a retiring HTTP/2 connection two extra attempts only
 // after the configured retry budget is exhausted. Other failures retain the
 // configured limit, and MaxRetries=1 remains a true no-retry setting.
 func extendRetryLimit(configured, limit, attempt int, err error) int {
-	if configured > 1 && limit == configured && attempt == limit && isHTTP2GoAway(err) {
+	if configured > 1 && limit == configured && attempt == limit && isHTTP2Replayable(err) {
 		return limit + gracefulHTTP2ExtraAttempts
 	}
 	return limit

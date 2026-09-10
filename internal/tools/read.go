@@ -60,9 +60,6 @@ func runReadResult(ctx context.Context, args json.RawMessage) (ToolResult, error
 		return ToolResult{}, err
 	}
 	if a.Ranges != nil {
-		if strings.TrimSpace(a.Path) != "" {
-			return ToolResult{}, fmt.Errorf("read cannot mix path with ranges")
-		}
 		if len(a.Ranges) == 0 {
 			return ToolResult{}, fmt.Errorf("read ranges cannot be empty")
 		}

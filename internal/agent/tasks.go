@@ -239,6 +239,7 @@ func (a *Agent) StartBackground(ctx context.Context, description, prompt string)
 	}
 
 	go func() {
+		defer cancel()
 		sub, err := a.newSubagent(taskCtx, "tiny")
 		status := TaskDone
 		text := ""
@@ -262,11 +263,11 @@ func (a *Agent) StartBackground(ctx context.Context, description, prompt string)
 		a.bg.mu.Unlock()
 		// Fan the result back into the parent as a steered message so the model
 		// sees it on the next loop boundary — settlement callbacks → channel
-		// close → Steer.
+		// close → steerNotice.
 		// text/status are locals (not the shared task struct), so no race.
 		recoveryNotice := fmt.Sprintf("\n\n[full report for %s remains in task record]", id)
 		steeredReport := tools.TruncateWithSuffix(text, recoveryNotice)
-		a.Steer(fmt.Sprintf("[background task %s %s] %s\n\n%s", id, status, description, steeredReport))
+		a.steerNotice(fmt.Sprintf("[background task %s %s] %s\n\n%s", id, status, description, steeredReport))
 	}()
 	return t, nil
 }

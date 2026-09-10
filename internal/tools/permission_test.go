@@ -53,6 +53,11 @@ func TestSegmentShellKeepsQuotedOperatorsAndRejectsSubstitution(t *testing.T) {
 	if _, err := SegmentShell(`echo $(cat secret)`); err == nil {
 		t.Fatal("command substitution must fail closed")
 	}
+	for _, command := range []string{`echo "$(cat secret)"`, "echo \"`cat secret`\""} {
+		if _, err := SegmentShell(command); err == nil {
+			t.Fatalf("quoted command substitution must fail closed: %q", command)
+		}
+	}
 	if got := CommandRule(`git status && rm -rf build`); got != "git status && rm -rf build" {
 		t.Fatalf("compound CommandRule = %q", got)
 	}

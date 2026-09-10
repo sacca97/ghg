@@ -224,7 +224,7 @@ func (m *model) updateSelectionEdge(msg tea.MouseMsg) tea.Cmd {
 		return nil
 	}
 	dir := 0
-	first := 2
+	first := transcriptTopRows
 	last := first + m.vp.Height - 1
 	if msg.Y <= first {
 		dir = -1

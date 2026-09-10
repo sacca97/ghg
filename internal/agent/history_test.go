@@ -3,6 +3,7 @@ package agent_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -78,6 +79,11 @@ func TestHistoryToolsSearchPaginateAndReadAsUntrustedEvidence(t *testing.T) {
 	tooBroad := tools.ExecuteResult(context.Background(), toolSet, "history_read", json.RawMessage(`{"start_seq":0,"end_seq":256}`))
 	if !strings.Contains(tooBroad.Preview, "too broad") {
 		t.Fatalf("inclusive history range limit was not enforced: %q", tooBroad.Preview)
+	}
+	maxInt := int(^uint(0) >> 1)
+	overflow := tools.ExecuteResult(context.Background(), toolSet, "history_read", json.RawMessage(fmt.Sprintf(`{"start_seq":0,"end_seq":%d}`, maxInt)))
+	if !strings.Contains(overflow.Preview, "too broad") {
+		t.Fatalf("overflowing history range was not rejected: %q", overflow.Preview)
 	}
 }
 

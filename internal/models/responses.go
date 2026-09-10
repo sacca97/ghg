@@ -158,6 +158,14 @@ func newOpenAIResponsesRequest(req Request, stream bool, flavor ...responsesFlav
 	for _, msg := range msgs {
 		switch msg.Role {
 		case "system":
+			if msg.Transient {
+				raw, err := responsesUserMessage(msg)
+				if err != nil {
+					return openAIResponsesRequest{}, err
+				}
+				wire.Input = append(wire.Input, raw)
+				continue
+			}
 			text, err := responsesSystemText(msg)
 			if err != nil {
 				return openAIResponsesRequest{}, err
@@ -423,7 +431,7 @@ func (c *OpenAIResponsesClient) stream(ctx context.Context, req Request, sink Ev
 			return msg, usage, nil
 		}
 		last = err
-		replayReasoning := isHTTP2GoAway(err) && !textEmitted
+		replayReasoning := isHTTP2Replayable(err) && !textEmitted
 		if (emitted && !replayReasoning) || !retryable(err) {
 			break
 		}

@@ -3,6 +3,7 @@ package agent
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 
 	"github.com/sacca97/ghg/internal/config"
@@ -146,6 +147,7 @@ func TestBuildAgentUsesModelsDevContextFallback(t *testing.T) {
 	t.Setenv("GHG_HOME", t.TempDir())
 	if err := config.SaveModelsDev(config.ModelsDevCache{
 		Providers: map[string]map[string]int{"route-test": {"minimax-m3": 131072}},
+		Reasoning: map[string]map[string]config.ModelsDevReasoning{"route-test": {"minimax-m3": {Efforts: []string{"low", "high"}, Toggle: true}}},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -167,6 +169,9 @@ func TestBuildAgentUsesModelsDevContextFallback(t *testing.T) {
 	}
 	if ag.ContextLimit != 131072 {
 		t.Fatalf("models.dev context = %d, want 131072", ag.ContextLimit)
+	}
+	if !ag.ReasoningToggle || !reflect.DeepEqual(ag.ReasoningEfforts, []string{"low", "high"}) {
+		t.Fatalf("models.dev reasoning = toggle=%t efforts=%v", ag.ReasoningToggle, ag.ReasoningEfforts)
 	}
 }
 

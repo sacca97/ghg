@@ -86,7 +86,13 @@ func (t *readCoverageTracker) prepare(calls []models.ToolCall, unavailable map[s
 	if hasRead && hasMutation {
 		return decisions
 	}
-	t.discardStale()
+	paths := make(map[string]struct{})
+	for _, decision := range decisions {
+		for _, request := range decision.requests {
+			paths[request.path] = struct{}{}
+		}
+	}
+	t.discardStale(paths)
 
 	for i, call := range calls {
 		requests := decisions[i].requests
@@ -257,9 +263,13 @@ func (t *readCoverageTracker) expandingPrefix(request readRequest) (readCoverage
 	return best, found
 }
 
-func (t *readCoverageTracker) discardStale() {
+func (t *readCoverageTracker) discardStale(paths map[string]struct{}) {
 	kept := t.coverage[:0]
 	for _, coverage := range t.coverage {
+		if _, requested := paths[coverage.path]; !requested {
+			kept = append(kept, coverage)
+			continue
+		}
 		info, err := os.Stat(coverage.path)
 		if err != nil || info.Size() != coverage.size || !info.ModTime().Equal(coverage.modTime) {
 			continue

@@ -268,9 +268,15 @@ func TestLSPDiagnosticsReachModel(t *testing.T) {
 			fmt.Fprintf(w, `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"t1","type":"function","function":{"name":"write","arguments":%s}}]}}]}`+"\n\n",
 				jsonString(string(argsJSON)))
 		} else {
-			last := req.Messages[len(req.Messages)-1]
+			var last models.Message
+			for i := len(req.Messages) - 1; i >= 0; i-- {
+				if req.Messages[i].Role == "tool" {
+					last = req.Messages[i]
+					break
+				}
+			}
 			if last.Role != "tool" {
-				t.Errorf("expected tool result, got %s", last.Role)
+				t.Errorf("expected tool result in request, got %+v", req.Messages)
 			}
 			if !strings.Contains(last.Content, "<diagnostics file=") || !strings.Contains(last.Content, "ERROR [2:3] undefined: foo") {
 				t.Errorf("tool result missing diagnostics block: %q", last.Content)
@@ -527,6 +533,44 @@ func TestTurnWithGoalCompletionStopsWithoutAnotherRequest(t *testing.T) {
 	}
 	if requests != 1 || update.Status != GoalStatusComplete {
 		t.Fatalf("requests=%d update=%+v", requests, update)
+	}
+}
+
+func TestGoalTurnIgnoresExplorationAndTurnCaps(t *testing.T) {
+	call := func(id, name, args string) models.ToolCall {
+		return models.ToolCall{ID: id, Type: "function", Function: struct {
+			Name      string `json:"name"`
+			Arguments string `json:"arguments"`
+		}{Name: name, Arguments: args}}
+	}
+	responses := make([]models.Message, 0, goalAttentionCheckpoint+1)
+	for i := 0; i < goalAttentionCheckpoint; i++ {
+		responses = append(responses, models.Message{Role: "assistant", ToolCalls: []models.ToolCall{call(fmt.Sprintf("read-%d", i), "read", `{"path":"README.md"}`)}})
+	}
+	responses = append(responses, models.Message{Role: "assistant", ToolCalls: []models.ToolCall{call("goal", GoalToolName, `{"status":"complete","progress":"verified"}`)}})
+	backend := &checkpointBackend{responses: responses}
+	ag := New(backend, "model", 100, "system")
+	ag.MaxTurns = 1
+	ag.Tools = []tools.Tool{{
+		Def: models.NewTool("read", "read", `{"type":"object"}`),
+		Run: func(context.Context, json.RawMessage) (string, error) { return "ok", nil },
+	}}
+	record := NewGoal("finish the work")
+	var notices int
+	if _, err := ag.TurnWithGoal(context.Background(), "start", record, Events{OnNotice: func(string) { notices++ }}); err != nil {
+		t.Fatal(err)
+	}
+	if len(backend.requests) != goalAttentionCheckpoint+1 {
+		t.Fatalf("goal turn stopped at the regular turn cap: %d requests", len(backend.requests))
+	}
+	if notices != 0 {
+		t.Fatalf("goal turn emitted exploration checkpoints: %d", notices)
+	}
+	if requestContains(backend.requests[goalAttentionCheckpoint-2], "<goal_attention_checkpoint>") {
+		t.Fatal("goal attention reminder appeared before round 50")
+	}
+	if !requestContains(backend.requests[goalAttentionCheckpoint-1], "<goal_attention_checkpoint>") {
+		t.Fatal("goal attention reminder missing at round 50")
 	}
 }
 
@@ -978,6 +1022,17 @@ func TestSteerContinuesTurn(t *testing.T) {
 	}
 }
 
+func TestSteerNoticeDoesNotFinalizeReview(t *testing.T) {
+	ag := &Agent{}
+	ag.steerNotice("provide the report")
+	if ag.consumeReviewFinalize() {
+		t.Fatal("internal background notice must not finalize review exploration")
+	}
+	if len(ag.pending) != 1 || ag.pending[0].text != "provide the report" {
+		t.Fatalf("internal notice was not queued: %+v", ag.pending)
+	}
+}
+
 func TestNoSteerEndsTurn(t *testing.T) {
 	srv := textServer(t, func(n int, req models.Request) string { return "done" })
 	defer srv.Close()
@@ -1018,10 +1073,15 @@ func TestUnavailableCapabilitiesAreNotAdvertised(t *testing.T) {
 type checkpointBackend struct {
 	responses []models.Message
 	requests  []models.Request
+	failAt    int
+	failErr   error
 }
 
 func (b *checkpointBackend) Stream(_ context.Context, req models.Request, _ models.EventSink) (models.Message, models.Usage, error) {
 	b.requests = append(b.requests, req)
+	if b.failAt > 0 && len(b.requests) == b.failAt {
+		return models.Message{}, models.Usage{}, b.failErr
+	}
 	if len(b.requests) > len(b.responses) {
 		return models.Message{Role: "assistant", Content: "done"}, models.Usage{}, nil
 	}
@@ -1033,8 +1093,8 @@ func (b *checkpointBackend) Complete(_ context.Context, _ models.Request) (model
 }
 
 func TestExplorationCheckpointsAreTransientAndBlockPendingTools(t *testing.T) {
-	const expectedFinalRound = 24
-	expectedCheckpointRounds := map[int]int{executionExplorationCheckpoint: 0, 10: 1, 16: 2, expectedFinalRound: 3}
+	const expectedFinalRound = explorationCheckpointFinal
+	expectedCheckpointRounds := map[int]int{executionExplorationCheckpoint: 0, explorationCheckpointOne: 1, explorationCheckpointTwo: 2, expectedFinalRound: 3}
 
 	call := func(id, name, args string) models.ToolCall {
 		return models.ToolCall{ID: id, Type: "function", Function: struct {
@@ -1083,7 +1143,13 @@ func TestExplorationCheckpointsAreTransientAndBlockPendingTools(t *testing.T) {
 		t.Fatalf("executed tool calls = %d, want %d", got, want)
 	}
 	baselineTools := backend.requests[0].Tools
-	if want := []string{"◎ execution checkpoint · round 8", "◎ exploration checkpoint · round 10", "◎ exploration checkpoint · round 16", "◎ exploration checkpoint · round 24"}; !reflect.DeepEqual(notices, want) {
+	want := []string{
+		fmt.Sprintf("◎ execution checkpoint · round %d", executionExplorationCheckpoint),
+		fmt.Sprintf("◎ exploration checkpoint · round %d", explorationCheckpointOne),
+		fmt.Sprintf("◎ exploration checkpoint · round %d", explorationCheckpointTwo),
+		fmt.Sprintf("◎ exploration checkpoint · round %d", explorationCheckpointFinal),
+	}
+	if !reflect.DeepEqual(notices, want) {
 		t.Fatalf("notices = %v, want %v", notices, want)
 	}
 	for round, level := range expectedCheckpointRounds {
@@ -1116,6 +1182,182 @@ func TestExplorationCheckpointsAreTransientAndBlockPendingTools(t *testing.T) {
 		if strings.Contains(message.Content, "<exploration_checkpoint level=") {
 			t.Fatal("checkpoint reminder was persisted in conversation history")
 		}
+	}
+}
+
+func TestPlanContinueRetainsExplorationCheckpoint(t *testing.T) {
+	call := func(id string) models.Message {
+		return models.Message{Role: "assistant", ToolCalls: []models.ToolCall{{
+			ID: id, Type: "function",
+			Function: struct {
+				Name      string `json:"name"`
+				Arguments string `json:"arguments"`
+			}{Name: "read", Arguments: `{"path":"README.md"}`},
+		}}}
+	}
+	responses := make([]models.Message, 0, explorationCheckpointOne)
+	for i := 0; i < explorationCheckpointOne; i++ {
+		responses = append(responses, call(fmt.Sprintf("read-%d", i)))
+	}
+	backend := &checkpointBackend{responses: responses, failAt: explorationCheckpointOne + 1, failErr: context.Canceled}
+	ag := New(backend, "model", 100, "system")
+	ag.PlanMode = true
+	ag.Tools = []tools.Tool{{
+		Def: models.NewTool("read", "read", `{"type":"object"}`),
+		Run: func(context.Context, json.RawMessage) (string, error) { return "ok", nil },
+	}}
+	if _, err := ag.TurnAuthored(context.Background(), "make a plan", Events{}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("interrupted plan error = %v, want context canceled", err)
+	}
+	if !ag.PlanPending() {
+		t.Fatal("interrupted plan did not retain continuation state")
+	}
+	ag.PlanMode = true
+	final, err := ag.Continue(context.Background(), Events{})
+	if err != nil || final != "done" {
+		t.Fatalf("continued plan = %q, %v", final, err)
+	}
+	if len(backend.requests) != explorationCheckpointOne+2 {
+		t.Fatalf("model calls = %d, want %d", len(backend.requests), explorationCheckpointOne+2)
+	}
+	continued := backend.requests[explorationCheckpointOne+1]
+	if !requestContains(continued, `level="1"`) {
+		t.Fatal("continued plan lost the pending checkpoint reminder")
+	}
+	if !reflect.DeepEqual(backend.requests[0].Tools, continued.Tools) {
+		t.Fatalf("continued plan changed its tool set: first=%v continued=%v", backend.requests[0].Tools, continued.Tools)
+	}
+	if ag.PlanPending() {
+		t.Fatal("successful plan retained stale continuation state")
+	}
+}
+
+func TestNextReasoningEffortIsOneForegroundCall(t *testing.T) {
+	call := func(id, name, args string) models.ToolCall {
+		return models.ToolCall{ID: id, Type: "function", Function: struct {
+			Name      string `json:"name"`
+			Arguments string `json:"arguments"`
+		}{Name: name, Arguments: args}}
+	}
+	cases := []struct {
+		name       string
+		first      []models.ToolCall
+		wantEffort []string
+	}{
+		{
+			name: "selected effort resets after next call",
+			first: []models.ToolCall{
+				call("read", "read", `{"path":"file.go"}`),
+				call("effort", nextReasoningEffortToolName, `{"effort":"HIGH"}`),
+			},
+			wantEffort: []string{"low", "high", "low"},
+		},
+		{
+			name:       "unsupported effort is ignored",
+			first:      []models.ToolCall{call("effort", nextReasoningEffortToolName, `{"effort":"turbo"}`)},
+			wantEffort: []string{"low", "low"},
+		},
+		{
+			name: "duplicate selectors are ignored",
+			first: []models.ToolCall{
+				call("effort-1", nextReasoningEffortToolName, `{"effort":"high"}`),
+				call("effort-2", nextReasoningEffortToolName, `{"effort":"low"}`),
+			},
+			wantEffort: []string{"low", "low"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			responses := []models.Message{{Role: "assistant", ToolCalls: tc.first}}
+			if tc.name == "selected effort resets after next call" {
+				responses = append(responses, models.Message{Role: "assistant", ToolCalls: []models.ToolCall{call("read-2", "read", `{"path":"file.go"}`)}})
+			}
+			responses = append(responses, models.Message{Role: "assistant", Content: "done"})
+			backend := &checkpointBackend{responses: responses}
+			ag := New(backend, "model", 100, "system")
+			ag.Effort = "low"
+			ag.ReasoningEfforts = []string{"low", "high"}
+			ag.Tools = []tools.Tool{{
+				Def: models.NewTool("read", "read", `{"type":"object"}`),
+				Run: func(context.Context, json.RawMessage) (string, error) { return "ok", nil },
+			}}
+			var starts []ModelCallStart
+			var selections []ReasoningSelection
+			if _, err := ag.Turn(context.Background(), "inspect", Events{
+				OnModelCallStart:     func(call ModelCallStart) { starts = append(starts, call) },
+				OnReasoningSelection: func(selection ReasoningSelection) { selections = append(selections, selection) },
+			}); err != nil {
+				t.Fatal(err)
+			}
+			if len(starts) != len(tc.wantEffort) {
+				t.Fatalf("model calls = %d, want %d", len(starts), len(tc.wantEffort))
+			}
+			for i, want := range tc.wantEffort {
+				if starts[i].ReasoningEffort != want {
+					t.Errorf("call %d effort = %q, want %q", i, starts[i].ReasoningEffort, want)
+				}
+			}
+			if ag.Effort != "low" || ag.Model != "model" {
+				t.Fatalf("agent baseline changed: effort=%q model=%q", ag.Effort, ag.Model)
+			}
+			if tc.name == "selected effort resets after next call" {
+				if len(selections) != 1 || selections[0].Current != "low" || selections[0].Requested != "HIGH" || selections[0].Next != "high" || !selections[0].Applied {
+					t.Fatalf("reasoning selection telemetry = %+v", selections)
+				}
+			}
+		})
+	}
+}
+
+func TestDynamicReasoningDoesNotChooseEffortAutomatically(t *testing.T) {
+	call := func(id string) models.Message {
+		return models.Message{Role: "assistant", ToolCalls: []models.ToolCall{{
+			ID: id, Type: "function",
+			Function: struct {
+				Name      string `json:"name"`
+				Arguments string `json:"arguments"`
+			}{Name: "read", Arguments: `{"path":"known.go"}`},
+		}}}
+	}
+	backend := &checkpointBackend{responses: []models.Message{
+		call("read-1"), call("read-2"), {Role: "assistant", Content: "done"},
+	}}
+	ag := New(backend, "model", 100, "system")
+	ag.Effort = "high"
+	ag.ReasoningEfforts = []string{"medium", "high"}
+	ag.Tools = []tools.Tool{{
+		Def: models.NewTool("read", "read", `{"type":"object"}`),
+		Run: func(context.Context, json.RawMessage) (string, error) { return "ok", nil },
+	}}
+	var starts []ModelCallStart
+	if _, err := ag.Turn(context.Background(), "inspect", Events{
+		OnModelCallStart: func(call ModelCallStart) { starts = append(starts, call) },
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(starts) != 3 {
+		t.Fatalf("model calls = %d, want 3", len(starts))
+	}
+	if starts[0].EffortApplied != "high" || starts[1].EffortApplied != "high" || starts[2].EffortApplied != "high" {
+		t.Fatalf("efforts changed without a model override = %q, %q, %q", starts[0].EffortApplied, starts[1].EffortApplied, starts[2].EffortApplied)
+	}
+	for i, start := range starts {
+		if !start.DynamicReasoning || start.ConfiguredEffort != "high" || start.EffortRequested != "high" || start.SelectionReason != "configured" {
+			t.Fatalf("call %d effort telemetry = %+v", i, start)
+		}
+	}
+}
+
+func TestDynamicReasoningCanDisableSelector(t *testing.T) {
+	disabled := false
+	ag := &Agent{ReasoningEfforts: []string{"low", "high"}, DynamicReasoning: &disabled}
+	if _, ok := ag.reasoningSelectorTool(); ok {
+		t.Fatal("disabled dynamic reasoning must not expose the selector tool")
+	}
+
+	ag.DynamicReasoning = nil
+	if _, ok := ag.reasoningSelectorTool(); !ok {
+		t.Fatal("unset dynamic reasoning must remain enabled")
 	}
 }
 
@@ -1772,7 +2014,7 @@ func TestCompactionTelemetryUsesSummaryRoute(t *testing.T) {
 	if len(starts) != 1 || len(ends) != 1 {
 		t.Fatalf("compaction telemetry start/end = %d/%d", len(starts), len(ends))
 	}
-	want := ModelCallStart{Role: "tiny", Provider: "tiny-provider", Model: "tiny-model", Protocol: string(summary.protocol)}
+	want := ModelCallStart{Role: "tiny", Provider: "tiny-provider", Model: "tiny-model", Protocol: string(summary.protocol), Purpose: "compaction"}
 	if starts[0] != want {
 		t.Fatalf("compaction start route = %+v, want %+v", starts[0], want)
 	}
@@ -1804,10 +2046,6 @@ func TestCompactTooLittleHistory(t *testing.T) {
 }
 
 func TestAgentBoundedTextPreservesUTF8(t *testing.T) {
-	note := truncateNote(strings.Repeat("界", MaxNoteBytes))
-	if !utf8.ValidString(note) || len(note) > MaxNoteBytes {
-		t.Fatalf("truncated note is not valid and bounded UTF-8: bytes=%d", len(note))
-	}
 	field := truncateField(strings.Repeat("界", 100), 10)
 	if !utf8.ValidString(field) || len(field) > 10 {
 		t.Fatalf("truncated field is not valid and bounded UTF-8: %q", field)

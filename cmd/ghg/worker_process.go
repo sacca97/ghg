@@ -209,10 +209,25 @@ func newWorkerProcess(runtimeFile workerwire.Runtime) (*workerProcessState, erro
 	if providerName == "" {
 		providerName = meta.Provider
 	}
+	var telemetry []session.TelemetryEvent
+	if events, telemetryErr := store.ListTelemetry(context.Background(), sessionID); telemetryErr == nil {
+		telemetry = events
+	}
 	role := os.Getenv(workerRoleEnv)
 	if role == "" {
 		if previous, stateErr := runtimeFile.ReadState(); stateErr == nil {
 			role = previous.Role
+		}
+	}
+	// The bridge's fallback role is not authoritative when a session already
+	// has model-call history. Resume with the route that made the last call.
+	for _, event := range telemetry {
+		if event.Kind != "model_call_start" {
+			continue
+		}
+		var call agent.ModelCallStart
+		if json.Unmarshal(event.Payload, &call) == nil && call.Purpose == "" && strings.TrimSpace(call.Role) != "" {
+			role = call.Role
 		}
 	}
 	mode := os.Getenv(workerModeEnv)
@@ -243,6 +258,26 @@ func newWorkerProcess(runtimeFile workerwire.Runtime) (*workerProcessState, erro
 	}
 	ag.Messages = append(ag.Messages, loaded...)
 	ag.RebuildTouched(ag.MessagesSnapshot())
+	if telemetry != nil {
+		var progress []agent.ReviewProgress
+		for _, event := range telemetry {
+			if event.Kind != "review_progress" {
+				continue
+			}
+			var value agent.ReviewProgress
+			if json.Unmarshal(event.Payload, &value) == nil {
+				progress = append(progress, value)
+			}
+		}
+		if len(progress) > 0 {
+			for i := len(loaded) - 1; i >= 0; i-- {
+				if loaded[i].Role == "user" && loaded[i].Authored {
+					ag.RestoreReviewContinuation(loaded[i].Content, progress)
+					break
+				}
+			}
+		}
+	}
 
 	configuredRuntime, runtimeCleanup, err := tools.NewConfiguredRuntime(".", cfg.Execution, false, cfg.PostEdit)
 	if err != nil {

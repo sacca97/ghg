@@ -124,6 +124,7 @@ func (r *errorAfterBody) Read(p []byte) (int, error) {
 func (r *errorAfterBody) Close() error { return nil }
 
 const http2GoAwayError = `http2: server sent GOAWAY and closed the connection; LastStreamID=27, ErrCode=NO_ERROR, debug=""`
+const http2InternalStreamError = `stream error: stream ID 25; INTERNAL_ERROR; received from peer`
 
 func TestStreamRetriesHTTP2GoAwayAfterReasoning(t *testing.T) {
 	noSleep(t)
@@ -137,6 +138,47 @@ func TestStreamRetriesHTTP2GoAwayAfterReasoning(t *testing.T) {
 				Body: &errorAfterBody{
 					data: []byte("data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"partial reasoning\"}}]}\n\n"),
 					err:  errors.New(http2GoAwayError),
+				},
+			}, nil
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(strings.NewReader("data: {\"choices\":[{\"delta\":{\"content\":\"recovered\"}}]}\n\ndata: [DONE]\n\n")),
+		}, nil
+	})}
+
+	var thinking, text strings.Builder
+	msg, _, err := client.Stream(context.Background(), Request{Model: "m"}, EventSink{
+		OnThink: func(delta string) { thinking.WriteString(delta) },
+		OnText:  func(delta string) { text.WriteString(delta) },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := thinking.String(); got != "partial reasoning" {
+		t.Fatalf("thinking = %q, want partial reasoning", got)
+	}
+	if got := text.String(); got != "recovered" || msg.Content != got {
+		t.Fatalf("text = %q, message content = %q, want recovered", got, msg.Content)
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("attempts = %d, want 2", got)
+	}
+}
+
+func TestStreamRetriesHTTP2InternalErrorAfterReasoning(t *testing.T) {
+	noSleep(t)
+	var calls atomic.Int32
+	client := testChatClient(t, "http://provider.test", "k")
+	client.HTTP = &http.Client{Transport: retryRoundTripper(func(*http.Request) (*http.Response, error) {
+		if calls.Add(1) == 1 {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body: &errorAfterBody{
+					data: []byte("data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"partial reasoning\"}}]}\n\n"),
+					err:  errors.New(http2InternalStreamError),
 				},
 			}, nil
 		}

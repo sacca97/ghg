@@ -142,6 +142,7 @@ type ConfigureRequest struct {
 	Protocol               string  `json:"protocol,omitempty"`
 	Effort                 string  `json:"effort,omitempty"`
 	UpdateEffort           bool    `json:"update_effort,omitempty"`
+	DynamicReasoning       *bool   `json:"dynamic_reasoning,omitempty"`
 	Mode                   string  `json:"mode,omitempty"`
 	Approval               string  `json:"approval,omitempty"`
 	CompactThreshold       float64 `json:"compact_threshold,omitempty"`

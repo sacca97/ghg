@@ -23,6 +23,13 @@ func SubagentsEnabled(c *Config) bool {
 	return c == nil || c.Subagents == nil || *c.Subagents
 }
 
+// DynamicReasoningEnabled reports whether the foreground agent may choose a
+// different advertised reasoning effort for its next call. Unset keeps the
+// per-call selector enabled for existing configurations.
+func DynamicReasoningEnabled(c *Config) bool {
+	return c == nil || c.DynamicReasoning == nil || *c.DynamicReasoning
+}
+
 // CompactThreshold returns the configured compaction fraction, clamped to the
 // supported 10–90% range. Zero selects DefaultCompactPct.
 func CompactThreshold(c *Config) float64 {
@@ -35,24 +42,24 @@ func CompactThreshold(c *Config) float64 {
 
 // Config is the root of ~/.ghg/config.json (JSONC: comments allowed).
 type Config struct {
-	DefaultModel    string                `json:"defaultModel"`
-	DefaultProvider string                `json:"defaultProvider,omitempty"` // override the model's first provider
-	DefaultEffort   string                `json:"defaultEffort,omitempty"`   // reasoning effort for new sessions: "", "low", "medium", "high"
-	CompactPct      int                   `json:"compactPct,omitempty"`      // compact at this % of the context window; 0 = DefaultCompactPct
-	Theme           string                `json:"theme,omitempty"`           // "light", "dark", or "" (auto-detect at startup)
-	Mouse           *bool                 `json:"mouse,omitempty"`           // false disables capture so native terminal selection works
-	Subagents       *bool                 `json:"subagents,omitempty"`       // false disables task tool and subagent delegation
-	Thinking        *bool                 `json:"thinking,omitempty"`        // nil defaults to on; false hides reasoning tokens (ctrl+o)
-	CollapsePaste   *bool                 `json:"collapsePaste,omitempty"`   // nil/false: pastes land verbatim; true collapses ≥3-line pastes into a [Pasted ~N lines] placeholder
-	GoalMaxRounds   int                   `json:"goalMaxRounds,omitempty"`   // global goal-loop round cap; 0 = DefaultGoalMaxRounds; projects.json may override per folder
-	MaxRetries      int                   `json:"maxRetries,omitempty"`      // attempts per provider request on transient failures (429/5xx/network); 0 = models.DefaultMaxAttempts, 1 = no retries
-	Outputs         *OutputConfig         `json:"outputs,omitempty"`         // bounded tool-result persistence; nil/enabled nil uses defaults
-	Artifacts       *OutputConfig         `json:"-"`                         // legacy in-memory alias for Outputs
-	Telegram        *TelegramConfig       `json:"telegram,omitempty"`        // optional completion notifications
-	Execution       *ExecutionConfig      `json:"execution,omitempty"`       // filesystem/network/approval policy for tool subprocesses
-	Providers       map[string]Provider   `json:"providers"`
-	Models          map[string]Model      `json:"models"`
-	Roles           map[string]RoleConfig `json:"roles,omitempty"`
+	DefaultModel     string                `json:"defaultModel"`
+	DefaultProvider  string                `json:"defaultProvider,omitempty"`  // override the model's first provider
+	DefaultEffort    string                `json:"defaultEffort,omitempty"`    // reasoning effort for new sessions: "", "low", "medium", "high"
+	DynamicReasoning *bool                 `json:"dynamicReasoning,omitempty"` // nil/on lets the model select an advertised effort for one call
+	CompactPct       int                   `json:"compactPct,omitempty"`       // compact at this % of the context window; 0 = DefaultCompactPct
+	Theme            string                `json:"theme,omitempty"`            // "light", "dark", or "" (auto-detect at startup)
+	Mouse            *bool                 `json:"mouse,omitempty"`            // false disables capture so native terminal selection works
+	Subagents        *bool                 `json:"subagents,omitempty"`        // false disables task tool and subagent delegation
+	Thinking         *bool                 `json:"thinking,omitempty"`         // nil defaults to on; false hides reasoning tokens (ctrl+o)
+	CollapsePaste    *bool                 `json:"collapsePaste,omitempty"`    // nil/false: pastes land verbatim; true collapses ≥3-line pastes into a [Pasted ~N lines] placeholder
+	MaxRetries       int                   `json:"maxRetries,omitempty"`       // attempts per provider request on transient failures (429/5xx/network); 0 = models.DefaultMaxAttempts, 1 = no retries
+	Outputs          *OutputConfig         `json:"outputs,omitempty"`          // bounded tool-result persistence; nil/enabled nil uses defaults
+	Artifacts        *OutputConfig         `json:"-"`                          // legacy in-memory alias for Outputs
+	Telegram         *TelegramConfig       `json:"telegram,omitempty"`         // optional completion notifications
+	Execution        *ExecutionConfig      `json:"execution,omitempty"`        // filesystem/network/approval policy for tool subprocesses
+	Providers        map[string]Provider   `json:"providers"`
+	Models           map[string]Model      `json:"models"`
+	Roles            map[string]RoleConfig `json:"roles,omitempty"`
 	// MCPServers is ghg's own MCP server block (ghg-native shape; see
 	// internal/mcp.ServerConfig for the normalized semantics). On load it is
 	// merged over imported claude/codex configs: ghg always wins per name.

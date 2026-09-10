@@ -211,14 +211,6 @@ func (m *model) resume(id string) error {
 	return m.applyResumeData(data)
 }
 
-func (m *model) resumeDisplay(id string) error {
-	data, err := loadResumeData(m.store, id)
-	if err != nil {
-		return err
-	}
-	return m.applyResumeData(data)
-}
-
 func (m *model) resumeCmd(id string) tea.Cmd {
 	store := m.store
 	return func() tea.Msg {
@@ -352,6 +344,12 @@ func (m *model) seedTranscript(msgs []models.Message, base int) {
 				m.blocks = append(m.blocks, block{kind: blockAssistant, text: strings.TrimRight(msg.TextContent(), "\n")})
 			}
 			for _, tc := range msg.ToolCalls {
+				if tc.Function.Name == "request_review_extension" {
+					if markdown := reviewExtensionMarkdown(tc.Function.Arguments); markdown != "" {
+						m.blocks = append(m.blocks, block{kind: blockAssistant, text: markdown})
+						continue
+					}
+				}
 				m.blocks = append(m.blocks, block{kind: blockText, text: toolStyle.Render("⚒ "+tc.Function.Name+" ") + dimStyle.Render(toolCallSummary(tc.Function.Name, tc.Function.Arguments))})
 			}
 		case "tool":
@@ -612,11 +610,6 @@ func (m *model) requestWorkerRewind(cut int) {
 	if msg := m.messageAt(cut); msg.Role == "user" && msg.Authored {
 		text = msg.TextContent()
 	}
-	if cut < len(current) {
-		m.future = append(slices.Clone(current[cut:]), m.future...)
-	} else if cut > len(current) {
-		m.future = slices.Clone(m.future[cut-len(current):])
-	}
 	requestID := workerRequestID("rewind")
 	m.workerHistoryRequest = requestID
 	m.workerRewindRestore = text
@@ -625,10 +618,24 @@ func (m *model) requestWorkerRewind(cut int) {
 	}); err != nil {
 		m.workerHistoryRequest = ""
 		m.workerRewindRestore = ""
+		m.clearPendingRewind()
 		m.append(errStyle.Render("rewind: " + err.Error()))
 		return
 	}
+	var nextFuture []models.Message
+	if cut < len(current) {
+		nextFuture = append(slices.Clone(current[cut:]), m.future...)
+	} else if cut > len(current) {
+		nextFuture = slices.Clone(m.future[cut-len(current):])
+	}
+	m.workerRewindFuture = nextFuture
+	m.workerRewindPending = true
 	m.append(dimStyle.Render("⟲ rewinding conversation…"))
+}
+
+func (m *model) clearPendingRewind() {
+	m.workerRewindFuture = nil
+	m.workerRewindPending = false
 }
 
 // messageAt reads conversation index i across the live/redo boundary.
