@@ -244,6 +244,20 @@ func (w *workerProcessState) Command(ctx context.Context, command workerwire.Com
 			return workerwire.CommandResult{}, fmt.Errorf("marshal notify result: %w", err)
 		}
 		return workerwire.CommandResult{Payload: data}, nil
+	case workerwire.CommandSearchProvider:
+		var request workerwire.SearchProviderRequest
+		if err := json.Unmarshal(command.Payload, &request); err != nil {
+			return workerwire.CommandResult{}, errors.New("search provider payload is invalid")
+		}
+		providers, err := w.searchProviderCommand(request)
+		if err != nil {
+			return workerwire.CommandResult{}, err
+		}
+		data, err := json.Marshal(providers)
+		if err != nil {
+			return workerwire.CommandResult{}, fmt.Errorf("marshal search providers: %w", err)
+		}
+		return workerwire.CommandResult{Payload: data}, nil
 	case workerwire.CommandDetach:
 		w.mu.Lock()
 		allowed := w.state == workerwire.StateRunning || w.state == workerwire.StateWaitingApproval || w.state == workerwire.StateWaitingQuestion || w.hasLiveWork()

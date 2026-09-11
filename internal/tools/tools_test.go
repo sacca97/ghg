@@ -238,8 +238,8 @@ func TestWritePreservesExistingMode(t *testing.T) {
 }
 
 func TestHelpersAndEdgeCases(t *testing.T) {
-	if len(Defs(All())) != 10 {
-		t.Fatal("expected 10 tool defs")
+	if len(Defs(All())) != 12 {
+		t.Fatal("expected 12 tool defs")
 	}
 	long := strings.Repeat("x", maxOutput+10)
 	if out := truncate(long); len(out) > maxOutput || !strings.Contains(out, "truncated") {

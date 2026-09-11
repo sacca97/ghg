@@ -258,6 +258,8 @@ var planSafeTools = map[string]bool{
 	"output_read":       true,
 	"history_search":    true,
 	"history_read":      true,
+	"web_fetch":         true,
+	"web_search":        true,
 }
 
 // planTools returns the read-only tool allowlist. It intentionally

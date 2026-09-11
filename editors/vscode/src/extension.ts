@@ -71,7 +71,7 @@ function promptWithReferences(prompt: string, paths: string[]): string {
 
 function commandMayRunDuringTurn(prompt: string): boolean {
 	const name = prompt.trim().split(/\s+/, 1)[0];
-	return ["/approval", "/commands", "/detach", "/help", "/notify", "/pwd", "/rename", "/q", "/quit", "/exit"].includes(name);
+	return ["/approval", "/commands", "/detach", "/help", "/notify", "/search-providers", "/pwd", "/rename", "/q", "/quit", "/exit"].includes(name);
 }
 
 function literalGlob(value: string): string {
@@ -753,6 +753,52 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 		terminal.show();
 	}
 
+	async configureSearchProvider(): Promise<void> {
+		const action = await vscode.window.showQuickPick(
+			[
+				{ label: "Add or update SearXNG endpoint", value: "add" },
+				{ label: "Select active provider", value: "use" },
+				{ label: "Remove SearXNG endpoint", value: "remove" },
+			],
+			{ placeHolder: "Configure web search" },
+		);
+		if (!action) return;
+		if (action.value === "use") {
+			const name = await vscode.window.showInputBox({
+				prompt: "Provider name, or brave to use BRAVE_SEARCH_API_KEY",
+				ignoreFocusOut: true,
+			});
+			if (name?.trim()) await this.bridgeCommand("search_provider", { action: "use", name: name.trim() });
+			return;
+		}
+		if (action.value === "remove") {
+			const name = await vscode.window.showInputBox({ prompt: "SearXNG provider name to remove", ignoreFocusOut: true });
+			if (name?.trim()) await this.bridgeCommand("search_provider", { action: "remove", name: name.trim() });
+			return;
+		}
+		const name = await vscode.window.showInputBox({
+			prompt: "SearXNG provider name",
+			placeHolder: "personal",
+			ignoreFocusOut: true,
+		});
+		if (!name?.trim()) return;
+		const baseURL = await vscode.window.showInputBox({
+			prompt: "SearXNG base URL",
+			placeHolder: "https://search.example.com",
+			ignoreFocusOut: true,
+		});
+		if (!baseURL?.trim()) return;
+		const apiKey = await vscode.window.showInputBox({
+			prompt: "SearXNG API key (optional)",
+			password: true,
+			ignoreFocusOut: true,
+		});
+		await this.bridgeCommand("search_provider", {
+			action: "add", name: name.trim(), base_url: baseURL.trim(), api_key: apiKey?.trim() || "",
+		});
+		this.post({ type: "notice", text: `SearXNG provider ${name.trim()} saved and selected` });
+	}
+
 	private async setExecutionSetting(name: string, value: string): Promise<void> {
 		if (!executionSettings.has(name)) throw new Error("unknown execution setting");
 		const allowed: Record<string, Set<string>> = {
@@ -873,6 +919,19 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 			}
 			if (args !== "" && args !== "on" && args !== "off") throw new Error("usage: /notify [config|on|off]");
 			return this.bridgeCommand("notify", { action: args || "status" });
+		case "/search-providers": {
+			const [action = "list", name, baseURL, apiKey] = fields.slice(1);
+			if (action === "add") {
+				if (!name || !baseURL) throw new Error("usage: /search-providers add <name> <base-url> [api-key]");
+				return this.bridgeCommand("search_provider", { action, name, base_url: baseURL, api_key: apiKey || "" });
+			}
+			if (action === "use" || action === "remove") {
+				if (!name) throw new Error(`usage: /search-providers ${action} <name|brave>`);
+				return this.bridgeCommand("search_provider", { action, name });
+			}
+			if (action !== "list") throw new Error("usage: /search-providers [list|add|use|remove]");
+			return this.bridgeCommand("search_provider", { action: "list" });
+		}
 		case "/lsp":
 			return this.bridgeCommand("lsp_status");
 		case "/context-doctor":
@@ -931,7 +990,7 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 			return;
 		case "/commands":
 		case "/help":
-			this.post({ type: "notice", text: "Extension commands: /ask /plan /execute /review /continue /compact /approval /notify /lsp /mcp /context-doctor /goal-from-context /cd /detach /rename /effort /dynamic-reasoning /model /pwd /clear /resume /quit (/exit, /q) and !<command>" });
+			this.post({ type: "notice", text: "Extension commands: /ask /plan /execute /review /continue /compact /approval /notify /search-providers /lsp /mcp /context-doctor /goal-from-context /cd /detach /rename /effort /dynamic-reasoning /model /pwd /clear /resume /quit (/exit, /q) and !<command>" });
 			return;
 		default:
 			throw new Error(`${name} is not available in the extension yet`);
@@ -966,6 +1025,9 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 				break;
 			case "openAuth":
 				await this.openAuth();
+				break;
+			case "configureSearchProvider":
+				await this.configureSearchProvider();
 				break;
 			case "configureModel": {
 				if (this.active) break;

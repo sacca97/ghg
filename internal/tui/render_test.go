@@ -386,6 +386,22 @@ func stripAll(s string) string {
 	return out.String()
 }
 
+func TestWorkerTextEventsPreserveStreamOrder(t *testing.T) {
+	m := compactCmdModel()
+	for _, chunk := range []string{"Stored in the config file ", "as literal plaintext, ", "not in an environment variable."} {
+		data, err := json.Marshal(chunk)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if cmd := m.workerEvent(workerEvent{Kind: "text", Data: data}); cmd != nil {
+			t.Fatal("text events should be applied synchronously")
+		}
+	}
+	if got, want := m.current, "Stored in the config file as literal plaintext, not in an environment variable."; got != want {
+		t.Fatalf("streamed text reordered: got %q, want %q", got, want)
+	}
+}
+
 func TestThinkingDisplayEphemeralAndCollapsedTranscript(t *testing.T) {
 	m := compactCmdModel()
 	m.showThinking = true

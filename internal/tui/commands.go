@@ -56,6 +56,7 @@ var registry = []registryEntry{
 	{Name: "/resume", Hint: "[id] — resume a previous session", Category: "Session", Immediate: true},
 	{Name: "/review", Hint: "<target> — run a one-shot read-only review with structured findings using the smart model", Category: "Agent"},
 	{Name: "/schedule", Hint: "@every 10m|<@at time> <prompt> — schedule a wakeup turn; list | cancel <n>", Category: "Session"},
+	{Name: "/search-providers", Hint: "[add|use|remove] — configure SearXNG search endpoints", Category: "Session", Immediate: true},
 	{Name: "/tasks", Hint: "[id] — background subagents: focus the dock, or open one subagent's live view", Keybind: "ctrl+t", Category: "Session", Immediate: true},
 	{Name: "/execute", Hint: "[plan] — execute the latest proposal or supplied plan with the fast model", Category: "Agent", Immediate: true},
 	{Name: "!cmd", Hint: "— run a shell command in the worker; output lands in the transcript and conversation", Category: "App"},
@@ -130,7 +131,7 @@ func busyCmd(text string) bool {
 		return false
 	}
 	switch fields[0] {
-	case "/approval", "/continue", "/help", "/effort", "/dynamic-reasoning", "/tasks", "/cd", "/pwd", "/report", "/detach", "/notify", "/rename":
+	case "/approval", "/continue", "/help", "/effort", "/dynamic-reasoning", "/tasks", "/cd", "/pwd", "/report", "/detach", "/notify", "/rename", "/search-providers":
 		return true
 	case "/ask", "/plan", "/execute", "/review": // handled immediately so a slash command is not sent as chat text
 		return true
@@ -295,6 +296,9 @@ func (m *model) command(text string) (tea.Model, tea.Cmd) {
 		if err := m.workerClient.Send(workerwire.CommandNotify, workerRequestID("notify"), workerwire.NotifyRequest{Action: action}); err != nil {
 			m.append(errStyle.Render("notify failed: " + err.Error()))
 		}
+		return m, nil
+	case "/search-providers":
+		m.searchProvidersCommand(fields[1:])
 		return m, nil
 	case "/mcp":
 		return m.mcpCommand(fields)

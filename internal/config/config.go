@@ -42,24 +42,26 @@ func CompactThreshold(c *Config) float64 {
 
 // Config is the root of ~/.ghg/config.json (JSONC: comments allowed).
 type Config struct {
-	DefaultModel     string                `json:"defaultModel"`
-	DefaultProvider  string                `json:"defaultProvider,omitempty"`  // override the model's first provider
-	DefaultEffort    string                `json:"defaultEffort,omitempty"`    // reasoning effort for new sessions: "", "low", "medium", "high"
-	DynamicReasoning *bool                 `json:"dynamicReasoning,omitempty"` // nil/on lets the model select an advertised effort for one call
-	CompactPct       int                   `json:"compactPct,omitempty"`       // compact at this % of the context window; 0 = DefaultCompactPct
-	Theme            string                `json:"theme,omitempty"`            // "light", "dark", or "" (auto-detect at startup)
-	Mouse            *bool                 `json:"mouse,omitempty"`            // false disables capture so native terminal selection works
-	Subagents        *bool                 `json:"subagents,omitempty"`        // false disables task tool and subagent delegation
-	Thinking         *bool                 `json:"thinking,omitempty"`         // nil defaults to on; false hides reasoning tokens (ctrl+o)
-	CollapsePaste    *bool                 `json:"collapsePaste,omitempty"`    // nil/false: pastes land verbatim; true collapses ≥3-line pastes into a [Pasted ~N lines] placeholder
-	MaxRetries       int                   `json:"maxRetries,omitempty"`       // attempts per provider request on transient failures (429/5xx/network); 0 = models.DefaultMaxAttempts, 1 = no retries
-	Outputs          *OutputConfig         `json:"outputs,omitempty"`          // bounded tool-result persistence; nil/enabled nil uses defaults
-	Artifacts        *OutputConfig         `json:"-"`                          // legacy in-memory alias for Outputs
-	Telegram         *TelegramConfig       `json:"telegram,omitempty"`         // optional completion notifications
-	Execution        *ExecutionConfig      `json:"execution,omitempty"`        // filesystem/network/approval policy for tool subprocesses
-	Providers        map[string]Provider   `json:"providers"`
-	Models           map[string]Model      `json:"models"`
-	Roles            map[string]RoleConfig `json:"roles,omitempty"`
+	DefaultModel     string                    `json:"defaultModel"`
+	DefaultProvider  string                    `json:"defaultProvider,omitempty"`  // override the model's first provider
+	DefaultEffort    string                    `json:"defaultEffort,omitempty"`    // reasoning effort for new sessions: "", "low", "medium", "high"
+	DynamicReasoning *bool                     `json:"dynamicReasoning,omitempty"` // nil/on lets the model select an advertised effort for one call
+	CompactPct       int                       `json:"compactPct,omitempty"`       // compact at this % of the context window; 0 = DefaultCompactPct
+	Theme            string                    `json:"theme,omitempty"`            // "light", "dark", or "" (auto-detect at startup)
+	Mouse            *bool                     `json:"mouse,omitempty"`            // false disables capture so native terminal selection works
+	Subagents        *bool                     `json:"subagents,omitempty"`        // false disables task tool and subagent delegation
+	Thinking         *bool                     `json:"thinking,omitempty"`         // nil defaults to on; false hides reasoning tokens (ctrl+o)
+	CollapsePaste    *bool                     `json:"collapsePaste,omitempty"`    // nil/false: pastes land verbatim; true collapses ≥3-line pastes into a [Pasted ~N lines] placeholder
+	MaxRetries       int                       `json:"maxRetries,omitempty"`       // attempts per provider request on transient failures (429/5xx/network); 0 = models.DefaultMaxAttempts, 1 = no retries
+	Outputs          *OutputConfig             `json:"outputs,omitempty"`          // bounded tool-result persistence; nil/enabled nil uses defaults
+	Artifacts        *OutputConfig             `json:"-"`                          // legacy in-memory alias for Outputs
+	Telegram         *TelegramConfig           `json:"telegram,omitempty"`         // optional completion notifications
+	Execution        *ExecutionConfig          `json:"execution,omitempty"`        // filesystem/network/approval policy for tool subprocesses
+	Providers        map[string]Provider       `json:"providers"`
+	Models           map[string]Model          `json:"models"`
+	Roles            map[string]RoleConfig     `json:"roles,omitempty"`
+	SearchProvider   string                    `json:"searchProvider,omitempty"`
+	SearchProviders  map[string]SearchProvider `json:"searchProviders,omitempty"`
 	// MCPServers is ghg's own MCP server block (ghg-native shape; see
 	// internal/mcp.ServerConfig for the normalized semantics). On load it is
 	// merged over imported claude/codex configs: ghg always wins per name.
@@ -369,6 +371,10 @@ func Load() (*Config, error) {
 		logf("config.load", "POST-EDIT VALIDATION FAILURE %s: %v", p, err)
 		return nil, fmt.Errorf("validate %s: %w", p, err)
 	}
+	if err := cfg.ValidateSearchProviders(); err != nil {
+		logf("config.load", "SEARCH PROVIDER VALIDATION FAILURE %s: %v", p, err)
+		return nil, fmt.Errorf("validate %s: %w", p, err)
+	}
 	// Recover from a clobbered/empty config: no providers and no models is
 	// never a usable state, so prefer the backup, else regenerate defaults —
 	// BUT preserve any MCP server/import entries: an mcp-only config is valid
@@ -416,6 +422,9 @@ func (c *Config) Save() error {
 		return err
 	}
 	if err := c.ValidatePostEdit(); err != nil {
+		return err
+	}
+	if err := c.ValidateSearchProviders(); err != nil {
 		return err
 	}
 	p, err := path()

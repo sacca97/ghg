@@ -33,7 +33,7 @@ func resultTool(def models.Tool, run func(context.Context, json.RawMessage) (Too
 
 // All returns the built-in tool set.
 func All() []Tool {
-	return []Tool{bashTool(), readTool(), writeTool(), editTool(), grepTool(), structuralSearchTool(), globTool(), findFilesTool(), lspTool(), lspRenameTool()}
+	return []Tool{bashTool(), readTool(), writeTool(), editTool(), grepTool(), structuralSearchTool(), globTool(), findFilesTool(), lspTool(), lspRenameTool(), webFetchTool(), webSearchTool()}
 }
 
 // CapabilityReporter lets an optional runtime service report deterministic
@@ -55,6 +55,8 @@ func FilterAvailable(ts []Tool, runtime *ToolRuntime) ([]Tool, []string) {
 	needBash := false
 	needLSP := false
 	needRG := false
+	needWebFetch := false
+	needWebSearch := false
 	for _, tool := range ts {
 		switch tool.Def.Function.Name {
 		case "bash":
@@ -63,6 +65,10 @@ func FilterAvailable(ts []Tool, runtime *ToolRuntime) ([]Tool, []string) {
 			needRG = true
 		case "lsp", "lsp_rename":
 			needLSP = true
+		case "web_fetch":
+			needWebFetch = true
+		case "web_search":
+			needWebSearch = true
 		}
 	}
 
@@ -92,6 +98,26 @@ func FilterAvailable(ts []Tool, runtime *ToolRuntime) ([]Tool, []string) {
 			missing["lsp_rename"] = missing["lsp"]
 			if len(lspNotices) == 0 {
 				notices = append(notices, missing["lsp"])
+			}
+		}
+	}
+	if needWebFetch || needWebSearch {
+		networkAllowed := runtime.Policy != nil && runtime.Policy.NetworkAllowed()
+		if !networkAllowed {
+			mode := runtime.CurrentApprovalMode()
+			canRequestApproval := runtime.Policy != nil && mode != ApprovalNever && (runtime.HumanGate != nil || (mode == ApprovalAutoReview && runtime.Reviewer != nil))
+			if !canRequestApproval {
+				missing["web_fetch"] = "web access unavailable: network is denied and no approval path is configured"
+				missing["web_search"] = missing["web_fetch"]
+				notices = append(notices, missing["web_fetch"])
+			} else {
+				notices = append(notices, "web access will request approval when first used")
+			}
+		}
+		if needWebSearch {
+			if _, err := searchProviderStatus(); err != nil {
+				missing["web_search"] = "web search unavailable: " + err.Error()
+				notices = append(notices, missing["web_search"])
 			}
 		}
 	}
@@ -182,6 +208,7 @@ var integerToolArgs = map[string]map[string]struct{}{
 	"glob":              {"max_results": {}},
 	"find_files":        {"max_results": {}},
 	"structural_search": {"max_results": {}},
+	"web_search":        {"count": {}},
 	"edit":              {"start_line": {}, "end_line": {}},
 }
 

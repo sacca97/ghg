@@ -351,7 +351,21 @@ func (m *model) workingDirectory() string {
 
 func (m *model) pumpWorker(client *workerwire.Client, generation uint64) {
 	p := m.prog
+	if p == nil {
+		return
+	}
+	// Keep worker frames in wire order. sendProg deliberately detaches each
+	// send, but one goroutine per frame lets Bubble Tea receive later chunks
+	// before earlier ones. A single sender preserves order without blocking the
+	// worker-frame reader on the program's message channel.
+	ordered := make(chan tea.Msg, 128)
 	go func() {
+		for msg := range ordered {
+			p.Send(msg)
+		}
+	}()
+	go func() {
+		defer close(ordered)
 		frames, errs := client.Frames(), client.Errors()
 		for frames != nil || errs != nil {
 			select {
@@ -360,18 +374,18 @@ func (m *model) pumpWorker(client *workerwire.Client, generation uint64) {
 					frames = nil
 					continue
 				}
-				sendProg(p, workerFrameMsg{frame: frame, client: client, generation: generation})
+				ordered <- workerFrameMsg{frame: frame, client: client, generation: generation}
 			case err, ok := <-errs:
 				if !ok {
 					errs = nil
 					continue
 				}
 				if err != nil {
-					sendProg(p, workerErrorMsg{err: err, client: client, generation: generation})
+					ordered <- workerErrorMsg{err: err, client: client, generation: generation}
 				}
 			}
 		}
-		sendProg(p, workerErrorMsg{err: errors.New("worker connection closed"), client: client, generation: generation})
+		ordered <- workerErrorMsg{err: errors.New("worker connection closed"), client: client, generation: generation}
 	}()
 }
 
@@ -658,6 +672,9 @@ func (m *model) applyWorkerSnapshot(snapshot workerwire.Snapshot) {
 }
 
 func (m *model) workerEvent(event workerEvent) tea.Cmd {
+	// Ordered stream events must be applied before the next worker frame is
+	// handled. Returning one tea.Cmd per chunk lets Bubble Tea run those
+	// commands concurrently, which can reorder text and tool rows.
 	switch event.Kind {
 	case "route":
 		if value, ok := decodeEvent[workerwire.ConfigureRequest](event.Data); ok {
@@ -711,33 +728,32 @@ func (m *model) workerEvent(event workerEvent) tea.Cmd {
 		return nil
 	case "mcp":
 		if value, ok := decodeEvent[[]workerwire.MCPStatus](event.Data); ok {
-			return func() tea.Msg { return mcpStatusMsg{statuses: value} }
+			return m.applyWorkerMsg(mcpStatusMsg{statuses: value})
 		}
-		return nil
 	case "text":
 		if value, ok := decodeEvent[string](event.Data); ok {
-			return func() tea.Msg { return textMsg(value) }
+			return m.applyWorkerMsg(textMsg(value))
 		}
 	case "think":
 		if value, ok := decodeEvent[string](event.Data); ok {
-			return func() tea.Msg { return thinkMsg(value) }
+			return m.applyWorkerMsg(thinkMsg(value))
 		}
 	case workerwire.EventPlanDelta:
 		if value, ok := decodeEvent[string](event.Data); ok {
-			return func() tea.Msg { return planDeltaMsg(value) }
+			return m.applyWorkerMsg(planDeltaMsg(value))
 		}
 	case workerwire.EventShellDone:
 		search.InvalidateFileIndex(m.workingDirectory())
 		if value, ok := decodeEvent[workerwire.ShellResult](event.Data); ok {
-			return func() tea.Msg { return shellDoneMsg{cmd: value.Command, out: value.Output} }
+			return m.applyWorkerMsg(shellDoneMsg{cmd: value.Command, out: value.Output})
 		}
 	case "steer":
 		if value, ok := decodeEvent[string](event.Data); ok {
-			return func() tea.Msg { return steeredMsg(value) }
+			return m.applyWorkerMsg(steeredMsg(value))
 		}
 	case "notice":
 		if value, ok := decodeEvent[string](event.Data); ok {
-			return func() tea.Msg { return noticeMsg(value) }
+			return m.applyWorkerMsg(noticeMsg(value))
 		}
 	case "model_call_start":
 		if value, ok := decodeEvent[agent.ModelCallStart](event.Data); ok {
@@ -770,15 +786,41 @@ func (m *model) workerEvent(event workerEvent) tea.Cmd {
 			Progress agent.ReviewProgress `json:"progress"`
 		}
 		if err := json.Unmarshal(event.Data, &envelope); err == nil {
-			return func() tea.Msg { return reviewProgressMsg{progress: envelope.Progress} }
+			return m.applyWorkerMsg(reviewProgressMsg{progress: envelope.Progress})
 		}
 	case "tool_start":
 		if value, ok := decodeEvent[workerToolStartEvent](event.Data); ok {
-			return func() tea.Msg { return toolStartMsg{value.ID, value.Name, value.Args} }
+			return m.applyWorkerMsg(toolStartMsg{value.ID, value.Name, value.Args})
 		}
 	case "tool_end":
 		if value, ok := decodeEvent[workerToolEndEvent](event.Data); ok {
-			return func() tea.Msg { return toolEndMsg{value.ID, value.Name, value.Result} }
+			return m.applyWorkerMsg(toolEndMsg{value.ID, value.Name, value.Result})
+		}
+	case "goal_update":
+		if value, ok := decodeEvent[agent.GoalUpdate](event.Data); ok {
+			return m.applyWorkerMsg(goalUpdateMsg{update: value})
+		}
+	case "retry":
+		if value, ok := decodeEvent[models.RetryEvent](event.Data); ok {
+			return m.applyWorkerMsg(noticeMsg(fmt.Sprintf("⚠ request failed (%s) — retrying in %s (attempt %d/%d)", value.Err, value.Delay.Round(time.Millisecond), value.Attempt+1, value.Max)))
+		}
+	case "goal":
+		if value, ok := decodeEvent[agent.GoalRecord](event.Data); ok {
+			return m.applyWorkerMsg(goalUpdateRecordMsg{record: value})
+		}
+	case "schedule":
+		if value, ok := decodeEvent[string](event.Data); ok {
+			return m.applyWorkerMsg(noticeMsg(value))
+		}
+	case "compact":
+		return m.applyWorkerMsg(noticeMsg("◎ compacted — raw history preserved"))
+	case "permission_request":
+		if value, ok := decodeEvent[workerwire.PermissionRequest](event.Data); ok {
+			return m.applyWorkerMsg(workerPermissionMsg{approval: value.Approval})
+		}
+	case workerwire.EventQuestionRequest:
+		if value, ok := decodeEvent[workerwire.QuestionRequest](event.Data); ok {
+			return m.applyWorkerMsg(workerQuestionMsg{request: value})
 		}
 	case "usage":
 		if value, ok := decodeEvent[models.Usage](event.Data); ok {
@@ -787,20 +829,6 @@ func (m *model) workerEvent(event workerEvent) tea.Cmd {
 				m.workerContextTokens = total
 			}
 			return nil
-		}
-	case "goal_update":
-		if value, ok := decodeEvent[agent.GoalUpdate](event.Data); ok {
-			return func() tea.Msg { return goalUpdateMsg{update: value} }
-		}
-	case "retry":
-		if value, ok := decodeEvent[models.RetryEvent](event.Data); ok {
-			return func() tea.Msg {
-				return noticeMsg(fmt.Sprintf("⚠ request failed (%s) — retrying in %s (attempt %d/%d)", value.Err, value.Delay.Round(time.Millisecond), value.Attempt+1, value.Max))
-			}
-		}
-	case "goal":
-		if value, ok := decodeEvent[agent.GoalRecord](event.Data); ok {
-			return func() tea.Msg { return goalUpdateRecordMsg{record: value} }
 		}
 	case "goal_from_context":
 		if value, ok := decodeEvent[workerwire.GoalFromContextResult](event.Data); ok {
@@ -821,12 +849,6 @@ func (m *model) workerEvent(event workerEvent) tea.Cmd {
 				return goalFromContextMsg{goal: goalText, record: record, usage: value.Usage, err: err}
 			}
 		}
-	case "schedule":
-		if value, ok := decodeEvent[string](event.Data); ok {
-			return func() tea.Msg { return noticeMsg(value) }
-		}
-	case "compact":
-		return func() tea.Msg { return noticeMsg("◎ compacted — raw history preserved") }
 	case "compact_done":
 		if value, ok := decodeEvent[workerwire.CompactResult](event.Data); ok {
 			err := workerError(value.Error)
@@ -838,16 +860,6 @@ func (m *model) workerEvent(event workerEvent) tea.Cmd {
 			return func() tea.Msg {
 				return workerCompactDoneMsg{err: err, usage: value.Usage, contextTokens: contextTokens}
 			}
-		}
-	case "permission_request":
-		if value, ok := decodeEvent[workerwire.PermissionRequest](event.Data); ok {
-			return func() tea.Msg {
-				return workerPermissionMsg{approval: value.Approval}
-			}
-		}
-	case workerwire.EventQuestionRequest:
-		if value, ok := decodeEvent[workerwire.QuestionRequest](event.Data); ok {
-			return func() tea.Msg { return workerQuestionMsg{request: value} }
 		}
 	case "turn_done":
 		search.InvalidateFileIndex(m.workingDirectory())
@@ -890,6 +902,11 @@ func (m *model) workerEvent(event workerEvent) tea.Cmd {
 		}
 	}
 	return nil
+}
+
+func (m *model) applyWorkerMsg(msg tea.Msg) tea.Cmd {
+	_, cmd := m.Update(msg)
+	return cmd
 }
 
 func (m *model) workerHasLiveTask() bool {

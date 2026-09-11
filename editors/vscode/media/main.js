@@ -14,6 +14,7 @@
   const settingsSandbox = document.getElementById("settings-sandbox");
   const settingsNetwork = document.getElementById("settings-network");
   const settingsApproval = document.getElementById("settings-approval");
+  const configureSearch = document.getElementById("configure-search");
   const settingsRuntime = document.getElementById("settings-runtime");
   const chatView = document.getElementById("chat-view");
   const transcript = document.getElementById("transcript");
@@ -1363,6 +1364,7 @@
       vscode.postMessage({ type: "setExecutionSetting", name, value: input.value });
     });
   }
+  configureSearch?.addEventListener("click", () => vscode.postMessage({ type: "configureSearchProvider" }));
   transcript.addEventListener("click", (event) => {
     const target = event.target;
     const anchor = target instanceof Element ? target.closest("a[href]") : null;

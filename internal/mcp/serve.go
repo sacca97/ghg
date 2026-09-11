@@ -22,6 +22,11 @@ func Serve(ctx context.Context, version string) error {
 	srv := sdkmcp.NewServer(&sdkmcp.Implementation{Name: "ghg", Version: version}, nil)
 	for _, t := range tools.All() {
 		t := t
+		// The stdio MCP server has no execution policy/runtime to grant host
+		// networking, so do not advertise tools that would reject every call.
+		if t.Def.Function.Name == "web_fetch" || t.Def.Function.Name == "web_search" {
+			continue
+		}
 		srv.AddTool(&sdkmcp.Tool{
 			Name:        t.Def.Function.Name,
 			Description: t.Def.Function.Description,

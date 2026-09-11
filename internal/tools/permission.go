@@ -30,8 +30,8 @@ const (
 
 // GateRequest describes one gated tool call for the prompt.
 type GateRequest struct {
-	Tool    string // bash | write | edit
-	Command string // the bash command or the file path
+	Tool    string // the tool requesting approval
+	Command string // the command, URL, or file path
 	Rule    string // the rule "always" would install (arity-collapsed)
 }
 

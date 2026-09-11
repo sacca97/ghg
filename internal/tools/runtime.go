@@ -543,6 +543,39 @@ func (r *ToolRuntime) authorizeCommand(ctx context.Context, tool, command, cwd s
 	return granted, true, nil
 }
 
+// authorizeNetwork reuses the ordinary capability gate for read-only web
+// tools. A denied network policy is the default, but an interactive approval
+// (or the configured auto-review path) may widen only this call's policy.
+func (r *ToolRuntime) authorizeNetwork(ctx context.Context, tool, target string) (*sandbox.Policy, error) {
+	if r == nil || r.Policy == nil {
+		return nil, errors.New("web access is unavailable without an execution policy")
+	}
+	if r.Policy.NetworkAllowed() {
+		return r.Policy, nil
+	}
+	target = truncateApprovalText(strings.TrimSpace(target), 2000)
+	command := strings.TrimSpace(tool + " " + target)
+	request := ApprovalRequest{
+		Tool: tool, Command: redactCommand(command, r.SecretNames), CWD: r.Policy.Workspace(),
+		ReadRoots: r.Policy.ReadRoots(), WriteRoots: r.Policy.WriteRoots(), Network: true,
+		Classification: string(dispositionReview), Justification: "public web access requires network approval",
+		Fingerprint: operationFingerprint(tool, target, r.Policy.Workspace()),
+	}
+	decision, _, err := r.reviewOrHuman(ctx, request, true)
+	if err != nil {
+		return r.Policy, err
+	}
+	if decision != GateAllowOnce && decision != GateAllowAlways {
+		return r.Policy, errors.New("web access approval was denied")
+	}
+	granted, err := r.grantRequest(request)
+	if err != nil {
+		return r.Policy, err
+	}
+	r.audit(ExecutionAudit{Request: request, Disposition: string(dispositionReview), Granted: grantedCapability(request)})
+	return granted, nil
+}
+
 func (r *ToolRuntime) approvalRequest(tool, command, cwd string, segments []CommandSegment, disposition commandDisposition, network bool, reason string, requestedReadRoots, requestedWriteRoots []string) ApprovalRequest {
 	canonicalCWD := cwd
 	if r.Policy != nil && cwd != "" {

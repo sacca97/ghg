@@ -360,7 +360,7 @@ func workerCommandName(name string) bool {
 		name == workerwire.CommandRewind || name == workerwire.CommandCompactRetry || name == workerwire.CommandGoal ||
 		name == workerwire.CommandGoalFromContext || name == workerwire.CommandChdir || name == workerwire.CommandAppend ||
 		name == workerwire.CommandShell || name == workerwire.CommandFork || name == workerwire.CommandRename ||
-		name == workerwire.CommandNotify
+		name == workerwire.CommandNotify || name == workerwire.CommandSearchProvider
 }
 
 func (b *bridge) forward(ctx context.Context) {

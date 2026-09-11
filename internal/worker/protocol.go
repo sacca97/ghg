@@ -61,10 +61,11 @@ const (
 	// CommandAppend appends a local user-role context message to the
 	// worker-owned conversation (or steers the running turn) — the `!` shell
 	// escape output has to reach the model that actually answers next.
-	CommandAppend = "append"
-	CommandFork   = "fork"
-	CommandRename = "rename"
-	CommandNotify = "notify"
+	CommandAppend         = "append"
+	CommandFork           = "fork"
+	CommandRename         = "rename"
+	CommandNotify         = "notify"
+	CommandSearchProvider = "search_provider"
 )
 
 var (
@@ -252,7 +253,7 @@ func knownCommand(name string) bool {
 		CommandStop, CommandPing, CommandLSPStatus, CommandMCPStatus,
 		CommandMCPReconnect, CommandMCPEnable, CommandMCPDisable, CommandContextDoctor, CommandRewind,
 		CommandCompactRetry, CommandGoal, CommandGoalFromContext,
-		CommandChdir, CommandAppend, CommandShell, CommandFork, CommandRename, CommandNotify:
+		CommandChdir, CommandAppend, CommandShell, CommandFork, CommandRename, CommandNotify, CommandSearchProvider:
 		return true
 	default:
 		return false

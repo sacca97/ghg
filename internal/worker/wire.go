@@ -278,3 +278,19 @@ type NotifyRequest struct {
 type NotifyResult struct {
 	Enabled bool `json:"enabled"`
 }
+
+// SearchProviderRequest manages one configured SearXNG endpoint. API keys are
+// accepted only on add and are never returned in SearchProviderInfo.
+type SearchProviderRequest struct {
+	Action  string `json:"action"`
+	Name    string `json:"name,omitempty"`
+	BaseURL string `json:"base_url,omitempty"`
+	APIKey  string `json:"api_key,omitempty"`
+}
+
+type SearchProviderInfo struct {
+	Name      string `json:"name"`
+	BaseURL   string `json:"base_url"`
+	Active    bool   `json:"active"`
+	HasAPIKey bool   `json:"has_api_key"`
+}

@@ -902,7 +902,7 @@ func (a *Agent) emitCallEnd(ev Events, call ModelCallStart, start time.Time, msg
 func isRepositoryNavigationTool(name string) bool {
 	switch name {
 	case "read", "grep", "structural_search", "glob", "find_files", "lsp",
-		"output_list", "output_read", "artifact_list", "artifact_read", "history_search", "history_read":
+		"output_list", "output_read", "artifact_list", "artifact_read", "history_search", "history_read", "web_fetch", "web_search":
 		return true
 	default:
 		return false
