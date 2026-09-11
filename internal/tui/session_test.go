@@ -6,7 +6,6 @@ import (
 	"errors"
 	"net"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -880,15 +879,6 @@ func TestNamePromptPreservesDraft(t *testing.T) {
 	press(t, m, esc(m)) // cancel: the draft comes back
 	if m.input.Value() != "my half-typed thought" {
 		t.Fatalf("draft lost: %q", m.input.Value())
-	}
-}
-
-func git(t *testing.T, dir string, args ...string) {
-	t.Helper()
-	cmd := exec.Command("git", args...)
-	cmd.Dir = dir
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
 	}
 }
 

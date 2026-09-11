@@ -51,7 +51,7 @@ const slashCommands = [
   ["/effort", "set reasoning effort"], ["/execute", "execute a plan"], ["/goal-from-context", "formulate a goal"],
   ["/help", "show commands"], ["/lsp", "show language server status"], ["/mcp", "manage MCP servers"],
   ["/model", "switch or refresh models"], ["/plan", "enter plan mode"],
-  ["/approval", "switch approval mode (ask|auto-review|never)"],
+  ["/approval", "switch approval mode (ask|auto|never)"],
   ["/notify", "Telegram completion notifications (config|on|off)"],
   ["/continue", "continue an interrupted turn"],
   ["/pwd", "print working directory"], ["/detach", "detach worker"], ["/quit", "exit"], ["/exit", "exit"], ["/q", "exit"], ["/rename", "rename session"],
@@ -617,6 +617,18 @@ const handlers = {
     save();
   },
 
+  busy(raw) {
+    // The host owns the busy state: a dropped or out-of-order event can no
+    // longer leave the button showing Send while a turn is still running.
+    active = raw.value === true;
+    if (active && !turnSince) turnSince = Date.now();
+    if (!active) turnSince = 0;
+    if (active && activity === "Ready") activity = "Thinking";
+    setSendButton(active);
+    send.classList.toggle("stop", active);
+    updateStatus();
+  },
+
   snapshot(raw) {
     applySnapshot(raw.snapshot);
   },
@@ -945,6 +957,11 @@ prompt.addEventListener("keydown", (event) => {
       hideCompletions();
       return;
     }
+  }
+  if (event.key === "Escape" && active) {
+    event.preventDefault();
+    post({ type: "stop" });
+    return;
   }
   if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
     event.preventDefault();

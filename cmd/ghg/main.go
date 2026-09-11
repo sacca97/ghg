@@ -82,7 +82,7 @@ func main() {
 	cautiousFlag := flag.Bool("cautious", false, "ask before running commands / writing files")
 	sandboxFlag := flag.String("sandbox", "", "execution sandbox: read-only, workspace-write, or danger-full-access")
 	networkFlag := flag.String("network", "", "execution network: deny or host")
-	approvalFlag := flag.String("approval", "", "exceptional capability approval: ask, auto-review, or never")
+	approvalFlag := flag.String("approval", "", "exceptional capability approval: ask, auto, or never")
 	flag.Usage = func() {
 		fmt.Fprintln(flag.CommandLine.Output(), "usage: ghg [flags] [prompt]")
 		flag.PrintDefaults()

@@ -481,12 +481,6 @@ func (m *Manager) covered(path string) bool {
 	return false
 }
 
-// diagsEqual compares two diagnostic sets (order-sensitive: servers push
-// ordered lists).
-func diagsEqual(a, b []Diagnostic) bool {
-	return slices.Equal(a, b)
-}
-
 // clientFor resolves a client for the file, spawning on demand. Spawn dedup:
 // concurrent touches for the same (server, root) share one spawn via a
 // close-to-broadcast channel — losers wait on <-ch, the winner closes it

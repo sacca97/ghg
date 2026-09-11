@@ -261,7 +261,7 @@ func (m *claudeCredentialManager) doRefreshToken(ctx context.Context, refreshTok
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode == http.StatusBadRequest || resp.StatusCode == http.StatusUnauthorized {
 		_ = m.Logout(ctx)
-		return nil, errors.New("Claude session expired or revoked; please run 'ghg auth claude-subscription' to sign in again")
+		return nil, errors.New("claude session expired or revoked; please run 'ghg auth claude-subscription' to sign in again")
 	}
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		return nil, fmt.Errorf("token refresh returned HTTP status %d", resp.StatusCode)

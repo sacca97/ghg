@@ -28,13 +28,13 @@ type ApprovalMode string
 
 const (
 	ApprovalAsk        ApprovalMode = "ask"
-	ApprovalAutoReview ApprovalMode = "auto-review"
+	ApprovalAutoReview ApprovalMode = "auto"
 	ApprovalNever      ApprovalMode = "never"
 )
 
 // ParseApprovalMode validates a user/configuration value. Empty is the
 // interactive default; headless callers should explicitly select never or
-// auto-review.
+// auto.
 func ParseApprovalMode(value string) (ApprovalMode, error) {
 	switch ApprovalMode(strings.TrimSpace(strings.ToLower(value))) {
 	case "", ApprovalAsk:
@@ -44,7 +44,7 @@ func ParseApprovalMode(value string) (ApprovalMode, error) {
 	case ApprovalNever:
 		return ApprovalNever, nil
 	default:
-		return "", fmt.Errorf("unknown approval mode %q (want ask, auto-review, or never)", value)
+		return "", fmt.Errorf("unknown approval mode %q (want ask, auto, or never)", value)
 	}
 }
 
@@ -545,7 +545,7 @@ func (r *ToolRuntime) authorizeCommand(ctx context.Context, tool, command, cwd s
 
 // authorizeNetwork reuses the ordinary capability gate for read-only web
 // tools. A denied network policy is the default, but an interactive approval
-// (or the configured auto-review path) may widen only this call's policy.
+// (or the configured auto path) may widen only this call's policy.
 func (r *ToolRuntime) authorizeNetwork(ctx context.Context, tool, target string) (*sandbox.Policy, error) {
 	if r == nil || r.Policy == nil {
 		return nil, errors.New("web access is unavailable without an execution policy")
@@ -642,7 +642,7 @@ func (r *ToolRuntime) reviewOrHumanOnce(ctx context.Context, request ApprovalReq
 	}
 	if allowAutoReview && approvalMode == ApprovalAutoReview {
 		if r.Reviewer == nil {
-			return GateReject, true, errors.New("auto-review is enabled but no tiny reviewer is configured")
+			return GateReject, true, errors.New("auto is enabled but no tiny reviewer is configured")
 		}
 		result, err := r.Reviewer(ctx, request)
 		if err == nil && result.Decision == ApprovalApproveOnce && result.Confidence >= 0.70 && strings.TrimSpace(result.Reason) != "" {

@@ -11,7 +11,7 @@ type Workspace = vscode.WorkspaceFolder | undefined;
 const roles = ["default", "smart", "fast", "tiny"] as const;
 const modes = ["execute", "plan", "review"] as const;
 const effortLevels = ["", "low", "medium", "high"] as const;
-const approvals = ["", "ask", "auto-review", "never"] as const;
+const approvals = ["", "ask", "auto", "never"] as const;
 const sandboxes = ["", "read-only", "workspace-write", "danger-full-access"] as const;
 const networks = ["", "deny", "host"] as const;
 
@@ -353,6 +353,12 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 		for (const event of events) void this.view.webview.postMessage(event);
 	}
 
+	private setActive(value: boolean): void {
+		if (this.active === value) return;
+		this.active = value;
+		this.post({ type: "busy", value });
+	}
+
 	private async pickModel(mode: "chat" | "plan", selectedRole?: Role): Promise<void> {
 		const workspace = currentWorkspace();
 		const binary = vscode.workspace.getConfiguration("ghg").get<string>("binaryPath", "ghg");
@@ -461,10 +467,10 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 				}
 			}
 			if (event.type === "turn_end") {
-				this.active = false;
+				this.setActive(false);
 			}
 			if (event.type === "error" && this.active) {
-				this.active = false;
+				this.setActive(false);
 				this.post({ type: "turn_end" });
 			}
 			void this.handleBridgeEvent(event).catch((error: unknown) => {
@@ -500,7 +506,7 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 				this.lastSnapshot = undefined;
 			}
 			if (this.active) {
-				this.active = false;
+				this.setActive(false);
 				this.post({ type: "turn_end" });
 			}
 		});
@@ -607,7 +613,7 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 		if (event.type === "snapshot") {
 			const snapshot = event.snapshot as Record<string, unknown> | undefined;
 			if (!snapshot) return;
-			this.active = typeof snapshot.state === "string" && busyStates.has(snapshot.state);
+			this.setActive(typeof snapshot.state === "string" && busyStates.has(snapshot.state));
 			if (snapshot.pending_approval && typeof snapshot.pending_approval === "object") {
 				await this.showApproval(snapshot.pending_approval as Record<string, unknown>);
 			}
@@ -616,7 +622,7 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 			}
 		}
 		if (event.type === "state") {
-			this.active = typeof event.state === "string" && busyStates.has(event.state);
+			this.setActive(typeof event.state === "string" && busyStates.has(event.state));
 		}
 	}
 
@@ -665,7 +671,7 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 		try {
 			await this.writeBridgeCommand(child, "detach", null, requestID);
 			await detached;
-			this.active = false;
+			this.setActive(false);
 			await this.stopBridge();
 		} finally {
 			this.detachWaiters.delete(requestID);
@@ -689,7 +695,7 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 		this.bridgeBinary = "";
 		this.lastSnapshot = undefined;
 		this.bufferedEvents = [];
-		this.active = false;
+		this.setActive(false);
 		if (!child) return Promise.resolve();
 		if (child.exitCode !== null) return Promise.resolve();
 		const stopped = new Promise<void>((resolve) => child.once("close", () => resolve()));
@@ -843,7 +849,7 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 		switch (name) {
 		case "/ask":
 			if (!args) throw new Error("usage: /ask <question>");
-			this.active = true;
+			this.setActive(true);
 			this.post({ type: "turn_start", mode: "chat" });
 			await this.submitInput(args, role, "execute", { ask: true }, references);
 			return;
@@ -853,21 +859,21 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 				this.post({ type: "notice", text: "switched to plan mode (read-only exploration)" });
 				return;
 			}
-			this.active = true;
+			this.setActive(true);
 			this.post({ type: "turn_start", mode: "plan" });
 			await this.bridgeCommand("input", { input: promptWithReferences(args, references), authored: true, plan_mode: true });
 			return;
 		case "/execute": {
 			const plan = args || (typeof message.plan === "string" ? message.plan : "");
 			if (!plan) throw new Error("no plan to execute — use /plan <goal> first");
-			this.active = true;
+			this.setActive(true);
 			this.post({ type: "turn_start", mode: "chat" });
 			await this.submitInput(`Execute the following approved plan. Create and maintain a todowrite checklist while implementing it.\n\n${plan}`, "fast", "execute", {}, references);
 			return;
 		}
 		case "/review":
 			if (!args) throw new Error("usage: /review <target or instructions>");
-			this.active = true;
+			this.setActive(true);
 			this.post({ type: "turn_start", mode: "chat" });
 			await this.submitInput(args, role, "execute", { review: true }, references);
 			return;
@@ -875,7 +881,7 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 			if (args) throw new Error("usage: /continue");
 			if (this.active) throw new Error("A ghg turn is already running.");
 			const continueMode = message.mode === "plan" ? "plan" : "execute";
-			this.active = true;
+			this.setActive(true);
 			this.post({ type: "turn_start", mode: continueMode });
 			await this.bridgeCommand("input", {
 				input: "continue",
@@ -892,7 +898,7 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 			if (args) throw new Error("usage: /compact [retry]");
 			return this.bridgeCommand("compact");
 		case "/approval":
-			if (args !== "ask" && args !== "auto-review" && args !== "never") throw new Error("usage: /approval <ask|auto-review|never>");
+			if (args !== "ask" && args !== "auto" && args !== "never") throw new Error("usage: /approval <ask|auto|never>");
 			return this.bridgeCommand("configure", { approval: args });
 		case "/notify":
 			if (args === "config") {
@@ -998,6 +1004,7 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 			case "ready":
 				this.webviewReady = true;
 				this.flushBufferedEvents();
+				this.post({ type: "busy", value: this.active });
 				this.post({ type: "extensionSettings", settings: this.extensionSettings() });
 				break;
 			case "refreshModels":
@@ -1137,7 +1144,7 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 				await this.sendCommand(prompt, message);
 				return;
 			}
-			this.active = true;
+			this.setActive(true);
 			this.post({ type: "turn_start", mode });
 			if (mode === "review") {
 				await this.submitInput(prompt, role, "execute", { review: true }, cleanReferences(message.references));
@@ -1147,7 +1154,7 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 		} catch (error) {
 			this.post({ type: "error", error: error instanceof Error ? error.message : String(error) });
 			if (!activeBefore) {
-				this.active = false;
+				this.setActive(false);
 				this.post({ type: "turn_end" });
 			}
 		}

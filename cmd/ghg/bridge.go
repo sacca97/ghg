@@ -109,7 +109,9 @@ func bridgeCLI(args []string) error {
 	var process *workerwire.Process
 	if runtimeFile.Live() {
 		client, err = bridgeConnect(runtimeFile)
-	} else {
+		if err != nil {
+			return err
+		}
 		if err = runtimeFile.WritePrompt(sysPrompt); err != nil {
 			return err
 		}

@@ -1,6 +1,7 @@
 package telegram
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -41,7 +42,7 @@ func TestSendCompletionMessage(t *testing.T) {
 	if !strings.HasSuffix(message, truncatedMark) {
 		t.Fatalf("truncated message missing marker: %q", message[len(message)-80:])
 	}
-	if err := (Client{BaseURL: "https://telegram.test", HTTPClient: client}).Send(nil, token, "chat-1", message); err != nil {
+	if err := (Client{BaseURL: "https://telegram.test", HTTPClient: client}).Send(context.TODO(), token, "chat-1", message); err != nil {
 		t.Fatal(err)
 	}
 	if gotPath != "/bot"+token+"/sendMessage" {
@@ -58,7 +59,7 @@ func TestSendFailureDoesNotLeakToken(t *testing.T) {
 		return telegramResponse(`{"ok":false,"description":"invalid token 12345:secret-token"}`), nil
 	})}
 
-	err := (Client{BaseURL: "https://telegram.test", HTTPClient: client}).Send(nil, token, "chat-1", "hello")
+	err := (Client{BaseURL: "https://telegram.test", HTTPClient: client}).Send(context.TODO(), token, "chat-1", "hello")
 	if err == nil || strings.Contains(err.Error(), token) {
 		t.Fatalf("error = %v, token leaked or error missing", err)
 	}

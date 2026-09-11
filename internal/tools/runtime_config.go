@@ -3,9 +3,9 @@ package tools
 import (
 	"errors"
 	"fmt"
+	"go/build"
 	"os"
 	"path/filepath"
-	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -64,7 +64,7 @@ func NewConfiguredRuntime(workspace string, cfg *config.ExecutionConfig, headles
 		}
 	}
 	// An interactive human prompt is not available to headless/goal/scheduled
-	// runs. Only an explicit auto-review setting can authorize escalation there.
+	// runs. Only an explicit auto setting can authorize escalation there.
 	if headless && approval != ApprovalAutoReview {
 		approval = ApprovalNever
 	}
@@ -378,7 +378,7 @@ func discoveredToolchainRoots(env map[string]string) []string {
 	for _, gopath := range splitPathList(envValue(env, "GOPATH")) {
 		candidates = append(candidates, filepath.Join(gopath, "bin"))
 	}
-	if goroot := strings.TrimSpace(runtime.GOROOT()); goroot != "" {
+	if goroot := strings.TrimSpace(build.Default.GOROOT); goroot != "" {
 		candidates = append(candidates, goroot)
 	}
 
@@ -510,7 +510,7 @@ func discoveredCacheEnvironment(tempRoot string) (map[string]string, error) {
 			}
 		}
 	}
-	if goroot := strings.TrimSpace(runtime.GOROOT()); goroot != "" {
+	if goroot := strings.TrimSpace(build.Default.GOROOT); goroot != "" {
 		if err := setPath("GOROOT", goroot); err != nil {
 			return nil, err
 		}

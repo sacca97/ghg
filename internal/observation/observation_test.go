@@ -38,13 +38,13 @@ func (s *testStore) LoadObservation(_ context.Context, sessionID, id string) (Re
 func TestRegistryScopesRecordsBySession(t *testing.T) {
 	registry := NewRegistry()
 	record := Record{ID: "obs-1", Path: "/tmp/a.go", StartLine: 1, EndLine: 1, Content: "x\n", Complete: true}
-	if err := registry.Save(nil, "one", record); err != nil {
+	if err := registry.Save(context.TODO(), "one", record); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := registry.Load(nil, "two", record.ID); err == nil {
+	if _, err := registry.Load(context.TODO(), "two", record.ID); err == nil {
 		t.Fatal("observation leaked across session boundary")
 	}
-	got, err := registry.Load(nil, "one", record.ID)
+	got, err := registry.Load(context.TODO(), "one", record.ID)
 	if err != nil || got.Content != record.Content || got.SessionID != "one" {
 		t.Fatalf("scoped observation = %+v, %v", got, err)
 	}
@@ -60,7 +60,7 @@ func TestRegistryBoundsPersistedLiveRecords(t *testing.T) {
 			StartLine: i + 1, EndLine: i + 1, Content: "x",
 			CreatedAt: timeForTest(i),
 		}
-		if err := registry.Save(nil, "session", record); err != nil {
+		if err := registry.Save(context.TODO(), "session", record); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -71,7 +71,7 @@ func TestRegistryBoundsPersistedLiveRecords(t *testing.T) {
 	if count > maxLiveObservationsPerSession || live {
 		t.Fatalf("live records = %d, oldest retained=%v", count, live)
 	}
-	if _, err := registry.Load(nil, "session", "obs-0"); err != nil {
+	if _, err := registry.Load(context.TODO(), "session", "obs-0"); err != nil {
 		t.Fatalf("evicted observation should reload from storage: %v", err)
 	}
 }
@@ -81,11 +81,11 @@ func TestBindSessionKeepsPendingRecordsOnStoreFailure(t *testing.T) {
 	registry := NewRegistry()
 	registry.SetPersistent(store)
 	for i := 0; i < 2; i++ {
-		if err := registry.Save(nil, "", Record{ID: fmt.Sprintf("obs-%d", i), Path: "/tmp/a.go", StartLine: i + 1, EndLine: i + 1}); err != nil {
+		if err := registry.Save(context.TODO(), "", Record{ID: fmt.Sprintf("obs-%d", i), Path: "/tmp/a.go", StartLine: i + 1, EndLine: i + 1}); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := registry.BindSession(nil, "session"); err == nil {
+	if err := registry.BindSession(context.TODO(), "session"); err == nil {
 		t.Fatal("expected persistence failure")
 	}
 	registry.mu.Lock()

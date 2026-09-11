@@ -82,11 +82,6 @@ func searchProviderStatus() (searchBackend, error) {
 	return searchBackend{Name: "brave", Endpoint: braveSearchEndpoint, APIKey: key}, nil
 }
 
-func searchProviderConfigured() bool {
-	_, err := searchProviderStatus()
-	return err == nil
-}
-
 func runWebSearch(ctx context.Context, args json.RawMessage) (ToolResult, error) {
 	var in webSearchArgs
 	if err := json.Unmarshal(args, &in); err != nil {
@@ -155,7 +150,7 @@ func searchBraveWithClient(ctx context.Context, in webSearchArgs, key, endpoint 
 		return ToolResult{}, errors.New("web_search response exceeds 1 MiB")
 	}
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return ToolResult{}, fmt.Errorf("Brave Search returned %s", resp.Status)
+		return ToolResult{}, fmt.Errorf("brave search returned %s", resp.Status)
 	}
 	var decoded braveSearchResponse
 	if err := json.Unmarshal(body, &decoded); err != nil {

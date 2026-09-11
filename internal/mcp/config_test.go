@@ -123,7 +123,7 @@ func TestLoadMergedDiscovery(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, ".mcp.json"), []byte(`{broken`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	merged, errs = LoadMerged(dir, nil)
+	_, errs = LoadMerged(dir, nil)
 	if _, ok := errs[".mcp.json"]; !ok {
 		t.Error("expected a parse error for .mcp.json")
 	}

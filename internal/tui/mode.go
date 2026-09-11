@@ -113,17 +113,6 @@ func (m *model) setMode(mode string) error {
 	return nil
 }
 
-// switchRole replaces the live route while preserving the conversation and
-// cumulative usage. Unlike /model, this is an execution detail and does not
-// rewrite the user's configured default route.
-func (m *model) switchRole(role string) error {
-	target, err := m.roleRoute(role)
-	if err != nil {
-		return err
-	}
-	return m.activateRoute(target.Model, target.Provider, role)
-}
-
 // activateRoute installs a concrete role route while preserving the current
 // conversation and session-local state. It deliberately does not rewrite the
 // configured default route: choosing a role model edits that role only.

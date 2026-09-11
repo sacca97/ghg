@@ -119,7 +119,7 @@
         },
         "ghg.approval": {
           "type": "string",
-          "enum": ["", "ask", "auto-review", "never"],
+          "enum": ["", "ask", "auto", "never"],
           "default": "",
           "description": "Exceptional capability approval policy."
         }

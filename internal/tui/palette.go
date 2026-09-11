@@ -1397,17 +1397,6 @@ func (m *model) modelsDevProviderIDs(instanceName string) []string {
 	return config.ModelsDevProviderIDs(m.profiles, instanceName, prov)
 }
 
-func (m *model) reasoningToggleFor(provName, apiID string) bool {
-	if cat, ok := m.catalogs[provName]; ok {
-		if info := cat.Find(apiID); info != nil && info.ReasoningToggle {
-			return true
-		}
-	}
-	metadata := config.LoadModelsDev()
-	info, ok := metadata.ReasoningFor(apiID, m.modelsDevProviderIDs(provName)...)
-	return ok && info.Toggle
-}
-
 func (m *model) fetchCatalogs(force bool, providers map[string]config.Provider) {
 	if m.cfg == nil {
 		return

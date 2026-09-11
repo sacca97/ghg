@@ -23,7 +23,6 @@ import (
 	"github.com/sacca97/ghg/internal/agent"
 	"github.com/sacca97/ghg/internal/config"
 	"github.com/sacca97/ghg/internal/export"
-	"github.com/sacca97/ghg/internal/lsp"
 	"github.com/sacca97/ghg/internal/memory"
 	"github.com/sacca97/ghg/internal/models"
 	"github.com/sacca97/ghg/internal/session"
@@ -48,7 +47,7 @@ func runCLI(args []string) error {
 	timeoutFlag := fs.Duration("timeout", 0, "wall-clock cap on the whole run (e.g. 30s, 5m); 0 = no timeout")
 	sandboxFlag := fs.String("sandbox", "", "execution sandbox: read-only, workspace-write, or danger-full-access")
 	networkFlag := fs.String("network", "", "execution network: deny or host")
-	approvalFlag := fs.String("approval", "", "exceptional capability approval: ask, auto-review, or never")
+	approvalFlag := fs.String("approval", "", "exceptional capability approval: ask, auto, or never")
 	quietFlag := fs.Bool("quiet", false, "suppress the stderr tool/session notes (clean stdout for -format json piping)")
 	noSessionFlag := fs.Bool("no-session", false, "run without persisting a session (one-off jobs don't clutter ghg sessions)")
 	fs.Usage = func() {
@@ -165,13 +164,11 @@ func runCLI(args []string) error {
 			fmt.Fprint(os.Stdout, delta)
 		}
 	}
-	runtime, runtimeCleanup, err := tools.NewConfiguredRuntime(".", cfg.Execution, true, cfg.PostEdit)
+	runtime, lspMgr, runtimeCleanup, err := newConfiguredRuntime(cfg, true)
 	if err != nil {
 		return err
 	}
 	defer runtimeCleanup()
-	lspMgr := lsp.NewManager(lsp.FromConfigMap(cfg.LSPServers))
-	lspMgr.SetRuntime(runtime)
 	defer lspMgr.Close()
 	if emit != nil {
 		status := runtime.Policy.Status()
@@ -301,7 +298,6 @@ func runCLI(args []string) error {
 	if err != nil {
 		return err
 	}
-	ag.Runtime = runtime
 	if runtime.ApprovalMode == tools.ApprovalAutoReview {
 		runtime.Reviewer = ag.ApproveForMe
 	}
@@ -312,21 +308,12 @@ func runCLI(args []string) error {
 	// files for --no-session runs. The latter are cleaned up when this process
 	// exits; the agent's live message slice still makes them readable during
 	// the run.
-	outputConfig := cfg.Outputs
-	if outputConfig == nil {
-		outputConfig = cfg.Artifacts
-	}
-	outputsDisabled := outputConfig != nil && outputConfig.Enabled != nil && !*outputConfig.Enabled
 	var outputStore *session.OutputStore
-	if !outputsDisabled {
-		maxBytes := session.DefaultMaxBytes
-		if outputConfig != nil && outputConfig.MaxBytes > 0 {
-			maxBytes = outputConfig.MaxBytes
-		}
+	if maxBytes, enabled := outputStoreLimit(cfg); enabled {
 		if *noSessionFlag {
-			outputStore, err = session.NewTempOutputStoreWithLimit(maxBytes)
+			outputStore, err = openOutputStore("", true, maxBytes)
 		} else if dir, derr := config.Dir(); derr == nil {
-			outputStore, err = session.NewOutputStoreWithLimit(filepath.Join(dir, "outputs"), maxBytes)
+			outputStore, err = openOutputStore(dir, false, maxBytes)
 		} else {
 			err = derr
 		}
@@ -342,9 +329,6 @@ func runCLI(args []string) error {
 			}
 		}()
 	}
-	ag.Outputs = outputStore
-	ag.SubagentsDisabled = !config.SubagentsEnabled(cfg)
-
 	// Session: resume an existing one, or create a fresh one — unless
 	// -no-session (a one-off cron job shouldn't clutter ghg sessions).
 	var store *session.Store
@@ -387,17 +371,10 @@ func runCLI(args []string) error {
 			sessionID = id
 		}
 	}
-	if store != nil {
-		ag.OutputCatalog = store
-		ag.HistoryCatalog = store
-		ag.SetObservationStore(store)
-		ag.SetSearchStore(store)
-	}
 	if emit != nil && sessionID != "" {
 		emit(map[string]string{"type": "session", "session_id": sessionID})
 	}
-	ag.SetSessionID(sessionID)
-	if err := ag.BindState(ctx); err != nil {
+	if err := bindAgentSubsystems(ctx, ag, runtime, outputStore, store, sessionID, cfg); err != nil {
 		return fmt.Errorf("bind session tool state: %w", err)
 	}
 	if store != nil && sessionID != "" {

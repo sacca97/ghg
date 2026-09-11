@@ -556,7 +556,7 @@ func TestBusyCmdAllowList(t *testing.T) {
 	runs := []string{
 		"/help", "/effort", "/effort high",
 		"/tasks", "/tasks abc123", "/goal", "/goal clear", "/goal rounds 5",
-		"/approval", "/approval auto-review", "/cd", "/cd /tmp", "/pwd", "/ask what is this?", "/notify", "/notify on", "/rename", "/continue",
+		"/approval", "/approval auto", "/cd", "/cd /tmp", "/pwd", "/ask what is this?", "/notify", "/notify on", "/rename", "/continue",
 	}
 	for _, c := range runs {
 		if !busyCmd(c) {

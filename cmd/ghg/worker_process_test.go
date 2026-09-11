@@ -97,7 +97,7 @@ func TestWorkerApprovalModeChangesLive(t *testing.T) {
 		t.Fatal(err)
 	}
 	w := &workerProcessState{cfg: cfg, runtime: runtime}
-	if err := w.configure(workerConfigureRequest{Approval: "auto-review"}); err != nil {
+	if err := w.configure(workerConfigureRequest{Approval: "auto"}); err != nil {
 		t.Fatal(err)
 	}
 	if got := runtime.CurrentApprovalMode(); got != tools.ApprovalAutoReview {

@@ -12,13 +12,13 @@ import (
 func TestRegistryScopesSnapshotsBySession(t *testing.T) {
 	registry := NewRegistry()
 	snapshot := Snapshot{ID: "grep-1", Kind: "grep", Items: []Item{{Path: "a.go", Line: 1}}, Complete: true}
-	if err := registry.Save(nil, "one", snapshot); err != nil {
+	if err := registry.Save(context.TODO(), "one", snapshot); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := registry.Load(nil, "two", snapshot.ID); err == nil {
+	if _, err := registry.Load(context.TODO(), "two", snapshot.ID); err == nil {
 		t.Fatal("snapshot leaked across session boundary")
 	}
-	got, err := registry.Load(nil, "one", snapshot.ID)
+	got, err := registry.Load(context.TODO(), "one", snapshot.ID)
 	if err != nil || len(got.Items) != 1 || got.Items[0].Path != "a.go" {
 		t.Fatalf("scoped snapshot = %+v, %v", got, err)
 	}
@@ -33,16 +33,16 @@ func TestRegistrySnapshotEviction(t *testing.T) {
 			Items:     []Item{{Path: "file.go", Line: i}},
 			CreatedAt: time.Now().Add(time.Duration(i) * time.Minute),
 		}
-		if err := registry.Save(nil, "sess-1", snap); err != nil {
+		if err := registry.Save(context.TODO(), "sess-1", snap); err != nil {
 			t.Fatal(err)
 		}
 	}
 	// Oldest snapshots (1 to 4) should be evicted
-	if _, err := registry.Load(nil, "sess-1", "a-snap"); err == nil {
+	if _, err := registry.Load(context.TODO(), "sess-1", "a-snap"); err == nil {
 		t.Fatal("expected oldest snapshot 'a-snap' to be evicted")
 	}
 	// Newer snapshots should be present
-	if _, err := registry.Load(nil, "sess-1", "t-snap"); err != nil {
+	if _, err := registry.Load(context.TODO(), "sess-1", "t-snap"); err != nil {
 		t.Fatalf("expected newest snapshot 't-snap' to be present: %v", err)
 	}
 }
@@ -90,7 +90,7 @@ func TestRegistryCapsLoadedAndBoundSnapshots(t *testing.T) {
 	registry.SetPersistent(store)
 	for i := 0; i < maxLiveSnapshotsPerSession+1; i++ {
 		id := "loaded-" + string(rune('a'+i))
-		if _, err := registry.Load(nil, "sess", id); err != nil {
+		if _, err := registry.Load(context.TODO(), "sess", id); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -107,7 +107,7 @@ func TestRegistryCapsLoadedAndBoundSnapshots(t *testing.T) {
 		pending.snapshots[sessionKey("", pendingID)] = Snapshot{ID: pendingID, CreatedAt: time.Unix(int64(i+maxLiveSnapshotsPerSession), 0)}
 	}
 	pending.mu.Unlock()
-	if err := pending.BindSession(nil, "sess"); err != nil {
+	if err := pending.BindSession(context.TODO(), "sess"); err != nil {
 		t.Fatal(err)
 	}
 	if got := countSessionSnapshots(pending, "sess"); got != maxLiveSnapshotsPerSession {
@@ -119,10 +119,10 @@ func TestRegistryCapsLoadedAndBoundSnapshots(t *testing.T) {
 	duplicate.snapshots[sessionKey("sess", "same")] = Snapshot{ID: "same", Items: []Item{{Path: "bound.go"}}}
 	duplicate.snapshots[sessionKey("", "same")] = Snapshot{ID: "same", Items: []Item{{Path: "pending.go"}}}
 	duplicate.mu.Unlock()
-	if err := duplicate.BindSession(nil, "sess"); err != nil {
+	if err := duplicate.BindSession(context.TODO(), "sess"); err != nil {
 		t.Fatal(err)
 	}
-	got, err := duplicate.Load(nil, "sess", "same")
+	got, err := duplicate.Load(context.TODO(), "sess", "same")
 	if err != nil || len(got.Items) != 1 || got.Items[0].Path != "bound.go" {
 		t.Fatalf("duplicate bind replaced destination: %+v, %v", got, err)
 	}

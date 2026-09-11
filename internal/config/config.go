@@ -85,7 +85,7 @@ type Config struct {
 type ExecutionConfig struct {
 	Sandbox        string   `json:"sandbox,omitempty"`        // read-only, workspace-write, danger-full-access
 	Network        string   `json:"network,omitempty"`        // deny or host
-	Approval       string   `json:"approval,omitempty"`       // ask, auto-review, never
+	Approval       string   `json:"approval,omitempty"`       // ask, auto, never
 	BubblewrapPath string   `json:"bubblewrapPath,omitempty"` // trusted absolute bwrap path on Linux
 	SecretNames    []string `json:"secretNames,omitempty"`    // additional secret-name glob patterns
 	ReadRoots      []string `json:"readRoots,omitempty"`      // explicit additional read roots
@@ -137,9 +137,9 @@ func (c *Config) ValidateExecution() error {
 		return err
 	}
 	switch strings.TrimSpace(strings.ToLower(c.Execution.Approval)) {
-	case "", "ask", "auto-review", "never":
+	case "", "ask", "auto", "never":
 	default:
-		return fmt.Errorf("unknown approval mode %q (want ask, auto-review, or never)", c.Execution.Approval)
+		return fmt.Errorf("unknown approval mode %q (want ask, auto, or never)", c.Execution.Approval)
 	}
 	if pathValue := strings.TrimSpace(c.Execution.BubblewrapPath); pathValue != "" && !filepath.IsAbs(pathValue) {
 		return fmt.Errorf("bubblewrapPath must be absolute: %q", c.Execution.BubblewrapPath)

@@ -3,6 +3,7 @@ package sandbox
 import (
 	"errors"
 	"fmt"
+	"go/build"
 	"net"
 	"os"
 	"os/exec"
@@ -226,7 +227,7 @@ func TestWrappedChildUsesNarrowCachesAndImmutableToolchains(t *testing.T) {
 	}
 	immutableRoots := []string{
 		filepath.Join(cargoHome, "bin"), filepath.Join(rustupHome, "toolchains"),
-		filepath.Join(bunInstall, "bin"), filepath.Join(gopath, "bin"), runtime.GOROOT(),
+		filepath.Join(bunInstall, "bin"), filepath.Join(gopath, "bin"), build.Default.GOROOT,
 	}
 	for _, dir := range append(append([]string{}, cacheRoots...), immutableRoots[:len(immutableRoots)-1]...) {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -234,7 +235,7 @@ func TestWrappedChildUsesNarrowCachesAndImmutableToolchains(t *testing.T) {
 		}
 	}
 	for _, root := range immutableRoots {
-		if root == runtime.GOROOT() {
+		if root == build.Default.GOROOT {
 			continue
 		}
 		if err := os.MkdirAll(root, 0o700); err != nil {
@@ -402,7 +403,7 @@ func TestWrappedChildRunsCachedGoTest(t *testing.T) {
 	policy, err := NewPolicy(PolicyConfig{
 		Workspace:  workspace,
 		Mode:       ModeReadOnly,
-		ReadRoots:  []string{runtime.GOROOT(), filepath.Dir(goBinary)},
+		ReadRoots:  []string{build.Default.GOROOT, filepath.Dir(goBinary)},
 		CacheRoots: []string{cacheRoot},
 		TempRoots:  []string{tempRoot},
 	})

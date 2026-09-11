@@ -954,7 +954,7 @@ func compileSearchPattern(pattern string, basenameWithoutSlash bool) (*searchPat
 	pattern = strings.TrimPrefix(pattern, "./")
 	for _, part := range strings.Split(pattern, "/") {
 		if part == ".." {
-			return nil, errors.New("glob pattern cannot contain ..")
+			return nil, errors.New("glob pattern must not contain '..'")
 		}
 	}
 	regex, err := compileGlobPattern(pattern)

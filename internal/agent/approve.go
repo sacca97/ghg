@@ -26,7 +26,7 @@ const approvalReviewerSystem = "You are ghg's approval reviewer. You receive one
 // ApproveForMe runs at most one tool-less tiny-role call for an ambiguous
 // capability request. It is intentionally a method on Agent so the configured
 // role factory selects the user's tiny provider/model; it never falls back to
-// the parent model when auto-review is enabled.
+// the parent model when auto is enabled.
 func (a *Agent) ApproveForMe(ctx context.Context, request tools.ApprovalRequest) (tools.ApprovalResult, error) {
 	if a == nil {
 		return tools.ApprovalResult{}, errors.New("approval reviewer: nil agent")

@@ -40,7 +40,7 @@ func (w *workerProcessState) notifyCommand(ctx context.Context, request workerwi
 		return w.enableTelegram(ctx, cfg, false)
 	case "config":
 		if strings.TrimSpace(request.BotToken) == "" || strings.TrimSpace(request.ChatID) == "" {
-			return workerwire.NotifyResult{}, "", fmt.Errorf("Telegram bot token and chat ID are required")
+			return workerwire.NotifyResult{}, "", fmt.Errorf("telegram bot token and chat ID are required")
 		}
 		cfg, err := config.Load()
 		if err != nil {

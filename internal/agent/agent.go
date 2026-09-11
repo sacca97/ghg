@@ -677,10 +677,7 @@ func toolResultError(res tools.ToolResult) (string, bool) {
 	if res.ExitCode == 0 {
 		return "", false
 	}
-	text := res.Preview
-	if strings.HasPrefix(text, "Error:") {
-		text = strings.TrimPrefix(text, "Error:")
-	}
+	text := strings.TrimPrefix(res.Preview, "Error:")
 	text = strings.TrimSpace(text)
 	if text == "" {
 		text = "tool execution failed"

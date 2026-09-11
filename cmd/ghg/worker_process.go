@@ -277,24 +277,16 @@ func newWorkerProcess(runtimeFile workerwire.Runtime) (*workerProcessState, erro
 		}
 	}
 
-	configuredRuntime, runtimeCleanup, err := tools.NewConfiguredRuntime(".", cfg.Execution, false, cfg.PostEdit)
+	configuredRuntime, lspMgr, runtimeCleanup, err := newConfiguredRuntime(cfg, false)
 	if err != nil {
 		store.Close()
 		return nil, err
 	}
-	outputConfig := cfg.Outputs
-	if outputConfig == nil {
-		outputConfig = cfg.Artifacts
-	}
-	outputsDisabled := outputConfig != nil && outputConfig.Enabled != nil && !*outputConfig.Enabled
 	var outputStore *session.OutputStore
-	if !outputsDisabled {
-		maxBytes := session.DefaultMaxBytes
-		if outputConfig != nil && outputConfig.MaxBytes > 0 {
-			maxBytes = outputConfig.MaxBytes
-		}
-		outputStore, err = session.NewOutputStoreWithLimit(filepath.Join(dir, "outputs"), maxBytes)
+	if maxBytes, enabled := outputStoreLimit(cfg); enabled {
+		outputStore, err = openOutputStore(dir, false, maxBytes)
 		if err != nil {
+			lspMgr.Close()
 			runtimeCleanup()
 			store.Close()
 			return nil, err
@@ -303,26 +295,19 @@ func newWorkerProcess(runtimeFile workerwire.Runtime) (*workerProcessState, erro
 	w := &workerProcessState{
 		cfg: cfg, profiles: profiles, ag: ag, store: store, runtime: configuredRuntime,
 		runtimeClean: runtimeCleanup,
+		lsp:          lspMgr,
 		runtimeFile:  runtimeFile, sessionID: sessionID, modelName: modelName,
 		provider: providerName, role: role, mode: mode, saved: len(ag.Messages), state: workerwire.StateIdle,
 		pending: make(map[string]*workerApprovalFlight), done: make(chan struct{}),
 		perms: tools.LoadPermRules(),
 	}
-	store.Outputs = outputStore
-	ag.Runtime = configuredRuntime
-	ag.Outputs = outputStore
-	ag.OutputCatalog = store
-	ag.HistoryCatalog = store
-	ag.SubagentsDisabled = !config.SubagentsEnabled(cfg)
-	ag.SetObservationStore(store)
-	ag.SetSearchStore(store)
-	ag.SetSessionID(sessionID)
-	ag.LoadTodosJSON(store.Todos(sessionID))
-	if err := ag.BindState(context.Background()); err != nil {
+	if err := bindAgentSubsystems(context.Background(), ag, configuredRuntime, outputStore, store, sessionID, cfg); err != nil {
+		lspMgr.Close()
 		runtimeCleanup()
 		store.Close()
 		return nil, err
 	}
+	ag.LoadTodosJSON(store.Todos(sessionID))
 	if meta.Effort != "" {
 		ag.Effort = meta.Effort
 	} else if effort := os.Getenv(workerEffortEnv); effort != "" {
@@ -369,8 +354,6 @@ func newWorkerProcess(runtimeFile workerwire.Runtime) (*workerProcessState, erro
 	if cautious, _ := strconv.ParseBool(os.Getenv(workerCautiousEnv)); cautious {
 		configuredRuntime.Cautious = true
 	}
-	w.lsp = lsp.NewManager(lsp.FromConfigMap(cfg.LSPServers))
-	w.lsp.SetRuntime(configuredRuntime)
 	if wd, wdErr := os.Getwd(); wdErr == nil {
 		disc := mcp.LoadMergedFiltered(wd, mcp.FromConfigMap(cfg.MCPServers), mcp.ImportPolicyFrom(cfg.MCPImport))
 		if len(disc.Merged) > 0 || len(disc.Blocked) > 0 || len(disc.Errs) > 0 {

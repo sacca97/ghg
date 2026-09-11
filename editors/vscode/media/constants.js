@@ -6,14 +6,14 @@
 export const ROLES = ["default", "smart", "fast", "tiny"];
 export const MODES = ["execute", "plan", "review"];
 export const EFFORT_LEVELS = ["", "low", "medium", "high"];
-export const APPROVALS = ["", "ask", "auto-review", "never"];
+export const APPROVALS = ["", "ask", "auto", "never"];
 export const SANDBOXES = ["", "read-only", "workspace-write", "danger-full-access"];
 export const NETWORKS = ["", "deny", "host"];
 
 export const ROLE_LABELS = { default: "Default", smart: "Smart", fast: "Fast", tiny: "Tiny" };
 export const MODE_LABELS = { execute: "Execute", plan: "Plan", review: "Review" };
 export const EFFORT_LABELS = { "": "Off", low: "Low", medium: "Medium", high: "High" };
-export const APPROVAL_LABELS = { "": "Configured default", ask: "Ask", "auto-review": "Auto-review", never: "Never" };
+export const APPROVAL_LABELS = { "": "Configured default", ask: "Ask", "auto": "Auto", never: "Never" };
 export const SANDBOX_LABELS = { "": "Configured default", "read-only": "Read only", "workspace-write": "Workspace write", "danger-full-access": "Full access" };
 export const NETWORK_LABELS = { "": "Configured default", deny: "Denied", host: "Host" };
 

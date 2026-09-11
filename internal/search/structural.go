@@ -159,7 +159,7 @@ func validateQuery(query Query) (*grammars.LangEntry, error) {
 	}
 	entry := grammars.DetectLanguageByName("go")
 	if entry == nil || entry.Language == nil {
-		return nil, errors.New("Go grammar is unavailable")
+		return nil, errors.New("go grammar is unavailable")
 	}
 	if len(query.Patterns) == 0 {
 		return nil, errors.New("at least one structural search pattern is required")

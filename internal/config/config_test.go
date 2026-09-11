@@ -29,10 +29,10 @@ func TestLoadSaveDefaults(t *testing.T) {
 
 func TestExecutionOverridesValidateWithoutPersisting(t *testing.T) {
 	cfg := &Config{}
-	if err := cfg.ApplyExecutionOverrides("workspace-write", "deny", "auto-review"); err != nil {
+	if err := cfg.ApplyExecutionOverrides("workspace-write", "deny", "auto"); err != nil {
 		t.Fatal(err)
 	}
-	if cfg.Execution == nil || cfg.Execution.Approval != "auto-review" {
+	if cfg.Execution == nil || cfg.Execution.Approval != "auto" {
 		t.Fatalf("execution overrides = %+v", cfg.Execution)
 	}
 	if err := cfg.ApplyExecutionOverrides("unsafe", "", ""); err == nil {

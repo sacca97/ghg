@@ -28,7 +28,7 @@ type registryEntry struct {
 var registry = []registryEntry{
 	{Name: "/auth", Hint: "[provider] [key] — connect any profile (bare lists profiles; provider-only opens a masked prompt; also: ghg auth <provider>)", Category: "Agent"},
 	{Name: "/ask", Hint: "<question> — answer directly; repository questions may be investigated read-only", Category: "Agent", Immediate: true},
-	{Name: "/approval", Hint: "[ask|auto-review|never] — switch capability approval live (bare shows the current mode)", Category: "Session", Immediate: true},
+	{Name: "/approval", Hint: "[ask|auto|never] — switch capability approval live (bare shows the current mode)", Category: "Session", Immediate: true},
 	{Name: "/cd", Hint: "[dir] — change working directory (bare prints it)", Category: "Session"},
 	{Name: "/clear", Hint: "— reset conversation", Category: "Session", Immediate: true},
 	{Name: "/compact", Hint: "— compact now using tiny → fast → default → smart; retry undoes the last compaction, log lists them; compaction level: ctrl+p › Compaction level", Category: "Session", Immediate: true},
@@ -199,7 +199,7 @@ func (m *model) command(text string) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		if len(fields) != 2 {
-			m.append(errStyle.Render("usage: /approval [ask|auto-review|never]"))
+			m.append(errStyle.Render("usage: /approval [ask|auto|never]"))
 			return m, nil
 		}
 		mode, err := tools.ParseApprovalMode(fields[1])

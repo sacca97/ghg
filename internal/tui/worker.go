@@ -159,25 +159,6 @@ func (m *model) ensureWorkerAction(action func() tea.Cmd) (tea.Model, tea.Cmd) {
 	return m, m.startWorkerCmd()
 }
 
-func (m *model) startWorkerProcess(cautious bool) error {
-	if m.store == nil {
-		return errors.New("worker requires a session store")
-	}
-	if m.modelName == "" || m.provName == "" {
-		return errors.New(m.degradedProviderNote())
-	}
-	result := startWorkerProcess(m.workerStartSpec(cautious))
-	if result.err != nil {
-		return result.err
-	}
-	m.workerProcess = result.process
-	generation := m.attachWorkerClient(result.client, result.runtime)
-	if result.process != nil {
-		m.monitorWorker(result.process, result.runtime, generation)
-	}
-	return nil
-}
-
 func startWorkerProcess(spec workerStartSpec) workerStartedMsg {
 	dir, err := config.Dir()
 	if err != nil {
