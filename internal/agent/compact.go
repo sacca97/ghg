@@ -92,10 +92,9 @@ func EstimateTokens(msgs []models.Message) int {
 const compactionContextTarget = 40_000
 
 type compactionBudget struct {
-	target   int
-	overhead int
-	summary  int
-	tail     int
+	target  int
+	summary int
+	tail    int
 }
 
 func (a *Agent) compactionBudget() (compactionBudget, error) {
@@ -103,42 +102,18 @@ func (a *Agent) compactionBudget() (compactionBudget, error) {
 	if a.ContextLimit > 0 && a.ContextLimit < target {
 		target = a.ContextLimit
 	}
-	overhead := a.compactionOverhead()
-	if EstimateTokens(a.Messages[:1])+overhead >= target {
+	// ponytail: provider counts use different tokenizers, so budget locally.
+	fixed := EstimateTokens(a.Messages[:1])
+	if fixed >= target {
 		return compactionBudget{}, fmt.Errorf("compaction fixed overhead exceeds %d-token working-set target", target)
 	}
-	available := target - overhead
+	available := target - fixed
 	summary := max(available/4, 1)
 	return compactionBudget{
-		target:   target,
-		overhead: overhead,
-		summary:  summary,
-		tail:     available - summary,
+		target:  target,
+		summary: summary,
+		tail:    available - summary,
 	}, nil
-}
-
-// compactionOverhead estimates provider-side system/tool framing from the
-// latest reported input count. It is intentionally zero until a provider has
-// supplied a measurement.
-func (a *Agent) compactionOverhead() int {
-	a.msgsMu.Lock()
-	defer a.msgsMu.Unlock()
-	for i := len(a.Messages) - 1; i > 0; i-- {
-		msg := a.Messages[i]
-		if msg.Role != "assistant" || msg.Usage == nil {
-			continue
-		}
-		reported := msg.Usage.PromptTokens
-		if reported <= 0 {
-			reported = msg.Usage.InputTokens
-		}
-		if reported <= 0 {
-			return 0
-		}
-		estimated := EstimateTokens(a.Messages[:i])
-		return max(reported-estimated, 0)
-	}
-	return 0
 }
 
 // compact replaces old turns with an LLM-generated summary, keeping the
@@ -385,15 +360,15 @@ func compactionSummaryFits(summary string, allowance int) bool {
 func fitCompactionView(sysPrompt models.Message, summary string, tail, all []models.Message, budget compactionBudget) ([]models.Message, []models.Message, bool) {
 	kept := shrinkCompactionTail(tail, budget.tail)
 	view := compactionView(sysPrompt, summary, kept, all)
-	if EstimateTokens(view)+budget.overhead <= budget.target {
+	if EstimateTokens(view) <= budget.target {
 		return view, kept, true
 	}
-	excess := EstimateTokens(view) + budget.overhead - budget.target
+	excess := EstimateTokens(view) - budget.target
 	if excess > 0 {
 		kept = shrinkCompactionTail(tail, max(budget.tail-excess, 0))
 		view = compactionView(sysPrompt, summary, kept, all)
 	}
-	return view, kept, EstimateTokens(view)+budget.overhead <= budget.target
+	return view, kept, EstimateTokens(view) <= budget.target
 }
 
 func compactionView(sysPrompt models.Message, summary string, tail, all []models.Message) []models.Message {

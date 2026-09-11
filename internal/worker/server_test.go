@@ -132,6 +132,73 @@ func TestServerAttachControllerAndDetach(t *testing.T) {
 	}
 }
 
+func TestRequestCacheScopedToControllerConnection(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Phase 3.7 first cut uses Unix sockets")
+	}
+	baseDir, err := os.MkdirTemp("", "gw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(baseDir)
+	rt, err := NewRuntime(baseDir, "s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := &testHandler{disconnected: make(chan bool, 1)}
+	server, err := NewServer(rt, h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = server.Serve(ctx) }()
+	defer server.Close()
+
+	first, err := Dial(context.Background(), rt)
+	if err != nil {
+		if strings.Contains(err.Error(), "operation not permitted") {
+			t.Skip("unix socket connection not permitted by sandbox environment")
+		}
+		t.Fatal(err)
+	}
+	nextFrame(t, first) // snapshot
+	nextFrame(t, first) // attached
+	if err := first.Send(CommandPing, "req-1", nil); err != nil {
+		t.Fatal(err)
+	}
+	if frame := nextFrame(t, first); frame.Type != TypeAck || frame.RequestID != "req-1" {
+		t.Fatalf("ping response = %+v", frame)
+	}
+	first.Close()
+	select {
+	case <-h.disconnected:
+	case <-time.After(time.Second):
+		t.Fatal("server did not observe the first controller disconnecting")
+	}
+
+	second, err := Dial(context.Background(), rt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	nextFrame(t, second) // snapshot
+	nextFrame(t, second) // attached
+	if err := second.Send(CommandPing, "req-1", nil); err != nil {
+		t.Fatal(err)
+	}
+	if frame := nextFrame(t, second); frame.Type != TypeAck || frame.RequestID != "req-1" {
+		t.Fatalf("second ping response = %+v", frame)
+	}
+
+	h.mu.Lock()
+	dispatched := len(h.commands)
+	h.mu.Unlock()
+	if dispatched != 2 {
+		t.Fatalf("handler dispatched %d commands, want the reused request id to run again on the new connection", dispatched)
+	}
+}
+
 func TestRuntimeRejectsInvalidSessionAndSecondOwner(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Phase 3.7 first cut uses Unix sockets")

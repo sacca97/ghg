@@ -1931,7 +1931,9 @@ func TestCompactionBuildsFortyThousandTokenWorkingSet(t *testing.T) {
 		)
 	}
 	last := len(ag.Messages) - 1
-	ag.Messages[last].Usage = &models.Usage{PromptTokens: EstimateTokens(ag.Messages[:last]) + 2_000}
+	// Provider tokenizers can report much more than the local estimate. That
+	// difference must not be treated as fixed compaction overhead.
+	ag.Messages[last].Usage = &models.Usage{PromptTokens: EstimateTokens(ag.Messages[:last]) + 250_000}
 	ag.CompactCandidates = []*Agent{candidate}
 
 	if err := ag.ManualCompact(context.Background(), Events{}); err != nil {
@@ -1943,8 +1945,8 @@ func TestCompactionBuildsFortyThousandTokenWorkingSet(t *testing.T) {
 	if backend.requests[0].MaxTokens >= 1_000_000 || backend.requests[0].MaxTokens > 10_000 {
 		t.Fatalf("summary output cap = %d, want the 40k-derived allowance", backend.requests[0].MaxTokens)
 	}
-	if got := EstimateTokens(ag.Messages); got+2_000 > compactionContextTarget {
-		t.Fatalf("post-compaction working set = %d, exceeds %d", got+2_000, compactionContextTarget)
+	if got := EstimateTokens(ag.Messages); got > compactionContextTarget {
+		t.Fatalf("post-compaction working set = %d, exceeds %d", got, compactionContextTarget)
 	}
 }
 

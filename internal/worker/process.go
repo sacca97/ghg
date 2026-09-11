@@ -24,6 +24,7 @@ func Launch(ctx context.Context, executable string, env map[string]string) (*Pro
 		return nil, fmt.Errorf("worker executable is empty")
 	}
 	cmd := exec.CommandContext(ctx, executable)
+	isolateProcess(cmd)
 	values := make(map[string]string)
 	for _, pair := range os.Environ() {
 		key, value, ok := strings.Cut(pair, "=")

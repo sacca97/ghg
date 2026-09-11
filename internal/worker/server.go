@@ -260,6 +260,11 @@ func (s *Server) serveConnection(conn net.Conn) {
 	// able to put an event ahead of the snapshot that describes its sequence.
 	s.controller = p
 	s.detached = false
+	// Request ids are chosen by the caller, so a replay cache only makes sense
+	// for the connection that produced it: a new controller must not receive a
+	// previous connection's cached response for a reused id.
+	s.requests = make(map[string]Frame)
+	s.requestOrder = nil
 	p.startWriter()
 	snapshotFrame := Frame{
 		Version:   ProtocolVersion,
