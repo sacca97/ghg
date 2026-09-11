@@ -257,6 +257,7 @@ func TestUnwrapTransparentClassifiesEffectiveCommand(t *testing.T) {
 		// xargs is hard-denied
 		{name: "xargs rm", command: "find . -name '*.tmp' | xargs rm", want: dispositionHardDeny},
 		{name: "xargs alone", command: "xargs echo", want: dispositionHardDeny},
+		{name: "find exec", command: "find . -exec rm -rf sub \\;", want: dispositionHardDeny},
 		// Wrappers around routine commands stay routine
 		{name: "env ls", command: "env ls -la", want: dispositionRoutine},
 		{name: "nice go test", command: "nice go test ./...", want: dispositionRoutine},

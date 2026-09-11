@@ -253,9 +253,6 @@ func collectGrepSnapshot(ctx context.Context, args grepArgs) (search.Snapshot, e
 	if errors.Is(err, errSearchLimit) {
 		collector.stop(fmt.Sprintf("scan limited to %d entries", maxSearchEntries))
 	}
-	if errors.Is(err, errSearchLimit) {
-		collector.stop(fmt.Sprintf("scan limited to %d entries", maxSearchEntries))
-	}
 	if err != nil && !errors.Is(err, errSearchLimit) {
 		return search.Snapshot{}, err
 	}
@@ -462,11 +459,13 @@ func renderSearchResult(ctx context.Context, snapshot search.Snapshot, cursor se
 	remaining := len(snapshot.Items) - searchPageItemsBefore(chunks, nextOffset)
 	pageText := renderSearchPage(snapshot.Kind, page, len(snapshot.Items), len(page), remaining, hasMore,
 		searchCursor{Kind: snapshot.Kind, ID: snapshot.ID, Offset: nextOffset}, opts.grouped, snapshot)
+	renderAgain := opts.observe != nil
 	if len(pageText) > searchPreviewBytes {
 		page = nil
 		nextOffset = cursor.Offset
 		hasMore = searchStore != nil && nextOffset < len(chunks)
 		remaining = len(snapshot.Items) - searchPageItemsBefore(chunks, nextOffset)
+		renderAgain = true
 	}
 	if opts.observe != nil {
 		page = opts.observe(ctx, page)
@@ -474,8 +473,10 @@ func renderSearchResult(ctx context.Context, snapshot search.Snapshot, cursor se
 			return errorToolResult(err)
 		}
 	}
-	pageText = renderSearchPage(snapshot.Kind, page, len(snapshot.Items), len(page), remaining, hasMore,
-		searchCursor{Kind: snapshot.Kind, ID: snapshot.ID, Offset: nextOffset}, opts.grouped, snapshot)
+	if renderAgain {
+		pageText = renderSearchPage(snapshot.Kind, page, len(snapshot.Items), len(page), remaining, hasMore,
+			searchCursor{Kind: snapshot.Kind, ID: snapshot.ID, Offset: nextOffset}, opts.grouped, snapshot)
+	}
 	if len(pageText) > searchPreviewBytes {
 		// Keep the cursor at the same offset so no later result is silently
 		// skipped; the model can narrow the search and retry.
@@ -742,7 +743,7 @@ type searchRank struct {
 
 func searchItemRank(display string, scope *searchScope, requested string, touched, modified map[string]struct{}) searchRank {
 	abs := display
-	if filepath.IsAbs(display) == false {
+	if !filepath.IsAbs(display) {
 		if candidate, err := filepath.Abs(display); err == nil {
 			abs = candidate
 		}

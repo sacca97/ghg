@@ -488,6 +488,10 @@ func classifyCommand(segments []CommandSegment, policy *sandbox.Policy) (command
 			disposition, reason = dispositionHardDeny, "permission/ownership changes are never delegated"
 		case "xargs":
 			disposition, reason = dispositionHardDeny, "xargs synthesizes commands from input and cannot be classified"
+		case "find":
+			if findExec(argv[1:]) {
+				disposition, reason = dispositionHardDeny, "find can execute nested commands that cannot be classified"
+			}
 		case "rm":
 			disposition, reason = classifyRemoval(argv[1:], policy)
 		case "sh", "bash", "zsh", "fish":
@@ -520,6 +524,15 @@ func classifyCommand(segments []CommandSegment, policy *sandbox.Policy) (command
 		best, reasons = strongerDisposition(best, reasons, disposition, reason)
 	}
 	return best, boundedReasons(reasons), network
+}
+
+func findExec(argv []string) bool {
+	for _, arg := range argv {
+		if arg == "-exec" || arg == "-execdir" {
+			return true
+		}
+	}
+	return false
 }
 
 func dispositionRank(disposition commandDisposition) int {

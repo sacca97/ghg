@@ -90,7 +90,7 @@ func main() {
 commands:
   run       execute one headless turn
   bridge    expose a persistent worker over newline-delimited JSON
-  models    list configured role models
+  models    list configured role models (--refresh fetches catalogs)
   sessions  list saved sessions
   ps        list live workers
   attach    attach to a live worker or resume its session

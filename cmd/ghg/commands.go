@@ -11,6 +11,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/sacca97/ghg/internal/auth"
 	"github.com/sacca97/ghg/internal/config"
 	"github.com/sacca97/ghg/internal/models"
 	"github.com/sacca97/ghg/internal/session"
@@ -35,6 +36,7 @@ func modelsCLI(args []string) error {
 	fs := flag.NewFlagSet("models", flag.ContinueOnError)
 	format := fs.String("format", "text", "output format: text or json")
 	all := fs.Bool("all", false, "list all configured catalog models")
+	refresh := fs.Bool("refresh", false, "refresh provider catalogs before listing")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -44,6 +46,17 @@ func modelsCLI(args []string) error {
 	cfg, err := config.Load()
 	if err != nil {
 		return err
+	}
+	if *refresh {
+		profiles, err := loadProviderProfiles()
+		if err != nil {
+			return err
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if _, err := config.FetchCatalogs(ctx, cfg, profiles, true, config.CatalogBackendFactory(auth.NewBackend)); err != nil {
+			return err
+		}
 	}
 	if *all {
 		choices := configuredCatalogModels(cfg)

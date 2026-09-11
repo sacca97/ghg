@@ -329,6 +329,9 @@ func prepareObservedContent(ctx context.Context, canonical, display string, r io
 			break
 		}
 	}
+	if lineNo == 0 && start == 1 {
+		return pendingObservedRead{}, fmt.Errorf("%s is empty", display)
+	}
 	if lineNo < start || selected == 0 {
 		return pendingObservedRead{}, fmt.Errorf("offset %d past end of file (%d lines)", offset, lineNo)
 	}

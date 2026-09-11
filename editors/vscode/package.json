@@ -42,6 +42,18 @@
           "icon": "$(history)",
           "when": "view == ghg.chatView",
           "group": "navigation@2"
+        },
+        {
+          "command": "ghg.refreshModels",
+          "icon": "$(sync)",
+          "when": "view == ghg.chatView",
+          "group": "navigation@3"
+        },
+        {
+          "command": "ghg.openSettings",
+          "icon": "$(settings-gear)",
+          "when": "view == ghg.chatView",
+          "group": "navigation@4"
         }
       ]
     },
@@ -55,6 +67,16 @@
         "command": "ghg.resumeSession",
         "title": "ghg: Resume Session",
         "icon": "$(history)"
+      },
+      {
+        "command": "ghg.refreshModels",
+        "title": "ghg: Refresh Models",
+        "icon": "$(sync)"
+      },
+      {
+        "command": "ghg.openSettings",
+        "title": "ghg: Settings",
+        "icon": "$(settings-gear)"
       }
     ],
     "configuration": {
@@ -64,6 +86,42 @@
           "type": "string",
           "default": "ghg",
           "description": "Path to the ghg executable."
+        },
+        "ghg.defaultRole": {
+          "type": "string",
+          "enum": ["default", "smart", "fast", "tiny"],
+          "default": "fast",
+          "description": "Model role selected for new chats."
+        },
+        "ghg.defaultMode": {
+          "type": "string",
+          "enum": ["execute", "plan", "review"],
+          "default": "execute",
+          "description": "Mode selected for new chats."
+        },
+        "ghg.defaultEffort": {
+          "type": "string",
+          "enum": ["", "low", "medium", "high"],
+          "default": "",
+          "description": "Thinking effort selected for new chats."
+        },
+        "ghg.sandbox": {
+          "type": "string",
+          "enum": ["", "read-only", "workspace-write", "danger-full-access"],
+          "default": "",
+          "description": "Sandbox mode passed to the next ghg worker."
+        },
+        "ghg.network": {
+          "type": "string",
+          "enum": ["", "deny", "host"],
+          "default": "",
+          "description": "Network policy passed to the next ghg worker."
+        },
+        "ghg.approval": {
+          "type": "string",
+          "enum": ["", "ask", "auto-review", "never"],
+          "default": "",
+          "description": "Exceptional capability approval policy."
         }
       }
     }

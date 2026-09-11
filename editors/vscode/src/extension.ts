@@ -9,9 +9,20 @@ type Role = "default" | "smart" | "tiny" | "fast";
 const effortLevels = new Set(["", "low", "medium", "high"]);
 const maxChildOutput = 1024 * 1024;
 const busyStates = new Set(["running", "waiting_approval", "waiting_question", "stopping"]);
+const executionSettings = new Set(["sandbox", "network", "approval"]);
+const defaultSettings = new Set(["defaultRole", "defaultMode", "defaultEffort"]);
 
 type SessionPick = vscode.QuickPickItem & { sessionId: string };
 type ReferenceSuggestion = { path: string; folder: boolean };
+type ExtensionSettings = {
+	role: Role;
+	mode: "execute" | "plan" | "review";
+	effort: string;
+	sandbox: string;
+	network: string;
+	approval: string;
+	binary: string;
+};
 
 const sessionKey = (workspace: Workspace): string =>
 	`session:${workspace?.uri.toString() ?? "global"}`;
@@ -40,7 +51,7 @@ function cleanReferences(value: unknown): string[] {
 }
 
 function cleanWorkspacePath(value: string): string | undefined {
-	const path = value.trim().replace(/\\/g, "/");
+	const path = value.trim().replace(/\\/g, "/").replace(/^\.\//, "");
 	if (!path || path.startsWith("/") || /^[A-Za-z]:/.test(path) || /[\r\n\0]/.test(path)) {
 		return undefined;
 	}
@@ -66,10 +77,37 @@ function literalGlob(value: string): string {
 	return value.replace(/[\\{}()[\]*?]/g, (character) => `\\${character}`);
 }
 
+function excludedReferencePath(path: string): boolean {
+	return path.split("/").some((segment) => segment === ".git" || segment === ".ghg" || segment === "node_modules");
+}
+
+async function directoryReferenceSuggestions(workspace: vscode.WorkspaceFolder, query: string): Promise<ReferenceSuggestion[]> {
+	const slash = query.lastIndexOf("/");
+	if (slash < 0) return [];
+	const parent = query.slice(0, slash);
+	if (excludedReferencePath(parent)) return [];
+	const parentURI = parent ? vscode.Uri.joinPath(workspace.uri, ...parent.split("/")) : workspace.uri;
+	const entries = await vscode.workspace.fs.readDirectory(parentURI);
+	return entries
+		.map(([name, type]) => {
+			const folder = (type & vscode.FileType.Directory) !== 0;
+			return {
+				path: `${parent ? `${parent}/` : ""}${name}${folder ? "/" : ""}`,
+				folder,
+			};
+		})
+		.filter((item) => item.path.toLowerCase().startsWith(query.toLowerCase()) && !excludedReferencePath(item.path))
+		.sort((a, b) => a.path.localeCompare(b.path))
+		.slice(0, 50);
+}
+
 async function referenceSuggestions(workspace: vscode.WorkspaceFolder, query: string): Promise<ReferenceSuggestion[]> {
 	const normalized = cleanWorkspacePath(query) ?? (query.trim() === "" ? "" : undefined);
 	if (normalized === undefined) {
 		return [];
+	}
+	if (normalized.includes("/")) {
+		return directoryReferenceSuggestions(workspace, normalized);
 	}
 	const pattern = normalized ? `**/*${literalGlob(normalized)}*` : "**/*";
 	const files = await vscode.workspace.findFiles(
@@ -147,7 +185,7 @@ function listSessions(binary: string, cwd: string | undefined): Promise<SessionP
 	});
 }
 
-function runJSONCommand(binary: string, cwd: string | undefined, args: string[]): Promise<unknown> {
+function runCommand(binary: string, cwd: string | undefined, args: string[]): Promise<string> {
 	return new Promise((resolve, reject) => {
 		const child = spawn(binary, args, { cwd, stdio: ["ignore", "pipe", "pipe"] });
 		if (!child.stdout || !child.stderr) {
@@ -164,21 +202,34 @@ function runJSONCommand(binary: string, cwd: string | undefined, args: string[])
 				reject(new Error(error.trim() || `ghg ${args.join(" ")} exited with code ${code ?? "unknown"}`));
 				return;
 			}
-			try { resolve(JSON.parse(output)); } catch (parseError) { reject(parseError); }
+			resolve(output);
 		});
 	});
 }
 
+function runJSONCommand(binary: string, cwd: string | undefined, args: string[]): Promise<unknown> {
+	return runCommand(binary, cwd, args).then((output) => JSON.parse(output));
+}
+
+function defaultExportFilename(kind: "plan" | "review"): string {
+	const now = new Date();
+	const pad = (value: number) => String(value).padStart(2, "0");
+	const stamp = `${now.getUTCFullYear()}${pad(now.getUTCMonth() + 1)}${pad(now.getUTCDate())}-${pad(now.getUTCHours())}${pad(now.getUTCMinutes())}${pad(now.getUTCSeconds())}`;
+	return `${kind}-${stamp}.md`;
+}
+
 function listModels(binary: string, cwd: string | undefined): Promise<Record<string, string>> {
-	return runJSONCommand(binary, cwd, ["models", "--format", "json"]).then((parsed) => {
-		if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("ghg models returned invalid JSON");
-		const models: Record<string, string> = {};
-		for (const role of ["default", "smart", "tiny", "fast"]) {
-			const model = (parsed as Record<string, unknown>)[role];
-			if (typeof model === "string" && model !== "") models[role] = model;
-		}
-		return models;
-	});
+	return runJSONCommand(binary, cwd, ["models", "--format", "json"]).then(parseRoleModels);
+}
+
+function parseRoleModels(parsed: unknown): Record<string, string> {
+	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("ghg models returned invalid JSON");
+	const models: Record<string, string> = {};
+	for (const role of ["default", "smart", "tiny", "fast"]) {
+		const model = (parsed as Record<string, unknown>)[role];
+		if (typeof model === "string" && model !== "") models[role] = model;
+	}
+	return models;
 }
 
 type CatalogModel = { model: string; provider: string };
@@ -204,10 +255,11 @@ function interrupt(child: ChildProcess): void {
 	child.once("close", () => clearTimeout(timer));
 }
 
-function htmlFor(webview: vscode.Webview, extensionUri: vscode.Uri): string {
+function htmlFor(webview: vscode.Webview, extensionUri: vscode.Uri, settings: ExtensionSettings): string {
 	const nonce = randomBytes(16).toString("hex");
 	const script = webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, "media", "main.js"));
 	const style = webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, "media", "main.css"));
+	const initialSettings = JSON.stringify(settings).replace(/</g, "\\u003c");
 	return `<!doctype html>
 <html lang="en">
 <head>
@@ -218,6 +270,72 @@ function htmlFor(webview: vscode.Webview, extensionUri: vscode.Uri): string {
 </head>
 <body>
 <main id="app">
+  <header id="toolbar">
+    <span class="toolbar-title">ghg</span>
+  </header>
+  <div id="views">
+  <section id="settings" hidden>
+    <div class="settings-card">
+      <div class="settings-header">
+        <div>
+          <div class="settings-eyebrow">ghg</div>
+          <h2>Settings</h2>
+        </div>
+        <button type="button" id="settings-close" aria-label="Close settings" title="Close settings">
+          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 4 8 8M12 4l-8 8"/></svg>
+        </button>
+      </div>
+      <p class="settings-lede">Configure the worker, model roles, and this chat view.</p>
+
+      <section class="settings-section">
+        <div class="settings-section-head">
+          <div><h3>Model roles</h3><p>Choose the model assigned to each role.</p></div>
+          <button type="button" class="settings-icon-button" id="refresh-models" aria-label="Refresh models" title="Refresh models">
+            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M13 5V2.5h-2.5M13 2.5A5.5 5.5 0 1 0 14 9"/></svg>
+          </button>
+        </div>
+        <div id="settings-models" class="settings-models"></div>
+      </section>
+
+      <section class="settings-section">
+        <div class="settings-section-head"><div><h3>Defaults</h3><p>These are the active controls for the next turn.</p></div></div>
+        <label class="settings-field">Role <select id="settings-role">
+          <option value="default">Default</option><option value="smart">Smart</option><option value="fast">Fast</option><option value="tiny">Tiny</option>
+        </select></label>
+        <label class="settings-field">Mode <select id="settings-mode">
+          <option value="execute">Execute</option><option value="plan">Plan</option><option value="review">Review</option>
+        </select></label>
+        <label class="settings-field">Thinking <select id="settings-effort">
+          <option value="">Off</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option>
+        </select></label>
+      </section>
+
+      <section class="settings-section">
+        <div class="settings-section-head"><div><h3>Providers</h3><p>Credentials stay in ghg. Open the guided provider login in a terminal.</p></div></div>
+        <button type="button" class="settings-action" id="open-auth">Configure provider access</button>
+      </section>
+
+      <section class="settings-section">
+        <div class="settings-section-head"><div><h3>Execution</h3><p>Changes apply when the next worker starts.</p></div></div>
+        <label class="settings-field">Sandbox <select id="settings-sandbox">
+          <option value="">Configured default</option><option value="read-only">Read only</option><option value="workspace-write">Workspace write</option><option value="danger-full-access">Full access</option>
+        </select></label>
+        <label class="settings-field">Network <select id="settings-network">
+          <option value="">Configured default</option><option value="deny">Denied</option><option value="host">Host</option>
+        </select></label>
+        <label class="settings-field">Approval <select id="settings-approval">
+          <option value="">Configured default</option><option value="ask">Ask</option><option value="auto-review">Auto-review</option><option value="never">Never</option>
+        </select></label>
+      </section>
+
+      <section class="settings-section settings-last">
+        <div class="settings-section-head"><div><h3>Runtime</h3><p id="settings-runtime">Binary: ghg</p></div></div>
+        <button type="button" class="settings-action" id="open-settings">Open VS Code settings</button>
+        <button type="button" class="settings-action settings-action-muted" id="settings-close-bottom">Back to chat</button>
+      </section>
+    </div>
+  </section>
+  <section id="chat-view">
   <section id="transcript" aria-live="polite"></section>
   <div id="status" role="status">Ready</div>
   <div id="references" aria-label="Referenced files"></div>
@@ -232,16 +350,22 @@ function htmlFor(webview: vscode.Webview, extensionUri: vscode.Uri): string {
 			  <option value="tiny">Configured</option>
 			  <option value="fast">Configured</option>
 			</select>
-			<select id="effort" aria-label="Thinking effort">
+		<select id="effort" aria-label="Thinking effort">
 		  <option value="">Off</option>
 		  <option value="low">Low</option>
 		  <option value="medium">Medium</option>
 		  <option value="high">High</option>
 		</select>
+      <button type="button" id="settings-toggle" aria-label="Open settings" title="Open settings">
+        <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="2.3"/><path d="M8 1.5v1.2M8 13.3v1.2M1.5 8h1.2M13.3 8h1.2M3.4 3.4l.9.9M11.7 11.7l.9.9M12.6 3.4l-.9.9M4.3 11.7l-.9.9"/></svg>
+      </button>
       <button type="submit" id="send" aria-label="Send" title="Send">➤</button>
     </div>
   </form>
+  </section>
+  </div>
 </main>
+<script nonce="${nonce}">window.ghgSettings = ${initialSettings};</script>
 <script nonce="${nonce}" src="${script}"></script>
 </body>
 </html>`;
@@ -266,6 +390,22 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 
 	constructor(private readonly extension: vscode.ExtensionContext) {}
 
+	extensionSettings(): ExtensionSettings {
+		const cfg = vscode.workspace.getConfiguration("ghg");
+		const role = cfg.get<string>("defaultRole", "fast");
+		const mode = cfg.get<string>("defaultMode", "execute");
+		const effort = cfg.get<string>("defaultEffort", "");
+		return {
+			role: ["default", "smart", "tiny", "fast"].includes(role) ? role as Role : "fast",
+			mode: ["execute", "plan", "review"].includes(mode) ? mode as ExtensionSettings["mode"] : "execute",
+			effort: effortLevels.has(effort) ? effort : "",
+			sandbox: cfg.get<string>("sandbox", ""),
+			network: cfg.get<string>("network", ""),
+			approval: cfg.get<string>("approval", ""),
+			binary: cfg.get<string>("binaryPath", "ghg"),
+		};
+	}
+
 	resolveWebviewView(view: vscode.WebviewView): void {
 		this.view = view;
 		this.webviewReady = false;
@@ -273,11 +413,11 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 			enableScripts: true,
 			localResourceRoots: [vscode.Uri.joinPath(this.extension.extensionUri, "media")],
 		};
-		view.webview.html = htmlFor(view.webview, this.extension.extensionUri);
+		view.webview.html = htmlFor(view.webview, this.extension.extensionUri, this.extensionSettings());
 		view.webview.onDidReceiveMessage((message: unknown) => {
 			void this.handleMessage(message);
 		});
-		void this.refreshModels();
+		void this.loadModels();
 		view.onDidDispose(() => {
 			if (this.view === view) {
 				this.view = undefined;
@@ -286,7 +426,7 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 		});
 	}
 
-	private async refreshModels(): Promise<void> {
+	private async loadModels(): Promise<void> {
 		const workspace = currentWorkspace();
 		const binary = vscode.workspace.getConfiguration("ghg").get<string>("binaryPath", "ghg");
 		try {
@@ -296,11 +436,19 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 		}
 	}
 
-	private post(message: unknown): void {
+	private async refreshModelCatalogs(): Promise<void> {
+		const workspace = currentWorkspace();
+		const binary = vscode.workspace.getConfiguration("ghg").get<string>("binaryPath", "ghg");
+		const parsed = await runJSONCommand(binary, workspace?.uri.fsPath, ["models", "--refresh", "--format", "json"]);
+		this.post({ type: "models", models: parseRoleModels(parsed) });
+		this.post({ type: "notice", text: "model catalogs refreshed" });
+	}
+
+	post(message: unknown): void {
 		const event = message && typeof message === "object" ? message as Event : undefined;
 		if (event?.type === "snapshot") {
 			this.lastSnapshot = event;
-			if (!this.view) this.bufferedEvents = [];
+			if (!this.view || !this.webviewReady) this.bufferedEvents = [];
 		}
 		if (!this.view || !this.webviewReady) {
 			if (event?.type !== "snapshot") this.bufferedEvents.push(event || {});
@@ -317,17 +465,22 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 		for (const event of events) void this.view.webview.postMessage(event);
 	}
 
-	private async pickModel(mode: "chat" | "plan"): Promise<void> {
+	private async pickModel(mode: "chat" | "plan", selectedRole?: Role): Promise<void> {
 		const workspace = currentWorkspace();
 		const binary = vscode.workspace.getConfiguration("ghg").get<string>("binaryPath", "ghg");
 		const configured = await listModels(binary, workspace?.uri.fsPath);
-		const rolePick = await vscode.window.showQuickPick(
-			(["default", "smart", "fast", "tiny"] as Role[])
-				.filter((role) => configured[role])
-				.map((role) => ({ label: role, description: configured[role], role })),
-			{ placeHolder: "Choose the model role to configure" },
-		);
-		if (!rolePick) return;
+		let role = selectedRole;
+		if (!role) {
+			const rolePick = await vscode.window.showQuickPick(
+				(["default", "smart", "fast", "tiny"] as Role[])
+					.filter((name) => configured[name])
+					.map((name) => ({ label: name, description: configured[name], role: name })),
+				{ placeHolder: "Choose the model role to configure" },
+			);
+			if (!rolePick) return;
+			role = rolePick.role;
+		}
+		if (!role) return;
 		const available = await listCatalogModels(binary, workspace?.uri.fsPath);
 		const picks = new Map<string, CatalogModel>();
 		for (const item of available) {
@@ -336,16 +489,16 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 		if (picks.size === 0) throw new Error("no configured catalog models found");
 		const modelPick = await vscode.window.showQuickPick(
 			[...picks.values()].map((item) => ({ label: `${item.provider}/${item.model}`, description: item.model, item })),
-			{ placeHolder: `Choose the model for ${rolePick.role}`, matchOnDescription: true },
+			{ placeHolder: `Choose the model for ${role}`, matchOnDescription: true },
 		);
 		if (!modelPick) return;
 		await this.bridgeCommand("set_role_model", {
-			role: rolePick.role,
+			role,
 			model: modelPick.item.model,
 			provider: modelPick.item.provider,
 			mode: mode === "plan" ? "plan" : "execute",
-		}, rolePick.role, mode === "plan" ? "plan" : "execute");
-		this.post({ type: "role_model", role: rolePick.role, model: modelPick.item.model });
+		}, (["default", "smart", "fast", "tiny"] as Role[]).find((name) => configured[name]) || role, mode === "plan" ? "plan" : "execute");
+		this.post({ type: "role_model", role, model: modelPick.item.model });
 	}
 
 	private async ensureBridge(initialRole: Role = "fast", initialMode: "execute" | "plan" = "execute"): Promise<void> {
@@ -359,6 +512,10 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 		}
 		if (this.bridge) await this.stopBridge();
 		const args = ["bridge", "--role", initialRole, "--mode", initialMode];
+		const cfg = this.extensionSettings();
+		if (cfg.sandbox) args.push("--sandbox", cfg.sandbox);
+		if (cfg.network) args.push("--network", cfg.network);
+		if (cfg.approval) args.push("--approval", cfg.approval);
 		if (sessionId) {
 			args.push("--session", sessionId);
 		}
@@ -659,6 +816,75 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 		if (!this.active) await this.stopBridge();
 	}
 
+	async refreshModels(): Promise<void> {
+		try {
+			await this.refreshModelCatalogs();
+		} catch (error) {
+			this.post({ type: "error", error: error instanceof Error ? error.message : String(error) });
+		}
+	}
+
+	private async exportResult(kind: "plan" | "review"): Promise<void> {
+		const workspace = currentWorkspace();
+		if (!workspace) throw new Error("open a workspace before exporting");
+		const binary = this.extensionSettings().binary;
+		const filename = defaultExportFilename(kind);
+		const sessionID = this.bridgeSession || this.extension.workspaceState.get<string>(sessionKey(workspace)) || "";
+		const args = ["export"];
+		if (sessionID) args.push("--session", sessionID);
+		args.push("--kind", kind, "--output", filename);
+		await runCommand(binary, workspace.uri.fsPath, args);
+		this.post({ type: "notice", text: `Exported ${kind} to ${filename}` });
+	}
+
+	async openSettings(): Promise<void> {
+		await vscode.commands.executeCommand("workbench.action.openSettings", "@ext:sacca97.ghg-vscode");
+	}
+
+	async openAuth(): Promise<void> {
+		const cfg = this.extensionSettings();
+		const provider = await vscode.window.showInputBox({
+			prompt: "Provider id",
+			placeHolder: "openai, anthropic, or another configured profile",
+			ignoreFocusOut: true,
+		});
+		if (!provider?.trim()) return;
+		const terminal = vscode.window.createTerminal({
+			name: "ghg auth",
+			cwd: currentWorkspace()?.uri.fsPath,
+			shellPath: cfg.binary,
+			shellArgs: ["auth", provider.trim()],
+		});
+		terminal.show();
+	}
+
+	private async setExecutionSetting(name: string, value: string): Promise<void> {
+		if (!executionSettings.has(name)) throw new Error("unknown execution setting");
+		const allowed: Record<string, Set<string>> = {
+			sandbox: new Set(["", "read-only", "workspace-write", "danger-full-access"]),
+			network: new Set(["", "deny", "host"]),
+			approval: new Set(["", "ask", "auto-review", "never"]),
+		};
+		if (!allowed[name].has(value)) throw new Error(`invalid ${name} setting`);
+		await vscode.workspace.getConfiguration("ghg").update(name, value || undefined, vscode.ConfigurationTarget.Global);
+		this.post({ type: "extensionSettings", settings: this.extensionSettings() });
+		if (name === "approval" && value && this.bridge) {
+			await this.bridgeCommand("configure", { approval: value });
+		}
+	}
+
+	private async setDefaultSetting(name: string, value: string): Promise<void> {
+		if (!defaultSettings.has(name)) throw new Error("unknown default setting");
+		const allowed: Record<string, Set<string>> = {
+			defaultRole: new Set(["default", "smart", "fast", "tiny"]),
+			defaultMode: new Set(["execute", "plan", "review"]),
+			defaultEffort: new Set(["", "low", "medium", "high"]),
+		};
+		if (!allowed[name].has(value)) throw new Error(`invalid ${name} setting`);
+		await vscode.workspace.getConfiguration("ghg").update(name, value, vscode.ConfigurationTarget.Global);
+		this.post({ type: "extensionSettings", settings: this.extensionSettings() });
+	}
+
 	private async submitInput(prompt: string, role: Role, mode: "execute" | "plan", flags: { ask?: boolean; review?: boolean }, references: string[]): Promise<void> {
 		await this.bridgeCommand("configure_role", { role, mode }, role, mode);
 		await this.bridgeCommand("input", {
@@ -784,6 +1010,7 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 			return this.bridgeCommand("configure_role", { role, mode, dynamic_reasoning: args === "on" }, role, mode);
 		}
 		case "/model": {
+			if (args === "refresh") return this.refreshModelCatalogs();
 			if (!args) return this.pickModel(message.mode === "plan" ? "plan" : "chat");
 			const [model, provider] = fields.slice(1);
 			const mode = message.mode === "plan" ? "plan" : "execute";
@@ -825,7 +1052,55 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 			case "ready":
 				this.webviewReady = true;
 				this.flushBufferedEvents();
+				this.post({ type: "extensionSettings", settings: this.extensionSettings() });
 				break;
+			case "refreshModels":
+				await this.refreshModels();
+				break;
+			case "exportResult": {
+				if (message.kind !== "plan" && message.kind !== "review") break;
+				try {
+					await this.exportResult(message.kind);
+				} catch (error) {
+					this.post({ type: "error", error: error instanceof Error ? error.message : String(error) });
+				}
+				break;
+			}
+			case "openSettings":
+				await this.openSettings();
+				break;
+			case "openAuth":
+				await this.openAuth();
+				break;
+			case "configureModel": {
+				if (this.active) break;
+				const role = message.role === "default" || message.role === "smart" || message.role === "tiny" || message.role === "fast" ? message.role : undefined;
+				if (!role) break;
+				try {
+					await this.pickModel(message.mode === "plan" ? "plan" : "chat", role);
+				} catch (error) {
+					this.post({ type: "error", error: error instanceof Error ? error.message : String(error) });
+				}
+				break;
+			}
+			case "setExecutionSetting": {
+				if (typeof message.name !== "string" || typeof message.value !== "string") break;
+				try {
+					await this.setExecutionSetting(message.name, message.value);
+				} catch (error) {
+					this.post({ type: "error", error: error instanceof Error ? error.message : String(error) });
+				}
+				break;
+			}
+			case "setDefaultSetting": {
+				if (typeof message.name !== "string" || typeof message.value !== "string") break;
+				try {
+					await this.setDefaultSetting(message.name, message.value);
+				} catch (error) {
+					this.post({ type: "error", error: error instanceof Error ? error.message : String(error) });
+				}
+				break;
+			}
 			case "send":
 				await this.send(message);
 				break;
@@ -984,11 +1259,20 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 export function activate(extension: vscode.ExtensionContext): void {
 	const provider = new GHGViewProvider(extension);
 	extension.subscriptions.push(
-		vscode.window.registerWebviewViewProvider("ghg.chatView", provider),
+		vscode.window.registerWebviewViewProvider("ghg.chatView", provider, {
+			webviewOptions: { retainContextWhenHidden: true },
+		}),
 		vscode.commands.registerCommand("ghg.newSession", () => provider.newSession()),
-	vscode.commands.registerCommand("ghg.resumeSession", () => provider.resumeSession()),
+		vscode.commands.registerCommand("ghg.resumeSession", () => provider.resumeSession()),
+		vscode.commands.registerCommand("ghg.refreshModels", () => provider.refreshModels()),
+		vscode.commands.registerCommand("ghg.openSettings", () => provider.openSettings()),
 		vscode.workspace.onDidChangeConfiguration((event) => {
-			if (event.affectsConfiguration("ghg.binaryPath")) void provider.reloadBridge();
+			if (event.affectsConfiguration("ghg")) {
+				provider.post({ type: "extensionSettings", settings: provider.extensionSettings() });
+				if (["binaryPath", "sandbox", "network", "approval"].some((name) => event.affectsConfiguration(`ghg.${name}`))) {
+					void provider.reloadBridge();
+				}
+			}
 		}),
 		{ dispose: () => provider.dispose() },
 	);

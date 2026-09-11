@@ -48,6 +48,9 @@ func bridgeCLI(args []string) error {
 	sessionFlag := fs.String("session", "", "session id to resume")
 	roleFlag := fs.String("role", config.RoleFast, "initial model role")
 	modeFlag := fs.String("mode", "execute", "initial mode: execute or plan")
+	sandboxFlag := fs.String("sandbox", "", "execution sandbox override")
+	networkFlag := fs.String("network", "", "execution network override")
+	approvalFlag := fs.String("approval", "", "execution approval override")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -60,6 +63,10 @@ func bridgeCLI(args []string) error {
 
 	cfg, err := config.Load()
 	if err != nil {
+		return err
+	}
+	validationCfg := *cfg
+	if err := validationCfg.ApplyExecutionOverrides(*sandboxFlag, *networkFlag, *approvalFlag); err != nil {
 		return err
 	}
 	profiles, err := loadProviderProfiles()
@@ -120,6 +127,15 @@ func bridgeCLI(args []string) error {
 			workerRoleEnv:         *roleFlag,
 			workerModeEnv:         *modeFlag,
 			workerCautiousEnv:     "false",
+		}
+		if *sandboxFlag != "" {
+			env[workerSandboxEnv] = *sandboxFlag
+		}
+		if *networkFlag != "" {
+			env[workerNetworkEnv] = *networkFlag
+		}
+		if *approvalFlag != "" {
+			env[workerApprovalEnv] = *approvalFlag
 		}
 		process, err = workerwire.Launch(context.Background(), os.Args[0], env)
 		if err == nil {

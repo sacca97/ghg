@@ -828,10 +828,6 @@ func redactArgv(argv []string, patterns ...[]string) []string {
 			out[i] = key + "=" + redactedApprovalValue
 			continue
 		}
-		if key, _, ok := strings.Cut(token, "="); ok && isAssignment(key) && sensitiveEnvName(key, configured...) {
-			out[i] = key + "=" + redactedApprovalValue
-			continue
-		}
 		if redacted := redactInlineToken(token, configured); redacted != token {
 			out[i] = redacted
 			continue

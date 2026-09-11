@@ -396,6 +396,11 @@ func TestReadObservedContentFromReader(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "offset 10 past end of file") {
 		t.Fatalf("expected past EOF error, got: %v", err)
 	}
+
+	_, err = readObservedContent(context.Background(), "/canonical/empty.go", "empty.go", strings.NewReader(""), 1, 1)
+	if err == nil || !strings.Contains(err.Error(), "empty.go is empty") {
+		t.Fatalf("expected explicit empty-file error, got: %v", err)
+	}
 }
 
 func TestSandboxNetworkDeniedClassifier(t *testing.T) {
