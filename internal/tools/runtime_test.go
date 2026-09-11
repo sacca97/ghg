@@ -84,6 +84,30 @@ func TestRuntimeNeverFailsClosedAndChildDoesNotWiden(t *testing.T) {
 	}
 }
 
+func TestSandboxedMutationsDoNotUseHumanGateUnlessCautious(t *testing.T) {
+	runtime, workspace := testRuntime(t, ApprovalAsk)
+	runtime.HumanGate = func(context.Context, GateRequest) (GateDecision, string) {
+		return GateReject, "unexpected prompt"
+	}
+	ctx := WithRuntime(context.Background(), runtime)
+
+	inside := filepath.Join(workspace, "main.go")
+	if got := checkGate(ctx, "write", inside); got != "" {
+		t.Fatalf("sandboxed write was gated: %q", got)
+	}
+
+	runtime.Cautious = true
+	if got := checkGate(ctx, "edit", inside); got == "" {
+		t.Fatal("cautious edit bypassed the human gate")
+	}
+
+	runtime.Cautious = false
+	outside := filepath.Join(t.TempDir(), "outside.go")
+	if got := checkGate(ctx, "write", outside); got == "" {
+		t.Fatal("out-of-root write bypassed the human gate")
+	}
+}
+
 func TestRuntimeExternalRedirectRequiresHumanAndGrantsOneCallRoot(t *testing.T) {
 	runtime, workspace := testRuntime(t, ApprovalAutoReview)
 	outside := t.TempDir()

@@ -1031,6 +1031,11 @@ func checkGate(ctx context.Context, tool, command string) string {
 	if runtime == nil || runtime.HumanGate == nil {
 		return ""
 	}
+	if !runtime.Cautious && (tool == "write" || tool == "edit" || tool == "lsp_rename") && runtime.Policy != nil {
+		if _, err := runtime.Policy.Authorize(command, sandbox.AccessWrite, true); err == nil {
+			return ""
+		}
+	}
 	decision, redirect := runtime.HumanGate(ctx, GateRequest{Tool: tool, Command: command, Rule: CommandRule(command)})
 	if decision == GateReject {
 		if redirect == "" {

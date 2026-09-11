@@ -71,6 +71,25 @@ Tests: `internal/tools/search_test.go` — `TestGrepTool`,
 `TestSearchLimitsCancellationAndInvalidArguments`,
 `TestMalformedGitignore`, and `TestExplicitIgnoredFileIsSearchable`.
 
+### Public web access
+
+`web_fetch` retrieves bounded text, HTML, JSON, or XML from a public HTTP(S)
+URL. HTML is reduced to readable text with headings and links; scripts,
+styles, forms, and other executable content are discarded. DNS results,
+redirects, response headers, and response bodies are bounded and private or
+metadata addresses are rejected. External bytes are marked untrusted and use
+the normal retained-output path.
+
+`web_search` uses the selected SearXNG endpoint, or Brave Search when no custom
+endpoint is selected and `BRAVE_SEARCH_API_KEY` is present. Configure endpoints
+with `/search-providers add <name> <base-url>`, then use `/search-providers use
+<name|brave>`; the VS Code settings view provides the same add flow. API keys
+are optional for SearXNG and are never returned in provider listings or model
+output. With the default network-denied policy, the first use goes through the
+normal approval gate; headless runs with no approval path hide the tools
+instead. They do not provide browser automation, JavaScript, cookies, or login
+support.
+
 `internal/tools/phase25_test.go`, `internal/search/snapshot_test.go`, and
 `internal/search/fileindex_test.go` cover OR
 patterns, stable cursors, noisy-file diversity, fuzzy late matches, long-result

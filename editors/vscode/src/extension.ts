@@ -6,8 +6,21 @@ import * as vscode from "vscode";
 
 type Event = { type?: unknown; [key: string]: unknown };
 type Workspace = vscode.WorkspaceFolder | undefined;
-type Role = "default" | "smart" | "tiny" | "fast";
-const effortLevels = new Set(["", "low", "medium", "high"]);
+// One list per enum, mirroring media/constants.js. Parsing, validation, and the
+// option order the webview renders are all derived from these tables.
+const roles = ["default", "smart", "fast", "tiny"] as const;
+const modes = ["execute", "plan", "review"] as const;
+const effortLevels = ["", "low", "medium", "high"] as const;
+const approvals = ["", "ask", "auto-review", "never"] as const;
+const sandboxes = ["", "read-only", "workspace-write", "danger-full-access"] as const;
+const networks = ["", "deny", "host"] as const;
+
+type Role = (typeof roles)[number];
+type Mode = (typeof modes)[number];
+
+const oneOf = <T extends string>(values: readonly T[], value: unknown): value is T =>
+	typeof value === "string" && (values as readonly string[]).includes(value);
+
 const maxChildOutput = 1024 * 1024;
 const busyStates = new Set(["running", "waiting_approval", "waiting_question", "stopping"]);
 const executionSettings = new Set(["sandbox", "network", "approval"]);
@@ -17,7 +30,7 @@ type SessionPick = vscode.QuickPickItem & { sessionId: string };
 type ReferenceSuggestion = { path: string; folder: boolean };
 type ExtensionSettings = {
 	role: Role;
-	mode: "execute" | "plan" | "review";
+	mode: Mode;
 	effort: string;
 	sandbox: string;
 	network: string;
@@ -122,7 +135,9 @@ async function referenceSuggestions(workspace: vscode.WorkspaceFolder, query: st
 		const path = vscode.workspace.asRelativePath(uri, false).replace(/\\/g, "/");
 		const lowerPath = path.toLowerCase();
 		const basename = path.slice(path.lastIndexOf("/") + 1).toLowerCase();
-		if (!lowerPath.startsWith(prefix) && (normalized.includes("/") || !basename.startsWith(prefix))) {
+		// normalized never contains "/" at this point (slash queries return early
+		// above), so a match has to come from the basename.
+		if (!lowerPath.startsWith(prefix) && !basename.startsWith(prefix)) {
 			continue;
 		}
 		if (!lowerPath.startsWith(prefix)) {
@@ -162,28 +177,6 @@ function parseSessions(output: string): SessionPick[] {
 function appendChildOutput(current: string, chunk: Buffer, keepTail = false): string {
 	const next = current + chunk.toString();
 	return next.length <= maxChildOutput ? next : keepTail ? next.slice(-maxChildOutput) : next.slice(0, maxChildOutput);
-}
-
-function listSessions(binary: string, cwd: string | undefined): Promise<SessionPick[]> {
-	return new Promise((resolve, reject) => {
-		const child = spawn(binary, ["sessions", "--format", "json"], { cwd, stdio: ["ignore", "pipe", "pipe"] });
-		if (!child.stdout || !child.stderr) {
-			reject(new Error("ghg did not expose piped output"));
-			return;
-		}
-		let output = "";
-		let error = "";
-		child.stdout.on("data", (chunk: Buffer) => { output = appendChildOutput(output, chunk); });
-		child.stderr.on("data", (chunk: Buffer) => { error = appendChildOutput(error, chunk, true); });
-		child.once("error", reject);
-		child.once("close", (code) => {
-			if (code !== 0) {
-				reject(new Error(error.trim() || `ghg sessions exited with code ${code ?? "unknown"}`));
-				return;
-			}
-			resolve(parseSessions(output));
-		});
-	});
 }
 
 function runCommand(binary: string, cwd: string | undefined, args: string[]): Promise<string> {
@@ -226,7 +219,7 @@ function listModels(binary: string, cwd: string | undefined): Promise<Record<str
 function parseRoleModels(parsed: unknown): Record<string, string> {
 	if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("ghg models returned invalid JSON");
 	const models: Record<string, string> = {};
-	for (const role of ["default", "smart", "tiny", "fast"]) {
+	for (const role of roles) {
 		const model = (parsed as Record<string, unknown>)[role];
 		if (typeof model === "string" && model !== "") models[role] = model;
 	}
@@ -291,9 +284,9 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 		const mode = cfg.get<string>("defaultMode", "execute");
 		const effort = cfg.get<string>("defaultEffort", "");
 		return {
-			role: ["default", "smart", "tiny", "fast"].includes(role) ? role as Role : "fast",
-			mode: ["execute", "plan", "review"].includes(mode) ? mode as ExtensionSettings["mode"] : "execute",
-			effort: effortLevels.has(effort) ? effort : "",
+			role: oneOf(roles, role) ? role : "fast",
+			mode: oneOf(modes, mode) ? mode : "execute",
+			effort: oneOf(effortLevels, effort) ? effort : "",
 			sandbox: cfg.get<string>("sandbox", ""),
 			network: cfg.get<string>("network", ""),
 			approval: cfg.get<string>("approval", ""),
@@ -367,8 +360,7 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 		let role = selectedRole;
 		if (!role) {
 			const rolePick = await vscode.window.showQuickPick(
-				(["default", "smart", "fast", "tiny"] as Role[])
-					.filter((name) => configured[name])
+				roles.filter((name) => configured[name])
 					.map((name) => ({ label: name, description: configured[name], role: name })),
 				{ placeHolder: "Choose the model role to configure" },
 			);
@@ -392,7 +384,7 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 			model: modelPick.item.model,
 			provider: modelPick.item.provider,
 			mode: mode === "plan" ? "plan" : "execute",
-		}, (["default", "smart", "fast", "tiny"] as Role[]).find((name) => configured[name]) || role, mode === "plan" ? "plan" : "execute");
+		}, roles.find((name) => configured[name]) || role, mode === "plan" ? "plan" : "execute");
 		this.post({ type: "role_model", role, model: modelPick.item.model });
 	}
 
@@ -802,9 +794,9 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 	private async setExecutionSetting(name: string, value: string): Promise<void> {
 		if (!executionSettings.has(name)) throw new Error("unknown execution setting");
 		const allowed: Record<string, Set<string>> = {
-			sandbox: new Set(["", "read-only", "workspace-write", "danger-full-access"]),
-			network: new Set(["", "deny", "host"]),
-			approval: new Set(["", "ask", "auto-review", "never"]),
+			sandbox: new Set<string>(sandboxes),
+			network: new Set<string>(networks),
+			approval: new Set<string>(approvals),
 		};
 		if (!allowed[name].has(value)) throw new Error(`invalid ${name} setting`);
 		await vscode.workspace.getConfiguration("ghg").update(name, value || undefined, vscode.ConfigurationTarget.Global);
@@ -817,9 +809,9 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 	private async setDefaultSetting(name: string, value: string): Promise<void> {
 		if (!defaultSettings.has(name)) throw new Error("unknown default setting");
 		const allowed: Record<string, Set<string>> = {
-			defaultRole: new Set(["default", "smart", "fast", "tiny"]),
-			defaultMode: new Set(["execute", "plan", "review"]),
-			defaultEffort: new Set(["", "low", "medium", "high"]),
+			defaultRole: new Set<string>(roles),
+			defaultMode: new Set<string>(modes),
+			defaultEffort: new Set<string>(effortLevels),
 		};
 		if (!allowed[name].has(value)) throw new Error(`invalid ${name} setting`);
 		await vscode.workspace.getConfiguration("ghg").update(name, value, vscode.ConfigurationTarget.Global);
@@ -846,7 +838,7 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 		const fields = prompt.trim().split(/\s+/);
 		const name = fields[0];
 		const args = prompt.trim().slice(name.length).trim();
-		const role: Role = message.role === "default" || message.role === "smart" || message.role === "tiny" || message.role === "fast" ? message.role : "fast";
+		const role: Role = oneOf(roles, message.role) ? message.role : "fast";
 		const references = cleanReferences(message.references);
 		switch (name) {
 		case "/ask":
@@ -954,7 +946,7 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 			if (!args) throw new Error("usage: /effort <off|low|medium|high>");
 			{
 				const effort = args.toLowerCase() === "off" ? "" : args.toLowerCase();
-				if (!effortLevels.has(effort)) throw new Error("usage: /effort <off|low|medium|high>");
+				if (!oneOf(effortLevels, effort)) throw new Error("usage: /effort <off|low|medium|high>");
 				const mode = message.mode === "plan" ? "plan" : "execute";
 				return this.bridgeCommand("configure_role", { role, mode, effort, update_effort: true }, role, mode);
 			}
@@ -1031,7 +1023,7 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 				break;
 			case "configureModel": {
 				if (this.active) break;
-				const role = message.role === "default" || message.role === "smart" || message.role === "tiny" || message.role === "fast" ? message.role : undefined;
+				const role = oneOf(roles, message.role) ? message.role : undefined;
 				if (!role) break;
 				try {
 					await this.pickModel(message.mode === "plan" ? "plan" : "chat", role);
@@ -1074,13 +1066,13 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 				if (this.active) {
 					break;
 				}
-				const role = message.role === "default" || message.role === "smart" || message.role === "tiny" || message.role === "fast" ? message.role : "fast";
+				const role = oneOf(roles, message.role) ? message.role : "fast";
 				const mode = message.mode === "plan" ? "plan" : "execute";
 				try {
 					const updateEffort = message.updateEffort === true || typeof message.effort === "string";
 					const effort = typeof message.effort === "string" ? message.effort.trim().toLowerCase() : "";
 					const normalizedEffort = effort === "off" ? "" : effort;
-					if (updateEffort && !effortLevels.has(normalizedEffort)) {
+					if (updateEffort && !oneOf(effortLevels, normalizedEffort)) {
 						throw new Error("unsupported thinking effort; choose off, low, medium, or high");
 					}
 					await this.bridgeCommand("configure_role", { role, mode, effort: normalizedEffort, update_effort: updateEffort }, role, mode);
@@ -1139,7 +1131,7 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 			this.post({ type: "error", error: "Choose Execute, Plan, or Review before sending." });
 			return;
 		}
-		const role: Role = message.role === "default" || message.role === "smart" || message.role === "tiny" || message.role === "fast" ? message.role : "fast";
+		const role: Role = oneOf(roles, message.role) ? message.role : "fast";
 		try {
 			if (prompt.startsWith("/") || prompt.startsWith("!")) {
 				await this.sendCommand(prompt, message);
@@ -1185,7 +1177,7 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 		const binary = vscode.workspace.getConfiguration("ghg").get<string>("binaryPath", "ghg");
 		let sessions: SessionPick[] = [];
 		try {
-			sessions = await listSessions(binary, workspace?.uri.fsPath);
+			sessions = parseSessions(await runCommand(binary, workspace?.uri.fsPath, ["sessions", "--format", "json"]));
 		} catch {
 			// Fall back to manual entry when the session database is unavailable.
 		}

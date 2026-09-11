@@ -5,7 +5,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta http-equiv="Content-Security-Policy"
-    content="default-src 'none'; style-src {{cspSource}}; script-src 'nonce-{{nonce}}';">
+    content="default-src 'none'; style-src {{cspSource}}; script-src 'nonce-{{nonce}}' {{cspSource}};">
   <link rel="stylesheet" href="{{styleUri}}">
 </head>
 
@@ -50,23 +50,9 @@
                 <p>These are the active controls for the next turn.</p>
               </div>
             </div>
-            <label class="settings-field">Role <select id="settings-role">
-                <option value="default">Default</option>
-                <option value="smart">Smart</option>
-                <option value="fast">Fast</option>
-                <option value="tiny">Tiny</option>
-              </select></label>
-            <label class="settings-field">Mode <select id="settings-mode">
-                <option value="execute">Execute</option>
-                <option value="plan">Plan</option>
-                <option value="review">Review</option>
-              </select></label>
-            <label class="settings-field">Thinking <select id="settings-effort">
-                <option value="">Off</option>
-                <option value="low">Low</option>
-                <option value="medium">Medium</option>
-                <option value="high">High</option>
-              </select></label>
+            <label class="settings-field">Role <select id="settings-role"></select></label>
+            <label class="settings-field">Mode <select id="settings-mode"></select></label>
+            <label class="settings-field">Thinking <select id="settings-effort"></select></label>
           </section>
 
           <section class="settings-section">
@@ -88,23 +74,9 @@
                 <p>Changes apply when the next worker starts.</p>
               </div>
             </div>
-            <label class="settings-field">Sandbox <select id="settings-sandbox">
-                <option value="">Configured default</option>
-                <option value="read-only">Read only</option>
-                <option value="workspace-write">Workspace write</option>
-                <option value="danger-full-access">Full access</option>
-              </select></label>
-            <label class="settings-field">Network <select id="settings-network">
-                <option value="">Configured default</option>
-                <option value="deny">Denied</option>
-                <option value="host">Host</option>
-              </select></label>
-            <label class="settings-field">Approval <select id="settings-approval">
-                <option value="">Configured default</option>
-                <option value="ask">Ask</option>
-                <option value="auto-review">Auto-review</option>
-                <option value="never">Never</option>
-              </select></label>
+            <label class="settings-field">Sandbox <select id="settings-sandbox"></select></label>
+            <label class="settings-field">Network <select id="settings-network"></select></label>
+            <label class="settings-field">Approval <select id="settings-approval"></select></label>
           </section>
 
           <section class="settings-section settings-last">
@@ -130,18 +102,8 @@
             aria-autocomplete="list" aria-controls="completion-menu" aria-expanded="false"></textarea>
           <div class="composer-row">
             <button type="button" id="mode-toggle" aria-label="Mode: Execute" title="Switch mode">Execute</button>
-            <select id="role" aria-label="Current model">
-              <option value="default">Configured</option>
-              <option value="smart">Configured</option>
-              <option value="tiny">Configured</option>
-              <option value="fast">Configured</option>
-            </select>
-            <select id="effort" aria-label="Thinking effort">
-              <option value="">Off</option>
-              <option value="low">Low</option>
-              <option value="medium">Medium</option>
-              <option value="high">High</option>
-            </select>
+            <select id="role" aria-label="Current model"></select>
+            <select id="effort" aria-label="Thinking effort"></select>
             <button type="button" id="settings-toggle" aria-label="Open settings" title="Open settings">
               <svg viewBox="0 0 16 16" aria-hidden="true">
                 <circle cx="8" cy="8" r="2.3" />
@@ -156,7 +118,7 @@
     </div>
   </main>
   <script nonce="{{nonce}}">window.ghgSettings = {{initialSettings}};</script>
-  <script nonce="{{nonce}}" src="{{scriptUri}}"></script>
+  <script type="module" nonce="{{nonce}}" src="{{scriptUri}}"></script>
 </body>
 
 </html>
