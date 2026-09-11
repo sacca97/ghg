@@ -29,6 +29,9 @@ type fileIndexEntry struct {
 var fileIndexes struct {
 	sync.Mutex
 	entries map[string]fileIndexEntry
+	// A global epoch avoids a second per-root map; unrelated invalidations can
+	// cause one harmless rebuild instead of allowing a stale walk to be cached.
+	generation uint64
 }
 
 // InvalidateFileIndex forces the next FuzzyFiles call for root to rescan it.
@@ -36,6 +39,7 @@ var fileIndexes struct {
 func InvalidateFileIndex(root string) {
 	root = cleanRoot(root)
 	fileIndexes.Lock()
+	fileIndexes.generation++
 	if fileIndexes.entries != nil {
 		delete(fileIndexes.entries, root)
 	}
@@ -209,10 +213,11 @@ func indexedFiles(root string) []string {
 	now := time.Now()
 	pruneFileIndexes(now)
 	if entry, ok := fileIndexes.entries[root]; ok {
-		files := slices.Clone(entry.files)
 		fileIndexes.Unlock()
-		return files
+		// FuzzyPaths only reads this cache-owned slice.
+		return entry.files
 	}
+	generation := fileIndexes.generation
 	fileIndexes.Unlock()
 
 	var files []string
@@ -242,9 +247,15 @@ func indexedFiles(root string) []string {
 	slices.Sort(files)
 
 	fileIndexes.Lock()
+	if fileIndexes.generation != generation {
+		// An invalidation happened while walking. Do not let this stale walk
+		// repopulate the cache with a fresh timestamp.
+		fileIndexes.Unlock()
+		return files
+	}
 	pruneFileIndexes(time.Now())
 	evictOldestFileIndex()
-	fileIndexes.entries[root] = fileIndexEntry{builtAt: time.Now(), files: slices.Clone(files)}
+	fileIndexes.entries[root] = fileIndexEntry{builtAt: time.Now(), files: files}
 	fileIndexes.Unlock()
 	return files
 }

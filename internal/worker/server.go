@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"io"
 	"net"
 	"sync"
 	"time"
@@ -86,12 +85,8 @@ func (s *Server) Serve(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if done := ctx.Done(); done != nil {
-		go func() {
-			<-done
-			_ = s.Close()
-		}()
-	}
+	stop := context.AfterFunc(ctx, func() { _ = s.Close() })
+	defer stop()
 	for {
 		conn, err := s.listener.Accept()
 		if err != nil {
@@ -214,6 +209,15 @@ func (s *Server) serveConnection(conn net.Conn) {
 	_ = conn.SetReadDeadline(time.Time{})
 
 	p := newPeer(conn)
+	abort := func(message string) {
+		if s.controller == p {
+			s.controller = nil
+		}
+		s.mu.Unlock()
+		_ = writeErrorWithDeadline(conn, s.runtime.SessionID, message)
+		p.close()
+		s.handler.Disconnected(context.Background(), false)
+	}
 	s.mu.Lock()
 	if s.closed {
 		s.mu.Unlock()
@@ -248,10 +252,7 @@ func (s *Server) serveConnection(conn net.Conn) {
 	s.attaching = false
 	state, snapshotSeq, snapshotErr := s.snapshotLocked(context.Background())
 	if snapshotErr != nil {
-		s.mu.Unlock()
-		_ = writeErrorWithDeadline(conn, s.runtime.SessionID, snapshotErr.Error())
-		p.close()
-		s.handler.Disconnected(context.Background(), false)
+		abort(snapshotErr.Error())
 		return
 	}
 
@@ -275,17 +276,11 @@ func (s *Server) serveConnection(conn net.Conn) {
 		Payload:   mustPayload(map[string]any{"last_seq": snapshotSeq}),
 	}
 	if _, err := encodeFrame(snapshotFrame); err != nil {
-		s.mu.Unlock()
-		_ = writeErrorWithDeadline(conn, s.runtime.SessionID, "worker snapshot exceeds protocol frame limit")
-		p.close()
-		s.handler.Disconnected(context.Background(), false)
+		abort("worker snapshot exceeds protocol frame limit")
 		return
 	}
 	if _, err := encodeFrame(attachedFrame); err != nil {
-		s.mu.Unlock()
-		_ = writeErrorWithDeadline(conn, s.runtime.SessionID, "worker attach response exceeds protocol frame limit")
-		p.close()
-		s.handler.Disconnected(context.Background(), false)
+		abort("worker attach response exceeds protocol frame limit")
 		return
 	}
 	_ = p.enqueue(snapshotFrame, true)
@@ -326,10 +321,7 @@ func (s *Server) handleCommand(p *peer, frame Frame) {
 	}
 	var request CommandRequest
 	if err := json.Unmarshal(frame.Payload, &request); err != nil || !knownCommand(request.Name) {
-		response := errorFrame(s.runtime.SessionID, "unknown worker command")
-		response.RequestID = frame.RequestID
-		s.remember(frame.RequestID, response)
-		p.enqueue(response, true)
+		p.enqueue(s.commandError(frame.RequestID, "unknown worker command"), true)
 		return
 	}
 	result, err := s.handler.Command(context.Background(), Command{
@@ -338,10 +330,7 @@ func (s *Server) handleCommand(p *peer, frame Frame) {
 		Payload:   request.Payload,
 	})
 	if err != nil {
-		response := errorFrame(s.runtime.SessionID, err.Error())
-		response.RequestID = frame.RequestID
-		s.remember(frame.RequestID, response)
-		p.enqueue(response, true)
+		p.enqueue(s.commandError(frame.RequestID, err.Error()), true)
 		return
 	}
 	responseType := TypeAck
@@ -360,8 +349,7 @@ func (s *Server) handleCommand(p *peer, frame Frame) {
 	}
 	detach := result.Detach
 	if _, err := encodeFrame(response); err != nil {
-		response = errorFrame(s.runtime.SessionID, "worker response exceeds protocol frame limit")
-		response.RequestID = frame.RequestID
+		response = s.commandError(frame.RequestID, "worker response exceeds protocol frame limit")
 		detach = false
 	}
 	if detach {
@@ -406,13 +394,16 @@ func errorFrame(sessionID, message string) Frame {
 	}
 }
 
-func writeError(w io.Writer, sessionID, message string) error {
-	return WriteFrame(w, errorFrame(sessionID, message))
+func (s *Server) commandError(requestID, message string) Frame {
+	response := errorFrame(s.runtime.SessionID, message)
+	response.RequestID = requestID
+	s.remember(requestID, response)
+	return response
 }
 
 func writeErrorWithDeadline(conn net.Conn, sessionID, message string) error {
 	_ = conn.SetWriteDeadline(time.Now().Add(time.Second))
-	return writeError(conn, sessionID, message)
+	return WriteFrame(conn, errorFrame(sessionID, message))
 }
 
 type peer struct {

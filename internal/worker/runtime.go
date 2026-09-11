@@ -72,9 +72,6 @@ func (r Runtime) Acquire() (*Lock, error) {
 	}
 	if err := lockFile(file); err != nil {
 		file.Close()
-		if errors.Is(err, ErrAlreadyRunning) {
-			return nil, ErrAlreadyRunning
-		}
 		return nil, err
 	}
 	return &Lock{file: file}, nil
@@ -104,19 +101,11 @@ func (r Runtime) Listen() (net.Listener, error) {
 }
 
 func (r Runtime) RemoveSocket() error {
-	err := os.Remove(r.SocketPath)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	return err
+	return removeIfExists(r.SocketPath)
 }
 
 func (r Runtime) RemovePrompt() error {
-	err := os.Remove(r.PromptPath)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	return err
+	return removeIfExists(r.PromptPath)
 }
 
 // Live reports whether a worker currently owns this runtime's lifetime lock.

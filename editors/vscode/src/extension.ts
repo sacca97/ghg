@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import * as fs from "node:fs";
 import * as readline from "node:readline";
 import { ChildProcess, spawn } from "node:child_process";
 import * as vscode from "vscode";
@@ -29,7 +30,7 @@ const sessionKey = (workspace: Workspace): string =>
 
 function currentWorkspace(): Workspace {
 	const editor = vscode.window.activeTextEditor;
-	return editor ? vscode.workspace.getWorkspaceFolder(editor.document.uri) : vscode.workspace.workspaceFolders?.[0];
+	return (editor && vscode.workspace.getWorkspaceFolder(editor.document.uri)) || vscode.workspace.workspaceFolders?.[0];
 }
 
 function cleanReferences(value: unknown): string[] {
@@ -260,115 +261,9 @@ function htmlFor(webview: vscode.Webview, extensionUri: vscode.Uri, settings: Ex
 	const script = webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, "media", "main.js"));
 	const style = webview.asWebviewUri(vscode.Uri.joinPath(extensionUri, "media", "main.css"));
 	const initialSettings = JSON.stringify(settings).replace(/</g, "\\u003c");
-	return `<!doctype html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src ${webview.cspSource}; script-src 'nonce-${nonce}';">
-<link rel="stylesheet" href="${style}">
-</head>
-<body>
-<main id="app">
-  <header id="toolbar">
-    <span class="toolbar-title">ghg</span>
-  </header>
-  <div id="views">
-  <section id="settings" hidden>
-    <div class="settings-card">
-      <div class="settings-header">
-        <div>
-          <div class="settings-eyebrow">ghg</div>
-          <h2>Settings</h2>
-        </div>
-        <button type="button" id="settings-close" aria-label="Close settings" title="Close settings">
-          <svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4 4 8 8M12 4l-8 8"/></svg>
-        </button>
-      </div>
-      <p class="settings-lede">Configure the worker, model roles, and this chat view.</p>
-
-      <section class="settings-section">
-        <div class="settings-section-head">
-          <div><h3>Model roles</h3><p>Choose the model assigned to each role.</p></div>
-          <button type="button" class="settings-icon-button" id="refresh-models" aria-label="Refresh models" title="Refresh models">
-            <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M13 5V2.5h-2.5M13 2.5A5.5 5.5 0 1 0 14 9"/></svg>
-          </button>
-        </div>
-        <div id="settings-models" class="settings-models"></div>
-      </section>
-
-      <section class="settings-section">
-        <div class="settings-section-head"><div><h3>Defaults</h3><p>These are the active controls for the next turn.</p></div></div>
-        <label class="settings-field">Role <select id="settings-role">
-          <option value="default">Default</option><option value="smart">Smart</option><option value="fast">Fast</option><option value="tiny">Tiny</option>
-        </select></label>
-        <label class="settings-field">Mode <select id="settings-mode">
-          <option value="execute">Execute</option><option value="plan">Plan</option><option value="review">Review</option>
-        </select></label>
-        <label class="settings-field">Thinking <select id="settings-effort">
-          <option value="">Off</option><option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option>
-        </select></label>
-      </section>
-
-      <section class="settings-section">
-        <div class="settings-section-head"><div><h3>Providers</h3><p>Credentials stay in ghg. Open the guided provider login in a terminal.</p></div></div>
-        <button type="button" class="settings-action" id="open-auth">Configure provider access</button>
-      </section>
-
-      <section class="settings-section">
-        <div class="settings-section-head"><div><h3>Execution</h3><p>Changes apply when the next worker starts.</p></div></div>
-        <label class="settings-field">Sandbox <select id="settings-sandbox">
-          <option value="">Configured default</option><option value="read-only">Read only</option><option value="workspace-write">Workspace write</option><option value="danger-full-access">Full access</option>
-        </select></label>
-        <label class="settings-field">Network <select id="settings-network">
-          <option value="">Configured default</option><option value="deny">Denied</option><option value="host">Host</option>
-        </select></label>
-        <label class="settings-field">Approval <select id="settings-approval">
-          <option value="">Configured default</option><option value="ask">Ask</option><option value="auto-review">Auto-review</option><option value="never">Never</option>
-        </select></label>
-      </section>
-
-      <section class="settings-section settings-last">
-        <div class="settings-section-head"><div><h3>Runtime</h3><p id="settings-runtime">Binary: ghg</p></div></div>
-        <button type="button" class="settings-action" id="open-settings">Open VS Code settings</button>
-        <button type="button" class="settings-action settings-action-muted" id="settings-close-bottom">Back to chat</button>
-      </section>
-    </div>
-  </section>
-  <section id="chat-view">
-  <section id="transcript" aria-live="polite"></section>
-  <div id="status" role="status">Ready</div>
-  <div id="references" aria-label="Referenced files"></div>
-  <div id="completion-menu" role="listbox" hidden></div>
-  <form id="composer">
-    <textarea id="prompt" rows="3" placeholder="Ask ghg anything…"></textarea>
-    <div class="composer-row">
-		<button type="button" id="mode-toggle" aria-label="Mode: Execute" title="Switch mode">Execute</button>
-			<select id="role" aria-label="Current model">
-			  <option value="default">Configured</option>
-			  <option value="smart">Configured</option>
-			  <option value="tiny">Configured</option>
-			  <option value="fast">Configured</option>
-			</select>
-		<select id="effort" aria-label="Thinking effort">
-		  <option value="">Off</option>
-		  <option value="low">Low</option>
-		  <option value="medium">Medium</option>
-		  <option value="high">High</option>
-		</select>
-      <button type="button" id="settings-toggle" aria-label="Open settings" title="Open settings">
-        <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="8" cy="8" r="2.3"/><path d="M8 1.5v1.2M8 13.3v1.2M1.5 8h1.2M13.3 8h1.2M3.4 3.4l.9.9M11.7 11.7l.9.9M12.6 3.4l-.9.9M4.3 11.7l-.9.9"/></svg>
-      </button>
-      <button type="submit" id="send" aria-label="Send" title="Send">➤</button>
-    </div>
-  </form>
-  </section>
-  </div>
-</main>
-<script nonce="${nonce}">window.ghgSettings = ${initialSettings};</script>
-<script nonce="${nonce}" src="${script}"></script>
-</body>
-</html>`;
+	let html = fs.readFileSync(vscode.Uri.joinPath(extensionUri, "media", "index.html").fsPath, "utf8");
+	const values = { cspSource: webview.cspSource, nonce, scriptUri: script.toString(), styleUri: style.toString(), initialSettings };
+	return html.replace(/{{(cspSource|nonce|scriptUri|styleUri|initialSettings)}}/g, (_, key: keyof typeof values) => values[key]);
 }
 
 type WebviewMessage = { type?: unknown; [key: string]: unknown };

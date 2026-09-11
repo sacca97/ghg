@@ -35,6 +35,9 @@ type OutputFilter struct {
 	Until      time.Time
 }
 
+const outputColumns = `session_id, message_seq, id, tool_call_id, tool_name,
+	media_type, original_bytes, stored_bytes, hash, path, complete, metadata, created_at`
+
 // OutputCatalog resolves session-owned output metadata.
 type OutputCatalog interface {
 	LookupOutput(context.Context, string, string) (OutputMetadata, error)
@@ -48,8 +51,7 @@ func (s *Store) LookupOutput(ctx context.Context, sessionID, id string) (OutputM
 	if strings.TrimSpace(id) == "" {
 		return OutputMetadata{}, fmt.Errorf("output id is required")
 	}
-	row := s.db.QueryRowContext(ctx, `SELECT session_id, message_seq, id, tool_call_id,
-		tool_name, media_type, original_bytes, stored_bytes, hash, path, complete, metadata, created_at
+	row := s.db.QueryRowContext(ctx, `SELECT `+outputColumns+`
 		FROM artifacts WHERE session_id=? AND id=?
 		ORDER BY created_at DESC, message_seq DESC, tool_call_id, rowid DESC LIMIT 1`, sessionID, id)
 	return scanOutput(row)
@@ -65,8 +67,7 @@ func (s *Store) ListOutputs(ctx context.Context, sessionID string, filter Output
 	if limit > maxOutputListLimit {
 		limit = maxOutputListLimit
 	}
-	query := `SELECT session_id, message_seq, id, tool_call_id, tool_name,
-		media_type, original_bytes, stored_bytes, hash, path, complete, metadata, created_at
+	query := `SELECT ` + outputColumns + `
 		FROM artifacts WHERE session_id=?`
 	args := []any{sessionID}
 	if filter.ToolName != "" {

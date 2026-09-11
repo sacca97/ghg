@@ -90,25 +90,18 @@ func (w *workerProcessState) startOperation(detail string, run func(context.Cont
 }
 
 // finishOperation is the one completion path for turns and auxiliary
-// operations: reset the active bookkeeping, publish idle, and — when the
-// worker is detached by then — arm the idle-exit grace. Detached planning and
-// compaction previously skipped the idle scheduling that turn completion had,
-// leaving a detached worker alive indefinitely.
+// operations: reset the active bookkeeping and publish idle. The worker stays
+// alive until its controller explicitly stops it.
 func (w *workerProcessState) finishOperation(detail string) {
-	var detached bool
 	w.transition(func() (workerwire.State, bool, string, bool) {
 		w.activeCancel = nil
 		w.activeTool = ""
-		detached = w.detached
 		if w.stopRequested {
 			return w.state, w.detached, "", false
 		}
 		return workerwire.StateIdle, w.detached, detail + " finished", true
 	})
 	w.clearLive()
-	if detached && !w.hasLiveWork() {
-		w.scheduleIdleExit()
-	}
 }
 
 func (w *workerProcessState) updateGoal(request workerwire.GoalRequest) (agent.GoalRecord, error) {

@@ -85,8 +85,6 @@ type workerProcessState struct {
 	stopDetail      string
 	stopOnce        sync.Once
 	stateWriteMu    sync.Mutex
-	disconnect      *time.Timer
-	idleTimer       *time.Timer
 	pending         map[string]*workerApprovalFlight
 	approvalSeq     atomic.Uint64
 	pendingQuestion *workerQuestionFlight
@@ -363,14 +361,6 @@ func newWorkerProcess(runtimeFile workerwire.Runtime) (*workerProcessState, erro
 		}
 		_ = store.SaveTask(sessionID, sessionTask(*task))
 		w.publish("task", workerTask(*task), true)
-		if task.Status != agent.TaskRunning {
-			w.mu.Lock()
-			detached := w.detached
-			w.mu.Unlock()
-			if detached && !w.hasLiveWork() {
-				w.scheduleIdleExit()
-			}
-		}
 	}
 	configuredRuntime.HumanGate = w.humanGate
 	// Keep the reviewer wired for the worker's lifetime; ApprovalMode is
@@ -480,14 +470,6 @@ func (w *workerProcessState) requestStop(interrupted bool, detail string) {
 			w.stopDetail = detail
 			cancel = w.activeCancel
 			shellCancel = w.shellCancel
-			if w.disconnect != nil {
-				w.disconnect.Stop()
-				w.disconnect = nil
-			}
-			if w.idleTimer != nil {
-				w.idleTimer.Stop()
-				w.idleTimer = nil
-			}
 			return workerwire.StateStopping, w.detached, detail, true
 		})
 		if cancel != nil {
@@ -530,29 +512,6 @@ func (w *workerProcessState) waitTasks() {
 	}
 }
 
-func (w *workerProcessState) scheduleIdleExit() {
-	w.mu.Lock()
-	if w.idleTimer != nil || !w.detached || w.stopRequested {
-		w.mu.Unlock()
-		return
-	}
-	w.idleTimer = time.AfterFunc(30*time.Second, func() {
-		w.mu.Lock()
-		w.idleTimer = nil
-		detached := w.detached
-		stopping := w.stopRequested
-		w.mu.Unlock()
-		if !detached || stopping {
-			return
-		}
-		if w.server != nil && w.server.ControllerPresent() || w.hasLiveWork() || w.hasActiveSchedules() {
-			return
-		}
-		w.requestStop(false, "detached worker idle grace elapsed")
-	})
-	w.mu.Unlock()
-}
-
 func (w *workerProcessState) scheduleLoop(ctx context.Context) {
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
@@ -585,22 +544,6 @@ func (w *workerProcessState) fireDueSchedule(now time.Time) {
 		return
 	}
 	w.publish("schedule", fmt.Sprintf("⏰ scheduled task #%d fired — %s", task.ID, task.Prompt), true)
-}
-
-func (w *workerProcessState) hasActiveSchedules() bool {
-	if w.store == nil || w.sessionID == "" {
-		return false
-	}
-	for _, task := range w.store.Schedules(w.sessionID) {
-		parsed, err := schedule.Parse(task.Schedule)
-		if err != nil {
-			continue
-		}
-		if parsed.Every > 0 || task.LastFire.IsZero() {
-			return true
-		}
-	}
-	return false
 }
 
 func (w *workerProcessState) hasLiveWork() bool {

@@ -10,7 +10,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/sacca97/ghg/internal/agent"
 	"github.com/sacca97/ghg/internal/config"
@@ -542,35 +541,12 @@ func workerEffortForModel(provider, model, current string, toggle bool) string {
 
 func (w *workerProcessState) Attached(context.Context) {
 	w.transition(func() (workerwire.State, bool, string, bool) {
-		if w.disconnect != nil {
-			w.disconnect.Stop()
-			w.disconnect = nil
-		}
-		if w.idleTimer != nil {
-			w.idleTimer.Stop()
-			w.idleTimer = nil
-		}
 		return w.state, false, "controller attached", true
 	})
 }
 
-func (w *workerProcessState) Disconnected(_ context.Context, detached bool) {
-	w.mu.Lock()
-	if detached || w.detached {
-		w.mu.Unlock()
-		return
-	}
-	if w.disconnect != nil {
-		w.disconnect.Stop()
-	}
-	w.disconnect = time.AfterFunc(2*time.Second, func() {
-		if w.server != nil && w.server.ControllerPresent() {
-			return
-		}
-		w.requestStop(true, "client disconnected")
-	})
-	w.mu.Unlock()
-}
+// A lost controller is recoverable; intentional shutdown sends CommandStop.
+func (w *workerProcessState) Disconnected(context.Context, bool) {}
 
 func (w *workerProcessState) publish(kind string, data any, important bool) {
 	if w.server != nil {

@@ -88,11 +88,19 @@ func (r *Registry) BindSession(ctx context.Context, sessionID string) error {
 	for key, snapshot := range r.snapshots {
 		if strings.HasPrefix(key, "\x00") {
 			copySnapshot := cloneSnapshot(snapshot)
-			r.snapshots[sessionKey(sessionID, snapshot.ID)] = copySnapshot
+			destination := sessionKey(sessionID, snapshot.ID)
+			if _, exists := r.snapshots[destination]; exists {
+				// Keep the already-bound snapshot authoritative; never overwrite
+				// a live or durable-session entry with pending state.
+				delete(r.snapshots, key)
+				continue
+			}
+			r.snapshots[destination] = copySnapshot
 			delete(r.snapshots, key)
 			pending = append(pending, copySnapshot)
 		}
 	}
+	r.evictOldest(sessionID)
 	r.mu.Unlock()
 	if store == nil {
 		return nil
@@ -134,24 +142,28 @@ func (r *Registry) Save(ctx context.Context, sessionID string, snapshot Snapshot
 // replace with an LRU only if this bound grows materially.
 func (r *Registry) evictOldest(sessionID string) {
 	prefix := sessionID + "\x00"
-	count := 0
-	for key := range r.snapshots {
-		if strings.HasPrefix(key, prefix) {
-			count++
+	for {
+		count := 0
+		for key := range r.snapshots {
+			if strings.HasPrefix(key, prefix) {
+				count++
+			}
 		}
-	}
-	if count <= maxLiveSnapshotsPerSession {
-		return
-	}
-	candidates := make(map[string]Snapshot, count)
-	for key, snapshot := range r.snapshots {
-		if strings.HasPrefix(key, prefix) {
-			candidates[key] = snapshot
+		if count <= maxLiveSnapshotsPerSession {
+			return
 		}
-	}
-	if oldest := oldestKey(candidates, func(snapshot Snapshot) time.Time {
-		return snapshot.CreatedAt
-	}, false); oldest != "" {
+		candidates := make(map[string]Snapshot, count)
+		for key, snapshot := range r.snapshots {
+			if strings.HasPrefix(key, prefix) {
+				candidates[key] = snapshot
+			}
+		}
+		oldest := oldestKey(candidates, func(snapshot Snapshot) time.Time {
+			return snapshot.CreatedAt
+		}, false)
+		if oldest == "" {
+			return
+		}
 		delete(r.snapshots, oldest)
 	}
 }
@@ -177,6 +189,7 @@ func (r *Registry) Load(ctx context.Context, sessionID, id string) (Snapshot, er
 	}
 	r.mu.Lock()
 	r.snapshots[sessionKey(sessionID, id)] = cloneSnapshot(snapshot)
+	r.evictOldest(sessionID)
 	r.mu.Unlock()
 	return snapshot, nil
 }

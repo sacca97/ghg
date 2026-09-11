@@ -93,11 +93,17 @@ func (m *Matcher) Search(ctx context.Context, source []byte) ([]Match, error) {
 		}
 		return nil, fmt.Errorf("parse Go source: %w", err)
 	}
-	if tree == nil || tree.ParseStoppedEarly() {
-		return nil, errors.New("parse Go source: syntax errors or an incomplete parse")
-	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if tree == nil {
+		return nil, errors.New("parse Go source: parser returned no tree")
+	}
+	if tree.ParseStoppedEarly() {
+		if tree.ParseStopReason() == gotreesitter.ParseStopTimeout {
+			return nil, errors.New("parse Go source: parse budget exceeded")
+		}
+		return nil, errors.New("parse Go source: incomplete parse")
 	}
 	bound := gotreesitter.Bind(tree)
 	defer bound.Release()

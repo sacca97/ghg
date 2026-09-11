@@ -114,6 +114,11 @@
     if (open) hideCompletions();
   }
 
+  function closeSettings() {
+    setSettings(false);
+    settingsToggle.focus();
+  }
+
   function text(value) {
     return typeof value === "string" ? value : "";
   }
@@ -124,7 +129,7 @@
   }
 
   function inlineMarkdown(element, source) {
-    const pattern = /(`[^`\n]+`|\*\*[^*\n]+\*\*|__[^_\n]+__|\[([^\]\n]+)\]\((https?:\/\/[^)\s]+)\)|\*[^*\n]+\*|_[^_\n]+_)/g;
+    const pattern = /(`[^`\n]+`|\*\*[^*\n]+\*\*|__[^_\n]+__|\[([^\]\n]+)\]\((https?:\/\/[^)\s]+)\)|\*[^*\n]+\*|(?<![\w])_[^_\n]+_(?![\w]))/g;
     let offset = 0;
     for (const match of source.matchAll(pattern)) {
       const token = match[0];
@@ -159,8 +164,7 @@
     element.replaceChildren();
     const lines = source.replace(/\r\n?/g, "\n").split("\n");
     let paragraph = [];
-    let list;
-    let listKind;
+    let lists = [];
     let code;
     let fence;
 
@@ -172,8 +176,7 @@
       paragraph = [];
     };
     const flushList = () => {
-      list = undefined;
-      listKind = undefined;
+      lists = [];
     };
     const flushText = () => {
       flushParagraph();
@@ -192,12 +195,37 @@
       }
       if (opening) {
         flushText();
-        const pre = document.createElement("pre");
-        code = document.createElement("code");
         const language = opening[2].replace(/[^\w+-]/g, "");
+        const codeBlock = document.createElement("div");
+        codeBlock.className = "code-block";
+        const header = document.createElement("div");
+        header.className = "code-header";
+        const label = document.createElement("span");
+        label.className = "code-language";
+        label.textContent = language || "code";
+        const copy = document.createElement("button");
+        copy.type = "button";
+        copy.className = "copy code-copy";
+        copy.innerHTML = '<svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5" y="5" width="8" height="8" rx="1"/><path d="M3 10V3h7"/></svg>';
+        copy.setAttribute("aria-label", "Copy code");
+        copy.title = "Copy code";
+        const pre = document.createElement("pre");
+        const codeElement = document.createElement("code");
+        code = codeElement;
         if (language) code.className = `language-${language}`;
         pre.append(code);
-        element.append(pre);
+        copy.addEventListener("click", () => {
+          void navigator.clipboard?.writeText(codeElement.textContent || "");
+          copy.textContent = "✓";
+          copy.title = "Copied";
+          setTimeout(() => {
+            copy.innerHTML = '<svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5" y="5" width="8" height="8" rx="1"/><path d="M3 10V3h7"/></svg>';
+            copy.title = "Copy code";
+          }, 1200);
+        });
+        header.append(label, copy);
+        codeBlock.append(header, pre);
+        element.append(codeBlock);
         fence = opening[1][0];
         continue;
       }
@@ -218,21 +246,38 @@
         element.append(document.createElement("hr"));
         continue;
       }
-      const bullet = line.match(/^ {0,3}[-+*]\s+(.+)$/);
-      const ordered = line.match(/^ {0,3}\d+[.)]\s+(.+)$/);
+      const bullet = line.match(/^(\s*)[-+*]\s+(.+)$/);
+      const ordered = line.match(/^(\s*)\d+[.)]\s+(.+)$/);
       if (bullet || ordered) {
         flushParagraph();
         const kind = ordered ? "ol" : "ul";
-        if (!list || listKind !== kind) {
-          flushList();
-          listKind = kind;
-          list = document.createElement(kind);
-          element.append(list);
+        const match = ordered || bullet;
+        const indent = match[1].length;
+        while (lists.length && lists[lists.length - 1].indent > indent) lists.pop();
+        let current = lists[lists.length - 1];
+        if (!current || current.indent !== indent || current.kind !== kind) {
+          if (current?.indent === indent) lists.pop();
+          const parent = lists[lists.length - 1];
+          const list = document.createElement(kind);
+          (parent?.item || element).append(list);
+          current = { indent, kind, item: undefined, list };
+          lists.push(current);
         }
         const item = document.createElement("li");
-        inlineMarkdown(item, (bullet || ordered)[1]);
-        list.append(item);
+        inlineMarkdown(item, match[2]);
+        current.list.append(item);
+        current.item = item;
         continue;
+      }
+      const continuation = line.match(/^(\s+)(.+)$/);
+      if (continuation && lists.length && lists[lists.length - 1].item) {
+        const item = lists[lists.length - 1].item;
+        item.append(document.createTextNode(" "));
+        inlineMarkdown(item, continuation[2].trim());
+        continue;
+      }
+      if (lists.length) {
+        flushList();
       }
       const quote = line.match(/^ {0,3}>\s?(.*)$/);
       if (quote) {
@@ -393,9 +438,16 @@
     if (summary) summary.textContent = thinkingLabel(block);
   }
 
-  function renderBlock(block) {
+  function sameBlock(left, right) {
+    if (!left || !right) return false;
+    return ["kind", "text", "name", "args", "failed", "resultKind", "effort", "durationMs", "finished"]
+      .every((key) => left[key] === right[key]);
+  }
+
+  function renderBlock(block, appendToTranscript = true) {
     const element = document.createElement("article");
     element.className = `block ${block.kind || "notice"}`;
+    element.block = block;
     if (block.kind === "user") {
       const body = document.createElement("pre");
       body.textContent = text(block.text);
@@ -440,16 +492,23 @@
     } else {
       element.textContent = text(block.text);
     }
-    transcript.append(element);
+    if (appendToTranscript) transcript.append(element);
     return element;
   }
 
   function rerender() {
     const followNow = nearBottom();
     const scrollTop = transcript.scrollTop;
-    transcript.replaceChildren();
-    for (const block of state.blocks) {
-      renderBlock(block);
+    const existing = [...transcript.children];
+    state.blocks.forEach((block, index) => {
+      const current = existing[index];
+      if (current?.block && sameBlock(current.block, block)) return;
+      const replacement = renderBlock(block, false);
+      if (current) current.replaceWith(replacement);
+      else transcript.append(replacement);
+    });
+    for (let index = existing.length - 1; index >= state.blocks.length; index -= 1) {
+      existing[index].remove();
     }
     renderReferences();
     updateMode();
@@ -757,9 +816,22 @@
 
   function hideCompletions() {
     completionMenu.hidden = true;
+    prompt.setAttribute("aria-expanded", "false");
+    prompt.removeAttribute("aria-activedescendant");
     completionToken = undefined;
     completionItems = [];
     completionKind = "reference";
+  }
+
+  function updateCompletionSelection() {
+    const options = completionMenu.querySelectorAll(".completion");
+    options.forEach((item, index) => {
+      const selected = index === completionIndex;
+      item.classList.toggle("selected", selected);
+      item.setAttribute("aria-selected", String(selected));
+    });
+    const selected = options[completionIndex];
+    if (selected) prompt.setAttribute("aria-activedescendant", selected.id);
   }
 
   function chooseCompletion(item) {
@@ -800,14 +872,16 @@
       const option = document.createElement("button");
       option.type = "button";
       option.className = "completion";
+      option.id = `completion-${completionKind}-${index}`;
       option.setAttribute("role", "option");
       option.textContent = `${item.path}${item.folder ? "  folder" : ""}`;
       option.addEventListener("mousedown", (event) => event.preventDefault());
       option.addEventListener("click", () => chooseCompletion(item));
       completionMenu.append(option);
-      if (index === 0) option.classList.add("selected");
     });
     completionMenu.hidden = false;
+    prompt.setAttribute("aria-expanded", "true");
+    updateCompletionSelection();
   }
 
   function renderCommandCompletions(items) {
@@ -823,14 +897,16 @@
       const option = document.createElement("button");
       option.type = "button";
       option.className = "completion";
+      option.id = `completion-${completionKind}-${index}`;
       option.setAttribute("role", "option");
       option.textContent = `${item.name} — ${item.hint}`;
       option.addEventListener("mousedown", (event) => event.preventDefault());
       option.addEventListener("click", () => chooseCommand(item));
       completionMenu.append(option);
-      if (index === 0) option.classList.add("selected");
     });
     completionMenu.hidden = false;
+    prompt.setAttribute("aria-expanded", "true");
+    updateCompletionSelection();
   }
 
   function commandToken() {
@@ -1179,7 +1255,8 @@
       if (event.key === "ArrowDown" || event.key === "ArrowUp") {
         event.preventDefault();
         completionIndex = (completionIndex + (event.key === "ArrowDown" ? 1 : completionItems.length - 1)) % completionItems.length;
-        completionMenu.querySelectorAll(".completion").forEach((item, index) => item.classList.toggle("selected", index === completionIndex));
+        updateCompletionSelection();
+        completionMenu.children[completionIndex]?.scrollIntoView({ block: "nearest" });
         return;
       }
       if (event.key === "Enter" || event.key === "Tab") {
@@ -1215,9 +1292,13 @@
     save();
     vscode.postMessage({ type: "configureRole", role: state.role, mode: state.mode });
   });
-  settingsToggle.addEventListener("click", () => setSettings(settings.hidden));
-  settingsClose.addEventListener("click", () => setSettings(false));
-  settingsCloseBottom.addEventListener("click", () => setSettings(false));
+  settingsToggle.addEventListener("click", () => {
+    const open = settings.hidden;
+    setSettings(open);
+    if (open) settingsClose.focus();
+  });
+  settingsClose.addEventListener("click", closeSettings);
+  settingsCloseBottom.addEventListener("click", closeSettings);
   refreshModels.addEventListener("click", () => {
     refreshModels.disabled = true;
     vscode.postMessage({ type: "refreshModels" });
@@ -1298,6 +1379,9 @@
     if (currentAssistant) assistantFollow = true;
     if (currentThinking) thinkingFollow = true;
   }, { passive: true });
+  window.addEventListener("keydown", (event) => {
+    if (event.key === "Escape" && !settings.hidden) closeSettings();
+  });
   window.addEventListener("message", (event) => handleEvent(event.data));
   setInterval(() => { if (active) updateStatus(); }, 1000);
 

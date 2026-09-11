@@ -51,31 +51,7 @@ func (r Runtime) WriteState(record StateRecord) error {
 	if err != nil {
 		return fmt.Errorf("marshal worker state: %w", err)
 	}
-	tmp, err := os.CreateTemp(r.Dir, ".state-*")
-	if err != nil {
-		return fmt.Errorf("create worker state: %w", err)
-	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
-	if err := tmp.Chmod(0600); err != nil {
-		tmp.Close()
-		return fmt.Errorf("restrict worker state: %w", err)
-	}
-	if _, err := tmp.Write(append(data, '\n')); err != nil {
-		tmp.Close()
-		return fmt.Errorf("write worker state: %w", err)
-	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		return fmt.Errorf("sync worker state: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("close worker state: %w", err)
-	}
-	if err := os.Rename(tmpName, r.StatePath); err != nil {
-		return fmt.Errorf("publish worker state: %w", err)
-	}
-	return nil
+	return writeFileAtomic(r.Dir, ".state-*", r.StatePath, "worker state", append(data, '\n'))
 }
 
 func (r Runtime) ReadState() (StateRecord, error) {
@@ -94,39 +70,47 @@ func (r Runtime) ReadState() (StateRecord, error) {
 }
 
 func (r Runtime) RemoveState() error {
-	err := os.Remove(r.StatePath)
+	return removeIfExists(r.StatePath)
+}
+
+func (r Runtime) WritePrompt(prompt string) error {
+	return writeFileAtomic(r.Dir, ".prompt-*", r.PromptPath, "worker prompt", []byte(prompt))
+}
+
+func writeFileAtomic(dir, pattern, path, label string, data []byte) error {
+	tmp, err := os.CreateTemp(dir, pattern)
+	if err != nil {
+		return fmt.Errorf("create %s: %w", label, err)
+	}
+	tmpName := tmp.Name()
+	defer func() {
+		_ = tmp.Close()
+		_ = os.Remove(tmpName)
+	}()
+	if err := tmp.Chmod(0600); err != nil {
+		return fmt.Errorf("restrict %s: %w", label, err)
+	}
+	if _, err := tmp.Write(data); err != nil {
+		return fmt.Errorf("write %s: %w", label, err)
+	}
+	if err := tmp.Sync(); err != nil {
+		return fmt.Errorf("sync %s: %w", label, err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close %s: %w", label, err)
+	}
+	if err := os.Rename(tmpName, path); err != nil {
+		return fmt.Errorf("publish %s: %w", label, err)
+	}
+	return nil
+}
+
+func removeIfExists(path string) error {
+	err := os.Remove(path)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
 	return err
-}
-
-func (r Runtime) WritePrompt(prompt string) error {
-	tmp, err := os.CreateTemp(r.Dir, ".prompt-*")
-	if err != nil {
-		return fmt.Errorf("create worker prompt: %w", err)
-	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
-	if err := tmp.Chmod(0600); err != nil {
-		tmp.Close()
-		return fmt.Errorf("restrict worker prompt: %w", err)
-	}
-	if _, err := tmp.WriteString(prompt); err != nil {
-		tmp.Close()
-		return fmt.Errorf("write worker prompt: %w", err)
-	}
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		return fmt.Errorf("sync worker prompt: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("close worker prompt: %w", err)
-	}
-	if err := os.Rename(tmpName, r.PromptPath); err != nil {
-		return fmt.Errorf("publish worker prompt: %w", err)
-	}
-	return nil
 }
 
 func (r Runtime) ReadPrompt() (string, error) {

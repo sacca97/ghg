@@ -145,16 +145,11 @@ func (d *Decoder) readLine() ([]byte, error) {
 	var line []byte
 	for {
 		part, err := d.reader.ReadSlice('\n')
-		if err == nil && len(line) == 0 {
-			if len(part) > d.frameLimit {
-				return nil, ErrFrameTooLarge
-			}
-			if len(part) == 1 {
-				return nil, ErrProtocol
-			}
-			return part[:len(part)-1], nil
+		if len(line) == 0 && err == nil {
+			line = part // ReadSlice's buffer remains valid until the next read.
+		} else {
+			line = append(line, part...)
 		}
-		line = append(line, part...)
 		if len(line) > d.frameLimit {
 			return nil, ErrFrameTooLarge
 		}

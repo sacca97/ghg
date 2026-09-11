@@ -29,12 +29,8 @@ type OutputStore struct {
 	temp    bool
 }
 
-func NewOutputStore(root string, limits ...int64) (*OutputStore, error) {
-	limit := DefaultMaxBytes
-	if len(limits) > 0 {
-		limit = limits[0]
-	}
-	return NewOutputStoreWithLimit(root, limit)
+func NewOutputStore(root string) (*OutputStore, error) {
+	return NewOutputStoreWithLimit(root, DefaultMaxBytes)
 }
 
 func NewOutputStoreWithLimit(root string, maxBytes int64) (*OutputStore, error) {
@@ -329,9 +325,6 @@ func privateDir(path string) error {
 }
 
 func retainHeadTail(data []byte, limit int64) []byte {
-	if limit <= 0 || int64(len(data)) <= limit {
-		return append([]byte(nil), data...)
-	}
 	head := int(limit / 2)
 	tail := int(limit) - head
 	out := make([]byte, 0, int(limit))
