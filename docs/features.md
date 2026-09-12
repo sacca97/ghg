@@ -1,7 +1,7 @@
 # Features
 
 ghg is a minimal coding agent: an interactive bubbletea TUI driving an
-LLM tool-use loop (bash / read / write / edit / grep / glob / find_files / lsp / lsp_rename / task) with provider-routable
+LLM tool-use loop (bash / read / write / edit / grep / glob / find_files / lsp / task) with provider-routable
 models. This document is the map of what's shipped and where it lives. Each
 section links the behavior to the code and its tests.
 
@@ -23,9 +23,8 @@ to goroutines and collects results on a buffered channel, laid back out in
 **per-canonical-path channel semaphore** (a 1-capacity `chan struct{}` per
 path: send to acquire, receive to release). Multi-file edits acquire all
 canonical paths in sorted order, so overlapping calls cannot deadlock. Edits
-to different files run in parallel; `bash` and `lsp_rename apply` take the
-global write side of a read/write lock because their side effects cannot be
-attributed to one path before validation. Reads and rename previews don't lock.
+to different files run in parallel; `bash` takes the global write side of a
+read/write lock because its side effects cannot be attributed to one path.
 
 This is the Go-native port of pi's `withFileMutationQueue` (per-path promise
 chains in TypeScript). In Go the lock is a buffered channel — no explicit
@@ -38,8 +37,7 @@ a concurrency counter), `TestSamePathEditsSerialize`, `TestToolMutationPath`,
 ### Native grep, glob, and fuzzy path search
 
 `internal/tools/search.go` provides read-only native `grep`, `glob`, and
-`find_files` tools; `internal/tools/structural_search.go` adds bounded,
-Go-only structural matching with metavariables. `grep` accepts a regular expression or an OR `patterns`
+`find_files` tools. `grep` accepts a regular expression or an OR `patterns`
 array, groups matching lines by file, ranks narrow/touched/modified paths, and
 returns stable cursor pages with a small per-file cap. `glob` returns exact
 relative-pattern matches; `find_files` uses the shared fuzzy path index and
@@ -90,11 +88,11 @@ normal approval gate; headless runs with no approval path hide the tools
 instead. They do not provide browser automation, JavaScript, cookies, or login
 support.
 
-`internal/tools/phase25_test.go`, `internal/search/snapshot_test.go`, and
+`internal/tools/search_test.go`, `internal/search/snapshot_test.go`, and
 `internal/search/fileindex_test.go` cover OR
 patterns, stable cursors, noisy-file diversity, fuzzy late matches, long-result
-byte ceilings, later-page accounting, and exploration redirects. The Phase 2.5
-acceptance matrix also covers every observed edit operation, overlap/stale/
+byte ceilings, later-page accounting, and exploration redirects. The test suites
+also cover every observed edit operation, overlap/stale/
 cross-session rejection, byte-limited reads, line-ending preservation, sorted
 multi-file locking, publication rollback, and bounded readback; the LSP output
 budget has a dedicated `internal/lsp/diagnostic_test.go` regression.
@@ -118,7 +116,7 @@ preserve modes/line endings, and return a compact diff, readback, and
 diagnostics. `ToolTelemetry` reports preview/retained/original bytes,
 truncation, and Bash exploration redirects to JSON consumers.
 
-### LSP navigation, safe rename, and post-edit hooks
+### LSP navigation and post-edit hooks
 
 `internal/lsp/manager.go` owns one lazy language-server manager per TUI or
 headless run. The same `tools.ToolRuntime` is inherited by Plan mode and
@@ -131,19 +129,11 @@ The read-only `lsp` tool supports only `definition`, `references`,
 `document_symbol`, and `hover`. Results are canonical, policy-authorized,
 sorted, deduplicated, bounded, and marked untrusted: limits are 20
 definitions, 100 references, 200 flattened symbols, and 8 KiB of hover text.
-Plan mode can use `lsp`, but not `lsp_rename`.
-
-`lsp_rename preview` validates a complete file-only `WorkspaceEdit`, converts
-UTF-16 ranges at exact rune boundaries, and stores the original/updated bytes
-behind a short `rn_...` id scoped to the current session. `lsp_rename apply`
-uses that exact plan under the global mutation lock, rechecks authorization,
-bytes, versions, and the normal permission gate, then publishes atomically;
-success consumes the id and stale or restarted sessions require a new preview.
-Server-driven `workspace/applyEdit` is rejected explicitly.
+Plan mode can use `lsp`; language-server workspace edits are not applied.
 
 Root `postEdit` config entries are trusted argv arrays with optional normalized
-extensions and a 1–60 second timeout. After a successful write, edit, or rename
-publication, matching hooks receive sorted canonical paths directly under the
+extensions and a 1–60 second timeout. After a successful write or edit,
+matching hooks receive sorted canonical paths directly under the
 shared sandbox/runtime; ghg then rereads final bytes and runs diagnostics.
 Hook failures never roll back the mutation or change its exit status, but
 bounded redacted output is reported. `internal/lsp/navigation_test.go` and
@@ -151,9 +141,9 @@ bounded redacted output is reported. `internal/lsp/navigation_test.go` and
 
 ### Project instructions and streamed tool output
 
-`internal/config/project.go` loads a bounded `AGENTS.md` only from the current
+`internal/config/instructions.go` loads a bounded `AGENTS.md` only from the current
 trusted project root. Missing, unreadable, oversized, or symlinked files are
-ignored; trusted instructions are inserted beside the user's `~/.ghg/me.md`
+ignored; trusted instructions are inserted beside the user's `~/.ghg/AGENTS.md`
 block in the system prompt. Interactive startup adds the block after the folder
 trust prompt, so first-run acceptance applies immediately. Headless
 `ghg run` is explicitly trusted automation and receives the same block.
@@ -259,7 +249,7 @@ path-free recovery hint. Persistent runs store payloads under
 permissions and index references in `sessions.db`; `--no-session` uses a
 private temporary store removed on exit. Set `{"outputs":{"enabled":false}}`
 to opt out; bounded previews remain available. `maxBytes` changes the
-per-result retention ceiling. The legacy `artifacts` config key remains accepted.
+per-result retention ceiling.
 
 The agent exposes `output_list` and `output_read` as session-scoped,
 read-only operations. Listing is metadata-only and bounded; reading accepts
@@ -330,6 +320,33 @@ dedicated local worker process communicating over a per-session Unix domain sock
   reconstructing the full
   transcript snapshot, live output rings, active roles, and any pending permission approvals.
 - `ghg stop <id>` — requests graceful cancellation and shutdown of a live session.
+
+#### Shared command layer
+
+`internal/worker/commands.go` — one declarative catalogue describes every
+user-facing command: canonical name, aliases, usage hint, and owner (`worker`,
+`client`, or `supervisor`). Execution stays in each adapter's ordinary switch
+statement; only the metadata is shared, so help and completion cannot drift
+between clients.
+
+- **Worker-owned** commands (`/model`, `/effort`, `/plan`, `/execute`, `/review`,
+  `/ask`, `/continue`, `/compact`, `/mcp`, `/lsp`, `/notify`, …) travel as the
+  canonical `workerwire` command names and payloads. The worker validates input,
+  writes configuration, and owns the state transition; a controller only asks.
+- **Client-owned** commands stay local because they need UI input or control
+  presentation: masked credential prompts (`/auth`, `/notify config`), pickers,
+  `/clear`, `/quit`, `/help`, and file exports.
+- **Supervisor-owned** `/resume` switches workers and stays off the ordinary
+  worker command path, alongside `ghg attach`/`ps`/`stop`.
+
+The bridge sends the catalogue with its `bridge_ready` event, so the VS Code
+extension renders the same hints the TUI does without a second command list;
+the bridge itself only checks `workerwire.KnownCommand` and forwards, with no
+alias translation.
+
+Tests: `internal/worker/commands_test.go`,
+`TestWorkerConfigurePersistsRoleModelAndDynamicReasoning`,
+`TestWorkerOwnedCommandUsesCanonicalAdapter`.
 
 Tests: `internal/worker/server_test.go` and `internal/worker/state_test.go`.
 
@@ -762,10 +779,14 @@ is `deny` by default or explicitly `host`. Missing or untrusted backends fail cl
 status plus recent denials appear in `/context-doctor`. Local MCP and LSP processes use the same
 boundary, with private temp and canonical build/package caches injected into children.
 
+Tagging a path with `@` grants turn-scoped read access to that exact canonical path, including
+paths outside the workspace and paths ignored by the repository. Tagging never grants writes;
+edits, shell commands, and OS-sandbox escapes still require their existing approval gates.
+
 Exceptional command approvals are separate from containment. Simple commands retain useful
 arity rules, but compound commands are fully classified and stored as exact normalized rules.
 Path-aware destructive removal keeps broad targets hard-denied and gives external roots only to
-the active human-approved call. `ask` uses the human prompt, `never` denies escalation, and opt-in `auto-review` calls the configured `tiny` role
+the active human-approved call. `ask` uses the human prompt, `never` denies escalation, and opt-in `auto` calls the configured `tiny` role
 once with no tools; the reviewer cannot approve broad/destructive, privileged, credential,
 policy, external-root, protected-metadata, global-install, persistent, or opaque shell
 operations. Explicit shell redirections outside configured roots and Git metadata writes use
@@ -775,10 +796,10 @@ flags, assignments, headers, URLs, and configured secret-name patterns; opaque s
 represented by a fingerprint rather than retained verbatim.
 
 The CLI accepts one-shot `--sandbox`, `--network`, and `--approval` overrides. Headless runs
-fail closed unless `--approval auto-review` (or the equivalent trusted execution config) is
+fail closed unless `--approval auto` (or the equivalent trusted execution config) is
 explicitly selected. Interactive TUI and VS Code workers can switch this live with
-`/approval ask|auto-review|never`; the setting is also persisted for future workers. See
-[the Phase 3 implementation plan](../.ai-docs/plans/phase-3-execution-policy/README.md).
+`/approval ask|auto|never`; the setting is also persisted for future workers. See
+the execution policy and OS sandbox containment implementation in `internal/sandbox` and `internal/tools`.
 
 ## LSP diagnostics
 
@@ -814,7 +835,8 @@ wakeup (a per-file channel close instead of polling timeouts).
   buffered channel drained by one writer goroutine (no locks). Frames are
   capped before allocation. Supported server requests receive typed responses:
   configuration gets `[]`, progress/capability registration gets `null`, and
-  `workspace/applyEdit` is explicitly rejected in favor of `lsp_rename`.
+  `workspace/applyEdit` is explicitly rejected because ghg does not apply
+  workspace edits.
   Unknown requests receive JSON-RPC method-not-found. Shutdown is polite
   `shutdown`/`exit` then SIGKILL of the process group; `Manager.Close()` runs
   next to `mcpMgr.Close()` on exit.
@@ -835,7 +857,7 @@ failure never fails the tool), `internal/agent/lsp_test.go`
 block in the tool result on the next call), `internal/tui/lsp_test.go`
 (`/lsp` status view).
 
-Out of scope (breadcrumbs in `.ai-docs/plans/lsp-diagnostics/README.md`):
+Out of scope:
 @-mention symbol-range expansion (Linear INF-4991), pull diagnostics, and
 auto-installing servers.
 

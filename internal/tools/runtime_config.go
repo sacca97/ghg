@@ -12,6 +12,7 @@ import (
 
 	"github.com/sacca97/ghg/internal/config"
 	"github.com/sacca97/ghg/internal/sandbox"
+	"github.com/sacca97/ghg/internal/sys"
 )
 
 type cacheLeaf struct {
@@ -33,12 +34,8 @@ var standardCacheTargets = []cacheTarget{
 	{envVar: "BUN_INSTALL", defaultSuffix: ".bun", leaves: []string{"install/cache"}, source: "Bun install cache"},
 }
 
-// NewConfiguredRuntime builds the process-wide execution boundary for one
-// workspace. Cache discovery happens once here, during trusted startup; tool
-// calls never broaden roots by inspecting the user's home directory.
-//
-// The returned cleanup removes the private temporary root created for this
-// runtime. It is safe to call more than once.
+// NewConfiguredRuntime builds the process execution boundary for a workspace.
+// Returns an idempotent cleanup function that removes the private temporary root.
 func NewConfiguredRuntime(workspace string, cfg *config.ExecutionConfig, headless bool, postEdit ...[]config.PostEditConfig) (*ToolRuntime, func(), error) {
 	mode := sandbox.ModeWorkspaceWrite
 	network := sandbox.NetworkDeny
@@ -69,7 +66,7 @@ func NewConfiguredRuntime(workspace string, cfg *config.ExecutionConfig, headles
 		approval = ApprovalNever
 	}
 
-	tempRoot, err := os.MkdirTemp("/tmp", "ghg-runtime-")
+	tempRoot, err := newRuntimeTempRoot()
 	if err != nil {
 		return nil, func() {}, fmt.Errorf("execution temp root: %w", err)
 	}
@@ -185,13 +182,6 @@ func NewConfiguredRuntime(workspace string, cfg *config.ExecutionConfig, headles
 			cacheRoots = appendUniqueString(cacheRoots, canonical)
 		}
 	}
-	for _, sysTemp := range []string{"/tmp", "/var/tmp"} {
-		if canonical, err := sandbox.CanonicalPath(sysTemp, false); err == nil && canonical != "" {
-			if privateCanonical == "" || !cacheRootsOverlap(canonical, privateCanonical) {
-				configuredTemp = appendUniqueString(configuredTemp, canonical)
-			}
-		}
-	}
 	configuredTemp = appendUniqueString(configuredTemp, tempRoot)
 
 	for key, value := range envOverrides {
@@ -229,6 +219,24 @@ func NewConfiguredRuntime(workspace string, cfg *config.ExecutionConfig, headles
 	runtime.envOverrides["TMP"] = tempRoot
 	runtime.envOverrides["TEMP"] = tempRoot
 	return runtime, cleanup, nil
+}
+
+func newRuntimeTempRoot() (string, error) {
+	base := os.TempDir()
+	if !filepath.IsAbs(base) {
+		var err error
+		base, err = os.UserCacheDir()
+		if err != nil {
+			return "", fmt.Errorf("resolve fallback temp directory: %w", err)
+		}
+		if !filepath.IsAbs(base) {
+			return "", errors.New("fallback temp directory is not absolute")
+		}
+		if err := os.MkdirAll(base, 0o700); err != nil {
+			return "", fmt.Errorf("create fallback temp directory: %w", err)
+		}
+	}
+	return os.MkdirTemp(base, "ghg-runtime-")
 }
 
 func configuredPostEditHooks(configs ...[]config.PostEditConfig) []PostEditHook {
@@ -681,7 +689,7 @@ func validateCacheComponents(path, allowedBase, canonicalBase string) error {
 		if !info.IsDir() {
 			return fmt.Errorf("cache component %q is not a directory", current)
 		}
-		if !cachePathOwned(info) {
+		if !sys.OwnedBy(info, uint32(os.Geteuid())) {
 			return fmt.Errorf("cache component %q has unexpected ownership", current)
 		}
 	}

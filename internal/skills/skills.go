@@ -11,18 +11,13 @@ import (
 	"strings"
 )
 
-// Skill is one discovered skill.
 type Skill struct {
 	Name        string
 	Description string
-	Path        string // path to the SKILL.md
-	// DisableModelInvocation excludes the skill from the system-prompt
-	// catalog: it can only be invoked explicitly ($name). Per the Agent
-	// Skills spec frontmatter field disable-model-invocation.
+	Path        string // path to SKILL.md
+	// DisableModelInvocation excludes the skill from the model prompt catalog ($name only).
 	DisableModelInvocation bool
-	// Warning is non-empty when the skill loaded but violates the Agent
-	// Skills spec (bad name, over-long description) — surfaced in the
-	// startup report so a broken skill is never silent.
+	// Warning contains specification violation details found during loading.
 	Warning string
 }
 

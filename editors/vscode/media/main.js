@@ -22,6 +22,7 @@ const settingsToggle = document.getElementById("settings-toggle");
 const settingsClose = document.getElementById("settings-close");
 const settingsCloseBottom = document.getElementById("settings-close-bottom");
 const refreshModels = document.getElementById("refresh-models");
+const exportChat = document.getElementById("export-chat");
 const openSettings = document.getElementById("open-settings");
 const openAuth = document.getElementById("open-auth");
 const settingsModels = document.getElementById("settings-models");
@@ -48,7 +49,7 @@ const modeToggle = document.getElementById("mode-toggle");
 const slashCommands = [
   ["/ask", "answer a question"], ["/cd", "change directory"],
   ["/clear", "reset conversation"], ["/compact", "compact context"], ["/context-doctor", "audit context"],
-  ["/effort", "set reasoning effort"], ["/execute", "execute a plan"], ["/goal-from-context", "formulate a goal"],
+  ["/effort", "set reasoning effort"], ["/execute", "execute a plan"], ["/export", "export the conversation or latest result"], ["/goal-from-context", "formulate a goal"],
   ["/help", "show commands"], ["/lsp", "show language server status"], ["/mcp", "manage MCP servers"],
   ["/model", "switch or refresh models"], ["/plan", "enter plan mode"],
   ["/approval", "switch approval mode (ask|auto|never)"],
@@ -348,7 +349,7 @@ function snapshotMessages(messages) {
         }
         if (isInternalReviewTool(name)) {
           const markdown = reviewFallbackMarkdown(text(call.function.arguments));
-          if (markdown) blocks.push({ kind: "assistant", text: markdown });
+          if (markdown) blocks.push({ kind: "assistant", text: markdown, resultKind: "review" });
           continue;
         }
         blocks.push({ kind: "tool", name, args: text(call.function.arguments), failed: false });
@@ -776,6 +777,7 @@ const handlers = {
     finishThinking();
     if (typeof raw.model === "string") model = raw.model;
     activeReasoningEffort = callEffort(raw);
+    streamFor("thinking");
     if (!raw.purpose && (typeof raw.configured_effort === "string" || typeof raw.effort_applied === "string" || typeof raw.selection_reason === "string")) {
       if (turnConfiguredEffort === undefined && typeof raw.configured_effort === "string") {
         turnConfiguredEffort = raw.configured_effort;
@@ -846,8 +848,12 @@ const handlers = {
   },
 
   compact_done(raw) {
-    if (typeof raw.error === "string" && raw.error) append({ kind: "error", text: raw.error }, true);
-    else append({ kind: "notice", text: "Context compacted." }, true);
+    const interrupted = raw.interrupted === true || (typeof raw.error === "string" && /context canceled|interrupted/i.test(raw.error));
+    if (!interrupted && typeof raw.error === "string" && raw.error) {
+      append({ kind: "error", text: raw.error }, true);
+    } else if (!interrupted) {
+      append({ kind: "notice", text: "Context compacted." }, true);
+    }
   },
 
   compact() {
@@ -874,8 +880,12 @@ const handlers = {
     refreshModels.disabled = false;
     flushStreams();
     pendingUser = false;
-    append({ kind: "error", text: text(raw.error) || "ghg failed" }, true);
-    activity = "Error";
+    const message = text(raw.error) || "ghg failed";
+    const interrupted = /context canceled|interrupted/i.test(message);
+    if (!interrupted) {
+      append({ kind: "error", text: message }, true);
+    }
+    activity = interrupted ? "Ready" : "Error";
     if (active) {
       active = false;
       turnSince = 0;
@@ -917,13 +927,15 @@ function handleEvent(raw) {
 composer.addEventListener("submit", (event) => {
   event.preventDefault();
   if (!prompt.value.trim()) return;
-  if (!active) {
-    append({ kind: "user", text: prompt.value.trim() }, true);
-    pendingUser = true;
+  const inputText = prompt.value.trim();
+  if (!inputText.startsWith("/") && !inputText.startsWith("!")) {
+    append({ kind: "user", text: active ? `${inputText} (steered)` : inputText }, true);
+    if (!active) pendingUser = true;
   }
   const message = { type: "send", prompt: prompt.value, mode: state.mode, role: state.role, references: state.references, plan: state.proposedPlan };
   prompt.value = "";
   state.references = [];
+  renderReferences();
   save();
   post(message);
 });
@@ -985,6 +997,7 @@ refreshModels.addEventListener("click", () => {
   refreshModels.disabled = true;
   post({ type: "refreshModels" });
 });
+exportChat.addEventListener("click", () => post({ type: "exportChat" }));
 openSettings.addEventListener("click", () => post({ type: "openSettings" }));
 openAuth.addEventListener("click", () => post({ type: "openAuth" }));
 configureSearch?.addEventListener("click", () => post({ type: "configureSearchProvider" }));

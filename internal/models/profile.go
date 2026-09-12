@@ -42,8 +42,6 @@ const (
 
 const maxProfileBytes = 256 << 10
 
-const legacyOpenCodeAnthropicProfileID = "opencode-anthropic"
-
 // Profile is the non-secret description of a provider endpoint. It is loaded
 // from YAML; credentials never belong here and are supplied by an Instance.
 type Profile struct {
@@ -236,10 +234,7 @@ func (p Profiles) ResolveModel(in Instance, modelID string) (Resolved, error) {
 		var ok bool
 		profile, ok = p.Lookup(id)
 		if !ok {
-			if id != legacyOpenCodeAnthropicProfileID {
-				return Resolved{}, fmt.Errorf("provider %q references unknown profile %q (available: %s)", name, id, strings.Join(p.IDs(), ", "))
-			}
-			profile = legacyOpenCodeAnthropicProfile(name, in)
+			return Resolved{}, fmt.Errorf("provider %q references unknown profile %q (available: %s)", name, id, strings.Join(p.IDs(), ", "))
 		}
 	} else {
 		profile = Profile{
@@ -276,7 +271,7 @@ func (p Profiles) ResolveModel(in Instance, modelID string) (Resolved, error) {
 		Protocol:       profile.Protocol,
 		Auth:           profile.Auth,
 		Docs:           profile.Docs,
-		DefaultHeaders: cloneHeaders(profile.DefaultHeaders),
+		DefaultHeaders: maps.Clone(profile.DefaultHeaders),
 		Catalog:        profile.Catalog,
 		Capabilities:   profile.Capabilities,
 	}
@@ -715,14 +710,14 @@ func hasControl(value string) bool {
 }
 
 func cloneProfile(profile Profile) Profile {
-	profile.DefaultHeaders = cloneHeaders(profile.DefaultHeaders)
+	profile.DefaultHeaders = maps.Clone(profile.DefaultHeaders)
 	if profile.Routes != nil {
 		routes := profile.Routes
 		profile.Routes = make([]Route, len(profile.Routes))
 		for i, route := range routes {
 			profile.Routes[i] = route
 			profile.Routes[i].Models = slices.Clone(route.Models)
-			profile.Routes[i].DefaultHeaders = cloneHeaders(route.DefaultHeaders)
+			profile.Routes[i].DefaultHeaders = maps.Clone(route.DefaultHeaders)
 		}
 	}
 	return profile
@@ -761,29 +756,6 @@ func applyRoute(resolved *Resolved, modelID string) error {
 		return nil
 	}
 	return nil
-}
-
-func legacyOpenCodeAnthropicProfile(name string, in Instance) Profile {
-	protocol := normalizeProtocol(in.Protocol)
-	if protocol == "" {
-		protocol = ProtocolAnthropicMessages
-	}
-	return Profile{
-		Schema:      SchemaVersion,
-		ID:          "anonymous",
-		DisplayName: name,
-		Protocol:    protocol,
-		BaseURL:     in.BaseURL,
-		Auth:        Auth{Kind: AuthHeader, Header: "x-api-key"},
-		DefaultHeaders: map[string]string{
-			"anthropic-version": "2023-06-01",
-		},
-		Catalog: Catalog{Kind: CatalogOpenAIModels, Public: true},
-	}
-}
-
-func cloneHeaders(headers map[string]string) map[string]string {
-	return maps.Clone(headers)
 }
 
 func located(source string, err error) error {

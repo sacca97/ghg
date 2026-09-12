@@ -743,6 +743,54 @@ func TestWorkerLSPAndMCPCommands(t *testing.T) {
 	}
 }
 
+// Worker-owned TUI commands go through one adapter: the canonical worker
+// command name, its payload, and a request-id prefix the frame switch routes
+// on. Without a worker the same path reports one actionable note instead of
+// sending anything.
+func TestWorkerOwnedCommandUsesCanonicalAdapter(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	defer serverConn.Close()
+	defer clientConn.Close()
+
+	m := compactCmdModel()
+	m.sessionID = "test-adapter"
+	m.workerClient = workerwire.NewClient(clientConn, "test-adapter")
+
+	readFrame := make(chan workerwire.Frame, 1)
+	go func() {
+		dec := workerwire.NewDecoder(serverConn)
+		f, _ := dec.Read()
+		readFrame <- f
+	}()
+	m.command("/notify on")
+	frame := <-readFrame
+	if !strings.HasPrefix(frame.RequestID, "notify-") {
+		t.Fatalf("request id = %q, want a notify- prefix", frame.RequestID)
+	}
+	var req workerwire.CommandRequest
+	if err := json.Unmarshal(frame.Payload, &req); err != nil {
+		t.Fatal(err)
+	}
+	if req.Name != workerwire.CommandNotify {
+		t.Fatalf("command = %q, want %q", req.Name, workerwire.CommandNotify)
+	}
+	var payload workerwire.NotifyRequest
+	if err := json.Unmarshal(req.Payload, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload.Action != "on" {
+		t.Fatalf("notify action = %q, want %q", payload.Action, "on")
+	}
+
+	cold := compactCmdModel()
+	before := len(cold.blocks)
+	cold.command("/lsp")
+	last := cold.blocks[len(cold.blocks)-1].text
+	if len(cold.blocks) != before+1 || !strings.Contains(last, "worker unavailable") {
+		t.Fatalf("expected one worker-unavailable note, got %q", last)
+	}
+}
+
 func TestContextLimitFromCatalog(t *testing.T) {
 	m := compactCmdModel()
 	if got := m.contextLimitFor("inference", "kimi-k3-fast"); got != 131072 {
@@ -1219,12 +1267,13 @@ func TestGoalFromContextMsgHandler(t *testing.T) {
 		t.Fatalf("expected a failure note, got %q", out)
 	}
 
-	// esc-cancel reads as an interrupt note, not an error
+	// esc-cancel is silent and does not replace the previous failure.
 	m.busy, m.cancel = true, func() {}
+	previous := lastBlock(m)
 	tm, _ = m.Update(goalFromContextMsg{err: context.Canceled})
 	m = tm.(*model)
-	if m.busy || !strings.Contains(lastBlock(m), "(interrupted)") {
-		t.Fatalf("cancelled formulation should interrupt cleanly: busy=%v last=%q", m.busy, lastBlock(m))
+	if m.busy || lastBlock(m) != previous {
+		t.Fatalf("cancelled formulation should be silent: busy=%v last=%q", m.busy, lastBlock(m))
 	}
 
 	// success: goal trimmed, set, and submitted — busy stays owned by the

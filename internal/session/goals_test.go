@@ -58,10 +58,6 @@ func TestGoalLifecycleRoundTrip(t *testing.T) {
 	if err != nil || !ok || got.Status != GoalStatusPaused || got.Blocker != "cleared by user" {
 		t.Fatalf("clear should preserve a paused record: %+v %v %v", got, ok, err)
 	}
-	meta, _, err := st.Load(sessionID)
-	if err != nil || meta.Goal != "" {
-		t.Fatalf("legacy active mirror should be empty after clear: %+v %v", meta, err)
-	}
 	checkpoints, err = st.GoalCheckpoints(sessionID, record.ID)
 	if err != nil || len(checkpoints) != 3 || checkpoints[2].Status != GoalStatusPaused {
 		t.Fatalf("clear checkpoint: %+v %v", checkpoints, err)

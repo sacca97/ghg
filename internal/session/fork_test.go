@@ -115,9 +115,12 @@ func TestForkCopiesPrefix(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if meta.Title != "experiment" || meta.Goal != "build the thing" ||
+	if meta.Title != "experiment" ||
 		meta.Model != "kimi-k3-fast" || meta.Provider != "inference" || meta.CWD != "/tmp" {
 		t.Fatalf("meta not carried over: %+v", meta)
+	}
+	if goal, ok, err := st.LoadGoal(newID); err != nil || !ok || goal.Objective != "build the thing" {
+		t.Fatalf("forked goal: %+v %v %v", goal, ok, err)
 	}
 	if !meta.Pinned || len(meta.Tags) != 2 || meta.UsageIn != 11 || meta.UsageCached != 7 || meta.UsageOut != 5 {
 		t.Fatalf("fork metadata not carried over: %+v", meta)

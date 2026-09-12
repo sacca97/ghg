@@ -39,7 +39,7 @@ type editOperation struct {
 func editTool() Tool {
 	return resultTool(models.NewTool("edit",
 		"Apply one or more observed line-range edits atomically. Each primary edit references a read observation; use mode=exact only for temporary unique old_string compatibility.",
-		`{"type":"object","properties":{"mode":{"type":"string","enum":["observed","exact"],"description":"observed is the primary range-authorized mode; exact is compatibility mode"},"edits":{"type":"array","description":"Observed operations to apply atomically across one or more files","items":{"type":"object","properties":{"observation":{"type":"string"},"path":{"type":"string"},"start_line":{"type":"integer"},"end_line":{"type":"integer"},"operation":{"type":"string","enum":["replace","delete","insert_before","insert_after"],"description":"Defaults to replace"},"content":{"type":"string"}},"required":["observation","path","start_line","end_line"]}},"path":{"type":"string","description":"Compatibility-mode file path"},"old_string":{"type":"string","description":"Compatibility-mode exact text"},"new_string":{"type":"string","description":"Compatibility-mode replacement"},"replace_all":{"type":"boolean","description":"Compatibility-mode replace every occurrence"}},"required":["mode"]}`),
+		`{"type":"object","properties":{"mode":{"type":"string","enum":["observed","exact"],"description":"observed is the primary range-authorized mode; exact is compatibility mode"},"edits":{"type":"array","description":"Observed operations to apply atomically across one or more files","items":{"type":"object","properties":{"observation":{"type":"string"},"path":{"type":"string"},"start_line":{"type":"integer"},"end_line":{"type":"integer"},"operation":{"type":"string","enum":["replace","delete","insert_before","insert_after"],"description":"Defaults to replace"},"content":{"type":"string","description":"Replacement or insertion text; replace requires non-empty content"}},"required":["observation","path","start_line","end_line"]}},"path":{"type":"string","description":"Compatibility-mode file path"},"old_string":{"type":"string","description":"Compatibility-mode exact text"},"new_string":{"type":"string","description":"Compatibility-mode replacement"},"replace_all":{"type":"boolean","description":"Compatibility-mode replace every occurrence"}},"required":["mode"]}`),
 		runEdit)
 }
 
@@ -91,9 +91,6 @@ func editDiff(oldS, newS string) string {
 	}
 	return strings.TrimSuffix(b.String(), "\n")
 }
-
-// EditDiff exposes the compact diff formatter to the LSP adapter.
-func EditDiff(oldS, newS string) string { return editDiff(oldS, newS) }
 
 const maxEditDiffLines = 40
 
@@ -170,7 +167,7 @@ func runExactEdit(ctx context.Context, request editRequest) (ToolResult, error) 
 			for _, report := range hookReports {
 				out += "\n\n" + report.note(RuntimeFromContext(ctx))
 			}
-			return textResult(out, truncate(out), 0), nil
+			return textResult(out, Truncate(out), 0), nil
 		}
 		return ToolResult{}, fmt.Errorf("read back %s: %w", canonical, readErr)
 	}
@@ -182,7 +179,7 @@ func runExactEdit(ctx context.Context, request editRequest) (ToolResult, error) 
 		out += "\n\n" + report.note(RuntimeFromContext(ctx))
 	}
 	out += lspDiagnostics(ctx, canonical)
-	return textResult(out, truncate(out), 0), nil
+	return textResult(out, Truncate(out), 0), nil
 }
 
 type observedEdit struct {
@@ -266,7 +263,7 @@ func runObservedEdit(ctx context.Context, request editRequest) (ToolResult, erro
 		}
 		recordPath := ""
 		if record.Path != "" {
-			recordPath, err = authorizedObservationPath(ctx, record.Path, sandbox.AccessRead, false)
+			recordPath, err = authorizedObservationPath(ctx, record.Path, sandbox.AccessRead, true)
 			if err != nil {
 				return fail(i, err)
 			}
@@ -280,6 +277,9 @@ func runObservedEdit(ctx context.Context, request editRequest) (ToolResult, erro
 		content := operation.Content
 		if content == "" && operation.NewContent != "" {
 			content = operation.NewContent
+		}
+		if opName == "replace" && content == "" {
+			return fail(i, errors.New("replace requires non-empty content; use delete to remove the selected range"))
 		}
 		plan := plans[canonical]
 		if plan == nil {
@@ -366,6 +366,9 @@ func runObservedEdit(ctx context.Context, request editRequest) (ToolResult, erro
 			startLine := 1 + bytes.Count(final[:min(startByte, len(final))], []byte{'\n'})
 			readRes, readErr := readObservedContent(ctx, path, path, bytes.NewReader(final), startLine, maxEditReadbackLines)
 			if readErr != nil {
+				note := "(no readback observation issued; run read before editing again)\n"
+				out.WriteString(note)
+				retained.WriteString(note)
 				rb := editReadback(final, plan.operations)
 				out.WriteString(rb)
 				retained.WriteString(rb)
@@ -396,7 +399,7 @@ func runObservedEdit(ctx context.Context, request editRequest) (ToolResult, erro
 	}
 	preview := strings.TrimSuffix(out.String(), "\n")
 	retainedStr := strings.TrimSuffix(retained.String(), "\n")
-	return textResult(retainedStr, truncate(preview), 0), nil
+	return textResult(retainedStr, Truncate(preview), 0), nil
 }
 
 func runtimePostEditReports(ctx context.Context, paths []string) []HookReport {
@@ -408,9 +411,7 @@ func runtimePostEditReports(ctx context.Context, paths []string) []HookReport {
 }
 
 // publishEditFiles stages every replacement before renaming any of them, then
-// publishes in lexical order. Rollback uses the same atomic writer as the
-// legacy edit path, so exact edits, observed edits, and rename apply share one
-// publication contract.
+// publishes in lexical order.
 func publishEditFiles(ctx context.Context, files []editPublication) error {
 	ordered := append([]editPublication(nil), files...)
 	sort.Slice(ordered, func(i, j int) bool { return ordered[i].path < ordered[j].path })
@@ -434,6 +435,17 @@ func publishEditFiles(ctx context.Context, files []editPublication) error {
 	}
 	published := make([]editPublication, 0, len(ordered))
 	for _, file := range ordered {
+		if err := verifyEditFile(file); err != nil {
+			rollbackErr := rollbackEditFiles(published)
+			cleanup()
+			if rollbackErr != nil {
+				return fmt.Errorf("edit publication at %s aborted: %w; rollback failed: %v", file.path, err, rollbackErr)
+			}
+			if len(published) > 0 {
+				return fmt.Errorf("edit publication at %s aborted: %w; published files were rolled back", file.path, err)
+			}
+			return fmt.Errorf("edit publication at %s aborted: %w", file.path, err)
+		}
 		if err := renameEditFile(staged[file.path], file.path); err != nil {
 			_ = os.Remove(staged[file.path])
 			rollbackErr := rollbackEditFiles(published)
@@ -447,6 +459,17 @@ func publishEditFiles(ctx context.Context, files []editPublication) error {
 		published = append(published, file)
 	}
 	cleanup()
+	return nil
+}
+
+func verifyEditFile(file editPublication) error {
+	current, err := os.ReadFile(file.path)
+	if err != nil {
+		return fmt.Errorf("file changed or was removed; re-read and retry: %w", err)
+	}
+	if !bytes.Equal(current, file.original) {
+		return errors.New("file changed since it was read; re-read and retry")
+	}
 	return nil
 }
 
@@ -495,14 +518,34 @@ func uniqueByteBlock(data, expected []byte) (int, int, error) {
 	if len(expected) == 0 {
 		return 0, 0, errors.New("empty observation cannot be relocated")
 	}
-	first := bytes.Index(data, expected)
-	if first < 0 {
+	locations := make([]int, 0, 8)
+	count := 0
+	for offset := 0; offset <= len(data)-len(expected); {
+		index := bytes.Index(data[offset:], expected)
+		if index < 0 {
+			break
+		}
+		first := offset + index
+		count++
+		if len(locations) < cap(locations) {
+			locations = append(locations, first)
+		}
+		offset = first + len(expected)
+	}
+	if count == 0 {
 		return 0, 0, errors.New("issued bytes are no longer present")
 	}
-	second := bytes.Index(data[first+1:], expected)
-	if second >= 0 {
-		return 0, 0, errors.New("issued bytes occur more than once")
+	if count > 1 {
+		lines := make([]string, len(locations))
+		for i, location := range locations {
+			lines[i] = fmt.Sprint(1 + bytes.Count(data[:location], []byte{'\n'}))
+		}
+		if count > len(locations) {
+			lines = append(lines, "…")
+		}
+		return 0, 0, fmt.Errorf("issued bytes occur more than once (%d matches at lines %s)", count, strings.Join(lines, ", "))
 	}
+	first := locations[0]
 	return first, first + len(expected), nil
 }
 
@@ -538,10 +581,10 @@ func rangesIntersect(aStart, aEnd, bStart, bEnd int) bool {
 		return aStart == bStart
 	}
 	if aStart == aEnd {
-		return aStart >= bStart && aStart <= bEnd
+		return aStart > bStart && aStart < bEnd
 	}
 	if bStart == bEnd {
-		return bStart >= aStart && bStart <= aEnd
+		return bStart > aStart && bStart < aEnd
 	}
 	return aStart < bEnd && bStart < aEnd
 }
@@ -679,55 +722,6 @@ func rollbackEditFiles(published []editPublication) error {
 	return nil
 }
 
-func applyRenamePlan(ctx context.Context, runtime *ToolRuntime, plan RenamePlan) (string, error) {
-	files := make([]editPublication, 0, len(plan.Files))
-	for _, file := range plan.Files {
-		files = append(files, editPublication{
-			path: file.Path, original: file.Original, updated: file.Updated, mode: file.Mode,
-		})
-	}
-	if err := publishEditFiles(ctx, files); err != nil {
-		return "", err
-	}
-	hookReports := runtime.RunPostEditHooks(ctx, renamePlanPaths(plan.Files))
-	var out strings.Builder
-	fmt.Fprintf(&out, "Applied rename %s\n", plan.ID)
-	sort.Slice(files, func(i, j int) bool { return files[i].path < files[j].path })
-	for _, file := range files {
-		final, err := os.ReadFile(file.path)
-		if err != nil {
-			if os.IsNotExist(err) {
-				fmt.Fprintf(&out, "- %s: file removed by postEdit\n", file.path)
-			} else {
-				fmt.Fprintf(&out, "- %s: readback failed: %v\n", file.path, err)
-			}
-			continue
-		}
-		fmt.Fprintf(&out, "- %s\n", file.path)
-		if diff := editDiff(string(file.original), string(final)); diff != "" {
-			out.WriteString("```diff\n")
-			out.WriteString(diff)
-			out.WriteString("\n```\n")
-		}
-		out.WriteString("readback:\n")
-		out.WriteString(editReadback(final, []observedEdit{{start: 0}}))
-		out.WriteString(lspDiagnostics(ctx, file.path))
-	}
-	for _, report := range hookReports {
-		out.WriteString(report.note(runtime))
-		out.WriteByte('\n')
-	}
-	return strings.TrimSuffix(out.String(), "\n"), nil
-}
-
-func renamePlanPaths(files []RenameFile) []string {
-	paths := make([]string, 0, len(files))
-	for _, file := range files {
-		paths = append(paths, file.Path)
-	}
-	return paths
-}
-
 func editReadback(data []byte, operations []observedEdit) string {
 	if len(data) == 0 {
 		return "(file is empty)\n"
@@ -743,7 +737,7 @@ func editReadback(data []byte, operations []observedEdit) string {
 	if line > len(spans) {
 		line = len(spans)
 	}
-	end := min(line+maxEditReadbackLines, len(spans))
+	end := min(line-1+maxEditReadbackLines, len(spans))
 	var b strings.Builder
 	for i := line - 1; i < end; i++ {
 		text := string(data[spans[i].start:spans[i].end])
@@ -760,3 +754,53 @@ const (
 	maxEditReadbackLines     = 8
 	maxEditReadbackLineBytes = 200
 )
+
+func writeTool() Tool {
+	return resultTool(models.NewTool("write",
+		"Write content to a file, creating it (and parent directories) or overwriting it.",
+		`{"type":"object","properties":{"path":{"type":"string","description":"Path to the file"},"content":{"type":"string","description":"Full file content"}},"required":["path","content"]}`),
+		runWriteResult)
+}
+
+func runWriteResult(ctx context.Context, args json.RawMessage) (ToolResult, error) {
+	var a struct {
+		Path    string `json:"path"`
+		Content string `json:"content"`
+	}
+	if err := json.Unmarshal(args, &a); err != nil {
+		return ToolResult{}, err
+	}
+	path, err := AuthorizePath(ctx, a.Path, sandbox.AccessWrite, true)
+	if err != nil {
+		return ToolResult{}, err
+	}
+	if deny := checkGate(ctx, "write", path); deny != "" {
+		return ToolResult{}, errors.New(deny)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return ToolResult{}, err
+	}
+	mode := os.FileMode(0o644)
+	if info, statErr := os.Stat(path); statErr == nil {
+		mode = info.Mode()
+	} else if !os.IsNotExist(statErr) {
+		return ToolResult{}, statErr
+	}
+	if err := atomicWriteFile(path, []byte(a.Content), mode); err != nil {
+		return ToolResult{}, err
+	}
+	hookReports := runtimePostEditReports(ctx, []string{path})
+	raw := fmt.Sprintf("Wrote %d bytes to %s", len(a.Content), path)
+	if final, readErr := os.ReadFile(path); readErr == nil {
+		if string(final) != a.Content {
+			raw += fmt.Sprintf("\npostEdit final bytes: %d", len(final))
+		}
+		raw += lspDiagnostics(ctx, path)
+	} else if os.IsNotExist(readErr) {
+		raw += "\npostEdit removed the file"
+	}
+	for _, report := range hookReports {
+		raw += "\n\n" + report.note(RuntimeFromContext(ctx))
+	}
+	return textResult(raw, raw, 0), nil
+}

@@ -65,46 +65,6 @@ func storedMessages(rows []storedMessage) []models.Message {
 	return msgs
 }
 
-// answerDanglingToolCalls repairs a history interrupted after tool calls.
-func answerDanglingToolCalls(msgs []models.Message) []models.Message {
-	answered := make(map[string]bool, len(msgs))
-	dangling := false
-	for _, m := range msgs {
-		if m.Role == "tool" {
-			answered[m.ToolCallID] = true
-		}
-	}
-	for _, m := range msgs {
-		if m.Role == "assistant" {
-			for _, tc := range m.ToolCalls {
-				dangling = dangling || !answered[tc.ID]
-			}
-		}
-	}
-	if !dangling {
-		return msgs
-	}
-	out := make([]models.Message, 0, len(msgs)+4)
-	for _, m := range msgs {
-		out = append(out, m)
-		if m.Role != "assistant" {
-			continue
-		}
-		for _, tc := range m.ToolCalls {
-			if !answered[tc.ID] {
-				out = append(out, models.Message{
-					Role:       "tool",
-					Content:    "Error: tool call interrupted — the session ended before a result was recorded",
-					ToolCallID: tc.ID,
-					Name:       tc.Function.Name,
-					Source:     interruptedToolResultSource,
-				})
-			}
-		}
-	}
-	return out
-}
-
 type Compaction struct {
 	Seq     int
 	Cutoff  int

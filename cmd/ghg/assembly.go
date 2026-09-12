@@ -7,7 +7,9 @@ import (
 	"github.com/sacca97/ghg/internal/agent"
 	"github.com/sacca97/ghg/internal/config"
 	"github.com/sacca97/ghg/internal/lsp"
+	"github.com/sacca97/ghg/internal/memory"
 	"github.com/sacca97/ghg/internal/session"
+	"github.com/sacca97/ghg/internal/skills"
 	"github.com/sacca97/ghg/internal/tools"
 )
 
@@ -21,11 +23,16 @@ func newConfiguredRuntime(cfg *config.Config, trusted bool) (*tools.ToolRuntime,
 	return runtime, lspMgr, cleanup, nil
 }
 
+func systemPromptAdditions(sessionID, mcpInstructions string) []string {
+	return []string{
+		skills.PromptBlock(skills.Scan(skills.DefaultDirs()...)),
+		memory.PromptBlock(memory.Installation(), memory.Session(sessionID)),
+		mcpInstructions,
+	}
+}
+
 func outputStoreLimit(cfg *config.Config) (int64, bool) {
 	outputConfig := cfg.Outputs
-	if outputConfig == nil {
-		outputConfig = cfg.Artifacts
-	}
 	if outputConfig != nil && outputConfig.Enabled != nil && !*outputConfig.Enabled {
 		return 0, false
 	}
@@ -36,10 +43,7 @@ func outputStoreLimit(cfg *config.Config) (int64, bool) {
 	return maxBytes, true
 }
 
-func openOutputStore(root string, temporary bool, maxBytes int64) (*session.OutputStore, error) {
-	if temporary {
-		return session.NewTempOutputStoreWithLimit(maxBytes)
-	}
+func openOutputStore(root string, maxBytes int64) (*session.OutputStore, error) {
 	return session.NewOutputStoreWithLimit(filepath.Join(root, "outputs"), maxBytes)
 }
 

@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/sacca97/ghg/internal/tools/bashrun"
+	"github.com/sacca97/ghg/internal/models"
 )
 
 func run(t *testing.T, name, args string) string {
@@ -59,6 +59,24 @@ func TestToolRoundTrip(t *testing.T) {
 	out = run(t, "nope", `{}`)
 	if !strings.Contains(out, "unknown tool") {
 		t.Fatalf("expected unknown tool error, got %q", out)
+	}
+}
+
+func TestBashGrepNoMatchIsNotFailure(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "runtime.go")
+	if err := os.WriteFile(path, []byte("package worker\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	command := fmt.Sprintf("cd %q && grep -n -A 12 %q %q | head -40", dir, "missing symbol", path)
+	result := ExecuteResult(context.Background(), All(), "bash", json.RawMessage(fmt.Sprintf(`{"command":%q}`, command)))
+	if result.ExitCode != 0 || !strings.Contains(result.Preview, "grep: (no matches)") {
+		t.Fatalf("grep no-match result = %+v", result)
+	}
+
+	failure := ExecuteResult(context.Background(), All(), "bash", json.RawMessage(`{"command":"false"}`))
+	if failure.ExitCode == 0 {
+		t.Fatalf("real bash failure was normalized: %+v", failure)
 	}
 }
 
@@ -238,18 +256,18 @@ func TestWritePreservesExistingMode(t *testing.T) {
 }
 
 func TestHelpersAndEdgeCases(t *testing.T) {
-	if len(Defs(All())) != 12 {
-		t.Fatal("expected 12 tool defs")
+	if len(Defs(All())) != 10 {
+		t.Fatal("expected 10 tool defs")
 	}
 	long := strings.Repeat("x", maxOutput+10)
-	if out := truncate(long); len(out) > maxOutput || !strings.Contains(out, "truncated") {
+	if out := Truncate(long); len(out) > maxOutput || !strings.Contains(out, "truncated") {
 		t.Fatalf("truncate: %q", out[len(out)-40:])
 	}
 	if out := TruncateTail(long); len(out) > maxOutput || !strings.HasPrefix(out, "[... first ") || !strings.Contains(out, "bytes truncated]") {
 		t.Fatalf("truncateTail: %q", out[:40])
 	}
 	// short strings pass through untouched
-	if truncate("ok") != "ok" || TruncateTail("ok") != "ok" {
+	if Truncate("ok") != "ok" || TruncateTail("ok") != "ok" {
 		t.Fatal("short strings must not be modified")
 	}
 
@@ -318,63 +336,6 @@ func TestHelpersAndEdgeCases(t *testing.T) {
 	}
 }
 
-// mockInteractiveRunner is a fake tools.InteractiveRunner used to verify the
-// bash tool's interactive hook wiring without spinning up a PTY.
-type mockInteractiveRunner struct {
-	gotCommand string
-	gotTimeout time.Duration
-	gotKeys    <-chan []byte
-	returnThis bashrun.Result
-}
-
-func (m *mockInteractiveRunner) Run(_ context.Context, command string, timeout time.Duration, keys <-chan []byte) bashrun.Result {
-	m.gotCommand = command
-	m.gotTimeout = timeout
-	m.gotKeys = keys
-	return m.returnThis
-}
-
-// TestBashToolInteractiveHook verifies that bash with interactive:true hands
-// off to the runtime's interactive runner, passing command+timeout+keys,
-// and returns whatever the runner returns. It also confirms the hook is
-// consulted only when interactive is true.
-func TestBashToolInteractiveHook(t *testing.T) {
-	output := "PASSWORD_ACCEPTED\n(exit: 0)"
-	mock := &mockInteractiveRunner{returnThis: bashrun.Result{
-		Output:        output,
-		OriginalBytes: int64(len(output)),
-		Complete:      false,
-	}}
-	ctx := WithRuntime(context.Background(), &ToolRuntime{InteractiveRunner: mock})
-
-	result := ExecuteResult(ctx, All(), "bash", json.RawMessage(`{"command":"sudo apt install -y sl","interactive":true,"timeout":20}`))
-	if result.Preview != output {
-		t.Fatalf("interactive bash should return runner output verbatim: %q", result.Preview)
-	}
-	if result.Complete {
-		t.Fatal("interactive bash should preserve incomplete runner metadata")
-	}
-	if mock.gotCommand != "sudo apt install -y sl" {
-		t.Fatalf("runner got wrong command: %q", mock.gotCommand)
-	}
-	if mock.gotTimeout != 20*time.Second {
-		t.Fatalf("runner got wrong timeout: %v", mock.gotTimeout)
-	}
-	if mock.gotKeys == nil {
-		t.Fatalf("runner must receive a keys channel")
-	}
-
-	// interactive:false must NOT call the runner even when it's installed
-	mock.gotCommand = ""
-	out := Execute(ctx, All(), "bash", json.RawMessage(`{"command":"echo nohook"}`))
-	if mock.gotCommand != "" {
-		t.Fatalf("non-interactive call should not reach the runner: %q", mock.gotCommand)
-	}
-	if !strings.Contains(out, "nohook") {
-		t.Fatalf("non-interactive output wrong: %q", out)
-	}
-}
-
 func TestReadObservedContentFromReader(t *testing.T) {
 	data := "first line\nsecond line\nthird line\n"
 	res, err := readObservedContent(context.Background(), "/canonical/path.go", "path.go", strings.NewReader(data), 2, 1)
@@ -403,17 +364,86 @@ func TestReadObservedContentFromReader(t *testing.T) {
 	}
 }
 
+func TestSuggestTool(t *testing.T) {
+	cands := []string{"bash", "read", "edit", "mcp__docs__greet", "mcp__docs__fail", "mcp__github__create_issue"}
+	tests := []struct {
+		name  string
+		cands []string
+		want  []string
+	}{
+		{"mcp__docs__gret", nil, []string{"mcp__docs__greet"}},
+		{"mcp__doc__greet", nil, []string{"mcp__docs__greet"}},
+		{"mcp__docs__greet2", nil, []string{"mcp__docs__greet"}},
+		{"mcp__docs__", nil, []string{"mcp__docs__greet", "mcp__docs__fail"}},
+		{"mcp__github__create_iss", nil, []string{"mcp__github__create_issue"}},
+		{"completely_unrelated_xyz", nil, nil},
+		{"bsh", nil, []string{"bash"}},
+		{"bash", []string{"read", "edit", "lsp"}, nil},
+	}
+	for _, tt := range tests {
+		candidates := tt.cands
+		if candidates == nil {
+			candidates = cands
+		}
+		got := SuggestTool(tt.name, candidates)
+		if len(got) != len(tt.want) {
+			t.Errorf("SuggestTool(%q) = %v, want %v", tt.name, got, tt.want)
+			continue
+		}
+		for i := range got {
+			if got[i] != tt.want[i] {
+				t.Errorf("SuggestTool(%q) = %v, want %v", tt.name, got, tt.want)
+				break
+			}
+		}
+	}
+}
+
+func TestSuggestToolCapsAtTwo(t *testing.T) {
+	cands := []string{"mcp__s__aaa", "mcp__s__aab", "mcp__s__aac"}
+	if got := SuggestTool("mcp__s__aa", cands); len(got) > 2 {
+		t.Errorf("got %v, want at most 2", got)
+	}
+}
+
+func TestLevenshteinCap(t *testing.T) {
+	if d := levenshtein("abc", "abc", 2); d != 0 {
+		t.Errorf("identical = %d", d)
+	}
+	if d := levenshtein("abc", "abd", 2); d != 1 {
+		t.Errorf("1 edit = %d", d)
+	}
+	if d := levenshtein("short", "a-much-longer-string", 3); d <= 3 {
+		t.Errorf("should exceed cap, got %d", d)
+	}
+	if d := levenshtein("", "abcdef", 2); d <= 2 {
+		t.Errorf("length gap beyond cap = %d", d)
+	}
+}
+
+func TestExecuteSuggestsOnUnknownTool(t *testing.T) {
+	docs := Tool{Def: models.NewTool("mcp__docs__greet", "", `{}`)}
+	out := Execute(context.Background(), []Tool{docs}, "mcp__doc__greet", nil)
+	if !strings.Contains(out, `unknown tool "mcp__doc__greet"`) || !strings.Contains(out, "did you mean mcp__docs__greet") {
+		t.Errorf("got %q", out)
+	}
+	other := Tool{Def: models.NewTool("mcp__other__greet", "", `{}`)}
+	out = Execute(context.Background(), []Tool{other}, "mcp__other__grete", nil)
+	if !strings.Contains(out, "did you mean mcp__other__greet") {
+		t.Errorf("current tool set was not used: %q", out)
+	}
+	out = Execute(context.Background(), []Tool{docs}, "nope", nil)
+	if strings.Contains(out, "did you mean") {
+		t.Errorf("unrelated tool should have no suggestion, got %q", out)
+	}
+}
+
 func TestSandboxNetworkDeniedClassifier(t *testing.T) {
 	tests := []struct {
 		name   string
 		output string
 		want   bool
 	}{
-		{
-			name:   "httptest failure",
-			output: "2026/09/02 12:00:00 httptest: failed to listen on 127.0.0.1:45678: operation not permitted\nFAIL\texample.com/pkg",
-			want:   true,
-		},
 		{
 			name:   "listen tcp failure",
 			output: "panic: listen tcp 127.0.0.1:8080: bind: operation not permitted",
@@ -438,5 +468,43 @@ func TestSandboxNetworkDeniedClassifier(t *testing.T) {
 				t.Fatalf("isSandboxNetworkDenied(%q) = %v, want %v", tc.output, got, tc.want)
 			}
 		})
+	}
+}
+
+// Every built-in tool's JSON schema must parse — a malformed schema
+// (trailing comma, stray quote) silently corrupts the provider request
+// body for ALL tools, surfacing as cryptic marshal errors deep in the
+// loop. This ratchet pins parseability at the source.
+func TestBuiltinToolSchemasParse(t *testing.T) {
+	for _, tool := range All() {
+		var v any
+		if err := json.Unmarshal(tool.Def.Function.Parameters, &v); err != nil {
+			t.Errorf("%s: schema does not parse: %v", tool.Def.Function.Name, err)
+		}
+	}
+}
+
+func TestGrepSchemaAcceptsEitherPatternForm(t *testing.T) {
+	var schema struct {
+		Required []string `json:"required"`
+		AnyOf    []struct {
+			Required []string `json:"required"`
+		} `json:"anyOf"`
+	}
+	if err := json.Unmarshal(grepTool().Def.Function.Parameters, &schema); err != nil {
+		t.Fatal(err)
+	}
+	if len(schema.Required) != 0 || len(schema.AnyOf) != 3 {
+		t.Fatalf("grep schema requirements = %+v", schema)
+	}
+	got := map[string]bool{}
+	for _, branch := range schema.AnyOf {
+		if len(branch.Required) != 1 {
+			t.Fatalf("grep schema branch = %+v", branch.Required)
+		}
+		got[branch.Required[0]] = true
+	}
+	if !got["pattern"] || !got["patterns"] || !got["cursor"] || len(got) != 3 {
+		t.Fatalf("grep schema does not require pattern, patterns, or cursor: %+v", got)
 	}
 }

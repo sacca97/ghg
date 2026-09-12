@@ -39,16 +39,9 @@ func (m *model) cdCommand(arg string) {
 		m.append(dimStyle.Render("(worker is busy — /cd after this turn)"))
 		return
 	}
-	if m.workerClient == nil && !m.ensureWorker() {
-		m.append(errStyle.Render("/cd: worker unavailable: " + m.workerStartError))
-		return
+	if requestID := m.sendWorkerCommand("/cd", "chdir", workerwire.CommandChdir, arg); requestID != "" {
+		m.workerChdirRequest = requestID
 	}
-	requestID := workerRequestID("chdir")
-	if err := m.workerClient.Send(workerwire.CommandChdir, requestID, arg); err != nil {
-		m.append(errStyle.Render("/cd: worker: " + err.Error()))
-		return
-	}
-	m.workerChdirRequest = requestID
 }
 
 // Compaction events are recorded in raw-log coordinates (session.Store.RawCutoff
@@ -63,21 +56,15 @@ func (m *model) compactRetry() {
 		m.append(dimStyle.Render("(no session to retry a compaction in)"))
 		return
 	}
-	if m.workerClient == nil && !m.ensureWorker() {
-		m.append(errStyle.Render("compact retry: worker unavailable: " + m.workerStartError))
-		return
-	}
 	if m.busy {
 		m.append(dimStyle.Render("(busy — /compact retry after this turn)"))
 		return
 	}
-	requestID := workerRequestID("compact-retry")
-	m.workerHistoryRequest = requestID
-	if err := m.workerClient.Send(workerwire.CommandCompactRetry, requestID, nil); err != nil {
-		m.workerHistoryRequest = ""
-		m.append(errStyle.Render("/compact retry: " + err.Error()))
+	requestID := m.sendWorkerCommand("/compact retry", "compact-retry", workerwire.CommandCompactRetry, nil)
+	if requestID == "" {
 		return
 	}
+	m.workerHistoryRequest = requestID
 	m.append(dimStyle.Render("⟲ retrying compaction…"))
 }
 

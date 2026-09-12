@@ -343,15 +343,8 @@ func (r *taskRegistry) emitter(id string) Events {
 	}
 }
 
-// broadcast runs a subscriber callback for each of the task's subscribers.
-// The slice is snapshotted under the registry lock, then callbacks run AFTER
-// the lock is released: subscribers are allowed to block (the TUI's task view
-// funnels events through prog.Send, which parks when the UI event queue is
-// backed up), and a blocked callback must never hold mu hostage — the UI
-// goroutine itself takes mu via List/Get when rendering the dock, so running
-// a blocking callback under the lock is an ABBA deadlock (worker holds mu →
-// waits on the UI queue; UI waits on mu). settle deletes the entry, so
-// post-settle events (there should be none) go nowhere.
+// broadcast executes subscriber callbacks after releasing registry.mu.
+// Releasing the lock prevents deadlocks when subscriber channels block.
 func (r *taskRegistry) broadcast(id string, call func(Events)) {
 	r.mu.Lock()
 	subs := append([]Events(nil), r.subs[id]...)

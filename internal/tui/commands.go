@@ -24,42 +24,64 @@ type registryEntry struct {
 	Immediate bool
 }
 
-// registry lists every user-facing slash command.
-var registry = []registryEntry{
-	{Name: "/auth", Hint: "[provider] [key] — connect any profile (bare lists profiles; provider-only opens a masked prompt; also: ghg auth <provider>)", Category: "Agent"},
-	{Name: "/ask", Hint: "<question> — answer directly; repository questions may be investigated read-only", Category: "Agent", Immediate: true},
-	{Name: "/approval", Hint: "[ask|auto|never] — switch capability approval live (bare shows the current mode)", Category: "Session", Immediate: true},
-	{Name: "/cd", Hint: "[dir] — change working directory (bare prints it)", Category: "Session"},
-	{Name: "/clear", Hint: "— reset conversation", Category: "Session", Immediate: true},
-	{Name: "/compact", Hint: "— compact now using tiny → fast → default → smart; retry undoes the last compaction, log lists them; compaction level: ctrl+p › Compaction level", Category: "Session", Immediate: true},
-	{Name: "/context-doctor", Hint: "— audit what a fresh session injects (skills, MCP, tool schemas) and its token cost", Category: "Session", Immediate: true},
-	{Name: "/continue", Hint: "— continue the interrupted turn using the current session history", Category: "Session", Immediate: true},
-	{Name: "/detach", Hint: "— stop the worker and exit; resume later (ctrl+d)", Keybind: "ctrl+d", Category: "Session", Immediate: true},
-	{Name: "/effort", Hint: "[level] — reasoning effort: off·low·medium·high (bare opens selector)", Category: "Agent", Immediate: true},
-	{Name: "/dynamic-reasoning", Hint: "— toggle model per-call reasoning effort selection (default on)", Category: "Agent", Immediate: true},
-	{Name: "/export", Hint: "[chat|plan|review|last] [path] [--format json|markdown] [--force] — export chat log or structured result to a file", Category: "Session"},
-	{Name: "/export-result", Hint: "[chat|plan|review|last] [path] [--format json|markdown] [--force] — export chat log, structured result, or last message to a file", Category: "Session"},
-	{Name: "/fork", Hint: "[name] — copy the conversation into a new session (pick a point in the rewind picker with f)", Category: "Session"},
-	{Name: "/goal", Hint: "<text> — keep working until the goal is met (unbounded; resume | clear)", Category: "Session", Immediate: true},
-	{Name: "/goal-from-context", Hint: "[n] — formulate a goal from the last n messages (default 8) and work until it's met", Category: "Session", Immediate: true},
-	{Name: "/help", Hint: "— show all commands and keybindings", Category: "App", Immediate: true},
-	{Name: "/mcp", Hint: "[name] [reconnect|enable|disable] — MCP servers: status, reconnect, toggle", Category: "Session", Immediate: true},
-	{Name: "/me", Hint: "— edit your standing instructions (~/.ghg/me.md) in $EDITOR", Category: "Agent"},
-	{Name: "/memory", Hint: "[n] [session] — saved memories: list what's injected each turn, mark entry n done", Category: "Session"},
-	{Name: "/model", Hint: "<name> [provider] — switch model (any provider-catalog model works; refresh pulls new announcements)", Category: "Agent", Immediate: true},
-	{Name: "/notify", Hint: "[config|on|off] — configure or toggle Telegram completion notifications", Category: "Session", Immediate: true},
-	{Name: "/plan", Hint: "[goal] — enter read-only Plan mode or explore a goal with the smart model (run it with /execute)", Category: "Agent"},
-	{Name: "/pwd", Hint: "— print working directory", Category: "Session", Immediate: true},
-	{Name: "/quit", Hint: "— exit", Keybind: "ctrl+c ctrl+c", Category: "App", Immediate: true},
-	{Name: "/rename", Hint: "[title] — retitle this session", Category: "Session"},
-	{Name: "/report", Hint: "— bug-report bundle: prefilled GitHub-issue link + copy-pastable environment snippet (terminal, versions)", Category: "App", Immediate: true},
-	{Name: "/resume", Hint: "[id] — resume a previous session", Category: "Session", Immediate: true},
-	{Name: "/review", Hint: "<target> — run a one-shot read-only review with structured findings using the smart model", Category: "Agent"},
-	{Name: "/schedule", Hint: "@every 10m|<@at time> <prompt> — schedule a wakeup turn; list | cancel <n>", Category: "Session"},
-	{Name: "/search-providers", Hint: "[add|use|remove] — configure SearXNG search endpoints", Category: "Session", Immediate: true},
-	{Name: "/tasks", Hint: "[id] — background subagents: focus the dock, or open one subagent's live view", Keybind: "ctrl+t", Category: "Session", Immediate: true},
-	{Name: "/execute", Hint: "[plan] — execute the latest proposal or supplied plan with the fast model", Category: "Agent", Immediate: true},
-	{Name: "!cmd", Hint: "— run a shell command in the worker; output lands in the transcript and conversation", Category: "App"},
+// tuiPresentation carries the TUI-only attributes of a catalogue command:
+// which help group it belongs to, its keybinding, and whether it must run
+// immediately while a turn is in flight. Names and hints come from the shared
+// worker catalogue so both clients render identical text.
+var tuiPresentation = map[string]registryEntry{
+	"!cmd":               {Category: "App"},
+	"/ask":               {Category: "Agent", Immediate: true},
+	"/approval":          {Category: "Session", Immediate: true},
+	"/auth":              {Category: "Agent", Immediate: true},
+	"/cd":                {Category: "Session", Immediate: true},
+	"/clear":             {Category: "Session", Immediate: true},
+	"/compact":           {Category: "Session", Immediate: true},
+	"/context-doctor":    {Category: "Session", Immediate: true},
+	"/continue":          {Category: "Session", Immediate: true},
+	"/detach":            {Keybind: "ctrl+d", Category: "Session", Immediate: true},
+	"/dynamic-reasoning": {Category: "Agent", Immediate: true},
+	"/effort":            {Category: "Agent", Immediate: true},
+	"/execute":           {Category: "Agent", Immediate: true},
+	"/export":            {Category: "Session"},
+	"/fork":              {Category: "Session"},
+	"/goal":              {Category: "Session", Immediate: true},
+	"/goal-from-context": {Category: "Session", Immediate: true},
+	"/help":              {Category: "App", Immediate: true},
+	"/lsp":               {Category: "Session", Immediate: true},
+	"/mcp":               {Category: "Session", Immediate: true},
+	"/me":                {Category: "Agent", Immediate: true},
+	"/memory":            {Category: "Session"},
+	"/model":             {Category: "Agent"},
+	"/notify":            {Category: "Session", Immediate: true},
+	"/plan":              {Category: "Agent", Immediate: true},
+	"/pwd":               {Category: "Session", Immediate: true},
+	"/quit":              {Keybind: "ctrl+c ctrl+c", Category: "App"},
+	"/rename":            {Category: "Session", Immediate: true},
+	"/report":            {Category: "App", Immediate: true},
+	"/resume":            {Category: "Session"},
+	"/review":            {Category: "Agent", Immediate: true},
+	"/schedule":          {Category: "Session"},
+	"/search-providers":  {Category: "Session", Immediate: true},
+	"/tasks":             {Keybind: "ctrl+t", Category: "Session", Immediate: true},
+}
+
+// registry lists every user-facing command, derived from the canonical worker
+// catalogue plus the TUI-only presentation attributes above. Help, completion,
+// and the palette all read this table, so a command can never be dispatchable
+// but undocumented (or documented but dead).
+var registry = buildRegistry()
+
+func buildRegistry() []registryEntry {
+	specs := workerwire.Commands()
+	out := make([]registryEntry, 0, len(specs))
+	for _, spec := range specs {
+		entry := registryEntry{Name: spec.Name, Hint: spec.Hint}
+		if extra, ok := tuiPresentation[spec.Name]; ok {
+			entry.Keybind, entry.Category, entry.Immediate = extra.Keybind, extra.Category, extra.Immediate
+		}
+		out = append(out, entry)
+	}
+	return out
 }
 
 // slashRegistry returns the registry entries that name a slash command,
@@ -78,6 +100,7 @@ func slashRegistry() []registryEntry {
 // registryFind returns the entry for a slash command name (nil for "!cmd"
 // and unknown names).
 func registryFind(name string) *registryEntry {
+	name = workerwire.CommandName(name)
 	for i := range registry {
 		if registry[i].Name == name {
 			return &registry[i]
@@ -130,17 +153,11 @@ func busyCmd(text string) bool {
 	if len(fields) == 0 {
 		return false
 	}
-	switch fields[0] {
-	case "/approval", "/continue", "/help", "/effort", "/dynamic-reasoning", "/tasks", "/cd", "/pwd", "/report", "/detach", "/notify", "/rename", "/search-providers":
-		return true
-	case "/ask", "/plan", "/execute", "/review": // handled immediately so a slash command is not sent as chat text
-		return true
-	case "/auth": // must run now even while busy: an inline key queued as a chat message would be sent to the model
-		return true
-	case "/goal": // status and clear are settings; resume/<text> submit turns
+	name := workerwire.CommandName(fields[0])
+	if name == "/goal" { // status and clear are settings; resume/<text> submit turns
 		return len(fields) == 1 || fields[1] == "clear" || fields[1] == "rounds"
 	}
-	return false
+	return registryImmediate(name)
 }
 
 func (m *model) currentApprovalMode() string {
@@ -233,7 +250,7 @@ func (m *model) command(text string) (tea.Model, tea.Cmd) {
 		m.memoryCommand(fields[1:])
 	case "/schedule":
 		m.scheduleCommand(fields[1:])
-	case "/me":
+	case "/me", "/agents":
 		return m, m.openMe()
 	case "/compact":
 		if len(fields) == 1 {
@@ -285,17 +302,11 @@ func (m *model) command(text string) (tea.Model, tea.Cmd) {
 			m.notifyConfigCommand()
 			return m, nil
 		}
-		if m.workerClient == nil && !m.ensureWorker() {
-			m.append(errStyle.Render("notify: worker unavailable: " + m.workerStartError))
-			return m, nil
-		}
 		action := "status"
 		if len(fields) == 2 {
 			action = fields[1]
 		}
-		if err := m.workerClient.Send(workerwire.CommandNotify, workerRequestID("notify"), workerwire.NotifyRequest{Action: action}); err != nil {
-			m.append(errStyle.Render("notify failed: " + err.Error()))
-		}
+		m.sendWorkerCommand("/notify", "notify", workerwire.CommandNotify, workerwire.NotifyRequest{Action: action})
 		return m, nil
 	case "/search-providers":
 		m.searchProvidersCommand(fields[1:])
@@ -465,17 +476,11 @@ func (m *model) command(text string) (tea.Model, tea.Cmd) {
 		}
 		m.openPicker()
 	case "/context-doctor":
-		if m.workerClient == nil && !m.ensureWorker() {
-			m.append(errStyle.Render("context doctor: worker unavailable: " + m.workerStartError))
-			return m, nil
-		}
-		if err := m.workerClient.Send(workerwire.CommandContextDoctor, workerRequestID("doctor"), nil); err != nil {
-			m.append(errStyle.Render("context doctor failed: " + err.Error()))
-		}
+		m.sendWorkerCommand("/context-doctor", "doctor", workerwire.CommandContextDoctor, nil)
 		return m, nil
 	case "/report":
 		m.append(m.reportBlock())
-	case "/help":
+	case "/help", "/commands":
 		m.append(dimStyle.Render(helpText()))
 	case "/auth":
 		m.authCommand(fields[1:])
@@ -536,14 +541,8 @@ func (m *model) requireAgent() bool {
 }
 
 // lspCommand handles "/lsp" — requests status from the worker.
-func (m *model) lspCommand(fields []string) (tea.Model, tea.Cmd) {
-	if m.workerClient == nil && !m.ensureWorker() {
-		m.append(errStyle.Render("LSP status failed: worker unavailable: " + m.workerStartError))
-		return m, nil
-	}
-	if err := m.workerClient.Send(workerwire.CommandLSPStatus, workerRequestID("lsp"), nil); err != nil {
-		m.append(errStyle.Render("LSP status failed: " + err.Error()))
-	}
+func (m *model) lspCommand([]string) (tea.Model, tea.Cmd) {
+	m.sendWorkerCommand("/lsp", "lsp", workerwire.CommandLSPStatus, nil)
 	return m, nil
 }
 
@@ -591,14 +590,8 @@ func workerLSPStatuses(statuses []workerwire.LSPStatus) []lsp.Status {
 
 // mcpCommand handles "/mcp [name] [reconnect|enable|disable]".
 func (m *model) mcpCommand(fields []string) (tea.Model, tea.Cmd) {
-	if m.workerClient == nil && !m.ensureWorker() {
-		m.append(errStyle.Render("MCP command failed: worker unavailable: " + m.workerStartError))
-		return m, nil
-	}
 	if len(fields) == 1 {
-		if err := m.workerClient.Send(workerwire.CommandMCPStatus, workerRequestID("mcp"), nil); err != nil {
-			m.append(errStyle.Render("MCP status failed: " + err.Error()))
-		}
+		m.sendWorkerCommand("/mcp", "mcp", workerwire.CommandMCPStatus, nil)
 		return m, nil
 	}
 	name := fields[1]
@@ -616,9 +609,7 @@ func (m *model) mcpCommand(fields []string) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 	}
-	if err := m.workerClient.Send(action, workerRequestID("mcp"), workerwire.MCPRequest{Name: name}); err != nil {
-		m.append(errStyle.Render("MCP command failed: " + err.Error()))
-	}
+	m.sendWorkerCommand("/mcp", "mcp", action, workerwire.MCPRequest{Name: name})
 	return m, nil
 }
 

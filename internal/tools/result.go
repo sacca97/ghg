@@ -8,13 +8,16 @@ import (
 	"strings"
 
 	"github.com/sacca97/ghg/internal/models"
+	"github.com/sacca97/ghg/internal/session"
 )
 
-const maxOutputBytes int64 = 10 << 20
+const maxOutputBytes int64 = session.DefaultMaxBytes
 const maxOutput = 16 << 10
 
 func Truncate(s string) string {
-	return truncate(s)
+	return truncateWithMarkerLimit(s, maxOutput, func(omitted int) string {
+		return fmt.Sprintf("\n... [truncated %d bytes]", omitted)
+	}, false)
 }
 
 func TruncateWithSuffix(s, suffix string) string {
@@ -29,20 +32,21 @@ func TruncateWithSuffix(s, suffix string) string {
 	}, false) + suffix
 }
 
-func truncate(s string) string {
-	return truncateWithMarker(s, func(omitted int) string {
-		return fmt.Sprintf("\n... [truncated %d bytes]", omitted)
-	}, false)
-}
-
 func TruncateTail(s string) string {
-	return truncateWithMarker(s, func(omitted int) string {
+	return truncateWithMarkerLimit(s, maxOutput, func(omitted int) string {
 		return fmt.Sprintf("[... first %d bytes truncated]\n", omitted)
 	}, true)
 }
 
-func truncateWithMarker(s string, marker func(omitted int) string, tail bool) string {
-	return truncateWithMarkerLimit(s, maxOutput, marker, tail)
+// TruncateTailWithLimit keeps the end of s within limit bytes and identifies
+// the omitted prefix.
+func TruncateTailWithLimit(s string, limit int) string {
+	if limit <= 0 {
+		return ""
+	}
+	return truncateWithMarkerLimit(s, limit, func(omitted int) string {
+		return fmt.Sprintf("[... first %d bytes truncated]\n", omitted)
+	}, true)
 }
 
 func truncateWithMarkerLimit(s string, limit int, marker func(omitted int) string, tail bool) string {
@@ -66,14 +70,8 @@ func truncateWithMarkerLimit(s string, limit int, marker func(omitted int) strin
 	}
 }
 
-// ToolResult is the internal result of one tool invocation.
-// Explicit bounded-output invariants:
-//   - Preview: bounded model-visible output.
-//   - Retained: bounded evidence available to the output store / debugging.
-//   - OriginalBytes: total unbounded source size where known.
-//   - Complete: whether Retained represents all source output without omission.
-//
-// Legacy tools may leave extra fields empty and are normalized by ExecuteResult.
+// ToolResult contains bounded output data from a tool execution.
+// Tracks preview text, retained output for storage, and source completeness.
 type ToolResult struct {
 	Preview       string
 	Retained      string
@@ -81,9 +79,7 @@ type ToolResult struct {
 	Complete      bool
 	Output        *models.OutputRef
 	ExitCode      int
-	// Source identifies the tool/integration that produced the bytes. It is
-	// assigned by ExecuteResult so MCP and future network tools share the same
-	// untrusted-content boundary.
+	// Source identifies the tool producing the result for content boundaries.
 	Source   string
 	Metadata map[string]string
 }
@@ -150,82 +146,116 @@ func retainBytes(data []byte, limit int64) []byte {
 	return out
 }
 
-// TextCapture is the string-side equivalent of the bash runner's bounded
-// capture. It lets file/MCP adapters count a large result without retaining
-// more than the output ceiling in memory.
-type TextCapture struct {
+// OutputCapture bounds output while retaining a deterministic representation
+// and an optional rolling preview.
+type OutputCapture struct {
 	limit     int
 	total     int64
 	data      []byte
 	head      []byte
 	tail      []byte
+	rolling   []byte
 	truncated bool
+	preview   bool
 }
 
-// NewTextCapture creates a bounded capture. A non-positive limit uses the
-// default output ceiling.
-func NewTextCapture(limit int64) *TextCapture {
+// NewOutputCapture creates a bounded capture. A non-positive limit uses the
+// default output ceiling. preview enables the rolling live-preview buffer.
+func NewOutputCapture(limit int64, preview ...bool) *OutputCapture {
 	if limit <= 0 {
 		limit = maxOutputBytes
 	}
-	return &TextCapture{limit: int(limit)}
+	return &OutputCapture{limit: int(limit), preview: len(preview) > 0 && preview[0]}
 }
 
-func (c *TextCapture) WriteString(s string) {
-	c.total += int64(len(s))
+func (c *OutputCapture) Write(p []byte) (int, error) {
+	c.write(p)
+	return len(p), nil
+}
+
+func (c *OutputCapture) WriteString(s string) (int, error) {
+	c.write([]byte(s))
+	return len(s), nil
+}
+
+func (c *OutputCapture) write(p []byte) {
+	c.total += int64(len(p))
+	if c.preview {
+		c.appendRolling(p, 16<<10)
+	}
 	if c.truncated {
-		c.appendTailString(s)
+		c.appendTail(p)
 		return
 	}
-	if len(c.data)+len(s) <= c.limit {
-		c.data = append(c.data, s...)
+	c.data = append(c.data, p...)
+	if len(c.data) <= c.limit {
 		return
 	}
 	c.truncated = true
 	headLen := c.limit / 2
-	c.head = make([]byte, 0, headLen)
-	if len(c.data) >= headLen {
-		c.head = append(c.head, c.data[:headLen]...)
-	} else {
-		c.head = append(c.head, c.data...)
-		c.head = append(c.head, s[:headLen-len(c.data)]...)
+	if headLen > len(c.data) {
+		headLen = len(c.data)
 	}
-	c.tail = lastBytes(c.data, s, c.limit-headLen)
+	c.head = append([]byte(nil), c.data[:headLen]...)
+	c.tail = append([]byte(nil), c.data[len(c.data)-(c.limit-headLen):]...)
 	c.data = nil
 }
 
-func (c *TextCapture) appendTailString(s string) {
-	tailLen := c.limit - c.limit/2
-	if len(s) >= tailLen {
-		c.tail = append(c.tail[:0], s[len(s)-tailLen:]...)
+func (c *OutputCapture) appendRolling(p []byte, limit int) {
+	if len(p) >= limit {
+		c.rolling = append(c.rolling[:0], p[len(p)-limit:]...)
 		return
 	}
-	keep := tailLen - len(s)
+	c.rolling = append(c.rolling, p...)
+	if len(c.rolling) > limit {
+		c.rolling = c.rolling[len(c.rolling)-limit:]
+	}
+}
+
+func (c *OutputCapture) appendTail(p []byte) {
+	tailLen := c.limit - c.limit/2
+	if len(p) >= tailLen {
+		c.tail = append(c.tail[:0], p[len(p)-tailLen:]...)
+		return
+	}
+	keep := tailLen - len(p)
 	if len(c.tail) < keep {
 		keep = len(c.tail)
 	}
 	start := len(c.tail) - keep
-	out := make([]byte, 0, keep+len(s))
+	out := make([]byte, 0, keep+len(p))
 	out = append(out, c.tail[start:]...)
-	out = append(out, s...)
+	out = append(out, p...)
 	c.tail = out
 }
 
-func lastBytes(prefix []byte, suffix string, limit int) []byte {
-	if len(suffix) >= limit {
-		return append([]byte(nil), suffix[len(suffix)-limit:]...)
+// Preview returns the latest output within limit bytes.
+func (c *OutputCapture) Preview(limit int) string {
+	if limit <= 0 {
+		limit = maxOutput
 	}
-	keep := limit - len(suffix)
-	if len(prefix) > keep {
-		prefix = prefix[len(prefix)-keep:]
+	data := c.rolling
+	if len(data) == 0 {
+		if c.truncated {
+			data = c.tail
+		} else {
+			data = c.data
+		}
 	}
-	out := make([]byte, 0, len(prefix)+len(suffix))
-	out = append(out, prefix...)
-	out = append(out, suffix...)
-	return out
+	if len(data) > limit {
+		data = data[len(data)-limit:]
+	}
+	return validUTF8Tail(data)
 }
 
-func (c *TextCapture) String() string {
+func validUTF8Tail(data []byte) string {
+	for len(data) > 0 && (data[0]&0xc0) == 0x80 {
+		data = data[1:]
+	}
+	return string(data)
+}
+
+func (c *OutputCapture) String() string {
 	if !c.truncated {
 		return string(c.data)
 	}
@@ -237,10 +267,17 @@ func (c *TextCapture) String() string {
 
 // OriginalBytes returns the total number of bytes written, including bytes
 // omitted from the retained representation.
-func (c *TextCapture) OriginalBytes() int64 { return c.total }
+func (c *OutputCapture) OriginalBytes() int64 { return c.total }
 
 // Complete reports whether every written byte is retained.
-func (c *TextCapture) Complete() bool { return !c.truncated }
+func (c *OutputCapture) Complete() bool { return !c.truncated }
+
+// TextCapture remains an alias for integration callers that use the older
+// name.
+type TextCapture = OutputCapture
+
+// NewTextCapture creates a bounded capture for integration output.
+func NewTextCapture(limit int64) *TextCapture { return NewOutputCapture(limit) }
 
 // CapturedTextResult converts a bounded capture into a structured result.
 func CapturedTextResult(c *TextCapture, preview string, exitCode int) ToolResult {
@@ -321,7 +358,7 @@ func normalizeResult(result ToolResult) ToolResult {
 	if result.Preview == "" {
 		result.Preview = "(no output)"
 	}
-	result.Preview = truncate(result.Preview)
+	result.Preview = Truncate(result.Preview)
 	return result
 }
 

@@ -54,7 +54,6 @@ type Config struct {
 	CollapsePaste    *bool                     `json:"collapsePaste,omitempty"`    // nil/false: pastes land verbatim; true collapses ≥3-line pastes into a [Pasted ~N lines] placeholder
 	MaxRetries       int                       `json:"maxRetries,omitempty"`       // attempts per provider request on transient failures (429/5xx/network); 0 = models.DefaultMaxAttempts, 1 = no retries
 	Outputs          *OutputConfig             `json:"outputs,omitempty"`          // bounded tool-result persistence; nil/enabled nil uses defaults
-	Artifacts        *OutputConfig             `json:"-"`                          // legacy in-memory alias for Outputs
 	Telegram         *TelegramConfig           `json:"telegram,omitempty"`         // optional completion notifications
 	Execution        *ExecutionConfig          `json:"execution,omitempty"`        // filesystem/network/approval policy for tool subprocesses
 	Providers        map[string]Provider       `json:"providers"`
@@ -161,43 +160,35 @@ type OutputConfig struct {
 	MaxBytes int64 `json:"maxBytes,omitempty"`
 }
 
-// ArtifactConfig is retained as a source-compatibility alias for callers
-// that still construct the old configuration type.
-type ArtifactConfig = OutputConfig
-
-// UnmarshalJSON accepts both the current outputs key and the legacy artifacts
-// key. The current key wins when both are present.
-func (c *Config) UnmarshalJSON(data []byte) error {
-	type plainConfig Config
-	var decoded plainConfig
-	if err := json.Unmarshal(data, &decoded); err != nil {
-		return err
-	}
-	var keys struct {
-		Outputs   *OutputConfig `json:"outputs"`
-		Artifacts *OutputConfig `json:"artifacts"`
-	}
-	if err := json.Unmarshal(data, &keys); err != nil {
-		return err
-	}
-	*c = Config(decoded)
-	c.Outputs = keys.Outputs
-	if c.Outputs == nil {
-		c.Outputs = keys.Artifacts
-	}
-	c.Artifacts = c.Outputs
-	return nil
+// TelegramConfig contains references to credentials used for completion
+// notifications. BotToken is resolved only when a message is sent.
+type TelegramConfig struct {
+	BotToken string `json:"botToken"`
+	ChatID   string `json:"chatId"`
 }
 
-// MarshalJSON writes the current outputs key, including when an older caller
-// populated only the legacy in-memory alias.
-func (c Config) MarshalJSON() ([]byte, error) {
-	type plainConfig Config
-	if c.Outputs == nil {
-		c.Outputs = c.Artifacts
+// TelegramCredentials resolves the configured bot token without exposing its
+// value in errors or operation logs.
+func (c *Config) TelegramCredentials() (string, string, error) {
+	if c == nil || c.Telegram == nil {
+		return "", "", fmt.Errorf("telegram is not configured")
 	}
-	c.Artifacts = nil
-	return json.Marshal(plainConfig(c))
+	chatID := strings.TrimSpace(c.Telegram.ChatID)
+	if chatID == "" {
+		return "", "", fmt.Errorf("telegram chatId is empty")
+	}
+	tokenReference := strings.TrimSpace(c.Telegram.BotToken)
+	if tokenReference == "" {
+		return "", "", fmt.Errorf("telegram botToken is empty")
+	}
+	token, err := ResolveSecret(tokenReference)
+	if err != nil {
+		return "", "", fmt.Errorf("telegram botToken: %w", err)
+	}
+	if strings.TrimSpace(token) == "" {
+		return "", "", fmt.Errorf("telegram botToken resolved to an empty value")
+	}
+	return token, chatID, nil
 }
 
 // LSPServer is the config-file form of an LSP server entry. It mirrors

@@ -4,7 +4,6 @@ import (
 	"context"
 	"io"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 )
@@ -100,18 +99,17 @@ func TestRepairToolHistoryIdempotent(t *testing.T) {
 // request Stream sends must always carry the synthetic results.
 func TestStreamSendsSyntheticResultsForUnansweredCalls(t *testing.T) {
 	var body []byte
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	client := testChatClientWithHandler(t, "test-key", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ = io.ReadAll(r.Body)
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n"))
 	}))
-	defer srv.Close()
 
 	msgs := []Message{
 		{Role: "user", Content: "q"},
 		{Role: "assistant", ToolCalls: []ToolCall{{ID: "call_1"}}},
 	}
-	if _, _, err := runStream(testChatClient(t, srv.URL, "test-key"), context.Background(), Request{Model: "m", Messages: msgs}, nil, nil); err != nil {
+	if _, _, err := runStream(client, context.Background(), Request{Model: "m", Messages: msgs}, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	s := string(body)
@@ -126,12 +124,11 @@ func TestStreamSendsSyntheticResultsForUnansweredCalls(t *testing.T) {
 // function's name.
 func TestStreamToolMessagesCarryName(t *testing.T) {
 	var body []byte
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	client := testChatClientWithHandler(t, "test-key", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ = io.ReadAll(r.Body)
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n"))
 	}))
-	defer srv.Close()
 
 	calls := []ToolCall{{ID: "call_1"}}
 	calls[0].Function.Name = "bash"
@@ -142,7 +139,7 @@ func TestStreamToolMessagesCarryName(t *testing.T) {
 		{Role: "tool", Content: "ok", ToolCallID: "call_1"},
 		{Role: "assistant", ToolCalls: []ToolCall{{ID: "call_2"}}}, // unanswered
 	}
-	if _, _, err := runStream(testChatClient(t, srv.URL, "test-key"), context.Background(), Request{Model: "m", Messages: msgs}, nil, nil); err != nil {
+	if _, _, err := runStream(client, context.Background(), Request{Model: "m", Messages: msgs}, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	s := string(body)

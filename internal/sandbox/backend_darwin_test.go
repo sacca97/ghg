@@ -119,3 +119,41 @@ if /usr/bin/printf denied > "$6" 2>/dev/null; then exit 13; fi
 		t.Fatalf("approved protected write output=%q err=%v", output, err)
 	}
 }
+
+func TestSeatbeltCanonicalTempRootAcceptsTmpAlias(t *testing.T) {
+	workspace := t.TempDir()
+	tmpRoot, err := os.MkdirTemp("/tmp", "ghg-seatbelt-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(tmpRoot)
+	target := filepath.Join(tmpRoot, "result")
+
+	policy, err := NewPolicy(PolicyConfig{
+		Workspace: workspace,
+		Mode:      ModeWorkspaceWrite,
+		TempRoots: []string{"/tmp"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireNativeBackend(t, policy)
+	wrapped, err := policy.WrapCommand(CommandSpec{
+		Program: "/bin/sh",
+		Args:    []string{"-c", `/usr/bin/printf ok > "$1"`, "sh", filepath.Join("/tmp", filepath.Base(tmpRoot), "result")},
+		Dir:     workspace,
+		Env:     []string{"PATH=/usr/bin:/bin"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(wrapped.Program, wrapped.Args...)
+	cmd.Dir = wrapped.Dir
+	cmd.Env = wrapped.Env
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("tmp alias output=%q err=%v", output, err)
+	}
+	if got, err := os.ReadFile(target); err != nil || string(got) != "ok" {
+		t.Fatalf("tmp alias target=%q err=%v", got, err)
+	}
+}

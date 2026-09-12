@@ -308,20 +308,7 @@ func (m *model) effortsFor() []string {
 			if !mi.ReasoningKnown && len(mi.ReasoningEfforts) == 0 && !mi.ReasoningToggle {
 				break // the model has no reasoning metadata yet: use defaults
 			}
-			out := []string{""}
-			if mi.ReasoningToggle && len(mi.ReasoningEfforts) == 0 {
-				return append(out, "on")
-			}
-			for _, e := range mi.ReasoningEfforts {
-				e = strings.TrimSpace(e)
-				if strings.EqualFold(e, "none") || strings.EqualFold(e, "off") || e == "" {
-					continue // "none"/"off" are our off ("")
-				}
-				if !slices.Contains(out, e) {
-					out = append(out, e)
-				}
-			}
-			return out
+			return mi.SupportedEfforts()
 		}
 	}
 	return defaultEfforts

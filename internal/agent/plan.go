@@ -4,9 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/sacca97/ghg/internal/models"
+	"github.com/sacca97/ghg/internal/sandbox"
 	"github.com/sacca97/ghg/internal/tools"
 )
 
@@ -200,7 +203,7 @@ func (a *Agent) SetTodos(items []Todo) error {
 // loading — Plan mode is a collaboration mode, not an agent definition.
 const planModePrompt = `You are planning in a read-only collaboration mode. Use only the read-only tools currently exposed in this request. You cannot write, edit, run shell commands, spawn tasks, or mutate memory — treat them as unavailable.
 
-Use grep for text, structural_search for syntax-aware code shapes, lsp for semantic symbol questions, and read only for the exact source needed. Prefer composite lsp operations when they eliminate an otherwise deterministic locate→navigate→read sequence.
+Use grep for text, lsp for semantic symbol questions, and read only for the exact source needed. Prefer composite lsp operations when they eliminate an otherwise deterministic locate→navigate→read sequence.
 
 Inspect only the code necessary to understand requirements, locate relevant components, and resolve ambiguity. Reuse evidence already gathered and do not reread unchanged source. Once the remaining uncertainties cannot materially change the implementation decisions, stop exploring and produce the plan.
 
@@ -216,18 +219,137 @@ End your response with a Markdown implementation plan in a single, exact block:
 
 A response without that block is valid only when actively gathering necessary initial evidence or asking clarifying questions. Only emit <proposed_plan> once, as your final answer.`
 
+const taggedPathNote = "[note: the user tagged "
+
+// taggedPathsFromTarget returns existing, canonical paths from the mention note.
+func taggedPathsFromTarget(target string) []string {
+	start := strings.Index(target, taggedPathNote)
+	if start < 0 {
+		return nil
+	}
+	value := target[start+len(taggedPathNote):]
+	if end := strings.IndexByte(value, ']'); end >= 0 {
+		value = value[:end]
+	}
+	value = strings.TrimSpace(value)
+	value = strings.TrimSuffix(value, " — contents are not inlined…")
+	value = strings.TrimSuffix(value, " — contents are not inlined")
+	var paths []string
+	seen := make(map[string]struct{})
+	for _, raw := range strings.Split(value, ";") {
+		path := strings.TrimSpace(raw)
+		if path == "" {
+			continue
+		}
+		path = stripTaggedLineRange(path)
+		canonical, err := sandbox.CanonicalPath(path, false)
+		if err != nil {
+			continue
+		}
+		info, err := os.Stat(canonical)
+		if err != nil || (!info.IsDir() && !info.Mode().IsRegular()) {
+			continue
+		}
+		if _, ok := seen[canonical]; ok {
+			continue
+		}
+		seen[canonical] = struct{}{}
+		paths = append(paths, canonical)
+	}
+	return paths
+}
+
+func stripTaggedLineRange(path string) string {
+	const prefix = " (lines "
+	if !strings.HasSuffix(path, ")") {
+		return path
+	}
+	start := strings.LastIndex(path, prefix)
+	if start < 0 || !validTaggedLineRange(path[start+len(prefix):len(path)-1]) {
+		return path
+	}
+	return strings.TrimSpace(path[:start])
+}
+
+func validTaggedLineRange(value string) bool {
+	parts := strings.Split(value, "-")
+	if len(parts) > 2 || len(parts) == 0 {
+		return false
+	}
+	for _, part := range parts {
+		if part == "" {
+			return false
+		}
+		for _, r := range part {
+			if r < '0' || r > '9' {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func taggedReadRoots(a *Agent, target string) []string {
+	paths := taggedPathsFromTarget(target)
+	if a == nil || a.Runtime == nil || a.Runtime.Policy == nil {
+		return paths
+	}
+	protected := a.Runtime.Policy.ProtectedRoots()
+	filtered := paths[:0]
+	for _, path := range paths {
+		blocked := false
+		for _, root := range protected {
+			if reviewWithin(root, path) {
+				blocked = true
+				break
+			}
+		}
+		if !blocked {
+			filtered = append(filtered, path)
+		}
+	}
+	return filtered
+}
+
+func taggedScopeName(workspace, path string) string {
+	if workspace != "" {
+		if rel, err := filepath.Rel(workspace, path); err == nil && reviewWithin(workspace, path) {
+			return filepath.ToSlash(rel)
+		}
+	}
+	return filepath.ToSlash(path)
+}
+
 func planTaggedScopePrompt(a *Agent, target string) string {
-	if !strings.Contains(target, "[note: the user tagged ") {
+	if !strings.Contains(target, taggedPathNote) {
 		return ""
 	}
-	inventory := reviewInventoryAt(reviewWorkspace(a), target)
-	if len(inventory.Files) == 0 {
+	workspace := reviewWorkspace(a)
+	inventory := reviewInventoryAt(workspace, target)
+	files := make([]string, 0, len(inventory.Files)+len(taggedPathsFromTarget(target)))
+	seen := make(map[string]struct{}, len(files))
+	for _, path := range taggedReadRoots(a, target) {
+		name := taggedScopeName(workspace, path)
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		files = append(files, name)
+	}
+	for _, file := range inventory.Files {
+		if _, ok := seen[file]; ok {
+			continue
+		}
+		seen[file] = struct{}{}
+		files = append(files, file)
+	}
+	if len(files) == 0 {
 		return ""
 	}
 	var b strings.Builder
 	b.WriteString("<tagged_scope>\n")
 	b.WriteString("The following deterministic inventory comes from the user's tagged paths. Inspect these paths directly; do not use glob or find_files to rediscover listed paths.\nfiles:\n")
-	for _, file := range inventory.Files {
+	for _, file := range files {
 		b.WriteString("- ")
 		b.WriteString(file)
 		b.WriteByte('\n')
@@ -248,18 +370,17 @@ If the question concerns the repository, inspect only the files and evidence nee
 // and side-effecting tools are structurally unreachable in Plan mode. MCP tools
 // are intentionally excluded because ghg cannot prove they are read-only.
 var planSafeTools = map[string]bool{
-	"read":              true,
-	"grep":              true,
-	"structural_search": true,
-	"glob":              true,
-	"lsp":               true,
-	"find_files":        true,
-	"output_list":       true,
-	"output_read":       true,
-	"history_search":    true,
-	"history_read":      true,
-	"web_fetch":         true,
-	"web_search":        true,
+	"read":           true,
+	"grep":           true,
+	"glob":           true,
+	"lsp":            true,
+	"find_files":     true,
+	"output_list":    true,
+	"output_read":    true,
+	"history_search": true,
+	"history_read":   true,
+	"web_fetch":      true,
+	"web_search":     true,
 }
 
 // planTools returns the read-only tool allowlist. It intentionally

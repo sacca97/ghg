@@ -7,15 +7,24 @@ import (
 
 const schema = `
 CREATE TABLE IF NOT EXISTS sessions (
-	id         TEXT PRIMARY KEY,
-	created_at TEXT NOT NULL,
-	updated_at TEXT NOT NULL,
-	cwd        TEXT NOT NULL,
-	model      TEXT NOT NULL,
-	provider   TEXT NOT NULL,
-	title      TEXT NOT NULL DEFAULT '',
-	goal       TEXT NOT NULL DEFAULT '',
-	notify     INTEGER NOT NULL DEFAULT 0
+	id           TEXT PRIMARY KEY,
+	created_at   TEXT NOT NULL,
+	updated_at   TEXT NOT NULL,
+	cwd          TEXT NOT NULL,
+	model        TEXT NOT NULL,
+	provider     TEXT NOT NULL,
+	title        TEXT NOT NULL DEFAULT '',
+	goal         TEXT NOT NULL DEFAULT '', -- legacy source used during migration
+	notify       INTEGER NOT NULL DEFAULT 0,
+	forked_from  TEXT NOT NULL DEFAULT '', -- source session id when created by /fork ("" = root)
+	fork_seq     INTEGER NOT NULL DEFAULT 0, -- branch point in the source session
+	tags         TEXT NOT NULL DEFAULT '', -- comma-separated labels
+	pinned       INTEGER NOT NULL DEFAULT 0, -- 1 = keep / sort first
+	effort       TEXT NOT NULL DEFAULT '', -- reasoning effort in effect ("" = global default)
+	usage_in     INTEGER NOT NULL DEFAULT 0, -- cumulative provider-reported input tokens
+	usage_cached INTEGER NOT NULL DEFAULT 0, -- of usage_in, tokens served from the prompt cache
+	usage_out    INTEGER NOT NULL DEFAULT 0, -- cumulative output tokens
+	todos        TEXT NOT NULL DEFAULT ''  -- todowrite plan JSON ([]agent.Todo)
 );
 CREATE TABLE IF NOT EXISTS messages (
 	session_id TEXT NOT NULL REFERENCES sessions(id),

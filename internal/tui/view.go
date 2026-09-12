@@ -344,14 +344,7 @@ func (m *model) contentPad() int {
 // is visually separate from the thing you read. It replaces what used to be a
 // bare blank line, so it costs no extra row — layout()'s chrome already counts
 // exactly one row here.
-//
-// While an interactive bash command owns the terminal the input box is hidden,
-// and a rule with nothing under it reads as a stray line, so that case keeps
-// the blank row instead.
 func (m *model) inputRule() string {
-	if m.iactive != nil {
-		return ""
-	}
 	w := min(max(m.width, 0), maxRuleWidth)
 	if w == 0 {
 		return ""
@@ -407,56 +400,41 @@ func fmtCost(d float64) string {
 // layout gives the viewport whatever height the chrome doesn't need,
 // growing the input box with its content so the whole prompt stays visible.
 func (m *model) layout() {
-	m.frameViewsValid = false
-	m.frameCurrent = ""
-	m.frameThinking = ""
-	m.frameInteractive = ""
-	m.framePermission = ""
-	m.frameQuestion = ""
-	m.frameRewind = ""
 	m.growInput()
-	// Rows View() spends outside the viewport, counted against m.height. Get
-	// this wrong and the frame overflows the terminal: a too-tall frame makes
-	// the terminal scroll on every repaint, which reads as "mouse scroll is
-	// broken" — the wheel moves the viewport while the repaint shoves the
-	// whole frame the other way.
-	//   1 header · 1 separator above the input · input.Height() ·
-	//   1 blank + the three-row status box
-	// The old two-line ctrl+p hint is no longer rendered in View().
+	// chrome calculates total row height outside the viewport.
+	// Accurate height prevents terminal frame overflow and mouse scroll jitter.
 	chrome := 6 + m.input.Height()
 	if m.quit1 || m.escClr || (m.esc1 && m.rew == nil && m.namePrompt == nil) {
 		chrome++ // an armed-hint line renders under the input
-	}
-	if m.iactive != nil {
-		// input box is hidden while a command has the terminal; drop its height
-		// and the leading blank line View inserts before it.
-		chrome -= m.input.Height()
 	}
 	if m.busy {
 		chrome += 2 // blank line above the spinner + the spinner line itself
 	}
 	if m.current != "" {
-		m.frameCurrent = m.currentView()
+		key := m.current + "\x00" + fmt.Sprint(m.inMsg)
+		m.frameCurrent = m.cachedFrameView(key, &m.frameCurrentKey, m.frameCurrent, m.currentView)
 		chrome += lipgloss.Height(m.frameCurrent) + 1 // + its blank separator
 	}
 	if !m.thinkStart.IsZero() && m.showThinking {
-		m.frameThinking = m.thinkView()
+		key := m.thinkStart.String() + "\x00" + m.thinkEffort
+		m.frameThinking = m.cachedFrameView(key, &m.frameThinkingKey, m.frameThinking, m.thinkView)
 		chrome += lipgloss.Height(m.frameThinking) + 1
 	}
-	if m.iactive != nil {
-		m.frameInteractive = m.interactiveView()
-		chrome += lipgloss.Height(m.frameInteractive) + 1
-	}
 	if m.permDialog != nil {
-		m.framePermission = m.permView()
+		d := m.permDialog
+		key := fmt.Sprintf("%p\x00%s\x00%s\x00%s\x00%s\x00%d\x00%t\x00%s", d, d.workerID, d.req.Tool, d.req.Command, d.req.Rule, d.sel, d.rejecting, d.rejectIn)
+		m.framePermission = m.cachedFrameView(key, &m.framePermissionKey, m.framePermission, m.permView)
 		chrome += lipgloss.Height(m.framePermission) + 1
 	}
 	if m.questionDialog != nil {
-		m.frameQuestion = m.questionView()
+		d := m.questionDialog
+		key := fmt.Sprintf("%p\x00%s\x00%d\x00%d\x00%t\x00%s\x00%d", d, d.request.ID, d.index, d.sel, d.other, d.otherIn, len(d.answers))
+		m.frameQuestion = m.cachedFrameView(key, &m.frameQuestionKey, m.frameQuestion, m.questionView)
 		chrome += lipgloss.Height(m.frameQuestion) + 1
 	}
 	if m.rew != nil {
-		m.frameRewind = m.rewindView()
+		key := fmt.Sprintf("%p\x00%d\x00%d", m.rew, m.rew.sel, len(m.rew.entries))
+		m.frameRewind = m.cachedFrameView(key, &m.frameRewindKey, m.frameRewind, m.rewindView)
 		chrome += lipgloss.Height(m.frameRewind) + 1
 	}
 	if m.menu != nil {
@@ -488,7 +466,16 @@ func (m *model) layout() {
 		m.vp.Width, m.vp.Height = w, h
 		m.refreshVP()
 	}
+	m.frameWidth = m.width
 	m.frameViewsValid = true
+}
+
+func (m *model) cachedFrameView(key string, oldKey *string, old string, render func() string) string {
+	if !m.frameViewsValid || m.frameWidth != m.width || *oldKey != key {
+		*oldKey = key
+		return render()
+	}
+	return old
 }
 
 // dockTop returns the screen row of the first TASK row in the dock: the dock
@@ -811,13 +798,6 @@ func (m *model) frameThinkingView() string {
 	return m.thinkView()
 }
 
-func (m *model) frameInteractiveView() string {
-	if m.frameViewsValid {
-		return m.frameInteractive
-	}
-	return m.interactiveView()
-}
-
 func (m *model) framePermissionView() string {
 	if m.frameViewsValid {
 		return m.framePermission
@@ -865,9 +845,6 @@ func (m *model) View() string {
 	if m.current != "" {
 		b.WriteString("\n" + m.frameCurrentView() + "\n")
 	}
-	if m.iactive != nil {
-		b.WriteString("\n" + m.frameInteractiveView() + "\n")
-	}
 	if m.permDialog != nil {
 		b.WriteString("\n" + m.framePermissionView() + "\n")
 	}
@@ -879,9 +856,7 @@ func (m *model) View() string {
 		if reviewHint := m.reviewBusyHint(); reviewHint != "" {
 			hint = reviewHint
 		}
-		if m.iactive != nil {
-			hint = " bash (interactive) — type to respond · ctrl+c ctrl+c to cancel"
-		} else if m.interrupt1 {
+		if m.interrupt1 {
 			hint = " thinking… (esc or ctrl+c again to interrupt)"
 		}
 		b.WriteString("\n" + m.spin.View() + dimStyle.Render(m.busyStats()+hint) + "\n")
@@ -914,20 +889,18 @@ func (m *model) View() string {
 	if m.rew != nil {
 		b.WriteString(m.frameRewindView() + "\n\n")
 	}
-	if m.iactive == nil {
-		if m.namePrompt != nil {
-			b.WriteString(m.namePrompt.label + " ")
-			if m.namePrompt.mask {
-				// Secrets never echo: render the mask instead of the input's
-				// live view (which would show the key in the clear). The "┃ "
-				// prompt matches how the textarea renders its own first line.
-				b.WriteString("┃ " + m.namePrompt.maskedValue(m.input.Value()))
-			} else {
-				b.WriteString(m.input.View())
-			}
+	if m.namePrompt != nil {
+		b.WriteString(m.namePrompt.label + " ")
+		if m.namePrompt.mask {
+			// Secrets never echo: render the mask instead of the input's
+			// live view (which would show the key in the clear). The "┃ "
+			// prompt matches how the textarea renders its own first line.
+			b.WriteString("┃ " + m.namePrompt.maskedValue(m.input.Value()))
 		} else {
 			b.WriteString(m.input.View())
 		}
+	} else {
+		b.WriteString(m.input.View())
 	}
 	if m.quit1 {
 		// first idle ctrl+c armed the quit; make the second press discoverable

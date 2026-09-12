@@ -4,10 +4,8 @@
 It records what the fork has, inherited from upstream whip's parity tracking against
 [pi](file:///home/abe/code/pi) and
 [opencode](file:///home/abe/code/coding-harnesses/opencode). Every unshipped item
-below carries its disposition — the phase in [plan.md](../plan.md) that owns it, or
-`deferred` / `cut` / `scoped down` from that document's
-[triage section](../plan.md#deferred-cut-and-scoped-down). Nothing here is an open
-question; if you want to reopen one, do it in `plan.md`, not by editing a checkbox.
+below carries its disposition — whether it is
+`deferred`, `cut`, or `scoped down`.
 
 Full exploration reports: [learnings/other-harnesses/opencode/](learnings/other-harnesses/opencode/),
 [learnings/other-harnesses/exo.md](learnings/other-harnesses/exo.md) (durable state, self-modification, scheduler/adapters).
@@ -17,17 +15,17 @@ its tests) and [concurrency.md](concurrency.md) (the channel patterns behind
 parallel tool calls and background subagents).
 
 **Post-pin upstream drift:** upstream shipped two agent-loop items after the pinned
-SHA in [UPSTREAM.md](../UPSTREAM.md). Streamed partial tool output shipped in Phase
-0.5; bash output spill is superseded by Phase 1's output store and will not be
+SHA in [UPSTREAM.md](../UPSTREAM.md). Streamed partial tool output is supported;
+bash output spill is superseded by the output store and will not be
 ported. This fork does not merge from upstream — see `UPSTREAM.md`.
 
 ## Fork baseline
 
-- [x] Phase 0 detachment: the pinned upstream revision is recorded in
+- [x] Independent detachment: the pinned upstream revision is recorded in
   [UPSTREAM.md](../UPSTREAM.md), the module/CLI/config surface is
   `github.com/sacca97/ghg`/`ghg`,
   and browser/computer automation plus its Swift driver are outside this fork's
-  initial scope. See the [living implementation plan](../plan.md).
+  initial scope.
 
 ## Table of contents
 
@@ -71,16 +69,16 @@ ported. This fork does not merge from upstream — see `UPSTREAM.md`.
 ## Sessions
 
 - [x] SQLite session store with `--resume` / `/resume` picker
-- [x] `--continue` resumes the newest session with persisted messages for the current working directory without opening the picker — `session.Store.MostRecentForCWD`, with a clear error when none exists (plan.md Phase 0.5)
+- [x] `--continue` resumes the newest session with persisted messages for the current working directory without opening the picker — `session.Store.MostRecentForCWD`, with a clear error when none exists
 - [x] Session titles: auto-generate a short title from the first exchange
 - [x] `/rename` a session (opencode: ctrl+r prompt dialog) — `/rename [title]`, bare opens an inline prompt prefilled with the current title, draft preserved
 - [x] `/fork` a session (pi: tree-structured JSONL entries with `parentId` — `docs/session-format.md`; opencode forks from any message via a per-message action menu) — `/fork [name]` copies the conversation to a new session with an auto-suggested `(fork #N)` name; `f` in the rewind picker forks from any message
 - [x] Timeline: jump-to-message picker that live-scrolls the transcript as you browse (opencode `dialog-timeline.tsx`) — the rewind picker (idle esc esc) does this and rewinds/forwards too
 - [x] Undo last message (conversation half): rewind restores the prompt text into the input for editing (opencode `routes/session/index.tsx:615`); file-change revert (opencode `revert.ts` git snapshots) is NOT done — conversation-only by design
 - [x] Compaction: summarize old turns when context fills (pi settings: `compaction: {reserveTokens, keepRecentTokens}`; opencode `/compact`) — `/compact` manually; auto-compacts proactively at an adaptive threshold ($\min(0.80 \times \text{window}, 400000, \text{window} - \text{reserve})$) or configurable % of the provider-advertised context_length (clamped 10–90, `compactPct`, slidable ←/→ in the ctrl+p settings); cumulative summarization reuses `<previous_checkpoint>` under a dedicated system prompt; kept tail is bounded at $\min(\text{window}/4, 24000)$ tokens and never orphans a tool_call from its result; retries once when the provider errors with context_length_exceeded; the configured `tiny` role supplies the summarizer; raw history is retained behind a recorded event and output references survive the prompt fold
-- [x] Session-scoped history recall: rebuildable SQLite FTS5 index (`history_search` and `history_read` tools) for searching earlier turns and retrieving raw messages without re-injecting them into the model context (plan.md Phase 3.6)
-- [x] Worker-backed live sessions: the TUI and bridge own the worker lifetime; `/detach` stops the worker for later resume, while `ghg ps`, `ghg attach`, and `ghg stop` manage live workers over local Unix sockets (plan.md Phase 3.7)
-- [x] Live context tracking and pre-call compaction: live token estimation for unmetered/OpenCode streams, in-flight token pressure guard before request dispatch, and runaway stream overflow watchdog (plan.md Phase 3.6)
+- [x] Session-scoped history recall: rebuildable SQLite FTS5 index (`history_search` and `history_read` tools) for searching earlier turns and retrieving raw messages without re-injecting them into the model context
+- [x] Worker-backed live sessions: the TUI and bridge own the worker lifetime; `/detach` stops the worker for later resume, while `ghg ps`, `ghg attach`, and `ghg stop` manage live workers over local Unix sockets
+- [x] Live context tracking and pre-call compaction: live token estimation for unmetered/OpenCode streams, in-flight token pressure guard before request dispatch, and runaway stream overflow watchdog
 - [x] Token/cost tracking per session (pi models.json carries `cost: {input, output, cacheRead, cacheWrite}`) — latest context usage/window in the bottom status box; cost computed from provider-advertised `pricing` in GET /models (cached in ~/.ghg/models.json), cached input billed at the cache-read rate; hidden when the provider doesn't advertise prices
 - [ ] Export transcript to markdown with include-options dialog (opencode `/export`, `ui/dialog-export-options.tsx`) — **cut**
 
@@ -98,19 +96,16 @@ ported. This fork does not merge from upstream — see `UPSTREAM.md`.
 - [x] Native `grep`, `glob`, and `find_files` — direct `rg --json` streaming with automatic in-process Go walker fallback; bounded grouped/OR text search, exact and fuzzy path search, stable cursors, byte-honest pages (capped at 250 matches / 8 KiB), snapshots bounded to 2,000 matches with a 16-snapshot registry and 30s cache TTL, deterministic ordering, binary/symlink policy, cancellation, and nested `.gitignore` matching
 - [x] Stateful observed edits & auto-healing fallback — bounded read observations authorize explicit range operations, including complete lines returned before a byte ceiling; auto-healing fallback reads target file from disk and applies changes in a single call when observations are missing/stale; post-edit observation chaining outputs fresh IDs for zero-roundtrip consecutive fixes; same-session exact-byte relocation, sorted multi-file locks, permission-first atomic publication, mode/line-ending preservation, compact diff/readback, diagnostics, and session persistence
 - [x] Tool-output telemetry and exploration redirects — per-tool preview/retained/original byte accounting, truncation metadata, route-correct model-call telemetry (including tiny compaction/title/goal calls), rolling UTF-8 preview buffer in bash runner, and conservative non-executing redirects for simple recursive inspection commands
-- [x] Plan runaway guard & per-turn tool freezing — tools and definitions are frozen once at turn start; Plan mode tracks weighted expenditure and enforces a 128 model-call ceiling, forcing plan synthesis when reserve is crossed; sparse `FanIn` eliminates unused JSON marshaling; code review failures trigger a cheap 2-round `submit_review`-only correction workflow (plan.md Phase 3.8)
-- [x] Streamed partial tool output — per-call context callback, 100ms accumulated snapshots, tool-id events, and a last-three-lines TUI tail that collapses on completion (plan.md Phase 0.5)
-- [ ] Spill truncated bash output to a temp file and mention the path (pi bash tool) — **superseded** by plan.md Phase 1 output storage — do not port
-- [x] Recoverable tool-result outputs — structured bounded results, deterministic head/tail retention up to 10 MiB, SHA-256 content-addressed payloads, session-scoped `output_list`/`output_read` (with legacy aliases), fork/rewind-safe metadata, explicit opt-out, no-session cleanup, untrusted-output delimiters, and `ghg outputs gc` — plan.md Phase 1
-- [x] Inject `GHG_SESSION_ID` / `GHG_MODEL` env into bash children (pi injects `PI_*`) — shipped: `bashrun.SetMarkers` stamps `GHG=1`, `GHG_SESSION_ID`, `GHG_MODEL`, `GHG_PID` on every child env (`internal/tools/bashrun/markers.go`, wired from `tui.go` on session create/resume); the checkbox was stale
-
-## Skills & subagents
-
-- [x] Trusted project instructions from `AGENTS.md` — bounded, symlink-rejecting load after the folder trust gate, injected beside `~/.ghg/me.md` (plan.md Phase 0.5)
+- [x] Plan runaway guard & per-turn tool freezing — tools and definitions are frozen once at turn start; Plan mode tracks weighted expenditure and enforces a 128 model-call ceiling, forcing plan synthesis when reserve is crossed; sparse `FanIn` eliminates unused JSON marshaling; code review failures trigger a cheap 2-round `submit_review`-only correction workflow
+- [x] Streamed partial tool output — per-call context callback, 100ms accumulated snapshots, tool-id events, and a last-three-lines TUI tail that collapses on completion
+- [ ] Spill truncated bash output to a temp file and mention the path (pi bash tool) — **superseded** by the output store — do not port
+- [x] Recoverable tool-result outputs — structured bounded results, deterministic head/tail retention up to 10 MiB, SHA-256 content-addressed payloads, session-scoped `output_list`/`output_read` (with legacy aliases), fork/rewind-safe metadata, explicit opt-out, no-session cleanup, untrusted-output delimiters, and `ghg outputs gc`
+- [x] Inject `GHG_SESSION_ID` / `GHG_MODEL` env into bash children (pi injects `PI_*`) — stamped on child env (`internal/tools/runtime_config.go`);
+- [x] Trusted project instructions from `AGENTS.md` — bounded, symlink-rejecting load after the folder trust gate, injected beside `~/.ghg/AGENTS.md`
 - [x] Skills: scan `.agents/skills/*/SKILL.md` (project) and `~/.ghg/skills/` (user), inject name+description into the system prompt as an `<available_skills>` block; the model reads a SKILL.md with its own read tool when relevant (pi's approach — no skill tool needed, `packages/coding-agent/src/core/skills.ts`)
 - [x] Subagents: a `task` tool that runs a self-contained prompt in a fresh `tiny`-role agent with the same tools (minus `task` — no recursion) and returns its final report; role-less legacy configs clone the parent route
 - [x] `$skill-name` invocation (codex-style) with live completion dropdown; skills re-indexed every turn and every `$` keystroke, so new skills load without restarting the ghg
-- [x] Custom agent definitions (`.agents/*.md` and `~/.ghg/agents/*.md` with strict `name`, `description`, `role`, `tools`, `max_rounds` frontmatter and Markdown prompts) — project-over-user precedence, unknown-tool load errors, and the reserved built-in reviewer; `/plan`, `ghg run --plan`, and `ghg run --plan-only` use the shared ordinary read-only Plan-mode turn loop — **plan.md Phase 2**
+- [x] Custom agent definitions (`.agents/*.md` and `~/.ghg/agents/*.md` with strict `name`, `description`, `role`, `tools`, `max_rounds` frontmatter and Markdown prompts) — project-over-user precedence, unknown-tool load errors, and the reserved built-in reviewer; `/plan`, `ghg run --plan`, and `ghg run --plan-only` use the shared ordinary read-only Plan-mode turn loop
 - [x] Parallel/background subagents (pi streams tool `onUpdate`; opencode `background-job.ts`) — `task` with `background:true` runs concurrently and reports back via a steered message; a `taskRegistry` keyed by id holds a `Done` channel whose single close follows the final `OnChange`/`OnRecord` callbacks and broadcasts persisted completion to every waiter; `/tasks` lists them and updates live via `OnChange`; tasks persist in the session store and are restored on `--resume` (a stale "running" row comes back as interrupted-error)
 - [ ] `@agent` mentions to target a named subagent (opencode autocomplete) — **deferred**
 
@@ -119,18 +114,16 @@ ported. This fork does not merge from upstream — see `UPSTREAM.md`.
 - [x] Model → provider routing in config (switch providers without touching models)
 - [x] Provider-neutral backend boundary with compiled OpenAI-compatible Chat Completions, OpenAI Responses, and Anthropic adapters plus optional model catalog capability
 - [x] Declarative YAML provider profiles with embedded/user/trusted-project precedence, strict validation, and anonymous legacy compatibility
-- [x] Profile-driven `/auth` and `ghg auth` for every loaded provider, with masked TUI input, validation-before-save, catalog seeding/probes, YAML-only custom profiles, a single-profile ordered route table for multi-protocol providers, and a degraded cold start that promotes the acting `fast` role when available (otherwise the first catalog model) in place — **plan.md Phase 2**
-- [x] `anthropic-messages` API style alongside `openai-completions` (pi: `packages/ai/src/api/`) — native Messages adapter with tools, vision, thinking, cache usage, retries, and model discovery; **plan.md Phase 2**
-- [x] `openai-responses` API style — native `/responses` adapter with flattened function tools, streamed text/reasoning/tool-call events, preserved output-item history, usage, retries, probing, and model discovery; **plan.md Phase 2**
-- [x] Model roles: JSONC `roles` accepts only `default`, `smart`, `fast`, and `tiny`; acting defaults to `fast`, planning defaults to `smart`, compaction and delegated tasks select `tiny`, and each role resolves through the profile factory with default/legacy fallback. The TUI exposes cycling bottom-bar `execute`/`plan` mode and model controls plus a role-first, API-key-filtered model selector (`plan` maps to `smart`) — **plan.md Phase 2**
+- [x] Profile-driven `/auth` and `ghg auth` for every loaded provider, with masked TUI input, validation-before-save, catalog seeding/probes, YAML-only custom profiles, a single-profile ordered route table for multi-protocol providers, and a degraded cold start that promotes the acting `fast` role when available (otherwise the first catalog model) in place
+- [x] `anthropic-messages` API style alongside `openai-completions` (pi: `packages/ai/src/api/`) — native Messages adapter with tools, vision, thinking, cache usage, retries, and model discovery
+- [x] `openai-responses` API style — native `/responses` adapter with flattened function tools, streamed text/reasoning/tool-call events, preserved output-item history, usage, retries, probing, and model discovery
+- [x] Model roles: JSONC `roles` accepts only `default`, `smart`, `fast`, and `tiny`; acting defaults to `fast`, planning defaults to `smart`, compaction and delegated tasks select `tiny`, and each role resolves through the profile factory with default/legacy fallback. The TUI exposes cycling bottom-bar `execute`/`plan` mode and model controls plus a role-first, API-key-filtered model selector (`plan` maps to `smart`)
 - [x] Context-window metadata fallback: when a provider catalog omits `context_length`, lazily fetch the matching `limit.context` from the daily models.dev provider/model snapshot; only listed model IDs are retained locally, and profile aliases cover gateways whose runtime ID differs from its public metadata ID
 - [x] `"$VAR"` / `"!cmd"` resolution for apiKey/header values in config (pi models.json value resolution) — shipped with secrets-by-reference (internal/config/secret.go), resolved at point of use
 - [x] Reasoning effort: `/effort` (bare opens the selector), tab-completes, and the clickable `(effort)` control use the selected model's models.dev/provider-advertised options, including `max`, toggle-only `off`/`on`, and explicit off-only models; graded values and adapter-supported toggle state are sent per request, inherited by subagents, and survive model switches
-- [ ] Per-model sampling params in config (`samplingParams: {temperature, top_p}`) — **plan.md Phase 2** — added with roles and the provider-specific request shape
+- [ ] Per-model sampling params in config (`samplingParams: {temperature, top_p}`) — added with roles and the provider-specific request shape
 
 ## MCP
-
-Improvement plan with per-item checkboxes: [`.ai-docs/plans/mcp-polish/`](../.ai-docs/plans/mcp-polish/README.md).
 
 - [x] MCP client: stdio + streamable HTTP servers; config merges claude-style `.mcp.json` and codex-style `~/.codex/config.toml [mcp_servers]` under ghg's own `"mcp"` block (opencode's status model `mcp/index.ts:83-106`, name sanitization + tool bridging `mcp/catalog.ts:47-90,117-119` — with the sanitize-collision fixed via hashed server keys; claude-code's `mcp__server__tool` naming kept). Lazy-with-kickoff connects (close-to-broadcast `ready` chan), per-server call serialization, 30s startup / 60s call timeouts, errors as tool output, `/mcp` status + reconnect/enable/disable, `ghg mcp add|list|remove|serve`
 - [ ] MCP resources/prompts (opencode: synthetic `read_mcp_resource` tools + prompts-as-slash-commands) — **deferred**
@@ -146,11 +139,11 @@ Improvement plan with per-item checkboxes: [`.ai-docs/plans/mcp-polish/`](../.ai
 
 ## LSP
 
-- [x] LSP diagnostics in `write`/`edit` tool output — stdlib-only client (`internal/lsp/`), gopls built-in + user servers via the `"lsp"` config block, capped 1.5s wait, sibling-file errors included (opencode `src/lsp/` diagnostics flow, research in `docs/learnings/other-harnesses/opencode/lsp.md`); plan: [`.ai-docs/plans/lsp-diagnostics/`](../.ai-docs/plans/lsp-diagnostics/README.md) (Linear INF-4989)
-- [ ] `@file.go#N` symbol-range expansion via `documentSymbol` (Linear INF-4991; deferred from the at-mentions port — see `docs/learnings/other-harnesses/opencode/at-mentions.md`) — **deferred** — plan.md Phase 3 adds `documentSymbol` anyway
-- [x] Read warm-up (forked `touchFile` on read so first-edit diagnostics and symbol lookups are instant — opencode `tool/read.ts:119`) — **plan.md Phase 3**
+- [x] LSP diagnostics in `write`/`edit` tool output — stdlib-only client (`internal/lsp/`), gopls built-in + user servers via the `"lsp"` config block, capped 1.5s wait, sibling-file errors included (opencode `src/lsp/` diagnostics flow, research in `docs/learnings/other-harnesses/opencode/lsp.md`, Linear INF-4989)
+- [ ] `@file.go#N` symbol-range expansion via `documentSymbol` (Linear INF-4991; deferred from the at-mentions port — see `docs/learnings/other-harnesses/opencode/at-mentions.md`) — **deferred** — `documentSymbol` is supported via the `lsp` tool
+- [x] Read warm-up (forked `touchFile` on read so first-edit diagnostics and symbol lookups are instant — opencode `tool/read.ts:119`)
 - [ ] Pull diagnostics (`textDocument/diagnostic`) for servers without push — **deferred**
-- [x] Navigation & safe rename tool (`lsp` tool for definition/references/document_symbol/hover; `lsp_rename` preview and atomic multi-file application with locked publication) — **plan.md Phase 3**
+- [x] LSP navigation tool (`lsp` tool for definition/references/document_symbol/hover)
 
 ## Safety & permissions
 
@@ -158,8 +151,8 @@ Improvement plan with per-item checkboxes: [`.ai-docs/plans/mcp-polish/`](../.ai
 - [x] Command-prefix arity for simple "allow always" rules: `git checkout branch` → rule for `git checkout`; compound commands use exact normalized rules and cannot reuse a first-command approval (opencode `permission/arity.ts`)
 - [x] Project trust prompt on first run in a directory (pi: `trust.json`, `defaultProjectTrust: "ask"`) — `internal/tui/trust.go` + `~/.ghg/trusted.json`, plain-terminal prompt before the TUI starts, piped stdin declines safely
 - [x] Secrets as references, never values: `"$VAR"`/`"!cmd"` (or `${ENV_VAR}`-style) indirection in config and MCP/tool init, resolved host-side at point of use so raw keys never enter the event log or model context (exo `crates/exoharness/src/secrets.rs` — AES-GCM at rest with keychain/file master key is the full version; the indirection alone is most of the safety)
-- [x] Initial shared execution policy and OS sandbox substrate: canonical native roots, protected metadata, minimal child environments, fail-closed macOS Seatbelt/Linux bubblewrap wrappers, explicit sandbox/network modes, local MCP/LSP process wiring, and headless/TUI runtime inheritance — plan.md Phase 3; backend-denial retry remains open
-- [x] Optional `auto-review`/`approve-for-me`: one tool-less bounded `tiny` decision for the deterministic ambiguous middle, strict structured output, human fallback in interactive mode, fail-closed headless behavior, one-shot network grants plus human-only external-root/protected grants, in-flight deduplication, and separate reviewer audit telemetry — plan.md Phase 3
+- [x] Initial shared execution policy and OS sandbox substrate: canonical native roots, protected metadata, minimal child environments, fail-closed macOS Seatbelt/Linux bubblewrap wrappers, explicit sandbox/network modes, local MCP/LSP process wiring, and headless/TUI runtime inheritance; backend-denial retry remains open
+- [x] Optional `auto`/`approve-for-me`: one tool-less bounded `tiny` decision for the deterministic ambiguous middle, strict structured output, human fallback in interactive mode, fail-closed headless behavior, one-shot network grants plus human-only external-root/protected grants, in-flight deduplication, and separate reviewer audit telemetry
 
 ## Theming & config
 
@@ -192,7 +185,7 @@ came out the way it did.
 - [x] Workspace rewind: git-snapshot the working tree per turn (or on demand) so file changes can be rolled back, and record the rollback in the session — "rewind does not erase history": rolling back the world must not delete the memory of what was tried (exo `rewind_sandbox` appends `SandboxStarted{snapshot_id}`; opencode `revert.ts` is the same idea) — pre-turn snapshot pinned under `refs/ghg/snapshots/`, keyed by turn index in a `snapshots` table that `DeleteFrom` trims with the messages; `applyRewind` restores via `checkout <ref> -- .` and notes "⟲ workspace rewound — N file(s) restored"; untracked files never touched
 
 - [x] `remember`/`forget` memory tools: plain markdown files (`~/.ghg/memory.md` installation scope + `~/.ghg/sessions/<id>.memory.md` session scope), checkbox bullets the user can edit by hand; `forget` strikes rather than deletes; always-inject with a hard cap (50 × 300 chars — the cap is the retrieval strategy, no embeddings); `/memory` lists both scopes numbered and marks entries done from the TUI (exo `exo/tools/memory-tools.ts`, redesigned to markdown after the opencode finding: opencode has no memory tool, its answer is AGENTS.md — files you own and diff)
-- [x] Stealable `me.md` operating rules for the system prompt: "the tool set changes turn to turn — never assume a tool exists because it did earlier"; "after ~3 failed attempts on the same blocker, escalate plainly instead of looping"; git hygiene ("never `git add .`, review staged diff for secrets, never force-push") (exo `exo/prompts/me.md`) — shipped in `cmd/ghg/main.go`'s system prompt, plus a remember/forget pointer
+- [x] Stealable `AGENTS.md` operating rules for the system prompt: "the tool set changes turn to turn — never assume a tool exists because it did earlier"; "after ~3 failed attempts on the same blocker, escalate plainly instead of looping"; git hygiene ("never `git add .`, review staged diff for secrets, never force-push") (exo `exo/prompts/me.md`) — shipped in `cmd/ghg/main.go`'s system prompt, plus a remember/forget pointer
 
 - [x] Minimal scheduler + generic wakeup channel: `@every 10m` / `@at <rfc3339>` tasks firing machine-authored user-message turns; grid-anchored fires (slow runs don't drift), one-shot completion stays listed as (fired), fires defer while busy without drifting the grid. Cron syntax deliberately cut (two forms cover the use); the record-then-deliver outbox and `reportPrompt` routing remain future work if external channels land (exo `scheduler_runtime.rs`, `conversation_wakeup.rs`) — `internal/schedule` (parser, ~70 lines), `schedules` table in sessions.db, 5s ticker in the TUI, `/schedule @every|@at <prompt> | list | cancel <n>`, ⏰ transcript marker
 

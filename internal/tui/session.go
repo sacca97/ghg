@@ -386,8 +386,8 @@ func (m *model) forkCommand(arg string) {
 	// bare: suggest "<title> (fork #N)" and let the user rename inline
 	suggest := "session (fork #1)"
 	if m.sessionID != "" {
-		if meta, _, err := m.store.Load(m.sessionID); err == nil {
-			if t, err := m.store.ForkTitle(meta.Title); err == nil {
+		if title, err := m.store.Title(m.sessionID); err == nil {
+			if t, err := m.store.ForkTitle(title); err == nil {
 				suggest = t
 			}
 		}
@@ -429,18 +429,10 @@ func (m *model) forkWorker(cut int, title string) {
 		m.append(dimStyle.Render("(worker is busy — fork after this work finishes)"))
 		return
 	}
-	if m.workerClient == nil && !m.ensureWorker() {
-		m.append(errStyle.Render("fork failed: worker unavailable: " + m.workerStartError))
-		return
-	}
-	requestID := workerRequestID("fork")
 	view := append(m.messagesSnapshot(), m.future...)
-	if err := m.workerClient.Send(workerwire.CommandFork, requestID, workerwire.ForkRequest{
+	m.sendWorkerCommand("/fork", "fork", workerwire.CommandFork, workerwire.ForkRequest{
 		Cut: cut, Title: title, Messages: view,
-	}); err != nil {
-		m.append(errStyle.Render("fork failed: " + err.Error()))
-		return
-	}
+	})
 }
 
 // renameCommand implements /rename [title].
@@ -455,8 +447,8 @@ func (m *model) renameCommand(arg string) {
 	}
 	cur := ""
 	if m.sessionID != "" {
-		if meta, _, err := m.store.Load(m.sessionID); err == nil {
-			cur = meta.Title
+		if title, err := m.store.Title(m.sessionID); err == nil {
+			cur = title
 		}
 	}
 	m.openNamePrompt("✎ session name:", cur, m.rename)
@@ -472,33 +464,13 @@ func (m *model) rename(title string) {
 		m.append(errStyle.Render("no session to rename"))
 		return
 	}
-	if m.workerClient == nil && !m.ensureWorker() {
-		m.append(errStyle.Render("rename failed: worker unavailable: " + m.workerStartError))
-		return
-	}
-	requestID := workerRequestID("rename")
-	if err := m.workerClient.Send(workerwire.CommandRename, requestID, workerwire.RenameRequest{Title: title}); err != nil {
-		m.append(errStyle.Render("rename failed: " + err.Error()))
-		return
-	}
+	m.sendWorkerCommand("/rename", "rename", workerwire.CommandRename, workerwire.RenameRequest{Title: title})
 }
 
-// Rewind: double-esc while idle opens a picker over the conversation's
-// authored user messages. Browsing live-scrolls the transcript (opencode's
-// dialog-timeline onMove). enter rewinds the conversation to just before the
-// selected message — Agent.Messages and the DB are truncated, the transcript
-// is rebuilt, and the message text lands back in the input for editing
-// (opencode's undo: "the input restore is what makes it feel good"). The
-// clipped tail is kept in memory as a redo stack: reopening the picker while
-// rewound lists the clipped messages dimmed below the live ones, and enter on
-// one moves forward again. Submitting anything new discards the future.
-// Fork from any entry with f.
+// Rewind truncates session history to a selected user message and restores its text to the input.
+// Truncated messages remain in an in-memory redo stack until a new turn is submitted.
 
-// rewindEntry is one row of the rewind picker. cut is the conversation index
-// the entry points at: for a live message it is its index in agent.Messages,
-// for a clipped "future" message it is its original conversation index
-// (base + position in the redo stack, where base = len(agent.Messages)).
-// enter rewinds to just before cut; f forks the history through cut.
+// rewindEntry represents one selectable point in the rewind timeline.
 type rewindEntry struct {
 	cut    int
 	text   string     // single-line preview
@@ -595,10 +567,6 @@ func (m *model) rewindKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m *model) requestWorkerRewind(cut int) {
-	if m.workerClient == nil && !m.ensureWorker() {
-		m.append(errStyle.Render("rewind: worker unavailable: " + m.workerStartError))
-		return
-	}
 	current := m.messagesSnapshot()
 	all := append(slices.Clone(current), m.future...)
 	cut = min(max(cut, 1), max(len(all)-1, 1))
@@ -610,18 +578,15 @@ func (m *model) requestWorkerRewind(cut int) {
 	if msg := m.messageAt(cut); msg.Role == "user" && msg.Authored {
 		text = msg.TextContent()
 	}
-	requestID := workerRequestID("rewind")
-	m.workerHistoryRequest = requestID
-	m.workerRewindRestore = text
-	if err := m.workerClient.Send(workerwire.CommandRewind, requestID, workerwire.RewindRequest{
+	requestID := m.sendWorkerCommand("rewind", "rewind", workerwire.CommandRewind, workerwire.RewindRequest{
 		Cut: cut, Messages: all[:cut],
-	}); err != nil {
-		m.workerHistoryRequest = ""
-		m.workerRewindRestore = ""
+	})
+	if requestID == "" {
 		m.clearPendingRewind()
-		m.append(errStyle.Render("rewind: " + err.Error()))
 		return
 	}
+	m.workerHistoryRequest = requestID
+	m.workerRewindRestore = text
 	var nextFuture []models.Message
 	if cut < len(current) {
 		nextFuture = append(slices.Clone(current[cut:]), m.future...)

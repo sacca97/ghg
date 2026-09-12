@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -223,6 +224,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.input, cmd = m.input.Update(msg)
 		return m, cmd
 	}
+	m.dockTasksValid = false
 	if m.settings != nil {
 		m.settings.rootRowsValid = false
 	}
@@ -345,7 +347,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.flushThink()
 			m.thinkStart = time.Time{}
 		}
-		if msg.err != nil && !wasDetached {
+		if msg.err != nil && !wasDetached && !errors.Is(msg.err, context.Canceled) {
 			m.append(errStyle.Render("worker: " + msg.err.Error()))
 		}
 		return m, nil
@@ -446,56 +448,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case meEditedMsg:
 		if msg.err != nil {
 			m.append(errStyle.Render("/me: editor failed: " + msg.err.Error()))
-		} else if n := len(config.MeInstructions()); n > 0 {
-			m.append(dimStyle.Render("✓ me.md saved — standing instructions updated (" + fmt.Sprint(n) + " chars)"))
+		} else if n := len(config.UserInstructions()); n > 0 {
+			m.append(dimStyle.Render("✓ " + filepath.Base(msg.path) + " saved — standing instructions updated (" + fmt.Sprint(n) + " chars)"))
 		} else {
-			m.append(dimStyle.Render("me.md saved — no standing instructions set (all comments)"))
-		}
-		return m, nil
-
-	case interactiveStartMsg:
-		// passthrough mode: route keystrokes into the PTY. The output pane is
-		// shown by View(); a fresh toolStartMsg-style banner is appended so the
-		// user sees "bash (interactive)" inline with the transcript.
-		m.flushStreaming()
-		m.iactive = &interactive{keys: msg.keys}
-		m.append(toolStyle.Render("⚒ bash ") + dimStyle.Render("(interactive — type to respond, 15s inactivity timeout)"))
-		return m, nil
-
-	case interactiveOutMsg:
-		if m.iactive == nil {
-			return m, nil
-		}
-		m.iactive.output += msg.chunk
-		// any output means the command is producing, not waiting
-		m.iactive.await = false
-		return m, nil
-
-	case interactiveAwaitMsg:
-		if m.iactive == nil {
-			return m, nil
-		}
-		m.iactive.await = true
-		m.iactive.awaitcd = msg.secsLeft
-		return m, nil
-
-	case interactiveDoneMsg:
-		if m.iactive != nil {
-			// fold the streamed output + exit into the transcript as a normal
-			// tool result so the session record matches the non-interactive path
-			lines := strings.Split(strings.TrimRight(msg.output, "\n"), "\n")
-			// cap the persisted preview like toolEndMsg, but keep the full text
-			// available to the model (it's already in the tool result string)
-			preview := toolPreview(lines)
-			out := dimStyle.Render("  " + strings.Join(preview, "\n  "))
-			if len(lines) > len(preview) {
-				out += dimStyle.Render(fmt.Sprintf("\n  … +%d lines", len(lines)-len(preview)))
-			}
-			if msg.exit != "" {
-				out += "\n" + dimStyle.Render("  ("+msg.exit+")")
-			}
-			m.append(out)
-			m.iactive = nil
+			m.append(dimStyle.Render(filepath.Base(msg.path) + " saved — no standing instructions set (all comments)"))
 		}
 		return m, nil
 
@@ -523,9 +479,10 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// goal and kick off the goal loop exactly like /goal <text>
 		m.flushStreaming()
 		switch {
-		case msg.err == context.Canceled:
+		case msg.interrupted || errors.Is(msg.err, context.Canceled):
 			m.finishTurnState()
-			m.append(dimStyle.Render("(interrupted)"))
+			// Intentional cancellation is an internal operation boundary, not a
+			// transcript error.
 		case msg.err != nil:
 			m.finishTurnState()
 			m.append(errStyle.Render("goal-from-context failed: " + msg.err.Error()))
@@ -555,7 +512,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if msg.err != nil {
 			if errors.Is(msg.err, context.Canceled) {
-				m.append(dimStyle.Render("(compaction interrupted)"))
+				// Intentional cancellation is silent.
 			} else {
 				m.append(errStyle.Render("compact failed: " + msg.err.Error()))
 			}
@@ -677,11 +634,9 @@ func (m *model) handleTurnDone(msg turnDoneMsg) (tea.Model, tea.Cmd) {
 	// Cancellation arrives wrapped from the in-flight http request
 	// ("Post ...: context canceled"), so identity comparison misses it —
 	// which would strand the queue instead of draining it.
-	canceled := errors.Is(msg.err, context.Canceled)
+	canceled := msg.interrupted || errors.Is(msg.err, context.Canceled)
 	if msg.err != nil && !canceled {
 		m.append(errStyle.Render("error: " + msg.err.Error()))
-	} else if canceled {
-		m.append(dimStyle.Render("(interrupted — any running tool calls will be recorded as interrupted; ghg can retry them next turn)"))
 	}
 	continueGoal := msg.goalContinue && msg.err == nil && !canceled
 	if msg.goal != nil {

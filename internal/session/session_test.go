@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/sacca97/ghg/internal/models"
+	"github.com/sacca97/ghg/internal/workspace"
 )
 
 func TestTaskRoundTrip(t *testing.T) {
@@ -541,7 +542,7 @@ func TestDeleteSessionDropsSnapshotRefs(t *testing.T) {
 	if err := st.SetSnapshot(otherID, 1, ref); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := RestoreWorkspace(repo, ref); err != nil {
+	if _, err := workspace.Restore(repo, ref); err != nil {
 		t.Fatal(err)
 	}
 	if out, err := exec.Command("git", "-C", repo, "show-ref", "--verify", "--quiet", "refs/ghg/snapshots/"+ref).CombinedOutput(); err != nil {
@@ -573,13 +574,15 @@ func TestGoalPersistence(t *testing.T) {
 	if err := st.SetGoal(id, "finish the thing"); err != nil {
 		t.Fatal(err)
 	}
-	meta, _, err := st.Load(id)
-	if err != nil || meta.Goal != "finish the thing" {
-		t.Fatalf("goal not restored: %+v %v", meta, err)
+	record, ok, err := st.LoadGoal(id)
+	if err != nil || !ok || record.Objective != "finish the thing" || record.Status != GoalStatusActive {
+		t.Fatalf("goal not restored: %+v %v %v", record, ok, err)
 	}
-	st.SetGoal(id, "")
-	if meta, _, _ = st.Load(id); meta.Goal != "" {
-		t.Fatalf("goal not cleared: %+v", meta)
+	if err := st.SetGoal(id, ""); err != nil {
+		t.Fatal(err)
+	}
+	if record, ok, err = st.LoadGoal(id); err != nil || !ok || record.Status != GoalStatusPaused {
+		t.Fatalf("goal not cleared: %+v %v %v", record, ok, err)
 	}
 }
 

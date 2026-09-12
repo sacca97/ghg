@@ -11,15 +11,8 @@ import (
 	"github.com/sacca97/ghg/internal/tools"
 )
 
-// fileLocks serializes mutations to the same canonical path across parallel
-// tool calls. Each path owns a 1-capacity channel used as a semaphore: a tool
-// acquires by sending (blocks until free) and releases by receiving. A channel
-// per path is the idiomatic Go form of pi's per-path promise-chain queue — no
-// explicit unlock bookkeeping.
-//
-// Only write/edit take a per-path lock; reads don't. Bash and lsp_rename apply
-// take the global lock because their side effects cannot be attributed to one
-// path before the tool validates the complete request.
+// fileLocks serializes write operations to identical canonical paths using 1-slot channel semaphores.
+// Path writes serialize concurrently with bash commands via world/global locks.
 type fileLocks struct {
 	mu     sync.Mutex
 	locks  map[string]chan struct{}
@@ -34,9 +27,7 @@ func newFileLocks() *fileLocks {
 	}
 }
 
-// acquirePaths takes every path lock in canonical lexical order. The sorted
-// order is important for a multi-file edit: two overlapping calls cannot
-// deadlock by taking their files in opposite orders.
+// acquirePaths acquires path locks in lexical order to prevent deadlocks across multi-file edits.
 func (f *fileLocks) acquirePaths(paths []string) func() {
 	keys := make([]string, 0, len(paths))
 	seen := make(map[string]struct{}, len(paths))
@@ -126,20 +117,8 @@ func toolMutationPaths(toolName, args string) []string {
 	return paths
 }
 
-func toolRequiresGlobalMutation(toolName, args string) bool {
-	if toolName == "bash" {
-		return true
-	}
-	if toolName != "lsp_rename" {
-		return false
-	}
-	var request struct {
-		Operation string `json:"operation"`
-	}
-	if err := json.Unmarshal([]byte(args), &request); err != nil {
-		return false
-	}
-	return strings.EqualFold(strings.TrimSpace(request.Operation), "apply")
+func toolRequiresGlobalMutation(toolName string) bool {
+	return toolName == "bash"
 }
 
 // RebuildTouched rehydrates the ranking hints from a resumed conversation.

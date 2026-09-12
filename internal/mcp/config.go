@@ -1,12 +1,5 @@
-// Package mcp implements ghg's Model Context Protocol support: a client that
-// connects to configured MCP servers (stdio and streamable HTTP) and exposes
-// their tools to the agent loop, plus a server (`ghg mcp serve`) exposing
-// ghg's own tools.
-//
-// Configuration is backwards compatible with claude-style (.mcp.json project
-// files) and codex-style (~/.codex/config.toml [mcp_servers]) formats; both
-// are normalized into ServerConfig and merged with ghg's own "mcp" block in
-// ~/.ghg/config.json, which always wins on name conflicts.
+// Package mcp provides MCP client and server implementations.
+// Merges local configurations from .mcp.json and config.toml into ~/.ghg/config.json.
 package mcp
 
 import (
@@ -216,15 +209,8 @@ func (p ImportSourcePolicy) Admits(name string) bool {
 	return true
 }
 
-// Filtered is the discovery result when an ImportPolicy is applied: Merged is
-// what the manager connects to; Blocked holds the servers the policy filtered
-// out, forced disabled with a note so they stay visible (/mcp, ghg mcp
-// list) instead of vanishing silently. Blocked never shadows a ghg entry of
-// the same name. Sources attributes every discovered name (merged or
-// blocked) to the file that contributes/would contribute it ("ghg",
-// ".mcp.json", or "codex") — codex wins over claude, ghg over both. Each
-// merged/blocked ServerConfig also carries its Source file path so a failed
-// server can point at the file to fix.
+// Filtered contains discovery results after applying an ImportPolicy.
+// Merged contains active servers; Blocked holds disabled servers for visibility.
 type Filtered struct {
 	Merged  map[string]ServerConfig
 	Blocked map[string]ServerConfig

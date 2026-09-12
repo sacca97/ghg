@@ -32,21 +32,20 @@ const (
 	maxEntryLength = 300
 )
 
-// Entry is one numbered memory line. Entries are numbered across the whole
-// file (done lines keep their numbers, so deletion targets stay stable).
+// Entry represents one numbered fact in a memory file.
 type Entry struct {
 	N    int    // 1-based line number among entry lines
-	Text string // the fact, without the checkbox
-	Done bool   // "- [x]" — struck, not injected
+	Text string // fact content without markdown checkbox
+	Done bool   // completed item flag
 }
 
-// Scope is one memory file.
+// Scope represents a memory file target.
 type Scope struct {
-	Path string // absolute path of the .md file
-	Name string // "installation" or "session" — used in the injected header
+	Path string // absolute path of the memory file
+	Name string // scope label ("installation" or "session")
 }
 
-// Installation returns the ~/.ghg/memory.md scope.
+// Installation returns the global ~/.ghg/memory.md scope.
 func Installation() Scope {
 	dir, err := config.Dir()
 	if err != nil {
@@ -55,7 +54,7 @@ func Installation() Scope {
 	return Scope{Path: filepath.Join(dir, "memory.md"), Name: "installation"}
 }
 
-// Session returns the per-session scope ("" id yields a no-scope zero value).
+// Session returns the per-session memory scope.
 func Session(id string) Scope {
 	if id == "" {
 		return Scope{}

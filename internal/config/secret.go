@@ -12,18 +12,8 @@ import (
 // SecretCmdTimeout bounds a "!cmd" secret reference.
 const SecretCmdTimeout = 5 * time.Second
 
-// ResolveSecret resolves a secret-by-reference configured value at the point
-// of use. The config file stores the REFERENCE, never the resolved value:
-//
-//	"$NAME" / "${NAME}" → os.Getenv(NAME); error if unset or empty.
-//	"!cmd args..."      → trimmed stdout of the command; error on failure.
-//	anything else       → returned as-is (a literal key; backwards compatible).
-//
-// This is the exo secrets-as-references pattern (secret_id indirection —
-// docs/learnings/other-harnesses/exo.md §10): resolution happens when the
-// secret is actually needed for a request, never at load or save, so config
-// and the session store hold only references. Resolved values must never be
-// passed to LogEvent or written to the event log.
+// ResolveSecret evaluates secret references ($VAR or !cmd) during request execution.
+// Configuration stores only references; do not write resolved secret values to logs.
 func ResolveSecret(v string) (string, error) {
 	switch {
 	case strings.HasPrefix(v, "${") && strings.HasSuffix(v, "}"):

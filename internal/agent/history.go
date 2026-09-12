@@ -7,11 +7,11 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-	"unicode/utf8"
 
 	"github.com/sacca97/ghg/internal/models"
 	"github.com/sacca97/ghg/internal/search"
 	"github.com/sacca97/ghg/internal/session"
+	"github.com/sacca97/ghg/internal/textutil"
 	"github.com/sacca97/ghg/internal/tools"
 )
 
@@ -333,21 +333,9 @@ func boundedHistoryDisplay(value string, limit int) string {
 	}
 	const suffix = "…"
 	if limit < len(suffix) {
-		return value[:utf8Prefix(value, limit)]
+		return value[:textutil.UTF8Prefix(value, limit)]
 	}
-	return value[:utf8Prefix(value, limit-len(suffix))] + suffix
-}
-
-func utf8Prefix(value string, limit int) int {
-	end := 0
-	for end < len(value) {
-		_, size := utf8.DecodeRuneInString(value[end:])
-		if end+size > limit {
-			break
-		}
-		end += size
-	}
-	return end
+	return value[:textutil.UTF8Prefix(value, limit-len(suffix))] + suffix
 }
 
 func renderHistoryRead(snapshot search.Snapshot, cursor historyCursor) (tools.ToolResult, bool) {

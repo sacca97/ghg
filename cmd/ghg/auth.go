@@ -124,16 +124,16 @@ func authCLI(args []string) error {
 	if err != nil {
 		return err
 	}
-	if err := cfg.UpsertProviderKey(name, result.Profile, key, *envMode); err != nil {
-		return err
+	infos := result.Models
+	if !result.Validated {
+		infos = nil
 	}
-	if err := cfg.Save(); err != nil {
-		return err
-	}
-	if result.Validated && len(result.Models) > 0 {
-		if err := config.SaveCatalog(name, result.Profile.BaseURL, result.Models); err != nil {
-			fmt.Printf("catalog prefetch failed; provider remains configured: %v\n", err)
+	if err := auth.CommitCredential(cfg, name, result.Profile, key, *envMode, infos); err != nil {
+		var catalogErr *auth.CatalogError
+		if !errors.As(err, &catalogErr) {
+			return err
 		}
+		fmt.Printf("catalog prefetch failed; provider remains configured: %v\n", catalogErr.Err)
 	}
 	if result.CatalogErr != nil {
 		fmt.Printf("catalog prefetch failed; provider remains configured: %v\n", result.CatalogErr)

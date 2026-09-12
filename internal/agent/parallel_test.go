@@ -4,8 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
@@ -39,31 +37,28 @@ func slowTool(name string, conc *atomic.Int32, maxConc *atomic.Int32) tools.Tool
 	}
 }
 
-// parallelServer emits three tool calls in one assistant turn, then a final answer.
-func parallelServer(t *testing.T) *httptest.Server {
+// parallelBackend emits three tool calls in one assistant turn, then a final answer.
+func parallelBackend(t *testing.T) models.Backend {
 	t.Helper()
 	call := 0
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return &mockAgentBackend{streamFn: func(_ context.Context, _ models.Request, sink models.EventSink) (models.Message, models.Usage, error) {
 		call++
-		w.Header().Set("Content-Type", "text/event-stream")
 		if call == 1 {
+			calls := make([]models.ToolCall, 3)
 			for i, id := range []string{"a", "b", "c"} {
-				args := fmt.Sprintf(`{"s":%q}`, id)
-				fmt.Fprintf(w, `data: {"choices":[{"delta":{"tool_calls":[{"index":%d,"id":%q,"type":"function","function":{"name":"slow","arguments":%q}}]}}]}`+"\n\n", i, id, args)
+				calls[i] = agentToolCall(id, "slow", fmt.Sprintf(`{"s":%q}`, id))
 			}
-			fmt.Fprint(w, `data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`+"\n\n")
-		} else {
-			fmt.Fprint(w, `data: {"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]}`+"\n\n")
+			return models.Message{Role: "assistant", ToolCalls: calls}, models.Usage{}, nil
 		}
-		fmt.Fprint(w, "data: [DONE]\n\n")
-	}))
+		if sink.OnText != nil {
+			sink.OnText("done")
+		}
+		return models.Message{Role: "assistant", Content: "done"}, models.Usage{}, nil
+	}}
 }
 
 func TestToolCallsRunInParallel(t *testing.T) {
-	srv := parallelServer(t)
-	defer srv.Close()
-
-	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
+	ag := New(parallelBackend(t), "m", 100, "sys")
 	var conc, maxConc atomic.Int32
 	// one shared tool named "slow" — all three calls hit it
 	ag.Tools = []tools.Tool{slowTool("slow", &conc, &maxConc)}
@@ -80,7 +75,7 @@ func TestToolCallsRunInParallel(t *testing.T) {
 // unrelated calls run in parallel.
 func TestSamePathEditsSerialize(t *testing.T) {
 	// craft an agent whose tool runner we drive directly
-	ag := New(testBackend("http://unused", "k"), "m", 100, "sys")
+	ag := New(&mockAgentBackend{}, "m", 100, "sys")
 
 	var conc, maxConc atomic.Int32
 	write := tools.Tool{
@@ -117,7 +112,7 @@ func TestSamePathEditsSerialize(t *testing.T) {
 }
 
 func TestMultiFileMutationsWithReversePathOrderDoNotDeadlock(t *testing.T) {
-	ag := New(testBackend("http://unused", "k"), "m", 100, "sys")
+	ag := New(&mockAgentBackend{}, "m", 100, "sys")
 	var conc, maxConc atomic.Int32
 	edit := tools.Tool{
 		Def: models.NewTool("edit", "e", `{"type":"object","properties":{"edits":{"type":"array"}}}`),
@@ -163,7 +158,7 @@ func TestMultiFileMutationsWithReversePathOrderDoNotDeadlock(t *testing.T) {
 }
 
 func TestParallelToolBatchSharesSearchHints(t *testing.T) {
-	ag := New(testBackend("http://unused", "k"), "m", 100, "sys")
+	ag := New(&mockAgentBackend{}, "m", 100, "sys")
 	var (
 		mu     sync.Mutex
 		hints1 tools.SearchHints
@@ -272,10 +267,7 @@ func mustStartBackground(t *testing.T, ag *Agent, desc, prompt string) *Backgrou
 // via the Done channel + a steered message. Large reports are bounded before Steer.
 func TestBackgroundTaskDeliversReport(t *testing.T) {
 	bigReport := strings.Repeat("report-body-line-data\n", 1500) // ~33 KiB > 16 KiB
-	srv := textServer(t, func(n int, req models.Request) string { return bigReport })
-	defer srv.Close()
-
-	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
+	ag := New(textBackend(t, func(n int, req models.Request) string { return bigReport }), "m", 100, "sys")
 	task := mustStartBackground(t, ag, "probe", "do the thing")
 
 	// wait on the Done channel — closes exactly once on settle
@@ -315,13 +307,10 @@ func TestBackgroundTaskDeliversReport(t *testing.T) {
 }
 
 func TestBackgroundSubagentConcurrencyLimit(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		<-r.Context().Done()
-	}))
-	defer srv.Close()
-
-	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
+	ag := New(&mockAgentBackend{streamFn: func(ctx context.Context, _ models.Request, _ models.EventSink) (models.Message, models.Usage, error) {
+		<-ctx.Done()
+		return models.Message{}, models.Usage{}, ctx.Err()
+	}}, "m", 100, "sys")
 	// Start three blocking background tasks
 	t1, err := ag.StartBackground(context.Background(), "t1", "p")
 	if err != nil {
@@ -363,13 +352,10 @@ func TestBackgroundSubagentConcurrencyLimit(t *testing.T) {
 // Multiple waiters all get woken by the single channel close — the property
 // that makes this cheap in Go (opencode needs a per-waiter Deferred).
 func TestBackgroundTaskBroadcastsToManyWaiters(t *testing.T) {
-	srv := textServer(t, func(n int, req models.Request) string {
+	ag := New(textBackend(t, func(n int, req models.Request) string {
 		time.Sleep(50 * time.Millisecond) // give waiters time to attach
 		return "ok"
-	})
-	defer srv.Close()
-
-	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
+	}), "m", 100, "sys")
 	task := mustStartBackground(t, ag, "d", "p")
 
 	const waiters = 8
@@ -394,14 +380,11 @@ func TestBackgroundTaskBroadcastsToManyWaiters(t *testing.T) {
 
 // Cancel marks the task cancelled and closes Done.
 func TestBackgroundTaskCancel(t *testing.T) {
-	// a server that hangs until cancelled
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		<-r.Context().Done() // block until the client (subagent ctx) is cancelled
-	}))
-	defer srv.Close()
-
-	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
+	// The backend hangs until the subagent context is cancelled.
+	ag := New(&mockAgentBackend{streamFn: func(ctx context.Context, _ models.Request, _ models.EventSink) (models.Message, models.Usage, error) {
+		<-ctx.Done()
+		return models.Message{}, models.Usage{}, ctx.Err()
+	}}, "m", 100, "sys")
 	task := mustStartBackground(t, ag, "d", "p")
 	if !ag.Tasks().Cancel(task.ID) {
 		t.Fatal("cancel should succeed on a running task")
@@ -521,13 +504,10 @@ func TestToolMutationPaths(t *testing.T) {
 // Subscribers registered via Subscribe receive the task's live event stream
 // (fanned in with usage accounting); a settled task rejects new subscribers.
 func TestBackgroundTaskSubscribersSeeLiveStream(t *testing.T) {
-	srv := textServer(t, func(n int, req models.Request) string {
+	ag := New(textBackend(t, func(n int, req models.Request) string {
 		time.Sleep(50 * time.Millisecond) // let the subscriber attach
 		return "stream-body"
-	})
-	defer srv.Close()
-
-	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
+	}), "m", 100, "sys")
 	task := mustStartBackground(t, ag, "d", "p")
 
 	var got atomic.Int32
@@ -567,36 +547,32 @@ func TestFanIn(t *testing.T) {
 	}
 }
 
-// toolLoopServer answers the first request with a tool call (so the subagent
+// toolLoopBackend answers the first request with a tool call (so the subagent
 // fires OnToolStart/OnToolEnd), the second with the final text. It also
 // records the role of every message seen, so the test can prove the tool
 // result made it back into the conversation.
-func toolLoopServer(t *testing.T) *httptest.Server {
+func toolLoopBackend(t *testing.T) models.Backend {
 	t.Helper()
 	call := 0
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var req models.Request
-		json.NewDecoder(r.Body).Decode(&req)
-		w.Header().Set("Content-Type", "text/event-stream")
+	return &mockAgentBackend{streamFn: func(_ context.Context, req models.Request, sink models.EventSink) (models.Message, models.Usage, error) {
 		call++
-		switch call {
-		case 1:
-			fmt.Fprint(w, `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"t1","type":"function","function":{"name":"read","arguments":"{\"path\":\"/tmp/x\"}"}}]}}]}`+"\n\n")
-			fmt.Fprint(w, `data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`+"\n\n")
-		default:
-			fmt.Fprint(w, `data: {"choices":[{"delta":{"content":"final report"},"finish_reason":"stop"}]}`+"\n\n")
+		if call == 1 {
+			return models.Message{Role: "assistant", ToolCalls: []models.ToolCall{agentToolCall("t1", "read", `{"path":"/tmp/x"}`)}}, models.Usage{}, nil
 		}
-		fmt.Fprint(w, "data: [DONE]\n\n")
-	}))
+		if len(req.Messages) == 0 || req.Messages[len(req.Messages)-1].Role != "tool" {
+			t.Errorf("tool result was not fed back: %+v", req.Messages)
+		}
+		if sink.OnText != nil {
+			sink.OnText("final report")
+		}
+		return models.Message{Role: "assistant", Content: "final report"}, models.Usage{}, nil
+	}}
 }
 
 // A subscriber on a task that runs tools sees the full lifecycle: tool start,
 // tool end, and the streamed text — not just the final report.
 func TestBackgroundTaskSubscriberSeesToolEvents(t *testing.T) {
-	srv := toolLoopServer(t)
-	defer srv.Close()
-
-	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
+	ag := New(toolLoopBackend(t), "m", 100, "sys")
 	task := mustStartBackground(t, ag, "d", "p")
 
 	var mu sync.Mutex
@@ -627,13 +603,10 @@ func TestBackgroundTaskSubscriberSeesToolEvents(t *testing.T) {
 // Multiple subscribers on one task each receive every event (the fan-out is
 // per-subscriber, not first-come).
 func TestBackgroundTaskManySubscribers(t *testing.T) {
-	srv := textServer(t, func(n int, req models.Request) string {
+	ag := New(textBackend(t, func(n int, req models.Request) string {
 		time.Sleep(30 * time.Millisecond) // let subscribers attach
 		return "broadcast-body"
-	})
-	defer srv.Close()
-
-	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
+	}), "m", 100, "sys")
 	task := mustStartBackground(t, ag, "d", "p")
 
 	const subs = 4
@@ -657,7 +630,7 @@ func TestBackgroundTaskManySubscribers(t *testing.T) {
 
 // Subscribing an unknown task id reports false rather than panicking.
 func TestSubscribeUnknownTask(t *testing.T) {
-	ag := New(testBackend("http://unused", "k"), "m", 100, "sys")
+	ag := New(&mockAgentBackend{}, "m", 100, "sys")
 	if ag.Tasks().Subscribe("task-999", Events{}) {
 		t.Fatal("Subscribe on an unknown id should report false")
 	}
@@ -666,15 +639,12 @@ func TestSubscribeUnknownTask(t *testing.T) {
 // Usage from a background subagent's API calls folds into the parent's
 // session totals (the FanIn second leg alongside the event emitter).
 func TestBackgroundTaskUsageRollsIntoParent(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		fmt.Fprint(w, `data: {"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]}`+"\n\n")
-		fmt.Fprint(w, `data: {"choices":[],"usage":{"prompt_tokens":50,"completion_tokens":5}}`+"\n\n")
-		fmt.Fprint(w, "data: [DONE]\n\n")
-	}))
-	defer srv.Close()
-
-	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
+	ag := New(&mockAgentBackend{streamFn: func(_ context.Context, _ models.Request, sink models.EventSink) (models.Message, models.Usage, error) {
+		if sink.OnText != nil {
+			sink.OnText("done")
+		}
+		return models.Message{Role: "assistant", Content: "done"}, models.Usage{PromptTokens: 50, CompletionTokens: 5}, nil
+	}}, "m", 100, "sys")
 	task := mustStartBackground(t, ag, "d", "p")
 	select {
 	case <-task.Done:
@@ -721,21 +691,15 @@ func TestRestoreTaskSettledAndVisible(t *testing.T) {
 // subscriber must be released by Cancel (not by contending on mu first).
 func TestBroadcastBlockingSubscriberCannotDeadlock(t *testing.T) {
 	release := make(chan struct{})
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		fmt.Fprint(w, `data: {"choices":[{"delta":{"content":"hi"}}]}`+"\n\n")
-		w.(http.Flusher).Flush() // deliver the delta while the stream stays open
-		// Park the handler (not the body read) so the connection closes on
-		// server shutdown even if a test assertion fails mid-way.
-		select {
-		case <-release:
-		case <-r.Context().Done():
+	t.Cleanup(func() { close(release) })
+	backend := &mockAgentBackend{streamFn: func(_ context.Context, _ models.Request, sink models.EventSink) (models.Message, models.Usage, error) {
+		if sink.OnText != nil {
+			sink.OnText("hi")
 		}
-	}))
-	t.Cleanup(func() { close(release) }) // before srv.Close so the handler unwinds first
-	defer srv.Close()
-
-	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
+		<-release
+		return models.Message{Role: "assistant", Content: "hi"}, models.Usage{}, nil
+	}}
+	ag := New(backend, "m", 100, "sys")
 	task := mustStartBackground(t, ag, "probe", "p")
 
 	inCallback := make(chan struct{})

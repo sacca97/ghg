@@ -41,10 +41,11 @@ type steeredMsg string
 // goalFromContextMsg carries the model-formulated goal back from the
 // /goal-from-context goroutine to the Update loop.
 type goalFromContextMsg struct {
-	goal   string
-	record *agent.GoalRecord
-	usage  models.Usage
-	err    error
+	goal        string
+	record      *agent.GoalRecord
+	usage       models.Usage
+	err         error
+	interrupted bool
 }
 
 type goalUpdateMsg struct{ update agent.GoalUpdate }
@@ -53,6 +54,7 @@ type goalUpdateRecordMsg struct{ record agent.GoalRecord }
 type turnDoneMsg struct {
 	final          string
 	err            error
+	interrupted    bool
 	plan           string // worker-authoritative proposed plan, when present
 	reviewMarkdown string
 	goal           *agent.GoalRecord
@@ -203,24 +205,29 @@ type model struct {
 	skillsLoaded    int
 	skillsSignature string
 
-	iactive *interactive // in-flight interactive command; nil when idle
-
 	permDialog     *permDialog // open permission modal; the turn is paused on it
 	questionDialog *questionDialog
 
-	tasksFocus       bool      // the tasks dock owns ↑/↓/enter/esc instead of the input
-	taskSel          int       // selected row in the dock (index into newest-first tasks)
-	dockSkip         int       // non-task rows at the dock's top (focused hint) — click math skips them
-	taskVP           *taskView // open per-task detail view; nil when on the main thread
-	dockRows         int       // rendered dock height; layout() maintains it for click math
-	dockView         string    // rendered dock cached by layout for the following View
-	frameViewsValid  bool
-	frameCurrent     string
-	frameThinking    string
-	frameInteractive string
-	framePermission  string
-	frameQuestion    string
-	frameRewind      string
+	tasksFocus         bool      // the tasks dock owns ↑/↓/enter/esc instead of the input
+	taskSel            int       // selected row in the dock (index into newest-first tasks)
+	dockSkip           int       // non-task rows at the dock's top (focused hint) — click math skips them
+	taskVP             *taskView // open per-task detail view; nil when on the main thread
+	dockRows           int       // rendered dock height; layout() maintains it for click math
+	dockView           string    // rendered dock cached by layout for the following View
+	dockTasksCache     []agent.BackgroundTask
+	dockTasksValid     bool
+	frameViewsValid    bool
+	frameWidth         int
+	frameCurrent       string
+	frameCurrentKey    string
+	frameThinking      string
+	frameThinkingKey   string
+	framePermission    string
+	framePermissionKey string
+	frameQuestion      string
+	frameQuestionKey   string
+	frameRewind        string
+	frameRewindKey     string
 
 	rew    *rewindState     // open rewind picker (double-esc while idle)
 	esc1   bool             // first idle esc pressed; second opens the rewind picker

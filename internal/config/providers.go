@@ -1,10 +1,8 @@
 package config
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/sacca97/ghg/internal/models"
@@ -46,35 +44,7 @@ func (p Provider) ResolveKey() (string, error) {
 		}
 		return k, nil
 	}
-	// ponytail: special-case fallback to the inf CLI's stored key; generalize to apiKeyFile if more providers need it
-	// when the profile or legacy URL identifies the built-in default service.
-	if p.Profile == "inference" || strings.Contains(p.BaseURL, "api.inference.net") {
-		return infKey(), nil
-	}
 	return "", nil
-}
-
-// infKey reads apiKey/codingAgentApiKey from ~/.inf/config.json (written by `inf auth set-key`).
-func infKey() string {
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return ""
-	}
-	data, err := os.ReadFile(filepath.Join(home, ".inf", "config.json"))
-	if err != nil {
-		return ""
-	}
-	var c struct {
-		APIKey            string `json:"apiKey"`
-		CodingAgentAPIKey string `json:"codingAgentApiKey"`
-	}
-	if json.Unmarshal(data, &c) != nil {
-		return ""
-	}
-	if c.APIKey != "" {
-		return c.APIKey
-	}
-	return c.CodingAgentAPIKey
 }
 
 // TrimKey normalizes a pasted API key: whitespace and a stray leading

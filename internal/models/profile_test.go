@@ -381,25 +381,6 @@ func TestResolveUnknownProfileAndProtocol(t *testing.T) {
 	}
 }
 
-func TestResolveRemovedOpenCodeAnthropicProfileAnonymously(t *testing.T) {
-	profiles, err := Load(LoadOptions{UserDir: t.TempDir()})
-	if err != nil {
-		t.Fatal(err)
-	}
-	resolved, err := profiles.Resolve(Instance{
-		Name:     "old-opencode",
-		Profile:  legacyOpenCodeAnthropicProfileID,
-		BaseURL:  "https://opencode.example/v1",
-		Protocol: ProtocolAnthropicMessages,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if resolved.Profile.ID != "anonymous" || resolved.Protocol != ProtocolAnthropicMessages || resolved.Auth.Header != "x-api-key" || resolved.DefaultHeaders["anthropic-version"] != "2023-06-01" {
-		t.Fatalf("removed profile should keep its old anonymous route working: %+v", resolved)
-	}
-}
-
 func writeProfileFile(t *testing.T, dir, name, content string) {
 	t.Helper()
 	if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o600); err != nil {

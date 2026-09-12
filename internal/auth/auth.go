@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 	"time"
 
@@ -49,6 +50,10 @@ func ResolveProfile(profiles models.Profiles, id string) (models.Resolved, error
 // A backend with neither capability returns NeedsConfirmation instead of
 // silently claiming the credential works.
 func Authenticate(ctx context.Context, profiles models.Profiles, id, key string, maxRetries int) (Result, error) {
+	return authenticate(ctx, profiles, id, key, maxRetries, nil)
+}
+
+func authenticate(ctx context.Context, profiles models.Profiles, id, key string, maxRetries int, client *http.Client) (Result, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -65,7 +70,7 @@ func Authenticate(ctx context.Context, profiles models.Profiles, id, key string,
 		return result, fmt.Errorf("provider %q needs an API key (%s)", resolved.Name, KeyHint(resolved))
 	}
 
-	backend, err := NewBackend(resolved, key, "", maxRetries)
+	backend, err := newBackend(resolved, key, "", maxRetries, client)
 	if err != nil {
 		return result, fmt.Errorf("provider %q: %w", resolved.Name, err)
 	}
@@ -88,7 +93,7 @@ func Authenticate(ctx context.Context, profiles models.Profiles, id, key string,
 		}
 		probeModel := ""
 		if len(modelInfos) > 0 {
-			probe, probeModel, err = routedProbe(profiles, resolved, key, maxRetries, modelInfos)
+			probe, probeModel, err = routedProbe(profiles, resolved, key, maxRetries, modelInfos, client)
 			if err != nil {
 				return result, newValidationError(resolved.Name, key, err)
 			}
@@ -129,7 +134,7 @@ func Authenticate(ctx context.Context, profiles models.Profiles, id, key string,
 // compiled probe-capable adapter. Public catalogs can contain models for a
 // protocol ghg does not support yet (for example OpenAI Responses), so those
 // entries must not prevent auth from validating against a supported sibling.
-func routedProbe(profiles models.Profiles, resolved models.Resolved, key string, maxRetries int, modelInfos []models.ModelInfo) (models.ProbeBackend, string, error) {
+func routedProbe(profiles models.Profiles, resolved models.Resolved, key string, maxRetries int, modelInfos []models.ModelInfo, client *http.Client) (models.ProbeBackend, string, error) {
 	var lastErr error
 	hadModel := false
 	for _, model := range modelInfos {
@@ -147,7 +152,7 @@ func routedProbe(profiles models.Profiles, resolved models.Resolved, key string,
 		if err != nil {
 			return nil, "", err
 		}
-		probeBackend, err := NewBackend(probeResolved, key, "", maxRetries)
+		probeBackend, err := newBackend(probeResolved, key, "", maxRetries, client)
 		if err != nil {
 			lastErr = err
 			continue

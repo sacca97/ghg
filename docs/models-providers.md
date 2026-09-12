@@ -96,9 +96,7 @@ single OpenCode Go profile points at one public catalog and uses ordered model
 routes to select chat completions or native Messages; the unsupported Responses
 route is shown as unavailable before a turn. Existing JSONC providers without
 `profile` keep working through anonymous in-memory profiles, so no config
-migration is required. A provider
-entry that still names the removed `opencode-anthropic` profile is retained
-through a compatibility anonymous route.
+migration is required.
 
 ## Key resolution
 

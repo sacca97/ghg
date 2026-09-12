@@ -7,18 +7,15 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 )
 
-func anthropicClientForTest(t *testing.T, handler http.Handler) (*AnthropicClient, *httptest.Server) {
+func anthropicClientForTest(t *testing.T, handler http.Handler) *AnthropicClient {
 	t.Helper()
-	srv := httptest.NewServer(handler)
-	client := testAnthropicClient(t, srv.URL, "anthropic-test-key")
-	return client, srv
+	return testAnthropicClientWithHandler(t, handler)
 }
 
 func writeAnthropicEvent(w http.ResponseWriter, payload string) {
@@ -208,7 +205,7 @@ func TestAnthropicReasoningToggle(t *testing.T) {
 }
 
 func TestAnthropicStreamAssemblesFragmentedThinkingAndUsage(t *testing.T) {
-	client, srv := anthropicClientForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	client := anthropicClientForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/messages" || r.Header.Get("x-api-key") != "anthropic-test-key" || r.Header.Get("anthropic-version") != "2023-06-01" {
 			http.Error(w, "bad request", http.StatusUnauthorized)
 			return
@@ -227,7 +224,6 @@ func TestAnthropicStreamAssemblesFragmentedThinkingAndUsage(t *testing.T) {
 		writeAnthropicFragmentedEvent(w, `{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":7}}`)
 		writeAnthropicFragmentedEvent(w, `{"type":"message_stop"}`)
 	}))
-	defer srv.Close()
 
 	var textOut, thinkOut strings.Builder
 	msg, usage, err := client.stream(context.Background(), Request{Model: "claude-test", Messages: []Message{{Role: "user", Content: "question"}}}, EventSink{
@@ -249,7 +245,7 @@ func TestAnthropicStreamAssemblesFragmentedThinkingAndUsage(t *testing.T) {
 }
 
 func TestAnthropicStreamParallelToolUses(t *testing.T) {
-	client, srv := anthropicClientForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	client := anthropicClientForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		writeAnthropicEvent(w, `{"type":"message_start","message":{"usage":{"input_tokens":3}}}`)
 		writeAnthropicEvent(w, `{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call-a","name":"read","input":{}}}`)
@@ -261,7 +257,6 @@ func TestAnthropicStreamParallelToolUses(t *testing.T) {
 		writeAnthropicEvent(w, `{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":5}}`)
 		writeAnthropicEvent(w, `{"type":"message_stop"}`)
 	}))
-	defer srv.Close()
 
 	msg, _, err := client.stream(context.Background(), Request{Model: "claude-test", Messages: []Message{{Role: "user", Content: "inspect"}}}, EventSink{})
 	if err != nil {
@@ -279,7 +274,7 @@ func TestAnthropicStreamParallelToolUses(t *testing.T) {
 }
 
 func TestAnthropicStreamTerminalUsageMerged(t *testing.T) {
-	client, srv := anthropicClientForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	client := anthropicClientForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		// Compatibility proxies like OpenCode send empty message_start usage, then report final tokens in message_delta
 		writeAnthropicEvent(w, `{"type":"message_start","message":{"usage":{"input_tokens":0}}}`)
@@ -288,7 +283,6 @@ func TestAnthropicStreamTerminalUsageMerged(t *testing.T) {
 		writeAnthropicEvent(w, `{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":33159,"output_tokens":1194}}`)
 		writeAnthropicEvent(w, `{"type":"message_stop"}`)
 	}))
-	defer srv.Close()
 
 	_, usage, err := client.stream(context.Background(), Request{Model: "qwen3.8-max", Messages: []Message{{Role: "user", Content: "hi"}}}, EventSink{})
 	if err != nil {
@@ -300,7 +294,7 @@ func TestAnthropicStreamTerminalUsageMerged(t *testing.T) {
 }
 
 func TestAnthropicStreamMaxTokensTruncatedToolDiscard(t *testing.T) {
-	client, srv := anthropicClientForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	client := anthropicClientForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		writeAnthropicEvent(w, `{"type":"message_start","message":{"usage":{"input_tokens":10}}}`)
 		writeAnthropicEvent(w, `{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"call-trunc","name":"write","input":{}}}`)
@@ -309,7 +303,6 @@ func TestAnthropicStreamMaxTokensTruncatedToolDiscard(t *testing.T) {
 		writeAnthropicEvent(w, `{"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":8192}}`)
 		writeAnthropicEvent(w, `{"type":"message_stop"}`)
 	}))
-	defer srv.Close()
 
 	msg, usage, err := client.stream(context.Background(), Request{Model: "claude-3-7-sonnet", Messages: []Message{{Role: "user", Content: "write code"}}}, EventSink{})
 	if err != nil {
@@ -325,13 +318,12 @@ func TestAnthropicStreamMaxTokensTruncatedToolDiscard(t *testing.T) {
 
 func TestAnthropicCompleteAndMaxTokenToolDiscard(t *testing.T) {
 	var streamField any
-	client, srv := anthropicClientForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	client := anthropicClientForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var body map[string]any
 		_ = json.NewDecoder(r.Body).Decode(&body)
 		streamField = body["stream"]
 		_, _ = io.WriteString(w, `{"content":[{"type":"tool_use","id":"call-1","name":"read","input":{"path":"x"}}],"stop_reason":"max_tokens","usage":{"input_tokens":4,"output_tokens":8}}`)
 	}))
-	defer srv.Close()
 
 	msg, usage, err := client.complete(context.Background(), Request{Model: "claude-test", Messages: []Message{{Role: "user", Content: "go"}}, MaxTokens: 9}, EventSink{})
 	if err != nil {
@@ -360,13 +352,12 @@ func TestAnthropicRetryBoundariesAndTypedErrors(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			var calls atomic.Int32
-			client, srv := anthropicClientForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			client := anthropicClientForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				calls.Add(1)
 				w.WriteHeader(tt.status)
 				_, _ = io.WriteString(w, tt.body)
 			}))
 			client.MaxRetries = 2
-			defer srv.Close()
 			_, _, err := client.stream(context.Background(), Request{Model: "claude-test", Messages: []Message{{Role: "user", Content: "x"}}}, EventSink{})
 			if err == nil {
 				t.Fatal("expected error")
@@ -388,13 +379,12 @@ func TestAnthropicRetryBoundariesAndTypedErrors(t *testing.T) {
 func TestAnthropicMalformedEventDoesNotRetry(t *testing.T) {
 	noSleep(t)
 	var calls atomic.Int32
-	client, srv := anthropicClientForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	client := anthropicClientForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		calls.Add(1)
 		w.Header().Set("Content-Type", "text/event-stream")
 		writeAnthropicEvent(w, "not-json")
 	}))
 	client.MaxRetries = 3
-	defer srv.Close()
 
 	_, _, err := client.stream(context.Background(), Request{Model: "claude-test", Messages: []Message{{Role: "user", Content: "x"}}}, EventSink{})
 	if err == nil || !strings.Contains(err.Error(), "malformed anthropic SSE event") {
@@ -407,16 +397,12 @@ func TestAnthropicMalformedEventDoesNotRetry(t *testing.T) {
 
 func TestAnthropicCancellationStopsRequest(t *testing.T) {
 	started := make(chan struct{})
-	client, srv := anthropicClientForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.WriteHeader(http.StatusOK)
-		if flusher, ok := w.(http.Flusher); ok {
-			flusher.Flush()
-		}
+	client := testAnthropicClient(t, "http://provider.test", "anthropic-test-key")
+	client.HTTP = &http.Client{Transport: testRoundTripper(func(r *http.Request) (*http.Response, error) {
 		close(started)
 		<-r.Context().Done()
-	}))
-	defer srv.Close()
+		return nil, r.Context().Err()
+	})}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -475,7 +461,7 @@ func TestAnthropicMessageProviderBlocksRoundTrip(t *testing.T) {
 
 func TestAnthropicModels(t *testing.T) {
 	var page atomic.Int32
-	client, srv := anthropicClientForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	client := anthropicClientForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet || r.URL.Path != "/models" || r.Header.Get("x-api-key") != "anthropic-test-key" {
 			http.Error(w, "bad request", http.StatusBadRequest)
 			return
@@ -494,7 +480,6 @@ func TestAnthropicModels(t *testing.T) {
 		}
 		_, _ = io.WriteString(w, `{"data":[{"id":"claude-b","max_input_tokens":100000,"max_tokens":4096,"capabilities":{"effort":{"supported":true,"levels":["low","medium","high"]}}}],"has_more":false,"last_id":"claude-b"}`)
 	}))
-	defer srv.Close()
 
 	models, err := client.Models(context.Background())
 	if err != nil {

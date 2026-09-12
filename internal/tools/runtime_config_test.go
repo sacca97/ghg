@@ -42,10 +42,13 @@ func TestNewConfiguredRuntimeProvidesPrivateTempAndDefaultCaches(t *testing.T) {
 			env[key] = value
 		}
 	}
-	for _, key := range []string{"TMPDIR", "TMP", "TEMP"} {
+	for _, key := range []string{"TMPDIR", "TMP", "TEMP", "GOTMPDIR"} {
 		if env[key] != runtime.TempDir {
 			t.Fatalf("child %s=%q, want private temp %q", key, env[key], runtime.TempDir)
 		}
+	}
+	if env["GHG_TMPDIR"] != runtime.TempDir {
+		t.Fatalf("child GHG_TMPDIR=%q, want private temp %q", env["GHG_TMPDIR"], runtime.TempDir)
 	}
 	for _, key := range []string{"GOCACHE", "GOMODCACHE", "CARGO_HOME", "RUSTUP_HOME", "BUN_INSTALL", "NPM_CONFIG_CACHE"} {
 		root := env[key]
@@ -79,6 +82,47 @@ func TestNewConfiguredRuntimeProvidesPrivateTempAndDefaultCaches(t *testing.T) {
 		if containsPath(runtime.Policy.WriteRoots(), cacheRoot) {
 			t.Fatalf("cache root %q was folded into ordinary write roots", cacheRoot)
 		}
+	}
+}
+
+func TestNewConfiguredRuntimeUsesPrivateTempForChildren(t *testing.T) {
+	for _, key := range []string{"GOPATH", "GOCACHE", "GOMODCACHE", "CARGO_HOME", "RUSTUP_HOME", "BUN_INSTALL", "NPM_CONFIG_CACHE", "XDG_CACHE_HOME"} {
+		t.Setenv(key, "")
+	}
+	hostTemp := t.TempDir()
+	t.Setenv("TMPDIR", hostTemp)
+	t.Setenv("TMP", hostTemp)
+	t.Setenv("TEMP", hostTemp)
+
+	workspace := t.TempDir()
+	rt, cleanup, err := NewConfiguredRuntime(workspace, nil, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	requireRuntimeBackend(t, rt, workspace)
+	tmpRoot := filepath.Join(rt.TempDir, "ghg-runtime-test")
+	if err := os.Mkdir(tmpRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(tmpRoot, "result")
+	wrapped, err := rt.WrapCommand(sandbox.CommandSpec{
+		Program: "/bin/sh",
+		Args:    []string{"-c", `test "$TMPDIR" = "$1" && test "$TMP" = "$1" && test "$TEMP" = "$1" && /usr/bin/printf ok > "$2"`, "sh", rt.TempDir, target},
+		Dir:     workspace,
+		Env:     rt.ChildEnv(nil),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(wrapped.Program, wrapped.Args...)
+	cmd.Dir = wrapped.Dir
+	cmd.Env = wrapped.Env
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("private temp child output=%q err=%v", output, err)
+	}
+	if got, err := os.ReadFile(target); err != nil || string(got) != "ok" {
+		t.Fatalf("tmp target=%q err=%v", got, err)
 	}
 }
 

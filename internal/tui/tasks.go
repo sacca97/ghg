@@ -1,13 +1,4 @@
-// tasks.go: the persistent background-subagent area and the per-task detail
-// view.
-//
-// The dock is a strip rendered above the input box (below the queue) whenever
-// background tasks exist — running or recently settled — so the user always
-// knows how many subagents are in flight without running /tasks. ctrl+t
-// focuses it; ↑/↓ (or the mouse wheel over the strip) moves the selection,
-// enter opens the selected task's detail view, and esc backs out: detail →
-// dock → main thread. The detail view is a scrollback pane filled from the
-// worker snapshot.
+// Package tui tasks manages background subagent dock and detail views.
 package tui
 
 import (
@@ -22,28 +13,24 @@ import (
 	"github.com/sacca97/ghg/internal/agent"
 )
 
-// taskView is the open per-task pane: the worker snapshot of one background
-// subagent (or its stored report once settled).
+// taskView renders the scrollback transcript for one background task.
 type taskView struct {
 	id   string
 	vp   viewport.Model
 	text string // full transcript text; vp shows a window into it
 }
 
-// tasksDockHeight is the maximum number of screen rows the dock strip
-// occupies (hint row + task rows); the strip scrolls if there are more tasks.
+// tasksDockHeight bounds the maximum row height for the dock strip.
 const tasksDockHeight = 6
 
-// dockSettledGrace is how long a settled task stays in the dock after
-// finishing — long enough to notice the ✓ and open the report, then the
-// strip cleans itself. Restored tasks (--resume history) never show: their
-// subagents died with the previous process. /tasks lists everything.
+// dockSettledGrace specifies duration finished tasks remain in the dock before removal.
 const dockSettledGrace = time.Minute
 
-// dockTasks returns the dock's tasks — running ones plus those settled
-// within dockSettledGrace, never restored ones — newest first. Bare test
-// models have no agent; the dock is simply empty.
+// dockTasks returns active and recently settled tasks.
 func (m *model) dockTasks() []agent.BackgroundTask {
+	if m.dockTasksValid {
+		return m.dockTasksCache
+	}
 	var out []agent.BackgroundTask
 	for _, task := range m.workerTasks {
 		if task.Restored {
@@ -60,6 +47,8 @@ func (m *model) dockTasks() []agent.BackgroundTask {
 		}
 		return strings.Compare(b.ID, a.ID)
 	})
+	m.dockTasksCache = out
+	m.dockTasksValid = true
 	return out
 }
 

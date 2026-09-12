@@ -8,9 +8,9 @@ import (
 	"fmt"
 	"sort"
 	"strings"
-	"unicode/utf8"
 
 	"github.com/sacca97/ghg/internal/models"
+	"github.com/sacca97/ghg/internal/textutil"
 )
 
 // ErrInvalidHistoryQuery hides SQLite parser details from model-facing tools.
@@ -72,21 +72,9 @@ func truncateHistory(value string, limit int) string {
 	}
 	const suffix = "…"
 	if limit < len(suffix) {
-		return value[:utf8Prefix(value, limit)]
+		return value[:textutil.UTF8Prefix(value, limit)]
 	}
-	return value[:utf8Prefix(value, limit-len(suffix))] + suffix
-}
-
-func utf8Prefix(value string, limit int) int {
-	end := 0
-	for end < len(value) {
-		_, size := utf8.DecodeRuneInString(value[end:])
-		if end+size > limit {
-			break
-		}
-		end += size
-	}
-	return end
+	return value[:textutil.UTF8Prefix(value, limit-len(suffix))] + suffix
 }
 
 // backfillHistoryFTS rebuilds the derived index once for databases created

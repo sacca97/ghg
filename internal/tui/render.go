@@ -1,45 +1,33 @@
 package tui
 
 import (
-	"github.com/charmbracelet/glamour"
-	glamouransi "github.com/charmbracelet/glamour/ansi"
-	"github.com/charmbracelet/glamour/styles"
-	"github.com/charmbracelet/x/ansi"
 	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
+
+	"github.com/charmbracelet/glamour"
+	glamouransi "github.com/charmbracelet/glamour/ansi"
+	"github.com/charmbracelet/glamour/styles"
+	"github.com/charmbracelet/x/ansi"
 )
 
-// Clickable links (OSC 8 hyperlinks): the terminal owns the click — no mouse
-// plumbing here. Two post-render passes over glamour's output:
-//
-//  1. hyperlinkGlamourLinks rewires rendered markdown links: glamour prints
-//     "[label](url)" as underlined `label url` with no hyperlink; the label
-//     atoms become one OSC 8 hyperlink to the href and the href atoms vanish
-//     (no doubled "label url", at any width). Bare autolinks become clickable
-//     in place.
-//  2. linkifyRenderedFilePaths wraps bare path/to/file[:N] tokens in file://
-//     hyperlinks, gated on the file existing on disk.
-//
-// linkifyFilePaths applies the same file-ref linkification to raw user text
-// (submit/resume/steer echoes), which never goes through glamour.
-//
-// Unsupported terminals ignore OSC 8 and show the underlined text as before;
-// ansi.Strip (copy/selection) drops the sequences. Width-safe: verified
-// against ansi.Wrap/Hardwrap/StringWidth.
+// Post-render passes convert glamour links and existing disk paths to terminal OSC 8 hyperlinks.
+// Terminals without OSC 8 support ignore these escape sequences.
 
-// fileRefRE matches a file reference with an optional :line suffix: a path
-// with at least one slash and a dotted extension. The leading run of
-// path-ish characters spans the full reference; matches inside [text](target)
-// or a URL are rejected in linkifyFilePaths via the preceding byte. Bare
-// filenames without a slash are not matched — too common as prose.
+// fileRefRE matches a file path with at least one slash and an optional :line suffix.
+// Bare filenames without slashes are not matched.
 var fileRefRE = regexp.MustCompile(
 	`/?[\w@+~-][\w@+~.-]*(?:/[\w@+~-][\w@+~.-]*)+(?::\d+)?` + // path with slashes
 		`|/?[\w@+~-][\w@+~.-]*\.[A-Za-z]{2,10}(?::\d+)?` + // bare multi-letter ext
 		`|\.{1,2}/[\w@+~-][\w@+~.-]*(?:/[\w@+~-][\w@+~.-]*)*(?::\d+)?`) // ./ ../
+
+var fileExistsCache struct {
+	sync.Mutex
+	paths map[string]bool
+}
 
 // linkifyFilePaths wraps mentions of existing local files in OSC 8 file://
 // hyperlinks. exists decides whether a candidate path names a real file
@@ -114,8 +102,22 @@ func realFileExists(path string) bool {
 		}
 		path = filepath.Join(wd, path)
 	}
+	path = filepath.Clean(path)
+	fileExistsCache.Lock()
+	defer fileExistsCache.Unlock()
+	if fileExistsCache.paths == nil {
+		fileExistsCache.paths = make(map[string]bool)
+	}
+	if found, ok := fileExistsCache.paths[path]; ok {
+		return found
+	}
 	info, err := os.Stat(path)
-	return err == nil && info.Mode().IsRegular()
+	found := err == nil && info.Mode().IsRegular()
+	if len(fileExistsCache.paths) >= 1024 {
+		clear(fileExistsCache.paths)
+	}
+	fileExistsCache.paths[path] = found
+	return found
 }
 
 // splitLineRef separates a trailing :N line number and any absorbed trailing
@@ -154,21 +156,7 @@ func absFileURI(path, line string) string {
 	return "file://" + (&url.URL{Path: path}).String()
 }
 
-// --- glamour link rewiring -------------------------------------------------
-
-// Rendered-link shape, verified against glamour v1.0.0: text is emitted as
-// word atoms, each an SGR span closed by \x1b[0m.
-// A "[label](url)" link renders as label atoms + doc-colored space atoms +
-// href atoms; glamour's wrap may split any atom across lines (a newline
-// lands inside the atom). A bare autolink renders as href atoms alone.
-//
-// hyperlinkGlamourLinks therefore works in two passes over the atoms: first
-// it groups consecutive label/href atoms into links (across newlines and
-// padding), recording each link's href and label spans; then it rewrites —
-// the label atoms become one OSC 8 hyperlink to the href, the href atoms and
-// their gap vanish, and a standalone href (autolink) becomes clickable in
-// place. Width-independent: the merge is structural, not adjacency-at-one-
-// width.
+// hyperlinkGlamourLinks groups label and href atoms across wraps and rewrites them into OSC 8 links.
 const (
 	linkTextSGRDark  = "\x1b[38;5;35;1m"
 	linkTextSGRLight = "\x1b[38;5;29;1m"

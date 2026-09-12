@@ -55,22 +55,18 @@ type HistoryCatalog interface {
 type HistoryHit = session.HistoryHit
 type HistoryMessage = session.HistoryMessage
 
-// SubagentFactory builds a fresh agent for a delegated task. role is one of
-// the config role names; the task tool currently supplies "tiny". Keeping the
-// factory at this boundary lets the TUI and headless runner select a different
-// provider/model without making the agent package depend on either UI.
+// SubagentFactory creates an agent for a delegated task.
 type SubagentFactory func(ctx context.Context, role, systemPrompt string) (*Agent, error)
 
-// Agent holds one conversation.
 type Agent struct {
 	Backend   models.Backend
-	Model     string // model id sent to the API
-	ModelName string // config model name (may differ from Model via id mapping)
-	Provider  string // config provider name
-	Protocol  string // compiled adapter protocol, for model-call telemetry
-	Role      string // selected model role (default, smart, fast, or tiny)
+	Model     string // model identifier sent to API
+	ModelName string // configured model name
+	Provider  string // configured provider name
+	Protocol  string // adapter protocol
+	Role      string // model role (default, smart, fast, tiny)
 	MaxTokens int
-	Effort    string // reasoning effort: "" = parameter omitted from requests
+	Effort    string // reasoning effort parameter ("" = omitted)
 	// ReasoningToggle indicates that the selected model has a separate
 	// on/off reasoning control from models.dev. Graded efforts still travel in
 	// Effort; the neutral request carries the enable/disable bit separately.
@@ -170,6 +166,9 @@ type Agent struct {
 
 	touchedMu sync.Mutex
 	touched   map[string]struct{}
+
+	turnRuntimeMu    sync.RWMutex
+	turnRuntimeValue *tools.ToolRuntime
 
 	operationMu   sync.Mutex
 	seenOperation map[string]int
@@ -517,6 +516,28 @@ func (a *Agent) ShareState(other *Agent) {
 	other.touchedMu.Unlock()
 	other.reviewContinuation = a.reviewContinuation
 	other.planContinuation = a.planContinuation
+}
+
+func (a *Agent) setTurnRuntime(runtime *tools.ToolRuntime) {
+	if a == nil {
+		return
+	}
+	a.turnRuntimeMu.Lock()
+	a.turnRuntimeValue = runtime
+	a.turnRuntimeMu.Unlock()
+}
+
+func (a *Agent) turnRuntime() *tools.ToolRuntime {
+	if a == nil {
+		return nil
+	}
+	a.turnRuntimeMu.RLock()
+	runtime := a.turnRuntimeValue
+	a.turnRuntimeMu.RUnlock()
+	if runtime != nil {
+		return runtime
+	}
+	return a.Runtime
 }
 
 // BindState persists observations and search snapshots collected before the
@@ -898,7 +919,7 @@ func (a *Agent) emitCallEnd(ev Events, call ModelCallStart, start time.Time, msg
 
 func isRepositoryNavigationTool(name string) bool {
 	switch name {
-	case "read", "grep", "structural_search", "glob", "find_files", "lsp",
+	case "read", "grep", "glob", "find_files", "lsp",
 		"output_list", "output_read", "artifact_list", "artifact_read", "history_search", "history_read", "web_fetch", "web_search":
 		return true
 	default:
@@ -946,22 +967,13 @@ func goalAttentionCheckpointReminder(rounds int) string {
 	return fmt.Sprintf("<goal_attention_checkpoint>\nYou have completed %d goal model/tool rounds. Pause and assess the active goal: what concrete progress has been made since the last checkpoint? Confirm that the current work still advances the goal. If it has drifted, realign before continuing. Record a concise progress update with update_goal, then continue with the next necessary action. Do not stop merely because this checkpoint appeared.\n</goal_attention_checkpoint>", rounds)
 }
 
-// Turn sends user input and loops until the model stops calling tools.
-// It returns the final assistant text. When the latest successful request's
-// reported context size crosses the adaptive 80% compaction budget (or the
-// explicit CompactThreshold override) of the
-// provider-advertised context limit, Turn compacts proactively before the next
-// request; if the provider still rejects the request because the conversation
-// exceeded its context window, Turn auto-compacts (summarizing old turns) and
-// retries once before surfacing the error to the caller.
+// Turn executes agent interaction rounds until tool execution finishes.
+// Triggers automatic context compaction when usage exceeds the configured threshold.
 func (a *Agent) Turn(ctx context.Context, input string, ev Events) (string, error) {
 	return a.turn(ctx, input, nil, false, false, nil, ev)
 }
 
-// TurnAuthored is Turn for a message the human actually typed and submitted
-// (vs. a steered background-task result or goal-continuation ghg injects).
-// The message is marked Authored so input-history recall cycles only real
-// submissions.
+// TurnAuthored executes Turn for directly entered user messages (Authored=true).
 func (a *Agent) TurnAuthored(ctx context.Context, input string, ev Events) (string, error) {
 	return a.turn(ctx, input, nil, true, false, nil, ev)
 }
@@ -1058,14 +1070,8 @@ func currentToolGuidance(ts []tools.Tool, notices []string) string {
 	return b.String()
 }
 
-// assembleRequestMessages constructs the model request messages while keeping
-// a byte-stable prefix across turns and tool rounds:
-//  1. Base system prompt (history[0])
-//  2. Stable collaboration-mode prompt (planModePrompt / reviewModePrompt)
-//  3. Scope preflight (if non-empty)
-//  4. Conversation history (history[1:])
-//  5. Changing transient blocks (capability/exploration/budget reminders)
-//  6. Trailing transient blocks (todoContent, goalContent)
+// assembleRequestMessages builds request messages with a byte-stable prefix.
+// Sequences base prompts, history, and transient reminder blocks.
 func (a *Agent) assembleRequestMessages(history []models.Message, todoContent, goalContent, budgetReminder, capabilityGuidance, explorationReminder, reviewPreflight string) []models.Message {
 	if len(history) == 0 {
 		return history
@@ -1176,6 +1182,17 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 	}
 	if a.PlanMode && authored && !resumePlan {
 		a.planContinuation = &planContinuation{target: reviewTarget, budget: planBudget}
+	}
+	if authored {
+		a.setTurnRuntime(a.Runtime)
+		if a.Runtime != nil && a.Runtime.Policy != nil {
+			if roots := taggedReadRoots(a, reviewTarget); len(roots) > 0 {
+				if granted, err := a.Runtime.Policy.Grant(roots, nil, false); err == nil {
+					a.setTurnRuntime(a.Runtime.WithPolicy(granted))
+				}
+			}
+		}
+		defer a.setTurnRuntime(a.Runtime)
 	}
 	readGuard := newReadCoverageTracker()
 	compactionEvents := ev
@@ -1962,7 +1979,7 @@ func (a *Agent) runToolResultsWithPolicy(ctx context.Context, calls []models.Too
 			if a.files != nil && !policyUnavailable {
 				if paths := toolMutationPaths(name, args); len(paths) > 0 {
 					release = a.files.acquirePaths(paths)
-				} else if toolRequiresGlobalMutation(name, args) {
+				} else if toolRequiresGlobalMutation(name) {
 					release = a.files.acquireGlobal()
 				}
 			}
@@ -1984,8 +2001,7 @@ func (a *Agent) runToolResultsWithPolicy(ctx context.Context, calls []models.Too
 			toolCtx = tools.WithObservationStore(toolCtx, a.currentSessionID(), observations)
 			toolCtx = tools.WithSearchStore(toolCtx, a.currentSessionID(), searchState)
 			toolCtx = tools.WithSearchHints(toolCtx, hints)
-			toolCtx = tools.WithSessionID(toolCtx, a.currentSessionID())
-			toolCtx = tools.WithRuntime(toolCtx, a.Runtime)
+			toolCtx = tools.WithRuntime(toolCtx, a.turnRuntime())
 			var result tools.ToolResult
 			if policyUnavailable {
 				result = tools.ToolResult{Preview: unavailableMessage, ExitCode: 1, Source: name}

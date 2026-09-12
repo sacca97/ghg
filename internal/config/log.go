@@ -8,18 +8,12 @@ import (
 	"time"
 )
 
-// ghg.log is an append-only event log for ghg operations that touch
-// on-disk state: config loads/saves (with a before/after fingerprint),
-// catalog refreshes, session store activity. It exists so that when state
-// gets corrupted there is a record of which process did what, when, and
-// with what result — "did the ghg misbehave?" becomes answerable.
-//
-// Logging never fails the caller: every write is best-effort.
+// ghg.log records file mutation events for state debugging.
+// Log writes are best-effort and ignore write failures.
 
 const (
 	logFileName = "ghg.log"
-	// logMaxBytes caps the file; past it the log is rotated to ghg.log.1
-	// (single generation — enough history to debug, never grows unbounded).
+	// logMaxBytes caps the log file before single-generation rotation.
 	logMaxBytes = 1 << 20 // 1 MiB
 )
 

@@ -58,7 +58,7 @@ func (c *AnthropicClient) tryForceRefresh(ctx context.Context) bool {
 	if c.Authorizer == nil {
 		return false
 	}
-	if refresher, ok := c.Authorizer.(interface{ ForceRefresh(context.Context) error }); ok {
+	if refresher, ok := c.Authorizer.(TokenRefresher); ok {
 		return refresher.ForceRefresh(ctx) == nil
 	}
 	return false
@@ -519,9 +519,6 @@ func marshalAnthropicBlock(block anthropicBlock) (json.RawMessage, error) {
 // Stream sends a native Messages streaming request. Retries are allowed before
 // answer text, with a GOAWAY exception for reasoning-only partial output.
 func (c *AnthropicClient) stream(ctx context.Context, req Request, sink EventSink) (Message, Usage, error) {
-	if req.SessionID != "" {
-		ctx = WithSessionID(ctx, req.SessionID)
-	}
 	wire, err := newAnthropicRequest(req, true)
 	if err != nil {
 		return Message{}, Usage{}, err
@@ -614,9 +611,6 @@ func (c *AnthropicClient) doStreamOnce(ctx context.Context, body []byte, onText,
 // Complete performs a non-streaming Messages request for compaction and
 // other one-shot calls.
 func (c *AnthropicClient) complete(ctx context.Context, req Request, sink EventSink) (Message, Usage, error) {
-	if req.SessionID != "" {
-		ctx = WithSessionID(ctx, req.SessionID)
-	}
 	wire, err := newAnthropicRequest(req, false)
 	if err != nil {
 		return Message{}, Usage{}, err

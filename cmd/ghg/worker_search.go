@@ -36,7 +36,7 @@ func (w *workerProcessState) searchProviderCommand(request workerwire.SearchProv
 		if err := cfg.Save(); err != nil {
 			return nil, fmt.Errorf("save search providers: %w", err)
 		}
-		w.publish("notice", searchProviderNotice(cfg), true)
+		w.publish(workerwire.EventNotice, searchProviderNotice(cfg), true)
 	}
 	return searchProviderInfos(cfg), nil
 }

@@ -4,8 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -13,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/sacca97/ghg/internal/models"
+	"github.com/sacca97/ghg/internal/sandbox"
 	"github.com/sacca97/ghg/internal/tools"
 )
 
@@ -125,7 +124,6 @@ func TestPlanModeRestrictsTools(t *testing.T) {
 	ag.Tools = []tools.Tool{
 		{Def: models.NewTool("read", "", "")},
 		{Def: models.NewTool("grep", "", "")},
-		{Def: models.NewTool("structural_search", "", "")},
 		{Def: models.NewTool("bash", "", "")},
 		{Def: models.NewTool("write", "", "")},
 		{Def: models.NewTool("edit", "", "")},
@@ -134,12 +132,12 @@ func TestPlanModeRestrictsTools(t *testing.T) {
 	}
 
 	planTools := ag.planTools()
-	if len(planTools) != 4 {
-		t.Fatalf("expected 4 safe tools, got %d", len(planTools))
+	if len(planTools) != 3 {
+		t.Fatalf("expected 3 safe tools, got %d", len(planTools))
 	}
 	for _, pt := range planTools {
 		name := pt.Def.Function.Name
-		if name != "read" && name != "grep" && name != "structural_search" && name != "lsp" {
+		if name != "read" && name != "grep" && name != "lsp" {
 			t.Errorf("unexpected tool in plan mode: %s", name)
 		}
 	}
@@ -473,44 +471,103 @@ func TestAssembleRequestMessagesPlacesChangingCapabilityGuidanceAfterHistory(t *
 
 func TestPlanTaggedScopePromptListsResolvedFiles(t *testing.T) {
 	workspace := t.TempDir()
+	outside := t.TempDir()
 	if err := os.MkdirAll(filepath.Join(workspace, "internal", "search"), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(workspace, "internal", "search", "state.go"), []byte("package search\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	outsideFile := filepath.Join(outside, "notes.txt")
+	if err := os.WriteFile(outsideFile, []byte("notes\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	canonicalOutside, err := sandbox.CanonicalPath(outsideFile, false)
+	if err != nil {
+		t.Fatal(err)
+	}
 	t.Chdir(workspace)
 
 	ag := New(nil, "model", 100, "system")
-	target := "inspect [note: the user tagged " + filepath.Join(workspace, "internal", "search") + " — contents are not inlined]"
+	target := "inspect [note: the user tagged " + filepath.Join(workspace, "internal", "search") + "; " + outsideFile + " (lines 1-2) — contents are not inlined]"
 	got := planTaggedScopePrompt(ag, target)
-	if !strings.Contains(got, "<tagged_scope>") || !strings.Contains(got, "internal/search/state.go") {
+	if !strings.Contains(got, "<tagged_scope>") || !strings.Contains(got, "internal/search") || !strings.Contains(got, canonicalOutside) || !strings.Contains(got, "internal/search/state.go") {
 		t.Fatalf("tagged scope prompt = %q", got)
 	}
 }
 
-func TestPlanModeTerminatesOnBudgetReserve(t *testing.T) {
-	var requests []models.Request
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var req models.Request
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			t.Errorf("decode request: %v", err)
-			return
+func TestTaggedReadGrantIsTurnScoped(t *testing.T) {
+	workspace := t.TempDir()
+	outside := t.TempDir()
+	outsideFile := filepath.Join(outside, "notes.txt")
+	protectedDir := filepath.Join(workspace, ".git")
+	if err := os.MkdirAll(protectedDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	protectedFile := filepath.Join(protectedDir, "secret")
+	if err := os.WriteFile(protectedFile, []byte("protected\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(outsideFile, []byte("outside notes\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	canonicalOutside, err := sandbox.CanonicalPath(outsideFile, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy, err := sandbox.NewPolicy(sandbox.PolicyConfig{Workspace: workspace, Mode: sandbox.ModeWorkspaceWrite})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime, err := tools.NewToolRuntime(policy, tools.ApprovalNever, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	call := 0
+	backend := &mockAgentBackend{streamFn: func(_ context.Context, _ models.Request, _ models.EventSink) (models.Message, models.Usage, error) {
+		call++
+		if call == 1 {
+			return models.Message{Role: "assistant", ToolCalls: []models.ToolCall{agentToolCall("read-1", "read", fmt.Sprintf(`{"path":%q}`, outsideFile))}}, models.Usage{}, nil
 		}
-		requests = append(requests, req)
-		w.Header().Set("Content-Type", "text/event-stream")
-		if len(requests) == 1 {
-			// First call: model calls read tool, returns usage that crosses 40k reserve
-			fmt.Fprint(w, `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"read","arguments":"{\"path\":\"agent.go\"}"}}]}}],"usage":{"prompt_tokens":1000,"completion_tokens":160000}}`+"\n\n")
-		} else {
-			// Second call: tools disabled, model emits final proposed plan
-			fmt.Fprint(w, `data: {"choices":[{"delta":{"content":"Synthesized plan:\n\n<proposed_plan>\n# Plan\n1. Do it\n</proposed_plan>"}}],"finish_reason":"stop"}`+"\n\n")
-		}
-		fmt.Fprint(w, "data: [DONE]\n\n")
-	}))
-	defer srv.Close()
+		return models.Message{Role: "assistant", Content: "done"}, models.Usage{}, nil
+	}}
+	ag := New(backend, "model", 100, "system")
+	ag.Runtime = runtime
+	var result string
+	target := "read this [note: the user tagged " + outsideFile + "; " + protectedFile + " — contents are not inlined]"
+	roots := taggedReadRoots(ag, target)
+	if len(roots) != 1 || roots[0] != canonicalOutside {
+		t.Fatalf("tagged read roots = %v, want only %q", roots, canonicalOutside)
+	}
+	if _, err := ag.TurnAuthored(context.Background(), target, Events{OnToolEnd: func(_, _, preview string) { result = preview }}); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(result, "outside notes") {
+		t.Fatalf("tagged read result = %q", result)
+	}
+	if _, err := policy.Authorize(outsideFile, sandbox.AccessRead, false); err == nil {
+		t.Fatal("parent policy unexpectedly authorized the tagged path")
+	}
+	if _, err := policy.Authorize(outsideFile, sandbox.AccessWrite, false); err == nil {
+		t.Fatal("parent policy unexpectedly authorized a write to the tagged path")
+	}
+}
 
-	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
+func TestPlanModeTerminatesOnBudgetReserve(t *testing.T) {
+	call := 0
+	var backend *mockAgentBackend
+	backend = &mockAgentBackend{streamFn: func(_ context.Context, _ models.Request, sink models.EventSink) (models.Message, models.Usage, error) {
+		call++
+		if call == 1 {
+			return models.Message{Role: "assistant", ToolCalls: []models.ToolCall{agentToolCall("call-1", "read", `{"path":"agent.go"}`)}}, models.Usage{PromptTokens: 1000, CompletionTokens: 160000}, nil
+		}
+		text := "Synthesized plan:\n\n<proposed_plan>\n# Plan\n1. Do it\n</proposed_plan>"
+		if sink.OnText != nil {
+			sink.OnText(text)
+		}
+		return models.Message{Role: "assistant", Content: text}, models.Usage{}, nil
+	}}
+	ag := New(backend, "m", 100, "sys")
 	ag.PlanMode = true
 
 	final, err := ag.TurnAuthored(context.Background(), "make a plan", Events{})
@@ -520,44 +577,34 @@ func TestPlanModeTerminatesOnBudgetReserve(t *testing.T) {
 	if !strings.Contains(final, "<proposed_plan>") {
 		t.Fatalf("expected final plan, got: %s", final)
 	}
-	if len(requests) != 2 {
-		t.Fatalf("requests = %d, want 2", len(requests))
+	if len(backend.requests) != 2 {
+		t.Fatalf("requests = %d, want 2", len(backend.requests))
 	}
-	if len(requests[0].Tools) == 0 {
+	if len(backend.requests[0].Tools) == 0 {
 		t.Fatal("the request crossing the reserve must still expose exploration tools")
 	}
-	if len(requests[1].Tools) != 0 {
-		t.Fatalf("final plan request exposed tools: %+v", requests[1].Tools)
+	if len(backend.requests[1].Tools) != 0 {
+		t.Fatalf("final plan request exposed tools: %+v", backend.requests[1].Tools)
 	}
-	if !requestContains(requests[1], "reached the planning budget reserve") {
+	if !requestContains(backend.requests[1], "reached the planning budget reserve") {
 		t.Fatal("final plan request is missing the terminal budget reminder")
 	}
 
 	t.Run("review", func(t *testing.T) {
-		var requests []models.Request
-		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			var req models.Request
-			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-				t.Errorf("decode request: %v", err)
-				return
-			}
-			requests = append(requests, req)
-			w.Header().Set("Content-Type", "text/event-stream")
-			switch len(requests) {
+		call := 0
+		var backend *mockAgentBackend
+		backend = &mockAgentBackend{streamFn: func(_ context.Context, _ models.Request, _ models.EventSink) (models.Message, models.Usage, error) {
+			call++
+			switch call {
 			case 1:
-				// Cross the weighted reserve after an exploratory read.
-				fmt.Fprint(w, `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"review-read-1","type":"function","function":{"name":"read","arguments":"{\"path\":\"agent.go\"}"}}]}}],"usage":{"prompt_tokens":1600000}}`+"\n\n")
+				return models.Message{Role: "assistant", ToolCalls: []models.ToolCall{agentToolCall("review-read-1", "read", `{"path":"agent.go"}`)}}, models.Usage{PromptTokens: 1600000}, nil
 			case 2:
-				// The model emitted a stale exploratory call despite the restricted schema.
-				fmt.Fprint(w, `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"review-read-2","type":"function","function":{"name":"read","arguments":"{\"path\":\"agent.go\"}"}}]}}],"usage":{"prompt_tokens":10,"completion_tokens":10}}`+"\n\n")
+				return models.Message{Role: "assistant", ToolCalls: []models.ToolCall{agentToolCall("review-read-2", "read", `{"path":"agent.go"}`)}}, models.Usage{PromptTokens: 10, CompletionTokens: 10}, nil
 			default:
-				fmt.Fprint(w, `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"review-submit-1","type":"function","function":{"name":"submit_review","arguments":"{\"summary\":\"ok\",\"verdict\":\"approve\",\"findings\":[]}"}}]}}],"usage":{"prompt_tokens":10,"completion_tokens":10}}`+"\n\n")
+				return models.Message{Role: "assistant", ToolCalls: []models.ToolCall{agentToolCall("review-submit-1", "submit_review", `{"summary":"ok","verdict":"approve","findings":[]}`)}}, models.Usage{PromptTokens: 10, CompletionTokens: 10}, nil
 			}
-			fmt.Fprint(w, "data: [DONE]\n\n")
-		}))
-		defer srv.Close()
-
-		ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
+		}}
+		ag := New(backend, "m", 100, "sys")
 		ag.ReviewMode = true
 		final, err := ag.TurnAuthored(context.Background(), "review the change", Events{})
 		if err != nil {
@@ -566,20 +613,20 @@ func TestPlanModeTerminatesOnBudgetReserve(t *testing.T) {
 		if !strings.Contains(final, `"verdict":"approve"`) {
 			t.Fatalf("expected submitted review, got: %s", final)
 		}
-		if len(requests) != 3 {
-			t.Fatalf("review requests = %d, want 3", len(requests))
+		if len(backend.requests) != 3 {
+			t.Fatalf("review requests = %d, want 3", len(backend.requests))
 		}
-		if len(requests[0].Tools) == 0 {
+		if len(backend.requests[0].Tools) == 0 {
 			t.Fatal("the request crossing the weighted reserve must expose exploration tools")
 		}
-		if !reflect.DeepEqual(requests[1].Tools, requests[0].Tools) {
-			t.Fatalf("review finalization changed tool schema: %+v, baseline %+v", requests[1].Tools, requests[0].Tools)
+		if !reflect.DeepEqual(backend.requests[1].Tools, backend.requests[0].Tools) {
+			t.Fatalf("review finalization changed tool schema: %+v, baseline %+v", backend.requests[1].Tools, backend.requests[0].Tools)
 		}
-		if !requestContains(requests[2], reviewFinalizationToolError) {
+		if !requestContains(backend.requests[2], reviewFinalizationToolError) {
 			t.Fatal("stale read result is missing the review finalization error")
 		}
-		if !reflect.DeepEqual(requests[2].Tools, requests[0].Tools) {
-			t.Fatalf("valid review request changed tool schema: %+v, baseline %+v", requests[2].Tools, requests[0].Tools)
+		if !reflect.DeepEqual(backend.requests[2].Tools, backend.requests[0].Tools) {
+			t.Fatalf("valid review request changed tool schema: %+v, baseline %+v", backend.requests[2].Tools, backend.requests[0].Tools)
 		}
 	})
 }
@@ -594,23 +641,16 @@ func requestContains(req models.Request, fragment string) bool {
 }
 
 func TestPlanModeBudgetExhaustedError(t *testing.T) {
-	requests := 0
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requests++
-		w.Header().Set("Content-Type", "text/event-stream")
-		if requests == 1 {
-			// Cross reserve and exhaust budget
-			fmt.Fprint(w, `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call-1","type":"function","function":{"name":"read","arguments":"{\"path\":\"agent.go\"}"}}]}}],"usage":{"prompt_tokens":1000,"completion_tokens":200000}}`+"\n\n")
-		} else {
-			// Final synthesis request fails with 500 error
-			http.Error(w, `{"error":{"message":"internal error"}}`, http.StatusInternalServerError)
-			return
+	call := 0
+	var backend *mockAgentBackend
+	backend = &mockAgentBackend{streamFn: func(_ context.Context, _ models.Request, _ models.EventSink) (models.Message, models.Usage, error) {
+		call++
+		if call == 1 {
+			return models.Message{Role: "assistant", ToolCalls: []models.ToolCall{agentToolCall("call-1", "read", `{"path":"agent.go"}`)}}, models.Usage{PromptTokens: 1000, CompletionTokens: 200000}, nil
 		}
-		fmt.Fprint(w, "data: [DONE]\n\n")
-	}))
-	defer srv.Close()
-
-	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
+		return models.Message{}, models.Usage{}, &models.HTTPError{Status: "500 Internal Server Error", Body: `{"error":{"message":"internal error"}}`}
+	}}
+	ag := New(backend, "m", 100, "sys")
 	ag.PlanMode = true
 
 	_, err := ag.TurnAuthored(context.Background(), "make a plan", Events{})

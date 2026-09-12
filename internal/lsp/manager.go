@@ -90,35 +90,25 @@ type Status struct {
 	Err   string // failure detail when State == "failed"
 }
 
-// Manager owns LSP server processes and the diagnostics cache.
-//
-// Concurrency (docs/concurrency.md): spawn dedup is a close-to-broadcast
-// channel per server key (spawning); diagnostic waiters are channels closed
-// by the publish handler, keyed by path — no per-waiter
-// goroutines. mu guards the maps only and is never held across I/O; the
-// publish handler runs on the client's read goroutine and only takes mu
-// briefly to swap caches/close waiters.
+// Manager controls LSP server lifecycles and diagnostic caches.
+// Mutex mu guards internal maps and is never held during I/O operations.
 type Manager struct {
-	mu          sync.Mutex
-	specs       map[string]ServerSpec
-	clients     map[string]*clientState // key: id + "\x00" + root
-	broken      map[string]string       // key -> error message
-	spawning    map[string]chan struct{}
-	diags       map[string][]Diagnostic    // abs path -> latest pushed set
-	diagSeq     map[string]uint64          // abs path -> push sequence
-	waiters     map[string][]chan struct{} // abs path -> pending wakes
-	keyer       spawnKeyer                 // nil = findRoot (production)
-	closed      bool
-	runtime     *tools.ToolRuntime
-	lifeCtx     context.Context
-	cancel      context.CancelFunc
-	docMu       sync.Mutex
-	warming     map[string]struct{}
-	warmWG      sync.WaitGroup
-	workspace   string
-	renamesMu   sync.Mutex
-	renames     map[string]*renameEntry
-	renameOrder map[string][]string
+	mu       sync.Mutex
+	specs    map[string]ServerSpec
+	clients  map[string]*clientState // key: id + "\x00" + root
+	broken   map[string]string       // key -> error message
+	spawning map[string]chan struct{}
+	diags    map[string][]Diagnostic    // abs path -> latest pushed set
+	diagSeq  map[string]uint64          // abs path -> push sequence
+	waiters  map[string][]chan struct{} // abs path -> pending wakes
+	keyer    spawnKeyer                 // nil = findRoot (production)
+	closed   bool
+	runtime  *tools.ToolRuntime
+	lifeCtx  context.Context
+	cancel   context.CancelFunc
+	docMu    sync.Mutex
+	warming  map[string]struct{}
+	warmWG   sync.WaitGroup
 }
 
 // SetRuntime attaches the shared restricted process boundary. It should be
@@ -183,51 +173,21 @@ type spawnKeyer func(serverID, abs string, markers []string) string
 func NewManager(specs map[string]ServerSpec) *Manager {
 	lifeCtx, cancel := context.WithCancel(context.Background())
 	return &Manager{
-		specs:       specs,
-		clients:     map[string]*clientState{},
-		broken:      map[string]string{},
-		spawning:    map[string]chan struct{}{},
-		diags:       map[string][]Diagnostic{},
-		diagSeq:     map[string]uint64{},
-		waiters:     map[string][]chan struct{}{},
-		lifeCtx:     lifeCtx,
-		cancel:      cancel,
-		warming:     map[string]struct{}{},
-		renames:     map[string]*renameEntry{},
-		renameOrder: map[string][]string{},
+		specs:    specs,
+		clients:  map[string]*clientState{},
+		broken:   map[string]string{},
+		spawning: map[string]chan struct{}{},
+		diags:    map[string][]Diagnostic{},
+		diagSeq:  map[string]uint64{},
+		waiters:  map[string][]chan struct{}{},
+		lifeCtx:  lifeCtx,
+		cancel:   cancel,
+		warming:  map[string]struct{}{},
 	}
 }
 
-// SetWorkspace supplies the canonical workspace used for rename containment
-// when a manager is used without a ToolRuntime (primarily focused tests).
-func (m *Manager) SetWorkspace(workspace string) error {
-	canonical, err := canonicalDocumentPath(workspace)
-	if err != nil {
-		return err
-	}
-	info, err := os.Stat(canonical)
-	if err != nil {
-		return err
-	}
-	if !info.IsDir() {
-		return errors.New("LSP workspace is not a directory")
-	}
-	m.mu.Lock()
-	m.workspace = canonical
-	m.mu.Unlock()
-	return nil
-}
-
-// WaitDiagnostics touches path (didOpen/didChange at current disk content),
-// waits up to diagWait for the server to push diagnostics for the new
-// version, and returns the rendered block for the tool output — including
-// sibling files the edit broke. Returns "" when no server covers the file,
-// the server failed, the wait timed out, or there is nothing to report.
-// Bounded by ctx: ctrl+c during a turn cancels the wait.
-//
-// WaitDiagnostics must not be called concurrently for the same path (the
-// agent's per-path file lock already guarantees this: writes/edits to one
-// path serialize, so their diagnostic waits do too).
+// WaitDiagnostics notifies the LSP server of file changes and waits for diagnostics.
+// Returns rendered diagnostics string, or empty string on timeout or failure.
 func (m *Manager) WaitDiagnostics(ctx context.Context, path string) string {
 	if m == nil {
 		return ""
@@ -709,7 +669,7 @@ func (m *Manager) Statuses() []Status {
 }
 
 // Close shuts every server down (shutdown/exit then kill) and wakes all
-// waiters. Called on ghg exit before bashrun.KillAll, mirroring mcpMgr.
+// waiters. Called on ghg exit to release all LSP resources.
 func (m *Manager) Close() {
 	if m == nil {
 		return
@@ -723,10 +683,6 @@ func (m *Manager) Close() {
 		return
 	}
 	m.closed = true
-	m.renamesMu.Lock()
-	m.renames = map[string]*renameEntry{}
-	m.renameOrder = map[string][]string{}
-	m.renamesMu.Unlock()
 	clients := make([]*clientState, 0, len(m.clients))
 	for _, cs := range m.clients {
 		clients = append(clients, cs)

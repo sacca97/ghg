@@ -9,9 +9,7 @@ require (
 	github.com/charmbracelet/glamour v1.0.0
 	github.com/charmbracelet/lipgloss v1.1.1-0.20250404203927-76690c660834
 	github.com/charmbracelet/x/ansi v0.11.6
-	github.com/creack/pty v1.1.24
 	github.com/modelcontextprotocol/go-sdk v1.7.0
-	github.com/odvcencio/gotreesitter v0.51.0
 	github.com/muesli/termenv v0.16.0
 	golang.org/x/sync v0.21.0
 	golang.org/x/sys v0.47.0

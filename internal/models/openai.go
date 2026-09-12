@@ -220,144 +220,6 @@ type ToolCall struct {
 	ExitCode   int        `json:"exit_code,omitempty"`
 }
 
-// stripAuthored returns a copy of msgs with the internal Authored marker and
-// SentAt timestamp cleared — they're ghg-local bookkeeping (input-history
-// recall, the rewind picker) and must never reach the provider. It copies
-// because req.Messages typically aliases the caller's conversation slice,
-// which must keep the fields for storage/recall.
-func stripAuthored(msgs []Message) []Message {
-	return stripAuthoredWithBlocks(msgs, false)
-}
-
-// stripAuthoredPreserveBlocks clears ghg bookkeeping while retaining
-// provider-native blocks for the adapter that owns them. The generic OpenAI
-// serializer uses stripAuthored so one provider's opaque blocks never leak to
-// another provider.
-func stripAuthoredPreserveBlocks(msgs []Message) []Message {
-	out := stripAuthoredWithBlocks(msgs, true)
-	// Anthropic represents tool failures with tool_result.is_error. ExitCode
-	// is still ghg metadata and is consumed only while this adapter builds
-	// that block; it is never serialized directly.
-	for i := range out {
-		if msgs[i].Role == "tool" {
-			out[i].ExitCode = msgs[i].ExitCode
-		}
-	}
-	return out
-}
-
-func stripAuthoredWithBlocks(msgs []Message, preserveBlocks bool) []Message {
-	out := make([]Message, len(msgs))
-	copy(out, msgs)
-	for i := range out {
-		out[i].Authored = false
-		out[i].SentAt = nil
-		out[i].Usage = nil
-		out[i].Model = ""
-		out[i].RewoundFrom = ""
-		out[i].Output = nil
-		out[i].ExitCode = 0
-		out[i].Source = ""
-		out[i].StopReason = ""
-		if !preserveBlocks {
-			out[i].ProviderBlocks = nil
-		}
-		for j := range out[i].ToolCalls {
-			out[i].ToolCalls[j].Output = nil
-			out[i].ToolCalls[j].DurationMs = 0
-			out[i].ToolCalls[j].ExitCode = 0
-		}
-	}
-	// Backfill tool-message Name from the owning call (older sessions predate
-	// the field; providers that require it only look at Name).
-	names := map[string]string{}
-	for _, m := range out {
-		if m.Role == "assistant" {
-			for _, tc := range m.ToolCalls {
-				names[tc.ID] = tc.Function.Name
-			}
-		}
-	}
-	for i := range out {
-		if out[i].Role == "tool" && out[i].Name == "" {
-			out[i].Name = names[out[i].ToolCallID]
-		}
-	}
-	return out
-}
-
-// repairToolHistory patches message-pairing defects that strict providers
-// (Kimi K3, Gemini) reject with a 400 before the first token:
-//
-//   - assistant tool_calls with no following tool result (interrupted turn)
-//     get a synthetic "(interrupted before execution)" result per call
-//   - tool messages whose tool_call_id has no owning assistant tool_call
-//     (compaction/rewind trimmed the caller) are flattened into plain user
-//     context — the model loses the ID pairing but keeps the information
-//
-// Idempotent: a well-formed conversation comes through unchanged.
-func repairToolHistory(msgs []Message) []Message {
-	answered := make(map[string]bool, len(msgs))
-	callName := make(map[string]string, len(msgs))
-	for i, m := range msgs {
-		if m.Role != "assistant" {
-			continue
-		}
-		for _, tc := range m.ToolCalls {
-			answered[tc.ID] = false
-			callName[tc.ID] = tc.Function.Name
-			for _, r := range msgs[i+1:] {
-				if r.Role == "tool" && r.ToolCallID == tc.ID {
-					answered[tc.ID] = true
-					break
-				}
-				if r.Role == "assistant" || r.Role == "user" {
-					break // results always immediately follow their call
-				}
-			}
-		}
-	}
-	out := make([]Message, 0, len(msgs))
-	var pending []string // unanswered call IDs from the last assistant message
-	flush := func() {    // synthetics land after any real results in the run
-		for _, id := range pending {
-			out = append(out, Message{
-				Role:       "tool",
-				Content:    "(interrupted before execution)",
-				ToolCallID: id,
-				Name:       callName[id],
-			})
-		}
-		pending = nil
-	}
-	for _, m := range msgs {
-		if m.Role == "tool" {
-			if _, ok := answered[m.ToolCallID]; !ok {
-				flush()
-				// orphan: flatten into user context rather than drop the info
-				out = append(out, Message{
-					Role:    "user",
-					Content: "[earlier tool result]\n" + m.Content,
-				})
-				continue
-			}
-			out = append(out, m)
-			continue
-		}
-		flush()
-		out = append(out, m)
-		if m.Role == "assistant" {
-			for _, tc := range m.ToolCalls {
-				if !answered[tc.ID] {
-					pending = append(pending, tc.ID)
-				}
-			}
-		}
-	}
-	flush()
-	return out
-}
-
 // Tool is a tool definition advertised to the model.
 type Tool struct {
 	Type     string `json:"type"`
@@ -653,9 +515,6 @@ func (c *Client) Stream(ctx context.Context, req Request, sink EventSink) (Messa
 // provider-neutral OpenAI adapter. Unlike Client.OnRetry, the sink is not
 // shared mutable state and is safe for concurrent backend calls.
 func (c *Client) stream(ctx context.Context, req Request, sink EventSink) (Message, Usage, error) {
-	if req.SessionID != "" {
-		ctx = WithSessionID(ctx, req.SessionID)
-	}
 	body, err := json.Marshal(newOpenAIRequest(req, true))
 	if err != nil {
 		return Message{}, Usage{}, err
@@ -815,9 +674,6 @@ func (c *Client) Complete(ctx context.Context, req Request) (Message, Usage, err
 // complete is the request-local completion implementation used by the
 // provider-neutral OpenAI adapter.
 func (c *Client) complete(ctx context.Context, req Request, sink EventSink) (Message, Usage, error) {
-	if req.SessionID != "" {
-		ctx = WithSessionID(ctx, req.SessionID)
-	}
 	body, err := json.Marshal(newOpenAIRequest(req, false))
 	if err != nil {
 		return Message{}, Usage{}, err

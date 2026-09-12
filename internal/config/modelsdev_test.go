@@ -2,7 +2,6 @@ package config
 
 import (
 	"context"
-	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -10,17 +9,18 @@ import (
 	"time"
 )
 
-func modelsDevTestServer(t *testing.T, handler http.Handler) *httptest.Server {
-	t.Helper()
-	defer func() {
-		if recovered := recover(); recovered != nil {
-			if strings.Contains(fmt.Sprint(recovered), "operation not permitted") {
-				t.Skip("loopback listener not permitted by sandbox environment")
-			}
-			panic(recovered)
-		}
-	}()
-	return httptest.NewServer(handler)
+const modelsDevTestURL = "https://models-dev.test/api.json"
+
+func modelsDevTestClient(handler http.Handler) *http.Client {
+	return &http.Client{Transport: modelsDevHandlerTransport{handler: handler}}
+}
+
+type modelsDevHandlerTransport struct{ handler http.Handler }
+
+func (t modelsDevHandlerTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	recorder := httptest.NewRecorder()
+	t.handler.ServeHTTP(recorder, req)
+	return recorder.Result(), nil
 }
 
 func TestParseModelsDevContext(t *testing.T) {
@@ -179,7 +179,7 @@ func TestModelsDevReasoningFallbackRequiresAgreement(t *testing.T) {
 }
 
 func TestFetchModelsDev(t *testing.T) {
-	server := modelsDevTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	client := modelsDevTestClient(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Accept") != "application/json" {
 			t.Errorf("Accept = %q", r.Header.Get("Accept"))
 		}
@@ -188,9 +188,8 @@ func TestFetchModelsDev(t *testing.T) {
 		}
 		_, _ = w.Write([]byte(`{"opencode":{"models":{"grok-4":{"limit":{"context":131072},"reasoning_options":[{"type":"effort","values":["low",null,"max"]}]}}}}`))
 	}))
-	defer server.Close()
 
-	cache, err := fetchModelsDev(context.Background(), server.Client(), server.URL, map[string]struct{}{"grok-4": {}})
+	cache, err := fetchModelsDev(context.Background(), client, modelsDevTestURL, map[string]struct{}{"grok-4": {}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -203,12 +202,11 @@ func TestFetchModelsDev(t *testing.T) {
 }
 
 func TestFetchModelsDevRejectsBadResponses(t *testing.T) {
-	server := modelsDevTestServer(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	client := modelsDevTestClient(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadGateway)
 		_, _ = w.Write([]byte("upstream unavailable"))
 	}))
-	defer server.Close()
-	if _, err := fetchModelsDev(context.Background(), server.Client(), server.URL, map[string]struct{}{"grok-4": {}}); err == nil || !strings.Contains(err.Error(), "unexpected HTTP status") {
+	if _, err := fetchModelsDev(context.Background(), client, modelsDevTestURL, map[string]struct{}{"grok-4": {}}); err == nil || !strings.Contains(err.Error(), "unexpected HTTP status") {
 		t.Fatalf("bad status error = %v", err)
 	}
 

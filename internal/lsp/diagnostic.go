@@ -2,7 +2,7 @@
 // stdlib-only LSP client over stdio that feeds compiler/linter diagnostics
 // back into the model's tool results after write/edit calls.
 //
-// Design notes (see .ai-docs/plans/lsp-diagnostics/README.md):
+// Design notes:
 //   - Diagnostics are wait-free: didOpen/didChange carry a version, the
 //     server pushes textDocument/publishDiagnostics, and a per-file channel
 //     close wakes waiters (opencode polls with timeouts —

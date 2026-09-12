@@ -19,9 +19,20 @@ import (
 	workerwire "github.com/sacca97/ghg/internal/worker"
 )
 
+func TestForwardRootArgs(t *testing.T) {
+	run := forwardRootArgs([]string{"--format", "json", "prompt"}, "run", "model", "provider", "session", true, "workspace-write", "deny", "ask")
+	if got, want := strings.Join(run, " "), "-m model -p provider --resume session --cautious --sandbox workspace-write --network deny --approval ask --format json prompt"; got != want {
+		t.Fatalf("run args = %q, want %q", got, want)
+	}
+	bridge := forwardRootArgs(nil, "bridge", "model", "provider", "session", false, "", "", "")
+	if got, want := strings.Join(bridge, " "), "-m model -p provider --session session"; got != want {
+		t.Fatalf("bridge args = %q, want %q", got, want)
+	}
+}
+
 // The system prompt always carries the built-in operating rules (the safety
-// rails); ~/.ghg/me.md appends the user's standing instructions after them.
-func TestSystemPromptAppendsUserMe(t *testing.T) {
+// rails); ~/.ghg/AGENTS.md appends the user's standing instructions after them.
+func TestSystemPromptAppendsUserInstructions(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("GHG_HOME", home)
 
@@ -33,13 +44,13 @@ func TestSystemPromptAppendsUserMe(t *testing.T) {
 		t.Fatal("embedded prompt must include the verification rule")
 	}
 	if strings.Contains(p, "Standing instructions") {
-		t.Fatal("a fresh install (all-comments me.md) appends nothing")
+		t.Fatal("a fresh install (all-comments AGENTS.md) appends nothing")
 	}
 
-	os.WriteFile(filepath.Join(home, "me.md"), []byte("- Always pnpm, never npm.\n"), 0o644)
+	os.WriteFile(filepath.Join(home, "AGENTS.md"), []byte("- Always pnpm, never npm.\n"), 0o644)
 	p = systemPrompt()
 	if !strings.Contains(p, "never force-push") {
-		t.Fatal("built-in rules survive a user me.md")
+		t.Fatal("built-in rules survive user instructions")
 	}
 	if !strings.Contains(p, "Standing instructions from the user") || !strings.Contains(p, "Always pnpm") {
 		t.Fatalf("user instructions should append:\n%s", p)
@@ -54,7 +65,7 @@ func TestSystemPromptAppendsTrustedProjectInstructions(t *testing.T) {
 	if err := config.Trust(root); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(home, "me.md"), []byte("prefer task test\n"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(home, "AGENTS.md"), []byte("prefer task test\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(root, "AGENTS.md"), []byte("run task check\n"), 0o644); err != nil {
@@ -120,7 +131,7 @@ func TestContinueSessionIDUsesCurrentDirectory(t *testing.T) {
 }
 
 func TestWorkerEventOrderTerminalBeforeIdle(t *testing.T) {
-	baseDir, err := os.MkdirTemp("/tmp", "ghg-w-")
+	baseDir, err := os.MkdirTemp("", "ghg-w-")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,15 +154,8 @@ func TestWorkerEventOrderTerminalBeforeIdle(t *testing.T) {
 	}
 	w.ag = agent.New(nil, "m", 100, "sys")
 
-	server, err := workerwire.NewServer(runtimeFile, w)
-	if err != nil {
-		t.Fatal(err)
-	}
-	w.server = server
-	defer server.Close()
-
 	w.startOperation("turn", func(ctx context.Context) {
-		w.publish("turn_done", workerTurnResult{}, true)
+		w.publish(workerwire.EventTurnDone, workerTurnResult{}, true)
 		eventsMu.Lock()
 		events = append(events, "turn_done")
 		eventsMu.Unlock()

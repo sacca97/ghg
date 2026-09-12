@@ -9,6 +9,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/sacca97/ghg/internal/models"
+	"github.com/sacca97/ghg/internal/textutil"
 )
 
 const compactSystemPrompt = `You produce a terse continuation checkpoint for another coding agent.
@@ -542,12 +543,12 @@ func shrinkCompactionContent(content string, maxBytes int) string {
 		available = maxBytes - len(marker)
 	}
 	if available < 2 {
-		return content[:utf8Prefix(content, maxBytes)]
+		return content[:textutil.UTF8Prefix(content, maxBytes)]
 	}
 	head := available / 2
 	tail := available - head
 	bodyEnd := len(content) - len(suffix)
-	headEnd := utf8Prefix(content[:bodyEnd], head)
+	headEnd := textutil.UTF8Prefix(content[:bodyEnd], head)
 	tailStart := bodyEnd - tail
 	if tailStart < headEnd {
 		tailStart = headEnd

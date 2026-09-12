@@ -191,7 +191,7 @@ export function buildBlock(block, post) {
     summary.className = "thinking-summary";
     summary.textContent = thinkingLabel(block);
     const body = document.createElement("div");
-    body.className = "markdown";
+    body.className = "markdown thinking-content";
     renderMarkdown(body, text(block.text));
     details.append(summary, body);
     element.append(details);

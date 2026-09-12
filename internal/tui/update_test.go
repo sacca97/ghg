@@ -18,24 +18,6 @@ import (
 	workerwire "github.com/sacca97/ghg/internal/worker"
 )
 
-func TestInteractiveDoneUsesToolPreview(t *testing.T) {
-	m := &model{input: newInput()}
-	m.Update(tea.WindowSizeMsg{Width: 80, Height: 24})
-	m.iactive = &interactive{}
-	m.Update(interactiveDoneMsg{output: "summary\n```diff\n--- file\n+++ file\n-old\n+new\n```"})
-
-	if m.iactive != nil || len(m.blocks) != 1 {
-		t.Fatalf("interactive command should settle into one transcript block: active=%v blocks=%d", m.iactive != nil, len(m.blocks))
-	}
-	got := ansi.Strip(m.blocks[0].text)
-	if strings.Contains(got, "```diff") || strings.Contains(got, "--- file") || strings.Contains(got, "+++ file") {
-		t.Fatalf("interactive preview should use the shared diff preview: %q", got)
-	}
-	if !strings.Contains(got, "-old") || !strings.Contains(got, "+new") {
-		t.Fatalf("interactive preview should retain diff lines: %q", got)
-	}
-}
-
 func TestCompactionDoneRebuildsTranscript(t *testing.T) {
 	m := compactCmdModel()
 	m.messages = []models.Message{
@@ -557,6 +539,7 @@ func TestBusyCmdAllowList(t *testing.T) {
 		"/help", "/effort", "/effort high",
 		"/tasks", "/tasks abc123", "/goal", "/goal clear", "/goal rounds 5",
 		"/approval", "/approval auto", "/cd", "/cd /tmp", "/pwd", "/ask what is this?", "/notify", "/notify on", "/rename", "/continue",
+		"/compact", "/clear",
 	}
 	for _, c := range runs {
 		if !busyCmd(c) {
@@ -564,8 +547,7 @@ func TestBusyCmdAllowList(t *testing.T) {
 		}
 	}
 	queues := []string{
-		"/goal resume", "/goal ship the release", "/model", "/model x",
-		"/compact", "/clear", "/fork", "/resume", "/quit",
+		"/goal resume", "/goal ship the release", "/model", "/model x", "/fork", "/resume", "/quit",
 		"/bogus", "hello",
 	}
 	for _, c := range queues {

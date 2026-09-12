@@ -89,6 +89,58 @@ func TestWorkerEffortForModelDoesNotEscalateBaseline(t *testing.T) {
 	}
 }
 
+// The worker owns configuration writes: a controller asks for a role model or
+// the dynamic-reasoning switch and the worker persists it, so both clients get
+// one validation and state-transition path.
+func TestWorkerConfigurePersistsRoleModelAndDynamicReasoning(t *testing.T) {
+	t.Setenv("GHG_HOME", t.TempDir())
+	cfg := &config.Config{
+		DefaultModel: "fast-model",
+		Providers: map[string]config.Provider{
+			"test": {BaseURL: "https://provider.example/v1", API: string(models.ProtocolOpenAICompletions), APIKey: "key"},
+		},
+		Models: map[string]config.Model{
+			"fast-model": {Providers: []string{"test"}, MaxOut: 1600},
+		},
+		Roles: map[string]config.RoleConfig{
+			config.RoleFast: {Model: "fast-model", Provider: "test"},
+		},
+	}
+	w := &workerProcessState{cfg: cfg, profiles: models.Profiles{}, ag: agent.New(nil, "fast-model", 100, "system")}
+	dynamicReasoning := false
+	if err := w.configure(workerConfigureRequest{
+		Role: config.RoleFast, Model: "fast-model", Provider: "test",
+		DynamicReasoning: &dynamicReasoning, PersistDynamicReasoning: true,
+		PersistRoleModel: true, Mode: "execute",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	saved, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := saved.Roles[config.RoleFast]; got.Model != "fast-model" || got.Provider != "test" {
+		t.Fatalf("persisted role route = %+v, want fast-model/test", got)
+	}
+	if saved.DynamicReasoning == nil || *saved.DynamicReasoning {
+		t.Fatalf("persisted dynamic reasoning = %v, want false", saved.DynamicReasoning)
+	}
+
+	// An unknown role must be refused before anything is written.
+	marker := config.RoleConfig{Model: "fast-model", Provider: "test"}
+	if err := w.configure(workerConfigureRequest{Model: "fast-model", Provider: "test", PersistRoleModel: true}); err == nil {
+		t.Fatal("persisting without a role should fail")
+	}
+	after, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := after.Roles[config.RoleFast]; got != marker {
+		t.Fatalf("failed persist changed the role route: %+v", got)
+	}
+}
+
 func TestWorkerApprovalModeChangesLive(t *testing.T) {
 	t.Setenv("GHG_HOME", t.TempDir())
 	cfg := config.Default()

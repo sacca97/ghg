@@ -501,6 +501,51 @@ func TestObservedEditReadbackIsBounded(t *testing.T) {
 	if len(got) > maxEditReadbackLineBytes+16 || !strings.Contains(got, "…") {
 		t.Fatalf("readback was not bounded: %d bytes %q", len(got), got)
 	}
+	lines := editReadback([]byte(strings.Repeat("x\n", maxEditReadbackLines+4)), []observedEdit{{start: 0}})
+	if gotLines := strings.Count(lines, "\n"); gotLines != maxEditReadbackLines {
+		t.Fatalf("readback rendered %d lines, want %d", gotLines, maxEditReadbackLines)
+	}
+}
+
+func TestRangesIntersectAllowsBoundaryInsert(t *testing.T) {
+	for _, test := range []struct {
+		name         string
+		aStart, aEnd int
+		bStart, bEnd int
+		want         bool
+	}{
+		{name: "before", aStart: 10, aEnd: 20, bStart: 10, bEnd: 10},
+		{name: "after", aStart: 10, aEnd: 20, bStart: 20, bEnd: 20},
+		{name: "inside", aStart: 10, aEnd: 20, bStart: 15, bEnd: 15, want: true},
+		{name: "same insert", aStart: 10, aEnd: 10, bStart: 10, bEnd: 10, want: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if got := rangesIntersect(test.aStart, test.aEnd, test.bStart, test.bEnd); got != test.want {
+				t.Fatalf("rangesIntersect = %v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
+func TestPublishEditFilesRejectsChangedTarget(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "main.go")
+	if err := os.WriteFile(path, []byte("external\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err := publishEditFiles(context.Background(), []editPublication{
+		{path: path, original: []byte("original\n"), updated: []byte("edited\n"), mode: 0o644},
+	})
+	if err == nil || !strings.Contains(err.Error(), "file changed since it was read") {
+		t.Fatalf("stale publication error = %v", err)
+	}
+	got, readErr := os.ReadFile(path)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if string(got) != "external\n" {
+		t.Fatalf("stale publication changed target: %q", got)
+	}
 }
 
 func TestObservedEditRejectsChangedAndAmbiguousBytes(t *testing.T) {
@@ -531,8 +576,20 @@ func TestObservedEditRejectsChangedAndAmbiguousBytes(t *testing.T) {
 		t.Fatal(err)
 	}
 	result = ExecuteResult(ctx, All(), "edit", observedReplaceArgs(id, path, 2, 2, "new"))
-	if !strings.Contains(result.Preview, "more than once") {
+	if !strings.Contains(result.Preview, "more than once") || !strings.Contains(result.Preview, "2 matches at lines 3, 4") {
 		t.Fatalf("ambiguous shifted bytes should fail: %q", result.Preview)
+	}
+
+	if err := os.WriteFile(path, []byte("one\ntarget\nthree\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	read = ExecuteResult(ctx, All(), "read", json.RawMessage(fmt.Sprintf("{\"path\":%q,\"offset\":2,\"limit\":1}", path)))
+	result = ExecuteResult(ctx, All(), "edit", observedReplaceArgs(read.Metadata["observation_id"], path, 2, 2, ""))
+	if !strings.Contains(result.Preview, "replace requires non-empty content") {
+		t.Fatalf("empty replace should fail explicitly: %q", result.Preview)
+	}
+	if got, err := os.ReadFile(path); err != nil || string(got) != "one\ntarget\nthree\n" {
+		t.Fatalf("empty replace changed file: %q, %v", got, err)
 	}
 }
 

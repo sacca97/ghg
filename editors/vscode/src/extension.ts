@@ -28,6 +28,7 @@ const defaultSettings = new Set(["defaultRole", "defaultMode", "defaultEffort"])
 
 type SessionPick = vscode.QuickPickItem & { sessionId: string };
 type ReferenceSuggestion = { path: string; folder: boolean };
+type SteerRequest = { prompt: string; role: Role; mode: Mode; references: string[] };
 type ExtensionSettings = {
 	role: Role;
 	mode: Mode;
@@ -84,7 +85,7 @@ function promptWithReferences(prompt: string, paths: string[]): string {
 
 function commandMayRunDuringTurn(prompt: string): boolean {
 	const name = prompt.trim().split(/\s+/, 1)[0];
-	return ["/approval", "/commands", "/detach", "/help", "/notify", "/search-providers", "/pwd", "/rename", "/q", "/quit", "/exit"].includes(name);
+	return ["/approval", "/commands", "/detach", "/export", "/export-result", "/export-chat", "/export-log", "/help", "/notify", "/search-providers", "/pwd", "/rename", "/q", "/quit", "/exit"].includes(name);
 }
 
 function literalGlob(value: string): string {
@@ -205,11 +206,29 @@ function runJSONCommand(binary: string, cwd: string | undefined, args: string[])
 	return runCommand(binary, cwd, args).then((output) => JSON.parse(output));
 }
 
-function defaultExportFilename(kind: "plan" | "review"): string {
+function defaultExportFilename(kind: string, format = "markdown"): string {
 	const now = new Date();
 	const pad = (value: number) => String(value).padStart(2, "0");
 	const stamp = `${now.getUTCFullYear()}${pad(now.getUTCMonth() + 1)}${pad(now.getUTCDate())}-${pad(now.getUTCHours())}${pad(now.getUTCMinutes())}${pad(now.getUTCSeconds())}`;
-	return `${kind}-${stamp}.md`;
+	return `${kind || "result"}-${stamp}.${format === "json" ? "json" : "md"}`;
+}
+
+function normalizeExportKind(value: string): string | undefined {
+	switch (value.toLowerCase()) {
+	case "chat":
+	case "plan":
+	case "review":
+		return value.toLowerCase();
+	case "last":
+	case "message":
+	case "response":
+		return "message";
+	case "log":
+	case "transcript":
+		return "chat";
+	default:
+		return undefined;
+	}
 }
 
 function listModels(binary: string, cwd: string | undefined): Promise<Record<string, string>> {
@@ -261,6 +280,26 @@ function htmlFor(webview: vscode.Webview, extensionUri: vscode.Uri, settings: Ex
 
 type WebviewMessage = { type?: unknown; [key: string]: unknown };
 
+// CommandSpec mirrors internal/worker.CommandSpec. The bridge sends the
+// canonical catalogue on startup, so both clients render the same hints
+// without a second hand-maintained command list.
+type CommandSpec = {
+	name: string;
+	aliases?: string[];
+	hint: string;
+	owner: string;
+};
+
+// The commands this extension implements. Hints and usage text come from the
+// bridge catalogue; only the supported set is declared here.
+const extensionCommands = [
+	"!cmd",
+	"/approval", "/ask", "/cd", "/clear", "/compact", "/context-doctor", "/continue",
+	"/detach", "/dynamic-reasoning", "/effort", "/execute", "/export", "/goal-from-context", "/help",
+	"/lsp", "/mcp", "/model", "/notify", "/plan", "/pwd", "/quit", "/rename",
+	"/resume", "/review", "/search-providers",
+];
+
 class GHGViewProvider implements vscode.WebviewViewProvider {
 	private view?: vscode.WebviewView;
 	private bridge?: ChildProcess;
@@ -275,6 +314,9 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 	private lastSnapshot?: Event;
 	private promptIDs = new Set<string>();
 	private detachWaiters = new Map<string, { resolve: () => void; reject: (error: Error) => void }>();
+	private commands: CommandSpec[] = [];
+	private pendingSteers: SteerRequest[] = [];
+	private steerCancelRequested = false;
 
 	constructor(private readonly extension: vscode.ExtensionContext) {}
 
@@ -359,6 +401,22 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 		this.post({ type: "busy", value });
 	}
 
+	private async submitSteered(request: SteerRequest): Promise<void> {
+		this.setActive(true);
+		this.post({ type: "turn_start", mode: request.mode });
+		try {
+			if (request.mode === "review") {
+				await this.submitInput(request.prompt, request.role, "execute", { review: true }, request.references);
+			} else {
+				await this.submitInput(request.prompt, request.role, request.mode === "plan" ? "plan" : "execute", {}, request.references);
+			}
+		} catch (error) {
+			this.post({ type: "error", error: error instanceof Error ? error.message : String(error) });
+			this.setActive(false);
+			this.post({ type: "turn_end" });
+		}
+	}
+
 	private async pickModel(mode: "chat" | "plan", selectedRole?: Role): Promise<void> {
 		const workspace = currentWorkspace();
 		const binary = vscode.workspace.getConfiguration("ghg").get<string>("binaryPath", "ghg");
@@ -385,11 +443,12 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 			{ placeHolder: `Choose the model for ${role}`, matchOnDescription: true },
 		);
 		if (!modelPick) return;
-		await this.bridgeCommand("set_role_model", {
+		await this.bridgeCommand("configure", {
 			role,
 			model: modelPick.item.model,
 			provider: modelPick.item.provider,
 			mode: mode === "plan" ? "plan" : "execute",
+			persist_role_model: true,
 		}, roles.find((name) => configured[name]) || role, mode === "plan" ? "plan" : "execute");
 		this.post({ type: "role_model", role, model: modelPick.item.model });
 	}
@@ -445,6 +504,10 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 			}
 			if (event.type === "bridge_ready") {
 				ready = true;
+				if (Array.isArray(event.commands)) {
+					this.commands = event.commands.filter((entry): entry is CommandSpec =>
+						!!entry && typeof entry === "object" && typeof (entry as CommandSpec).name === "string");
+				}
 				if (typeof event.session_id === "string" && event.session_id !== "") {
 					this.bridgeSession = event.session_id;
 					void this.extension.workspaceState.update(sessionKey(workspace), event.session_id);
@@ -468,6 +531,9 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 			}
 			if (event.type === "turn_end") {
 				this.setActive(false);
+				this.steerCancelRequested = false;
+				const nextSteer = this.pendingSteers.shift();
+				if (nextSteer) queueMicrotask(() => void this.submitSteered(nextSteer));
 			}
 			if (event.type === "error" && this.active) {
 				this.setActive(false);
@@ -687,6 +753,8 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 	}
 
 	private stopBridge(): Promise<void> {
+		this.pendingSteers = [];
+		this.steerCancelRequested = false;
 		const child = this.bridge;
 		this.bridge = undefined;
 		this.bridgeReady = undefined;
@@ -717,17 +785,21 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 		}
 	}
 
-	private async exportResult(kind: "plan" | "review"): Promise<void> {
+	private async exportResult(kind = "", destination = "", format = "", force = false): Promise<void> {
 		const workspace = currentWorkspace();
 		if (!workspace) throw new Error("open a workspace before exporting");
 		const binary = this.extensionSettings().binary;
-		const filename = defaultExportFilename(kind);
+		const resolvedFormat = format || (destination.toLowerCase().endsWith(".json") ? "json" : "markdown");
+		if (resolvedFormat !== "markdown" && resolvedFormat !== "json") throw new Error("usage: /export [chat|plan|review|last] [path] [--format json|markdown] [--force]");
+		const filename = destination || defaultExportFilename(kind, resolvedFormat);
 		const sessionID = this.bridgeSession || this.extension.workspaceState.get<string>(sessionKey(workspace)) || "";
 		const args = ["export"];
 		if (sessionID) args.push("--session", sessionID);
-		args.push("--kind", kind, "--output", filename);
+		if (kind) args.push("--kind", kind);
+		args.push("--format", resolvedFormat, "--output", filename);
+		if (force) args.push("--force");
 		await runCommand(binary, workspace.uri.fsPath, args);
-		this.post({ type: "notice", text: `Exported ${kind} to ${filename}` });
+		this.post({ type: "notice", text: `Exported ${kind || "latest result"} to ${filename}` });
 	}
 
 	async openSettings(): Promise<void> {
@@ -825,7 +897,7 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 	}
 
 	private async submitInput(prompt: string, role: Role, mode: "execute" | "plan", flags: { ask?: boolean; review?: boolean }, references: string[]): Promise<void> {
-		await this.bridgeCommand("configure_role", { role, mode }, role, mode);
+		await this.bridgeCommand("configure", { role, mode }, role, mode);
 		await this.bridgeCommand("input", {
 			input: promptWithReferences(prompt, references),
 			authored: true,
@@ -854,7 +926,7 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 			await this.submitInput(args, role, "execute", { ask: true }, references);
 			return;
 		case "/plan":
-			await this.bridgeCommand("configure_role", { role, mode: "plan" }, role, "plan");
+			await this.bridgeCommand("configure", { role, mode: "plan" }, role, "plan");
 			if (!args) {
 				this.post({ type: "notice", text: "switched to plan mode (read-only exploration)" });
 				return;
@@ -877,6 +949,39 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 			this.post({ type: "turn_start", mode: "chat" });
 			await this.submitInput(args, role, "execute", { review: true }, references);
 			return;
+		case "/export":
+		case "/export-result":
+		case "/export-chat":
+		case "/export-log": {
+			let kind = name === "/export-chat" || name === "/export-log" ? "chat" : "";
+			let destination = "";
+			let format = "";
+			let force = false;
+			for (let i = 1; i < fields.length; i++) {
+				const field = fields[i];
+				if (field === "--force" || field === "-f") {
+					force = true;
+					continue;
+				}
+				if (field === "--format" || field === "-format") {
+					format = fields[++i] || "";
+					continue;
+				}
+				if (field.startsWith("--format=")) {
+					format = field.slice("--format=".length);
+					continue;
+				}
+				if (field === "--output" || field === "-o") {
+					destination = fields[++i] || "";
+					continue;
+				}
+				const normalized = normalizeExportKind(field);
+				if (normalized && !kind) kind = normalized;
+				else if (!destination) destination = field;
+				else throw new Error("usage: /export [chat|plan|review|last] [path] [--format json|markdown] [--force]");
+			}
+			return this.exportResult(kind, destination, format, force);
+		}
 		case "/continue": {
 			if (args) throw new Error("usage: /continue");
 			if (this.active) throw new Error("A ghg turn is already running.");
@@ -954,19 +1059,19 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 				const effort = args.toLowerCase() === "off" ? "" : args.toLowerCase();
 				if (!oneOf(effortLevels, effort)) throw new Error("usage: /effort <off|low|medium|high>");
 				const mode = message.mode === "plan" ? "plan" : "execute";
-				return this.bridgeCommand("configure_role", { role, mode, effort, update_effort: true }, role, mode);
+				return this.bridgeCommand("configure", { role, mode, effort, update_effort: true }, role, mode);
 			}
 		case "/dynamic-reasoning": {
 			if (args !== "on" && args !== "off") throw new Error("usage: /dynamic-reasoning <on|off>");
 			const mode = message.mode === "plan" ? "plan" : "execute";
-			return this.bridgeCommand("configure_role", { role, mode, dynamic_reasoning: args === "on" }, role, mode);
+			return this.bridgeCommand("configure", { role, mode, dynamic_reasoning: args === "on", persist_dynamic_reasoning: true }, role, mode);
 		}
 		case "/model": {
 			if (args === "refresh") return this.refreshModelCatalogs();
 			if (!args) return this.pickModel(message.mode === "plan" ? "plan" : "chat");
 			const [model, provider] = fields.slice(1);
 			const mode = message.mode === "plan" ? "plan" : "execute";
-			await this.bridgeCommand("set_role_model", { model, provider, role, mode }, role, mode);
+			await this.bridgeCommand("configure", { model, provider, role, mode, persist_role_model: true }, role, mode);
 			this.post({ type: "role_model", role, model });
 			return;
 		}
@@ -987,9 +1092,15 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 			void this.stopBridge();
 			return;
 		case "/commands":
-		case "/help":
-			this.post({ type: "notice", text: "Extension commands: /ask /plan /execute /review /continue /compact /approval /notify /search-providers /lsp /mcp /context-doctor /goal-from-context /cd /detach /rename /effort /dynamic-reasoning /model /pwd /clear /resume /quit (/exit, /q) and !<command>" });
+		case "/help": {
+			const supported = new Set(extensionCommands);
+			const entries = this.commands.filter((entry) => supported.has(entry.name));
+			const lines = entries.length > 0
+				? entries.sort((a, b) => (a.name < b.name ? -1 : 1)).map((entry) => `${entry.name} ${entry.hint}`)
+				: extensionCommands;
+			this.post({ type: "notice", text: lines.join("\n") });
 			return;
+		}
 		default:
 			throw new Error(`${name} is not available in the extension yet`);
 		}
@@ -1010,10 +1121,27 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 			case "refreshModels":
 				await this.refreshModels();
 				break;
+			case "exportChat": {
+				const choice = await vscode.window.showQuickPick(
+					[
+						{ label: "Markdown", value: "markdown" },
+						{ label: "JSON", value: "json" },
+					],
+					{ placeHolder: "Export chat as…" },
+				);
+				if (choice) {
+					try {
+						await this.exportResult("chat", "", choice.value);
+					} catch (error) {
+						this.post({ type: "error", error: error instanceof Error ? error.message : String(error) });
+					}
+				}
+				break;
+			}
 			case "exportResult": {
-				if (message.kind !== "plan" && message.kind !== "review") break;
+				if (typeof message.kind !== "string" || !normalizeExportKind(message.kind)) break;
 				try {
-					await this.exportResult(message.kind);
+					await this.exportResult(normalizeExportKind(message.kind));
 				} catch (error) {
 					this.post({ type: "error", error: error instanceof Error ? error.message : String(error) });
 				}
@@ -1082,7 +1210,7 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 					if (updateEffort && !oneOf(effortLevels, normalizedEffort)) {
 						throw new Error("unsupported thinking effort; choose off, low, medium, or high");
 					}
-					await this.bridgeCommand("configure_role", { role, mode, effort: normalizedEffort, update_effort: updateEffort }, role, mode);
+					await this.bridgeCommand("configure", { role, mode, effort: normalizedEffort, update_effort: updateEffort }, role, mode);
 				} catch (error) {
 					this.post({ type: "error", error: error instanceof Error ? error.message : String(error) });
 				}
@@ -1121,11 +1249,24 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 		}
 		const prompt = message.prompt.trim();
 		const activeBefore = this.active;
+		const mode = message.mode === "plan" ? "plan" : message.mode === "review" ? "review" : message.mode === "execute" || message.mode === "chat" ? "execute" : undefined;
+		if (!mode) {
+			this.post({ type: "error", error: "Choose Execute, Plan, or Review before sending." });
+			return;
+		}
+		const role: Role = oneOf(roles, message.role) ? message.role : "fast";
+		const references = cleanReferences(message.references);
 		if (activeBefore && !prompt.startsWith("/") && !prompt.startsWith("!")) {
-			try {
-				await this.bridgeCommand("append", { content: promptWithReferences(prompt, cleanReferences(message.references)) });
-			} catch (error) {
-				this.post({ type: "error", error: error instanceof Error ? error.message : String(error) });
+			this.pendingSteers.push({ prompt, role, mode, references });
+			if (!this.steerCancelRequested) {
+				this.steerCancelRequested = true;
+				try {
+					await this.bridgeCommand("cancel");
+				} catch (error) {
+					this.pendingSteers.pop();
+					this.steerCancelRequested = false;
+					this.post({ type: "error", error: error instanceof Error ? error.message : String(error) });
+				}
 			}
 			return;
 		}
@@ -1133,12 +1274,6 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 			this.post({ type: "error", error: "A ghg turn is already running." });
 			return;
 		}
-		const mode = message.mode === "plan" ? "plan" : message.mode === "review" ? "review" : message.mode === "execute" || message.mode === "chat" ? "execute" : undefined;
-		if (!mode) {
-			this.post({ type: "error", error: "Choose Execute, Plan, or Review before sending." });
-			return;
-		}
-		const role: Role = oneOf(roles, message.role) ? message.role : "fast";
 		try {
 			if (prompt.startsWith("/") || prompt.startsWith("!")) {
 				await this.sendCommand(prompt, message);

@@ -8,15 +8,14 @@ import (
 	"io"
 	"math"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 )
 
-func sseServer(t *testing.T, lines ...string) *httptest.Server {
+func sseClient(t *testing.T, lines ...string) *Client {
 	t.Helper()
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return testChatClientWithHandler(t, "test-key", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("Authorization"); got != "Bearer test-key" {
 			http.Error(w, "bad auth: "+got, http.StatusUnauthorized)
 			return
@@ -32,19 +31,18 @@ func sseServer(t *testing.T, lines ...string) *httptest.Server {
 // provider — the request body must not contain it even when a message carries it.
 func TestStreamStripsAuthoredFlag(t *testing.T) {
 	var body []byte
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	client := testChatClientWithHandler(t, "test-key", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, _ = io.ReadAll(r.Body)
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n"))
 	}))
-	defer srv.Close()
 
 	sent := time.Now()
 	ref := &OutputRef{ID: "sha256:" + strings.Repeat("a", 64), Hash: strings.Repeat("a", 64), OriginalBytes: 2, StoredBytes: 2, Complete: true}
 	msgs := []Message{{Role: "user", Content: "typed by me", Authored: true, SentAt: &sent}, {
 		Role: "tool", Content: "preview", ToolCallID: "c1", Output: ref, ExitCode: 1, Source: "bash",
 	}}
-	if _, _, err := runStream(testChatClient(t, srv.URL, "test-key"), context.Background(), Request{Model: "m", Messages: msgs}, nil, nil); err != nil {
+	if _, _, err := runStream(client, context.Background(), Request{Model: "m", Messages: msgs}, nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	if strings.Contains(string(body), "authored") {
@@ -61,7 +59,7 @@ func TestStreamStripsAuthoredFlag(t *testing.T) {
 }
 
 func TestModels(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	client := testChatClientWithHandler(t, "test-key", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/models" || r.Method != http.MethodGet {
 			http.Error(w, "unexpected "+r.Method+" "+r.URL.Path, http.StatusNotFound)
 			return
@@ -75,9 +73,8 @@ func TestModels(t *testing.T) {
 			{"id":"gemini-3.5-flash"}
 		]}`))
 	}))
-	defer srv.Close()
 
-	models, err := testChatClient(t, srv.URL, "test-key").Models(context.Background())
+	models, err := client.Models(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,17 +93,16 @@ func TestModels(t *testing.T) {
 }
 
 func TestModelsHTTPError(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	client := testChatClientWithHandler(t, "k", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "nope", http.StatusForbidden)
 	}))
-	defer srv.Close()
-	if _, err := testChatClient(t, srv.URL, "k").Models(context.Background()); err == nil {
+	if _, err := client.Models(context.Background()); err == nil {
 		t.Fatal("expected error")
 	}
 }
 
 func TestStreamTextAndToolCalls(t *testing.T) {
-	srv := sseServer(t,
+	client := sseClient(t,
 		`data: {"choices":[{"delta":{"content":"hel"}}]}`,
 		`data: {"choices":[{"delta":{"content":"lo"}}]}`,
 		`: comment to ignore`,
@@ -116,10 +112,9 @@ func TestStreamTextAndToolCalls(t *testing.T) {
 		`data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`,
 		`data: [DONE]`,
 	)
-	defer srv.Close()
 
 	var streamed strings.Builder
-	msg, _, err := runStream(testChatClient(t, srv.URL, "test-key"), context.Background(), Request{Model: "m"}, func(d string) { streamed.WriteString(d) }, nil)
+	msg, _, err := runStream(client, context.Background(), Request{Model: "m"}, func(d string) { streamed.WriteString(d) }, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -136,14 +131,13 @@ func TestStreamTextAndToolCalls(t *testing.T) {
 }
 
 func TestStreamLengthDiscardsToolCalls(t *testing.T) {
-	srv := sseServer(t,
+	client := sseClient(t,
 		`data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"bash","arguments":"{\"comm"}}]}}]}`,
 		`data: {"choices":[{"delta":{},"finish_reason":"length"}]}`,
 		`data: [DONE]`,
 	)
-	defer srv.Close()
 
-	msg, _, err := runStream(testChatClient(t, srv.URL, "test-key"), context.Background(), Request{Model: "m"}, nil, nil)
+	msg, _, err := runStream(client, context.Background(), Request{Model: "m"}, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -156,26 +150,24 @@ func TestStreamLengthDiscardsToolCalls(t *testing.T) {
 }
 
 func TestStreamAPIError(t *testing.T) {
-	srv := sseServer(t, `data: {"error":{"message":"boom"}}`)
-	defer srv.Close()
-	_, _, err := runStream(testChatClient(t, srv.URL, "test-key"), context.Background(), Request{Model: "m"}, nil, nil)
+	client := sseClient(t, `data: {"error":{"message":"boom"}}`)
+	_, _, err := runStream(client, context.Background(), Request{Model: "m"}, nil, nil)
 	if err == nil || !strings.Contains(err.Error(), "boom") {
 		t.Fatalf("expected api error, got %v", err)
 	}
 }
 
 func TestStreamReasoningRoutedToOnThink(t *testing.T) {
-	srv := sseServer(t,
+	client := sseClient(t,
 		`data: {"choices":[{"delta":{"reasoning_content":"think","role":"assistant"}}]}`,
 		`data: {"choices":[{"delta":{"reasoning_content":"ing…"}}]}`,
 		`data: {"choices":[{"delta":{"content":"4"}}]}`,
 		`data: {"choices":[{"delta":{},"finish_reason":"stop"}]}`,
 		`data: [DONE]`,
 	)
-	defer srv.Close()
 
 	var think, text strings.Builder
-	msg, _, err := runStream(testChatClient(t, srv.URL, "test-key"), context.Background(), Request{Model: "m"},
+	msg, _, err := runStream(client, context.Background(), Request{Model: "m"},
 		func(d string) { text.WriteString(d) }, func(d string) { think.WriteString(d) })
 	if err != nil {
 		t.Fatal(err)
@@ -189,10 +181,9 @@ func TestStreamReasoningRoutedToOnThink(t *testing.T) {
 }
 
 func TestStreamHTTPError(t *testing.T) {
-	c := testChatClient(t, "http://x/", "wrong-key")
-	srv := sseServer(t)
-	defer srv.Close()
-	c.BaseURL = srv.URL
+	c := testChatClientWithHandler(t, "wrong-key", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "bad auth", http.StatusUnauthorized)
+	}))
 	_, _, err := runStream(c, context.Background(), Request{Model: "m"}, nil, nil)
 	if err == nil || !strings.Contains(err.Error(), "401") {
 		t.Fatalf("expected 401 error, got %v", err)
@@ -211,9 +202,10 @@ func TestStreamTransportErrors(t *testing.T) {
 	if _, _, err := runStream(testChatClient(t, "http://\x7f", "k"), context.Background(), Request{}, nil, nil); err == nil {
 		t.Fatal("expected bad-url error")
 	}
-	srv := sseServer(t)
-	srv.Close() // connection refused
-	if _, _, err := runStream(testChatClient(t, srv.URL, "test-key"), context.Background(), Request{}, nil, nil); err == nil {
+	client := retryClient(t, testRoundTripper(func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("connection refused")
+	}))
+	if _, _, err := runStream(client, context.Background(), Request{}, nil, nil); err == nil {
 		t.Fatal("expected connection error")
 	}
 }
@@ -253,16 +245,15 @@ func TestOpenAIReasoningToggleSerialized(t *testing.T) {
 }
 
 func TestComplete(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	client := testChatClientWithHandler(t, "test-key", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("Authorization"); got != "Bearer test-key" {
 			http.Error(w, "bad auth", http.StatusUnauthorized)
 			return
 		}
 		w.Write([]byte(`{"choices":[{"message":{"content":"a summary"}}]}`))
 	}))
-	defer srv.Close()
 
-	got, _, err := completeText(testChatClient(t, srv.URL, "test-key"), context.Background(), Request{Model: "m"})
+	got, _, err := completeText(client, context.Background(), Request{Model: "m"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -275,13 +266,12 @@ func TestCompleteStreamOmitted(t *testing.T) {
 	var req struct {
 		Stream bool `json:"stream"`
 	}
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	client := testChatClientWithHandler(t, "k", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		json.NewDecoder(r.Body).Decode(&req)
 		w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}]}`))
 	}))
-	defer srv.Close()
 
-	if _, _, err := completeText(testChatClient(t, srv.URL, "k"), context.Background(), Request{Model: "m"}); err != nil {
+	if _, _, err := completeText(client, context.Background(), Request{Model: "m"}); err != nil {
 		t.Fatal(err)
 	}
 	if req.Stream {
@@ -296,16 +286,15 @@ func TestStreamUsageParsed(t *testing.T) {
 			IncludeUsage bool `json:"include_usage"`
 		} `json:"stream_options"`
 	}
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	client := testChatClientWithHandler(t, "k", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		json.NewDecoder(r.Body).Decode(&reqSeen)
 		w.Header().Set("Content-Type", "text/event-stream")
 		fmt.Fprint(w, `data: {"choices":[{"delta":{"content":"hi"}}]}`+"\n\n")
 		fmt.Fprint(w, `data: {"choices":[],"usage":{"prompt_tokens":1200,"completion_tokens":45,"prompt_tokens_details":{"cached_tokens":800}}}`+"\n\n")
 		fmt.Fprint(w, "data: [DONE]\n\n")
 	}))
-	defer srv.Close()
 
-	_, u, err := runStream(testChatClient(t, srv.URL, "k"), context.Background(), Request{Model: "m"}, nil, nil)
+	_, u, err := runStream(client, context.Background(), Request{Model: "m"}, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -318,12 +307,11 @@ func TestStreamUsageParsed(t *testing.T) {
 }
 
 func TestCompleteUsageParsed(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	client := testChatClientWithHandler(t, "k", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`{"choices":[{"message":{"content":"ok"}}],"usage":{"prompt_tokens":10,"completion_tokens":5,"prompt_tokens_details":{"cached_tokens":4}}}`))
 	}))
-	defer srv.Close()
 
-	_, u, err := completeText(testChatClient(t, srv.URL, "k"), context.Background(), Request{Model: "m"})
+	_, u, err := completeText(client, context.Background(), Request{Model: "m"})
 	if err != nil {
 		t.Fatal(err)
 	}

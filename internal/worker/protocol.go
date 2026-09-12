@@ -16,6 +16,21 @@ const (
 )
 
 const (
+	WorkerSessionEnv  = "GHG_WORKER_SESSION"
+	WorkerBaseEnv     = "GHG_WORKER_BASE"
+	WorkerCWDEnv      = "GHG_WORKER_CWD"
+	WorkerModelEnv    = "GHG_WORKER_MODEL"
+	WorkerProviderEnv = "GHG_WORKER_PROVIDER"
+	WorkerRoleEnv     = "GHG_WORKER_ROLE"
+	WorkerEffortEnv   = "GHG_WORKER_EFFORT"
+	WorkerModeEnv     = "GHG_WORKER_MODE"
+	WorkerCautiousEnv = "GHG_WORKER_CAUTIOUS"
+	WorkerSandboxEnv  = "GHG_WORKER_SANDBOX"
+	WorkerNetworkEnv  = "GHG_WORKER_NETWORK"
+	WorkerApprovalEnv = "GHG_WORKER_APPROVAL"
+)
+
+const (
 	TypeAttach            = "attach"
 	TypeAttached          = "attached"
 	TypeSnapshot          = "snapshot"
@@ -28,9 +43,32 @@ const (
 )
 
 const (
-	EventPlanDelta       = "plan_delta"
-	EventShellDone       = "shell_done"
-	EventQuestionRequest = "question_request"
+	EventRoute             = "route"
+	EventState             = "state"
+	EventTask              = "task"
+	EventMCP               = "mcp"
+	EventText              = "text"
+	EventThink             = "think"
+	EventPlanDelta         = "plan_delta"
+	EventShellDone         = "shell_done"
+	EventSteer             = "steer"
+	EventNotice            = "notice"
+	EventModelCallStart    = "model_call_start"
+	EventReviewProgress    = "review_progress"
+	EventToolStart         = "tool_start"
+	EventToolOutput        = "tool_output"
+	EventToolEnd           = "tool_end"
+	EventGoalUpdate        = "goal_update"
+	EventRetry             = "retry"
+	EventGoal              = "goal"
+	EventSchedule          = "schedule"
+	EventCompact           = "compact"
+	EventPermissionRequest = "permission_request"
+	EventQuestionRequest   = "question_request"
+	EventUsage             = "usage"
+	EventGoalFromContext   = "goal_from_context"
+	EventCompactDone       = "compact_done"
+	EventTurnDone          = "turn_done"
 )
 
 const (
@@ -91,10 +129,6 @@ type AttachRequest struct{}
 type CommandRequest struct {
 	Name    string          `json:"name"`
 	Payload json.RawMessage `json:"payload,omitempty"`
-}
-
-type SnapshotEnvelope struct {
-	State json.RawMessage `json:"state"`
 }
 
 type EventEnvelope struct {
@@ -246,7 +280,9 @@ func knownType(kind string) bool {
 	}
 }
 
-func knownCommand(name string) bool {
+// KnownCommand reports whether name is a canonical worker command. Controllers
+// use it to reject names the worker would refuse anyway.
+func KnownCommand(name string) bool {
 	switch name {
 	case CommandDetach, CommandCancel, CommandInput, CommandApprove, CommandAnswerQuestion,
 		CommandConfigure, CommandCompact,

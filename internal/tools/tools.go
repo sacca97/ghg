@@ -6,11 +6,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 
 	"github.com/sacca97/ghg/internal/models"
-	"github.com/sacca97/ghg/internal/tools/bashrun"
 )
 
 // Tool is a named executable tool with a JSON schema.
@@ -33,7 +33,7 @@ func resultTool(def models.Tool, run func(context.Context, json.RawMessage) (Too
 
 // All returns the built-in tool set.
 func All() []Tool {
-	return []Tool{bashTool(), readTool(), writeTool(), editTool(), grepTool(), structuralSearchTool(), globTool(), findFilesTool(), lspTool(), lspRenameTool(), webFetchTool(), webSearchTool()}
+	return []Tool{bashTool(), readTool(), writeTool(), editTool(), grepTool(), globTool(), findFilesTool(), lspTool(), webFetchTool(), webSearchTool()}
 }
 
 // CapabilityReporter lets an optional runtime service report deterministic
@@ -61,9 +61,9 @@ func FilterAvailable(ts []Tool, runtime *ToolRuntime) ([]Tool, []string) {
 		switch tool.Def.Function.Name {
 		case "bash":
 			needBash = true
-		case "grep", "glob", "find_files", "structural_search":
+		case "grep", "glob", "find_files":
 			needRG = true
-		case "lsp", "lsp_rename":
+		case "lsp":
 			needLSP = true
 		case "web_fetch":
 			needWebFetch = true
@@ -74,12 +74,12 @@ func FilterAvailable(ts []Tool, runtime *ToolRuntime) ([]Tool, []string) {
 
 	missing := make(map[string]string)
 	var notices []string
-	if needBash && !bashrun.Available() {
+	if needBash && !bashAvailable() {
 		missing["bash"] = "bash unavailable: the selected shell is not on PATH"
 	}
 	_, rgOK := rgAvailable()
 	if needRG && !rgOK {
-		for _, name := range []string{"grep", "glob", "find_files", "structural_search"} {
+		for _, name := range []string{"grep", "glob", "find_files"} {
 			missing[name] = "repository search unavailable: rg is not on PATH"
 		}
 		notices = append(notices, missing["grep"])
@@ -95,7 +95,6 @@ func FilterAvailable(ts []Tool, runtime *ToolRuntime) ([]Tool, []string) {
 		}
 		if !lspAvailable {
 			missing["lsp"] = "lsp unavailable: no configured language server is runnable"
-			missing["lsp_rename"] = missing["lsp"]
 			if len(lspNotices) == 0 {
 				notices = append(notices, missing["lsp"])
 			}
@@ -203,13 +202,12 @@ func ExecuteResult(ctx context.Context, ts []Tool, name string, args json.RawMes
 }
 
 var integerToolArgs = map[string]map[string]struct{}{
-	"read":              {"offset": {}, "limit": {}},
-	"grep":              {"max_results": {}},
-	"glob":              {"max_results": {}},
-	"find_files":        {"max_results": {}},
-	"structural_search": {"max_results": {}},
-	"web_search":        {"count": {}},
-	"edit":              {"start_line": {}, "end_line": {}},
+	"read":       {"offset": {}, "limit": {}},
+	"grep":       {"max_results": {}},
+	"glob":       {"max_results": {}},
+	"find_files": {"max_results": {}},
+	"web_search": {"count": {}},
+	"edit":       {"start_line": {}, "end_line": {}},
 }
 
 func normalizeIntegerArgs(name string, args json.RawMessage) json.RawMessage {
@@ -300,3 +298,74 @@ func canonicalToolName(name string) string {
 		return name
 	}
 }
+
+func SuggestTool(name string, candidates []string) []string {
+	type scored struct {
+		name string
+		dist int
+	}
+	var hits []scored
+	for _, candidate := range candidates {
+		prefix := strings.HasPrefix(candidate, name) || strings.HasPrefix(name, candidate)
+		distance := levenshtein(name, candidate, 4)
+		maxDistance := 3
+		if min(len(name), len(candidate)) <= 4 {
+			maxDistance = 1
+		} else if min(len(name), len(candidate)) <= 6 {
+			maxDistance = 2
+		}
+		if prefix {
+			distance = -len(candidate)
+		} else if distance > maxDistance {
+			continue
+		}
+		hits = append(hits, scored{candidate, distance})
+	}
+	sort.Slice(hits, func(i, j int) bool {
+		if hits[i].dist != hits[j].dist {
+			return hits[i].dist < hits[j].dist
+		}
+		return hits[i].name < hits[j].name
+	})
+	out := make([]string, 0, min(len(hits), 2))
+	for _, hit := range hits {
+		if len(out) == 2 {
+			break
+		}
+		out = append(out, hit.name)
+	}
+	return out
+}
+
+func levenshtein(a, b string, cap int) int {
+	if a == b {
+		return 0
+	}
+	if d := len(a) - len(b); d > cap || -d > cap {
+		return cap + 1
+	}
+	prev := make([]int, len(b)+1)
+	for j := range prev {
+		prev[j] = j
+	}
+	for i := 1; i <= len(a); i++ {
+		cur := make([]int, len(b)+1)
+		cur[0] = i
+		rowMin := cur[0]
+		for j := 1; j <= len(b); j++ {
+			cost := 0
+			if a[i-1] != b[j-1] {
+				cost = 1
+			}
+			cur[j] = min3(cur[j-1]+1, prev[j]+1, prev[j-1]+cost)
+			rowMin = min(rowMin, cur[j])
+		}
+		if rowMin > cap {
+			return cap + 1
+		}
+		prev = cur
+	}
+	return prev[len(b)]
+}
+
+func min3(a, b, c int) int { return min(min(a, b), c) }

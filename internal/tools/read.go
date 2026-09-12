@@ -425,10 +425,22 @@ func authorizedObservationPath(ctx context.Context, name string, access sandbox.
 		if err != nil {
 			return "", err
 		}
-		if err := requireRegularFile(canonical, name); err != nil {
-			return "", err
+		if !allowMissing {
+			if err := requireRegularFile(canonical, name); err != nil {
+				return "", err
+			}
 		}
 		return canonical, nil
+	}
+	if allowMissing {
+		if len(name) > maxObservationPath {
+			return "", fmt.Errorf("path exceeds %d-byte limit", maxObservationPath)
+		}
+		abs, err := filepath.Abs(name)
+		if err != nil {
+			return "", fmt.Errorf("resolve %s: %w", name, err)
+		}
+		return filepath.Clean(abs), nil
 	}
 	return canonicalObservationPath(name)
 }

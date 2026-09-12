@@ -2,6 +2,7 @@ package session
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -53,6 +54,52 @@ func (s *Store) ListTelemetry(ctx context.Context, sessionID string) ([]Telemetr
 		return nil, err
 	}
 	defer func() { _ = rows.Close() }()
+	return scanTelemetry(rows)
+}
+
+func (s *Store) ListTelemetryKind(ctx context.Context, sessionID, kind string) ([]TelemetryEvent, error) {
+	if strings.TrimSpace(sessionID) == "" {
+		return nil, errors.New("session id is required")
+	}
+	if strings.TrimSpace(kind) == "" {
+		return nil, errors.New("telemetry kind is required")
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT seq, kind, payload, created_at
+		FROM telemetry_events WHERE session_id=? AND kind=? ORDER BY seq`, sessionID, kind)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	return scanTelemetry(rows)
+}
+
+func (s *Store) LatestTelemetry(ctx context.Context, sessionID, kind string) (TelemetryEvent, bool, error) {
+	if strings.TrimSpace(sessionID) == "" {
+		return TelemetryEvent{}, false, errors.New("session id is required")
+	}
+	if strings.TrimSpace(kind) == "" {
+		return TelemetryEvent{}, false, errors.New("telemetry kind is required")
+	}
+	var event TelemetryEvent
+	var payload, created string
+	err := s.db.QueryRowContext(ctx, `SELECT seq, kind, payload, created_at
+		FROM telemetry_events WHERE session_id=? AND kind=? ORDER BY seq DESC LIMIT 1`, sessionID, kind).Scan(
+		&event.Seq, &event.Kind, &payload, &created)
+	if errors.Is(err, sql.ErrNoRows) {
+		return TelemetryEvent{}, false, nil
+	}
+	if err != nil {
+		return TelemetryEvent{}, false, err
+	}
+	event.Payload = json.RawMessage(payload)
+	event.CreatedAt, err = time.Parse(time.RFC3339Nano, created)
+	if err != nil {
+		return TelemetryEvent{}, false, fmt.Errorf("parse telemetry timestamp: %w", err)
+	}
+	return event, true, nil
+}
+
+func scanTelemetry(rows *sql.Rows) ([]TelemetryEvent, error) {
 	var events []TelemetryEvent
 	for rows.Next() {
 		var event TelemetryEvent
@@ -61,6 +108,7 @@ func (s *Store) ListTelemetry(ctx context.Context, sessionID string) ([]Telemetr
 			return nil, err
 		}
 		event.Payload = json.RawMessage(payload)
+		var err error
 		event.CreatedAt, err = time.Parse(time.RFC3339Nano, created)
 		if err != nil {
 			return nil, fmt.Errorf("parse telemetry timestamp: %w", err)

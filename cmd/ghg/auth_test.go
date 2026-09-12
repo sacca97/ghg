@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,9 +13,9 @@ import (
 	"github.com/sacca97/ghg/internal/models"
 )
 
-func fakeProfileServer(t *testing.T, goodKey string) *httptest.Server {
+func fakeProfileServer(t *testing.T, goodKey string) *testEndpoint {
 	t.Helper()
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	return testEndpointFor(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		key := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
 		if r.Method == http.MethodPost && r.URL.Path == "/chat/completions" {
 			if key != goodKey {

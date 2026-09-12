@@ -74,24 +74,6 @@ func TestProviderKey(t *testing.T) {
 	}
 }
 
-func TestInfKeyFallback(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	p := Provider{Profile: "inference"}
-	if k := p.Key(); k != "" {
-		t.Fatalf("missing ~/.inf should yield empty, got %q", k)
-	}
-	os.MkdirAll(filepath.Join(home, ".inf"), 0o700)
-	os.WriteFile(filepath.Join(home, ".inf", "config.json"), []byte(`{"codingAgentApiKey":"inf_sk_x"}`), 0o600)
-	if k := p.Key(); k != "inf_sk_x" {
-		t.Fatalf("inf fallback: %q", k)
-	}
-	os.WriteFile(filepath.Join(home, ".inf", "config.json"), []byte(`{"apiKey":"inf_sk_main"}`), 0o600)
-	if k := p.Key(); k != "inf_sk_main" {
-		t.Fatalf("apiKey should win: %q", k)
-	}
-}
-
 func TestResolveRouting(t *testing.T) {
 	cfg := &Config{
 		DefaultModel: "m1",
@@ -130,42 +112,44 @@ func TestHomeUnavailable(t *testing.T) {
 	if err := (&Config{}).Save(); err == nil {
 		t.Fatal("expected Save error")
 	}
-	if k := infKey(); k != "" {
-		t.Fatalf("infKey with no HOME: %q", k)
-	}
 }
 
-func TestInfKeyBadJSON(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	os.MkdirAll(filepath.Join(home, ".inf"), 0o700)
-	os.WriteFile(filepath.Join(home, ".inf", "config.json"), []byte("{bad"), 0o600)
-	if k := infKey(); k != "" {
-		t.Fatalf("bad json should yield empty key, got %q", k)
-	}
-}
-
-func TestMeSeedsTemplateAndStripsComments(t *testing.T) {
+func TestUserInstructionsSeedsTemplateAndStripsComments(t *testing.T) {
 	t.Setenv("GHG_HOME", t.TempDir())
 
-	if got := MeInstructions(); got != "" {
+	if got := UserInstructions(); got != "" {
 		t.Fatalf("a fresh seed is all comments — nothing to inject, got %q", got)
 	}
-	data, err := os.ReadFile(filepath.Join(os.Getenv("GHG_HOME"), "me.md"))
+	path := filepath.Join(os.Getenv("GHG_HOME"), "AGENTS.md")
+	data, err := os.ReadFile(path)
 	if err != nil || !strings.Contains(string(data), "# Your standing instructions") {
 		t.Fatalf("seed file should exist with the template: %v\n%s", err, data)
 	}
 
-	if err := os.WriteFile(filepath.Join(os.Getenv("GHG_HOME"), "me.md"),
+	if err := os.WriteFile(path,
 		[]byte("# hi\n\n- Always pnpm.\n- Ask before force-push.\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	got := MeInstructions()
+	got := UserInstructions()
 	if !strings.Contains(got, "- Always pnpm.") || strings.Contains(got, "# hi") {
 		t.Fatalf("instructions should carry user lines only:\n%s", got)
 	}
-	if !strings.Contains(MeSeed, "/me opens this file") {
+	if !strings.Contains(AgentsSeed, "/me opens this file") {
 		t.Fatal("seed should tell the user how to edit")
+	}
+
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	legacy := filepath.Join(os.Getenv("GHG_HOME"), "me.md")
+	if err := os.WriteFile(legacy, []byte("legacy instructions\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if got := UserInstructionsPath(); got != legacy {
+		t.Fatalf("legacy instructions path = %q, want %q", got, legacy)
+	}
+	if got := UserInstructions(); got != "legacy instructions" {
+		t.Fatalf("legacy instructions = %q", got)
 	}
 }
 
@@ -506,7 +490,7 @@ func TestLoadMixedTokenFields(t *testing.T) {
 	}
 }
 
-func TestOutputConfigRoundTripAndLegacyKey(t *testing.T) {
+func TestOutputConfigRoundTrip(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	dir := filepath.Join(home, ".ghg")
@@ -517,7 +501,7 @@ func TestOutputConfigRoundTripAndLegacyKey(t *testing.T) {
   "defaultModel": "m1",
   "providers": { "a": { "baseUrl": "https://a", "api": "openai-completions" } },
   "models": { "m1": { "providers": ["a"] } },
-  "artifacts": { "enabled": false, "maxBytes": 4096 }
+  "outputs": { "enabled": false, "maxBytes": 4096 }
 }`), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -535,8 +519,8 @@ func TestOutputConfigRoundTripAndLegacyKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(saved), `"outputs"`) || strings.Contains(string(saved), `"artifacts"`) {
-		t.Fatalf("legacy config was not saved under outputs: %s", saved)
+	if !strings.Contains(string(saved), `"outputs"`) {
+		t.Fatalf("output config was not saved: %s", saved)
 	}
 	reloaded, err := Load()
 	if err != nil {

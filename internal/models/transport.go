@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,7 +11,6 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -49,44 +47,6 @@ func (t transport) httpClient() *http.Client {
 	return http.DefaultClient
 }
 
-var (
-	ephemeralSessionMu sync.Mutex
-	ephemeralSessionID string
-)
-
-func fallbackSessionID() string {
-	ephemeralSessionMu.Lock()
-	defer ephemeralSessionMu.Unlock()
-	if ephemeralSessionID == "" {
-		b := make([]byte, 8)
-		if _, err := rand.Read(b); err != nil {
-			ephemeralSessionID = fmt.Sprintf("ghg-%x", time.Now().UnixNano())
-		} else {
-			ephemeralSessionID = fmt.Sprintf("ghg-%x", b)
-		}
-	}
-	return ephemeralSessionID
-}
-
-type sessionIDKey struct{}
-
-// WithSessionID returns a context carrying the conversation's session ID.
-func WithSessionID(ctx context.Context, sessionID string) context.Context {
-	if sessionID == "" {
-		return ctx
-	}
-	return context.WithValue(ctx, sessionIDKey{}, sessionID)
-}
-
-// SessionIDFromContext returns the session ID stored in ctx, or "".
-func SessionIDFromContext(ctx context.Context) string {
-	if ctx == nil {
-		return ""
-	}
-	id, _ := ctx.Value(sessionIDKey{}).(string)
-	return id
-}
-
 func (t transport) setRequestHeaders(req *http.Request) error {
 	return applyRequestHeaders(req, t.Headers, t.APIKey, t.AuthKind, t.AuthHeader)
 }
@@ -97,13 +57,6 @@ func applyRequestHeaders(req *http.Request, headers map[string]string, apiKey, a
 	}
 	for name, value := range headers {
 		req.Header.Set(name, value)
-	}
-	if req.Header.Get("X-Opencode-Session") == "" {
-		sid := SessionIDFromContext(req.Context())
-		if sid == "" {
-			sid = fallbackSessionID()
-		}
-		req.Header.Set("X-Opencode-Session", sid)
 	}
 	kind := authKind
 	if kind == "" {
@@ -276,6 +229,11 @@ func IsContextLimit(err error) bool {
 
 type RequestAuthorizer interface {
 	Authorize(*http.Request) error
+}
+
+// TokenRefresher retries authentication after an expired credential.
+type TokenRefresher interface {
+	ForceRefresh(context.Context) error
 }
 
 func authenticatedProbe(ctx context.Context, client *http.Client, endpoint string, body []byte, setHeaders func(*http.Request) error) error {

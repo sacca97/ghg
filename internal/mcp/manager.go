@@ -707,7 +707,7 @@ func (m *Manager) Reconnect(name string) bool {
 // Close shuts every session down. Stdio transports terminate their child
 // process on Close (the SDK sends SIGTERM after stdin closes, then SIGKILL);
 // children get their own process group at spawn (defaultTransport) so ghg's
-// exit path can also group-kill strays via the bashrun registry pattern.
+// exit path also closes every MCP session and its transport.
 func (m *Manager) Close() {
 	m.onChangeMu.Lock()
 	m.closed = true

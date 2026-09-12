@@ -13,12 +13,11 @@ import (
 	"github.com/sacca97/ghg/internal/agent"
 	"github.com/sacca97/ghg/internal/config"
 	"github.com/sacca97/ghg/internal/export"
-	"github.com/sacca97/ghg/internal/memory"
 	"github.com/sacca97/ghg/internal/models"
 	"github.com/sacca97/ghg/internal/session"
-	"github.com/sacca97/ghg/internal/skills"
 	"github.com/sacca97/ghg/internal/tools"
 	workerwire "github.com/sacca97/ghg/internal/worker"
+	"github.com/sacca97/ghg/internal/workspace"
 )
 
 func (w *workerProcessState) startCompact() bool {
@@ -34,24 +33,7 @@ func (w *workerProcessState) startGoalFromContext(window int) bool {
 }
 
 func (w *workerProcessState) startShell(command string) bool {
-	w.mu.Lock()
-	if w.stopRequested || w.shellCancel != nil {
-		w.mu.Unlock()
-		return false
-	}
-	ctx, cancel := context.WithCancel(context.Background())
-	w.shellCancel = cancel
-	w.turns.Add(1)
-	w.mu.Unlock()
-
-	go func() {
-		defer w.turns.Done()
-		defer func() {
-			w.mu.Lock()
-			w.shellCancel = nil
-			w.mu.Unlock()
-		}()
-
+	return w.startOperation("shell", func(ctx context.Context) {
 		args, err := json.Marshal(workerwire.ShellRequest{Command: command})
 		if err != nil {
 			return
@@ -61,8 +43,7 @@ func (w *workerProcessState) startShell(command string) bool {
 			return
 		}
 		w.publish(workerwire.EventShellDone, workerwire.ShellResult{Command: command, Output: result.Preview}, true)
-	}()
-	return true
+	})
 }
 
 func (w *workerProcessState) startOperation(detail string, run func(context.Context)) bool {
@@ -122,7 +103,7 @@ func (w *workerProcessState) updateGoal(request workerwire.GoalRequest) (agent.G
 			if err := w.store.CheckpointGoal(w.sessionID, record); err != nil {
 				return agent.GoalRecord{}, err
 			}
-			w.publish("goal", record, true)
+			w.publish(workerwire.EventGoal, record, true)
 			return record, nil
 		}
 		return agent.GoalRecord{}, nil
@@ -142,7 +123,7 @@ func (w *workerProcessState) updateGoal(request workerwire.GoalRequest) (agent.G
 	if err := w.store.CheckpointGoal(w.sessionID, record); err != nil {
 		return agent.GoalRecord{}, err
 	}
-	w.publish("goal", record, true)
+	w.publish(workerwire.EventGoal, record, true)
 	return record, nil
 }
 
@@ -156,7 +137,7 @@ func (w *workerProcessState) runGoalFromContext(ctx context.Context, window int)
 			ReasoningEffort: reasoningEffort, ReasoningEnabled: reasoningEnabled,
 		}, agent.Events{})
 		w.ag.AddUsage(usage)
-		w.publish("usage", usage, true)
+		w.publish(workerwire.EventUsage, usage, true)
 		err = callErr
 		if err == nil {
 			objective := strings.TrimSpace(message.TextContent())
@@ -167,15 +148,20 @@ func (w *workerProcessState) runGoalFromContext(ctx context.Context, window int)
 				if saveErr := w.store.CheckpointGoal(w.sessionID, record); saveErr != nil {
 					err = saveErr
 				} else {
-					w.publish("goal", record, true)
-					w.publish("goal_from_context", workerwire.GoalFromContextResult{Goal: &record, Usage: usage}, true)
+					w.publish(workerwire.EventGoal, record, true)
+					w.publish(workerwire.EventGoalFromContext, workerwire.GoalFromContextResult{Goal: &record, Usage: usage}, true)
 					w.persist()
 					return
 				}
 			}
 		}
 	}
-	w.publish("goal_from_context", workerwire.GoalFromContextResult{Usage: models.Usage{}, Error: err.Error()}, true)
+	interrupted := errors.Is(err, context.Canceled) || ctx.Err() != nil
+	result := workerwire.GoalFromContextResult{Usage: models.Usage{}, Interrupted: interrupted}
+	if !interrupted {
+		result.Error = err.Error()
+	}
+	w.publish(workerwire.EventGoalFromContext, result, true)
 }
 
 func (w *workerProcessState) runCompact(ctx context.Context) {
@@ -190,8 +176,8 @@ func (w *workerProcessState) runCompact(ctx context.Context) {
 			return w.store.PersistCompaction(w.sessionID, saved, messages, modelName, providerName, summary, cutoff)
 		},
 		OnCompacted: func(value string, at int) { summary, cutoff = value, at },
-		OnUsage:     func(usage models.Usage) { w.publish("usage", usage, true) },
-		OnRetry:     func(retry models.RetryEvent) { w.publish("retry", retry, true) },
+		OnUsage:     func(usage models.Usage) { w.publish(workerwire.EventUsage, usage, true) },
+		OnRetry:     func(retry models.RetryEvent) { w.publish(workerwire.EventRetry, retry, true) },
 	}
 	appendTelemetryCallbacks(&ev, w.store, w.sessionID)
 	err := w.ag.ManualCompact(ctx, ev)
@@ -200,17 +186,18 @@ func (w *workerProcessState) runCompact(ctx context.Context) {
 		w.mu.Lock()
 		w.saved = kept
 		w.mu.Unlock()
-		w.publish("compact", map[string]any{
+		w.publish(workerwire.EventCompact, map[string]any{
 			"summary": summary, "cutoff": cutoff,
 			"took": before - kept, "kept": kept,
 		}, true)
 	}
 	w.persist()
-	result := workerCompactResult{Usage: w.ag.Usage(), Messages: boundedWorkerMessages(w.ag.MessagesSnapshot())}
-	if err != nil {
+	interrupted := errors.Is(err, context.Canceled) || ctx.Err() != nil
+	result := workerCompactResult{Usage: w.ag.Usage(), Messages: boundedWorkerMessages(w.ag.MessagesSnapshot()), Interrupted: interrupted}
+	if err != nil && !interrupted {
 		result.Error = err.Error()
 	}
-	w.publish("compact_done", result, true)
+	w.publish(workerwire.EventCompactDone, result, true)
 }
 
 func (w *workerProcessState) compactRetry() (workerwire.HistoryResult, error) {
@@ -274,7 +261,7 @@ func (w *workerProcessState) rewind(request workerwire.RewindRequest) (workerwir
 			if err != nil {
 				return workerwire.HistoryResult{}, err
 			}
-			restored, err = session.RestoreWorkspace(wd, best)
+			restored, err = workspace.Restore(wd, best)
 			if err != nil {
 				return workerwire.HistoryResult{}, err
 			}
@@ -336,7 +323,7 @@ func (w *workerProcessState) runTurn(ctx context.Context, input workerInput) {
 	snap := input.Snap
 	if snap == "" {
 		if wd, err := os.Getwd(); err == nil {
-			snap = session.SnapshotWorkspace(wd)
+			snap = workspace.Snapshot(wd)
 		}
 	}
 	if snap != "" && w.store != nil {
@@ -357,13 +344,11 @@ func (w *workerProcessState) runTurn(ctx context.Context, input workerInput) {
 			additions = append(additions, project)
 		}
 	}
-	additions = append(additions,
-		skills.PromptBlock(skills.Scan(skills.DefaultDirs()...)),
-		memory.PromptBlock(memory.Installation(), memory.Session(w.sessionID)),
-	)
+	var mcpInstructions string
 	if w.mcp != nil {
-		additions = append(additions, w.mcp.InstructionsBlock())
+		mcpInstructions = w.mcp.InstructionsBlock()
 	}
+	additions = append(additions, systemPromptAdditions(w.sessionID, mcpInstructions)...)
 	w.ag.SetSystemPrompt(agent.CompileSystemPrompt(systemPrompt, additions...))
 	if input.AskMode {
 		w.ag.AskMode = true
@@ -399,18 +384,18 @@ func (w *workerProcessState) runTurn(ctx context.Context, input workerInput) {
 	ev := agent.Events{
 		OnThink: func(s string) {
 			w.appendLive("think", s)
-			w.publish("think", s, false)
+			w.publish(workerwire.EventThink, s, false)
 		},
-		OnSteer:  func(s string) { w.publish("steer", s, true) },
-		OnNotice: func(s string) { w.publish("notice", s, true) },
-		OnUsage:  func(u models.Usage) { addUsage(u); w.publish("usage", u, true) },
-		OnRetry:  func(ev models.RetryEvent) { w.publish("retry", ev, true) },
+		OnSteer:  func(s string) { w.publish(workerwire.EventSteer, s, true) },
+		OnNotice: func(s string) { w.publish(workerwire.EventNotice, s, true) },
+		OnUsage:  func(u models.Usage) { addUsage(u); w.publish(workerwire.EventUsage, u, true) },
+		OnRetry:  func(ev models.RetryEvent) { w.publish(workerwire.EventRetry, ev, true) },
 		OnQuestion: func(questionCtx context.Context, request agent.QuestionRequest) (agent.QuestionResult, error) {
 			return w.questionGate(questionCtx, request)
 		},
 		OnGoalUpdate: func(update agent.GoalUpdate) {
 			w.persistGoalUpdate(update)
-			w.publish("goal_update", update, true)
+			w.publish(workerwire.EventGoalUpdate, update, true)
 		},
 		OnCompactionReady: func(messages []models.Message, summary string, cutoff int) error {
 			w.mu.Lock()
@@ -422,7 +407,7 @@ func (w *workerProcessState) runTurn(ctx context.Context, input workerInput) {
 			w.mu.Lock()
 			w.saved = len(w.ag.MessagesSnapshot())
 			w.mu.Unlock()
-			w.publish("compact", map[string]any{"summary": summary, "cutoff": cutoff}, true)
+			w.publish(workerwire.EventCompact, map[string]any{"summary": summary, "cutoff": cutoff}, true)
 		},
 	}
 	setupWireEvents(&ev, w.emitWireEvent)
@@ -521,7 +506,7 @@ func (w *workerProcessState) runTurn(ctx context.Context, input workerInput) {
 	w.mu.Unlock()
 	clean := true
 	if wd, err := os.Getwd(); err == nil {
-		clean = session.WorkspaceClean(wd)
+		clean = workspace.Clean(wd)
 		if clean && snap != "" {
 			if w.store != nil && w.store.SetSnapshot(w.sessionID, turnAt, "") == nil {
 				w.store.DropSnapshotIfUnreferenced(wd, snap)
@@ -537,10 +522,12 @@ func (w *workerProcessState) runTurn(ctx context.Context, input workerInput) {
 		Messages: boundedWorkerMessages(w.ag.MessagesSnapshot()),
 		Plan:     planMD, Review: reviewPayload, ReviewMarkdown: reviewMarkdown, Goal: goalRecord, GoalContinue: goalContinue,
 	}
-	if err != nil {
+	interrupted := errors.Is(err, context.Canceled) || ctx.Err() != nil
+	result.Interrupted = interrupted
+	if err != nil && !interrupted {
 		result.Error = err.Error()
 	}
-	w.publish("turn_done", result, true)
+	w.publish(workerwire.EventTurnDone, result, true)
 	w.notifyCompletion(result)
 }
 
@@ -574,36 +561,36 @@ func (w *workerProcessState) emitWireEvent(value any) {
 		}
 	}
 	switch kind {
-	case "text":
+	case workerwire.EventText:
 		if value, ok := data["delta"].(string); ok {
-			w.appendLive("text", value)
+			w.appendLive(workerwire.EventText, value)
 			w.publish(kind, value, false)
 		}
-	case "plan_delta":
+	case workerwire.EventPlanDelta:
 		if value, ok := data["delta"].(string); ok {
 			w.appendLive("plan", value)
 			w.publish(workerwire.EventPlanDelta, value, false)
 		}
-	case "tool_start":
+	case workerwire.EventToolStart:
 		if name, ok := data["name"].(string); ok {
 			w.mu.Lock()
 			w.activeTool = name
 			w.mu.Unlock()
 		}
 		w.publish(kind, data, false)
-	case "tool_output":
+	case workerwire.EventToolOutput:
 		if output, ok := data["output"].(string); ok {
 			w.appendLive("tool_output", output)
 		}
 		w.publish(kind, data, false)
-	case "tool_end":
+	case workerwire.EventToolEnd:
 		w.mu.Lock()
 		w.activeTool = ""
 		w.mu.Unlock()
 		w.publish(kind, data, false)
-	case "notice":
+	case workerwire.EventNotice:
 		w.publish(kind, data, true)
-	case "review_progress":
+	case workerwire.EventReviewProgress:
 		w.publish(kind, data, true)
 	default:
 		w.publish(kind, data, false)

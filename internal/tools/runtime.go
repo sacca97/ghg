@@ -128,21 +128,20 @@ type ExecutionAudit struct {
 // a narrowed view of the same boundary and never reconstructs a permissive
 // default.
 type ToolRuntime struct {
-	Policy            *sandbox.Policy
-	ApprovalMode      ApprovalMode
-	Reviewer          ApprovalReviewer
-	SecretNames       []string
-	TempDir           string
-	HumanGate         func(context.Context, GateRequest) (GateDecision, string)
-	Cautious          bool
-	InteractiveRunner InteractiveRunner
-	LanguageService   LanguageService
-	PostEditHooks     []PostEditHook
-	Headless          bool
-	Goal              string
-	Justification     string
-	OnAudit           func(ExecutionAudit)
-	OnReviewerCall    func(ReviewerCall)
+	Policy          *sandbox.Policy
+	ApprovalMode    ApprovalMode
+	Reviewer        ApprovalReviewer
+	SecretNames     []string
+	TempDir         string
+	HumanGate       func(context.Context, GateRequest) (GateDecision, string)
+	Cautious        bool
+	LanguageService LanguageService
+	PostEditHooks   []PostEditHook
+	Headless        bool
+	Goal            string
+	Justification   string
+	OnAudit         func(ExecutionAudit)
+	OnReviewerCall  func(ReviewerCall)
 
 	envOverrides map[string]string
 	state        *runtimeState
@@ -170,7 +169,7 @@ var childEnvAllowed = map[string]struct{}{
 	"TMP": {}, "TEMP": {}, "USER": {}, "LOGNAME": {},
 	"LANG": {}, "NO_COLOR": {}, "CI": {}, "GOCACHE": {},
 	"GOMODCACHE": {}, "GOPATH": {}, "GOROOT": {},
-	"GOTOOLCHAIN": {}, "GOPROXY": {}, "GOSUMDB": {},
+	"GOTOOLCHAIN": {}, "GOPROXY": {}, "GOSUMDB": {}, "GOTMPDIR": {},
 	"GONOSUMDB": {}, "GOPRIVATE": {}, "XDG_CACHE_HOME": {},
 	"XDG_CONFIG_HOME": {}, "XDG_DATA_HOME": {}, "CARGO_HOME": {},
 	"RUSTUP_HOME": {}, "NPM_CONFIG_CACHE": {}, "BUN_INSTALL": {},
@@ -398,6 +397,13 @@ func (r *ToolRuntime) ChildEnv(explicit map[string]string) []string {
 	if r != nil {
 		for key, value := range r.envOverrides {
 			values[key] = value
+		}
+		if r.TempDir != "" {
+			values["GHG_TMPDIR"] = r.TempDir
+			values["GOTMPDIR"] = r.TempDir
+			values["TMPDIR"] = r.TempDir
+			values["TMP"] = r.TempDir
+			values["TEMP"] = r.TempDir
 		}
 	}
 	if _, ok := values["GIT_CONFIG_GLOBAL"]; !ok {

@@ -29,13 +29,7 @@ func (m *model) notifyConfigCommand() {
 }
 
 func (m *model) sendNotifyConfig(token, chatID string) {
-	if m.workerClient == nil && !m.ensureWorker() {
-		m.append(errStyle.Render("notify: worker unavailable: " + m.workerStartError))
-		return
-	}
-	if err := m.workerClient.Send(workerwire.CommandNotify, workerRequestID("notify-config"), workerwire.NotifyRequest{
+	m.sendWorkerCommand("/notify config", "notify-config", workerwire.CommandNotify, workerwire.NotifyRequest{
 		Action: "config", BotToken: token, ChatID: chatID,
-	}); err != nil {
-		m.append(errStyle.Render("notify config failed: " + err.Error()))
-	}
+	})
 }

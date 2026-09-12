@@ -55,7 +55,7 @@ func (c *OpenAIResponsesClient) tryForceRefresh(ctx context.Context) bool {
 	if c.Authorizer == nil {
 		return false
 	}
-	if refresher, ok := c.Authorizer.(interface{ ForceRefresh(context.Context) error }); ok {
+	if refresher, ok := c.Authorizer.(TokenRefresher); ok {
 		return refresher.ForceRefresh(ctx) == nil
 	}
 	return false
@@ -394,9 +394,6 @@ func (c *OpenAIResponsesClient) Complete(ctx context.Context, req Request) (Mess
 }
 
 func (c *OpenAIResponsesClient) stream(ctx context.Context, req Request, sink EventSink) (Message, Usage, error) {
-	if req.SessionID != "" {
-		ctx = WithSessionID(ctx, req.SessionID)
-	}
 	wire, err := newOpenAIResponsesRequest(req, true, c.flavor)
 	if err != nil {
 		return Message{}, Usage{}, err
@@ -484,9 +481,6 @@ func (c *OpenAIResponsesClient) doStreamOnce(ctx context.Context, body []byte, o
 }
 
 func (c *OpenAIResponsesClient) complete(ctx context.Context, req Request, sink EventSink) (Message, Usage, error) {
-	if req.SessionID != "" {
-		ctx = WithSessionID(ctx, req.SessionID)
-	}
 	wire, err := newOpenAIResponsesRequest(req, false, c.flavor)
 	if err != nil {
 		return Message{}, Usage{}, err

@@ -113,14 +113,8 @@ type PromptView struct {
 	ContextLimit    int `json:"context_limit"`
 }
 
-// FanIn multiplexes several Events values into one: every fired callback is
-// invoked on each source that implements it. A background worker runs its
-// Turn with FanIn(registry.emitter(id), Events{OnUsage: …}) so the TUI's
-// per-task subscribers and the parent's usage accounting both see the live
-// stream.
-// FanIn multiplexes several Events values into one: every fired callback is
-// invoked on each source that implements it. Callbacks absent from all inputs
-// remain nil so background agents do not calculate unneeded telemetry.
+// FanIn merges multiple Events instances into a single combined event dispatcher.
+// Callbacks absent from all inputs remain nil to avoid unused telemetry calculations.
 func FanIn(evs ...Events) Events {
 	var out Events
 	var hasText, hasThink, hasToolStart, hasToolOutput, hasToolEnd, hasTelemetry, hasSteer bool

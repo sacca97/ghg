@@ -33,16 +33,6 @@ func (s *stubLSP) Navigate(_ context.Context, request NavigationRequest) (Naviga
 	}
 	return NavigationResult{}, errors.New("not implemented")
 }
-func (*stubLSP) PreviewRename(context.Context, RenameRequest) (RenamePreview, error) {
-	return RenamePreview{}, errors.New("not implemented")
-}
-func (*stubLSP) LookupRename(context.Context, string, string) (RenamePlan, error) {
-	return RenamePlan{}, errors.New("not implemented")
-}
-func (*stubLSP) ValidateRename(context.Context, RenamePlan) error {
-	return errors.New("not implemented")
-}
-func (*stubLSP) ConsumeRename(context.Context, string, string) error { return nil }
 
 func TestWriteEditAppendLSPDiagnostics(t *testing.T) {
 	stub := &stubLSP{block: "\n\n<diagnostics file=\"x.go\">\nERROR [1:1] boom\n</diagnostics>"}

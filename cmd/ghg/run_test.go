@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -21,7 +20,7 @@ import (
 // server that replies with reply (and records each request into reqs).
 func runFixture(t *testing.T, reply string, reqs *[]models.Request) {
 	t.Helper()
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := testEndpointFor(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req models.Request
 		json.NewDecoder(r.Body).Decode(&req)
 		if reqs != nil {
@@ -49,7 +48,7 @@ func runFixture(t *testing.T, reply string, reqs *[]models.Request) {
 func runPlanFixture(t *testing.T, reqs *[]models.Request) {
 	t.Helper()
 	var calls int
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := testEndpointFor(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		data, err := io.ReadAll(r.Body)
 		if err != nil {
 			t.Errorf("read request: %v", err)
@@ -203,7 +202,7 @@ func TestRunPlanOnlyUsesReadOnlyPlannerAndExits(t *testing.T) {
 	}
 	for _, name := range names {
 		switch name {
-		case "read", "grep", "structural_search", "glob", "find_files", "lsp", "output_list", "output_read", "history_search", "history_read":
+		case "read", "grep", "glob", "find_files", "lsp", "output_list", "output_read", "history_search", "history_read":
 		default:
 			t.Fatalf("planner exposed non-read-only tool %q (all tools: %q)", name, strings.Join(names, ","))
 		}
@@ -372,7 +371,7 @@ func TestRunSystemOverride(t *testing.T) {
 // -max-turns caps the tool loop; a capped run errors non-zero.
 func TestRunMaxTurns(t *testing.T) {
 	// a server that always calls a tool (never finishes)
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := testEndpointFor(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		fmt.Fprint(w, `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"t1","type":"function","function":{"name":"read","arguments":"{\"path\":\"/tmp/x\"}"}}]}}]}`+"\n\n")
 		fmt.Fprint(w, `data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`+"\n\n")
@@ -396,7 +395,7 @@ func TestRunMaxTurns(t *testing.T) {
 
 // -timeout cancels an in-flight run and reports the timeout.
 func TestRunTimeout(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := testEndpointFor(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(3 * time.Second) // hang past the timeout
 		w.Header().Set("Content-Type", "text/event-stream")
 		fmt.Fprint(w, "data: [DONE]\n\n")

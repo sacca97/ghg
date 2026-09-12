@@ -60,10 +60,14 @@ func LoginFor(ctx context.Context, resolved models.Resolved, opts LoginOptions) 
 
 // NewBackend builds the adapter selected by a resolved provider profile.
 func NewBackend(resolved models.Resolved, key, modelAPI string, maxRetries int) (models.Backend, error) {
+	return newBackend(resolved, key, modelAPI, maxRetries, nil)
+}
+
+func newBackend(resolved models.Resolved, key, modelAPI string, maxRetries int, client *http.Client) (models.Backend, error) {
 	if resolved.RequiresAPIKey() && strings.TrimSpace(key) == "" {
 		return nil, fmt.Errorf("no API key for provider %q (set apiKey/apiKeyEnv in ~/.ghg/config.json)", resolved.Name)
 	}
-	opts := models.BackendOptions{APIKey: key, MaxRetries: maxRetries}
+	opts := models.BackendOptions{APIKey: key, MaxRetries: maxRetries, HTTP: client}
 	if modelAPI = strings.TrimSpace(modelAPI); modelAPI != "" {
 		opts.ProtocolOverride = models.Protocol(modelAPI)
 	}

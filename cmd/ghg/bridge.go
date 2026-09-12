@@ -4,12 +4,12 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
-	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -18,7 +18,6 @@ import (
 
 	"github.com/sacca97/ghg/internal/agent"
 	"github.com/sacca97/ghg/internal/config"
-	"github.com/sacca97/ghg/internal/models"
 	"github.com/sacca97/ghg/internal/session"
 	workerwire "github.com/sacca97/ghg/internal/worker"
 )
@@ -33,9 +32,6 @@ type bridgeRequest struct {
 type bridge struct {
 	client    *workerwire.Client
 	process   *workerwire.Process
-	cfg       *config.Config
-	profiles  models.Profiles
-	role      string
 	turnDone  bool
 	detached  atomic.Bool
 	outMu     sync.Mutex
@@ -46,8 +42,11 @@ type bridge struct {
 func bridgeCLI(args []string) error {
 	fs := flag.NewFlagSet("bridge", flag.ContinueOnError)
 	sessionFlag := fs.String("session", "", "session id to resume")
+	modelFlag := fs.String("m", "", "model name")
+	providerFlag := fs.String("p", "", "provider name")
 	roleFlag := fs.String("role", config.RoleFast, "initial model role")
 	modeFlag := fs.String("mode", "execute", "initial mode: execute or plan")
+	cautiousFlag := fs.Bool("cautious", false, "ask before running commands / writing files")
 	sandboxFlag := fs.String("sandbox", "", "execution sandbox override")
 	networkFlag := fs.String("network", "", "execution network override")
 	approvalFlag := fs.String("approval", "", "execution approval override")
@@ -74,12 +73,17 @@ func bridgeCLI(args []string) error {
 		return err
 	}
 	sessionID := strings.TrimSpace(*sessionFlag)
-	modelName, providerName := "", ""
+	modelName, providerName := strings.TrimSpace(*modelFlag), strings.TrimSpace(*providerFlag)
 	if sessionID != "" {
 		if dir, dirErr := config.Dir(); dirErr == nil {
 			if st, openErr := session.Open(filepath.Join(dir, "sessions.db")); openErr == nil {
 				if meta, _, loadErr := st.Load(sessionID); loadErr == nil {
-					modelName, providerName = meta.Model, meta.Provider
+					if modelName == "" {
+						modelName = meta.Model
+					}
+					if providerName == "" {
+						providerName = meta.Provider
+					}
 				}
 				_ = st.Close()
 			}
@@ -89,8 +93,16 @@ func bridgeCLI(args []string) error {
 	}
 
 	sysPrompt := systemPrompt()
-	if modelName == "" || providerName == "" {
+	if modelName == "" && providerName == "" {
 		_, modelName, providerName, err = agent.NewConfiguredForRole(cfg, profiles, *roleFlag, sysPrompt, false)
+		if err != nil {
+			return err
+		}
+	} else {
+		_, modelName, providerName, err = agent.NewConfigured(agent.BuildOptions{
+			Config: cfg, Profiles: profiles, Model: modelName, Provider: providerName,
+			Role: *roleFlag, SystemPrompt: sysPrompt,
+		})
 		if err != nil {
 			return err
 		}
@@ -112,6 +124,7 @@ func bridgeCLI(args []string) error {
 		if err != nil {
 			return err
 		}
+	} else {
 		if err = runtimeFile.WritePrompt(sysPrompt); err != nil {
 			return err
 		}
@@ -120,24 +133,24 @@ func bridgeCLI(args []string) error {
 			return cwdErr
 		}
 		env := map[string]string{
-			"GHG_INTERNAL_WORKER": "1",
-			workerSessionEnv:      sessionID,
-			workerBaseEnv:         dir,
-			workerCWDEnv:          cwd,
-			workerModelEnv:        modelName,
-			workerProviderEnv:     providerName,
-			workerRoleEnv:         *roleFlag,
-			workerModeEnv:         *modeFlag,
-			workerCautiousEnv:     "false",
+			"GHG_INTERNAL_WORKER":        "1",
+			workerwire.WorkerSessionEnv:  sessionID,
+			workerwire.WorkerBaseEnv:     dir,
+			workerwire.WorkerCWDEnv:      cwd,
+			workerwire.WorkerModelEnv:    modelName,
+			workerwire.WorkerProviderEnv: providerName,
+			workerwire.WorkerRoleEnv:     *roleFlag,
+			workerwire.WorkerModeEnv:     *modeFlag,
+			workerwire.WorkerCautiousEnv: strconv.FormatBool(*cautiousFlag),
 		}
 		if *sandboxFlag != "" {
-			env[workerSandboxEnv] = *sandboxFlag
+			env[workerwire.WorkerSandboxEnv] = *sandboxFlag
 		}
 		if *networkFlag != "" {
-			env[workerNetworkEnv] = *networkFlag
+			env[workerwire.WorkerNetworkEnv] = *networkFlag
 		}
 		if *approvalFlag != "" {
-			env[workerApprovalEnv] = *approvalFlag
+			env[workerwire.WorkerApprovalEnv] = *approvalFlag
 		}
 		process, err = workerwire.Launch(context.Background(), os.Args[0], env)
 		if err == nil {
@@ -152,9 +165,9 @@ func bridgeCLI(args []string) error {
 		}
 	}
 
-	b := &bridge{client: client, process: process, cfg: cfg, profiles: profiles, role: *roleFlag, pending: make(map[string]string)}
+	b := &bridge{client: client, process: process, pending: make(map[string]string)}
 	defer b.close()
-	b.emit(map[string]any{"type": "bridge_ready", "session_id": sessionID})
+	b.emit(map[string]any{"type": "bridge_ready", "session_id": sessionID, "commands": workerwire.Commands()})
 	ctx, stop := signalContext()
 	defer stop()
 	go b.forward(ctx)
@@ -263,82 +276,7 @@ func (b *bridge) handle(request bridgeRequest) error {
 	if requestID == "" {
 		requestID = fmt.Sprintf("bridge-%d", time.Now().UnixNano())
 	}
-	if request.Name == "set_role_model" {
-		var payload struct {
-			Role     string `json:"role"`
-			Model    string `json:"model"`
-			Provider string `json:"provider"`
-			Mode     string `json:"mode,omitempty"`
-		}
-		if err := json.Unmarshal(request.Payload, &payload); err != nil || !config.IsRole(payload.Role) || strings.TrimSpace(payload.Model) == "" {
-			return errors.New("role model configuration is invalid")
-		}
-		payload.Model = strings.TrimSpace(payload.Model)
-		payload.Provider = strings.TrimSpace(payload.Provider)
-		if _, _, _, err := agent.NewConfigured(agent.BuildOptions{
-			Config: b.cfg, Profiles: b.profiles, Model: payload.Model, Provider: payload.Provider,
-			Role: payload.Role, SystemPrompt: systemPrompt(),
-		}); err != nil {
-			return err
-		}
-		if b.cfg.Roles == nil {
-			b.cfg.Roles = make(map[string]config.RoleConfig)
-		}
-		b.cfg.Roles[payload.Role] = config.RoleConfig{Model: payload.Model, Provider: payload.Provider}
-		if err := b.cfg.Save(); err != nil {
-			return err
-		}
-		if payload.Mode != "plan" {
-			payload.Mode = "execute"
-		}
-		active, err := b.cfg.ResolveRole(payload.Role)
-		if err != nil {
-			return err
-		}
-		request.Name = workerwire.CommandConfigure
-		request.Payload, err = json.Marshal(workerwire.ConfigureRequest{
-			Model: active.Model, Provider: active.Provider, Role: payload.Role, Mode: payload.Mode,
-		})
-		if err != nil {
-			return err
-		}
-		b.role = payload.Role
-	}
-	if request.Name == "configure_role" {
-		var payload struct {
-			Role             string `json:"role"`
-			Mode             string `json:"mode,omitempty"`
-			Effort           string `json:"effort,omitempty"`
-			UpdateEffort     bool   `json:"update_effort,omitempty"`
-			DynamicReasoning *bool  `json:"dynamic_reasoning,omitempty"`
-		}
-		if err := json.Unmarshal(request.Payload, &payload); err != nil || !config.IsRole(payload.Role) {
-			return errors.New("bridge role configuration is invalid")
-		}
-		if payload.DynamicReasoning != nil {
-			b.cfg.DynamicReasoning = payload.DynamicReasoning
-			if err := b.cfg.Save(); err != nil {
-				return err
-			}
-		}
-		_, modelName, providerName, err := agent.NewConfiguredForRole(b.cfg, b.profiles, payload.Role, systemPrompt(), false)
-		if err != nil {
-			return err
-		}
-		request.Name = workerwire.CommandConfigure
-		request.Payload, err = json.Marshal(workerwire.ConfigureRequest{
-			Model: modelName, Provider: providerName, Role: payload.Role,
-			Effort: strings.TrimSpace(payload.Effort), UpdateEffort: payload.UpdateEffort || payload.Effort != "", DynamicReasoning: payload.DynamicReasoning, Mode: payload.Mode,
-		})
-		if err != nil {
-			return err
-		}
-		b.role = payload.Role
-	}
-	if request.Name == "stop" {
-		request.Name = workerwire.CommandStop
-	}
-	if !workerCommandName(request.Name) {
+	if !workerwire.KnownCommand(request.Name) {
 		return fmt.Errorf("unsupported bridge command %q", request.Name)
 	}
 	b.pendingMu.Lock()
@@ -351,18 +289,6 @@ func (b *bridge) handle(request bridgeRequest) error {
 		return err
 	}
 	return nil
-}
-
-func workerCommandName(name string) bool {
-	return name == workerwire.CommandDetach || name == workerwire.CommandCancel || name == workerwire.CommandInput ||
-		name == workerwire.CommandApprove || name == workerwire.CommandAnswerQuestion || name == workerwire.CommandConfigure ||
-		name == workerwire.CommandCompact || name == workerwire.CommandStop || name == workerwire.CommandPing ||
-		name == workerwire.CommandLSPStatus || name == workerwire.CommandMCPStatus || name == workerwire.CommandMCPReconnect ||
-		name == workerwire.CommandMCPEnable || name == workerwire.CommandMCPDisable || name == workerwire.CommandContextDoctor ||
-		name == workerwire.CommandRewind || name == workerwire.CommandCompactRetry || name == workerwire.CommandGoal ||
-		name == workerwire.CommandGoalFromContext || name == workerwire.CommandChdir || name == workerwire.CommandAppend ||
-		name == workerwire.CommandShell || name == workerwire.CommandFork || name == workerwire.CommandRename ||
-		name == workerwire.CommandNotify || name == workerwire.CommandSearchProvider
 }
 
 func (b *bridge) forward(ctx context.Context) {
@@ -394,9 +320,8 @@ func (b *bridge) forwardFrame(frame workerwire.Frame) {
 	case workerwire.TypeAttached:
 		return
 	case workerwire.TypeSnapshot:
-		var envelope workerwire.SnapshotEnvelope
 		var snapshot workerwire.Snapshot
-		if json.Unmarshal(frame.Payload, &envelope) == nil && json.Unmarshal(envelope.State, &snapshot) == nil {
+		if json.Unmarshal(frame.Payload, &snapshot) == nil {
 			b.emit(map[string]any{"type": "snapshot", "snapshot": snapshot})
 		}
 	case workerwire.TypeEvent:
@@ -437,20 +362,20 @@ func (b *bridge) forwardEvent(envelope workerwire.EventEnvelope) {
 	} else {
 		field := "data"
 		switch envelope.Kind {
-		case "text", "think", workerwire.EventPlanDelta:
+		case workerwire.EventText, workerwire.EventThink, workerwire.EventPlanDelta:
 			field = "delta"
-		case "notice", "steer":
+		case workerwire.EventNotice, workerwire.EventSteer:
 			field = "text"
 		}
 		b.emit(map[string]any{"type": envelope.Kind, field: value})
 	}
-	if envelope.Kind == "turn_done" {
+	if envelope.Kind == workerwire.EventTurnDone {
 		// The worker publishes turn_done before its operation wrapper clears
 		// activeCancel. Wait for the following idle state before advertising a
 		// turn end, otherwise the next command can race cleanup.
 		b.turnDone = true
 	}
-	if envelope.Kind == "state" {
+	if envelope.Kind == workerwire.EventState {
 		if stateValue, ok := value.(map[string]any); ok {
 			state, ok := stateValue["state"].(string)
 			if ok && b.turnDone && (state == string(workerwire.StateIdle) || state == string(workerwire.StateInterrupted)) {

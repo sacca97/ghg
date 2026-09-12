@@ -6,16 +6,13 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"testing"
 )
 
-func responsesClientForTest(t *testing.T, handler http.Handler) (*OpenAIResponsesClient, *httptest.Server) {
+func responsesClientForTest(t *testing.T, handler http.Handler) *OpenAIResponsesClient {
 	t.Helper()
-	srv := httptest.NewServer(handler)
-	client := testResponsesClient(t, srv.URL, "responses-test-key")
-	return client, srv
+	return testResponsesClientWithHandler(t, handler)
 }
 
 func writeResponsesEvent(w io.Writer, payload string) {
@@ -110,7 +107,7 @@ func TestOpenAIResponsesRequestTranslation(t *testing.T) {
 }
 
 func TestOpenAIResponsesStreamAssemblesTextThinkingAndUsage(t *testing.T) {
-	client, srv := responsesClientForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	client := responsesClientForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/responses" || r.Header.Get("Authorization") != "Bearer responses-test-key" {
 			http.Error(w, "bad request", http.StatusUnauthorized)
 			return
@@ -127,7 +124,6 @@ func TestOpenAIResponsesStreamAssemblesTextThinkingAndUsage(t *testing.T) {
 		writeResponsesEvent(w, `{"type":"response.output_item.done","output_index":1,"item":{"id":"msg_1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"answer"}]}}`)
 		writeResponsesEvent(w, `{"type":"response.completed","response":{"id":"resp_1","status":"completed","output":[{"id":"rs_1","type":"reasoning","summary":[]},{"id":"msg_1","type":"message","role":"assistant","status":"completed","content":[{"type":"output_text","text":"answer"}]}],"usage":{"input_tokens":10,"output_tokens":7,"input_tokens_details":{"cached_tokens":4}}}}`)
 	}))
-	defer srv.Close()
 
 	var textOut, thinkOut strings.Builder
 	msg, usage, err := client.stream(context.Background(), Request{
@@ -151,7 +147,7 @@ func TestOpenAIResponsesStreamAssemblesTextThinkingAndUsage(t *testing.T) {
 }
 
 func TestOpenAIResponsesStreamAssemblesFunctionCall(t *testing.T) {
-	client, srv := responsesClientForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	client := responsesClientForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		writeResponsesEvent(w, `{"type":"response.output_item.added","output_index":0,"item":{"id":"fc_item","type":"function_call","call_id":"call-1","name":"read","arguments":""}}`)
 		writeResponsesEvent(w, `{"type":"response.function_call_arguments.delta","item_id":"fc_item","call_id":"call-1","name":"read","delta":"{\"path\":"}`)
@@ -160,7 +156,6 @@ func TestOpenAIResponsesStreamAssemblesFunctionCall(t *testing.T) {
 		writeResponsesEvent(w, `{"type":"response.output_item.done","output_index":0,"item":{"id":"fc_item","type":"function_call","call_id":"call-1","name":"read","arguments":"{\"path\":\"README.md\"}","status":"completed"}}`)
 		writeResponsesEvent(w, `{"type":"response.completed","response":{"id":"resp_1","status":"completed","output":[{"id":"fc_item","type":"function_call","call_id":"call-1","name":"read","arguments":"{\"path\":\"README.md\"}","status":"completed"}],"usage":{"input_tokens":3,"output_tokens":5}}}`)
 	}))
-	defer srv.Close()
 
 	msg, usage, err := client.stream(context.Background(), Request{Model: "grok-test", Messages: []Message{{Role: "user", Content: "read"}}}, EventSink{})
 	if err != nil {
@@ -179,7 +174,7 @@ func TestOpenAIResponsesStreamAssemblesFunctionCall(t *testing.T) {
 }
 
 func TestOpenAIResponsesComplete(t *testing.T) {
-	client, srv := responsesClientForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	client := responsesClientForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/responses" {
 			t.Errorf("path = %q", r.URL.Path)
 		}
@@ -192,7 +187,6 @@ func TestOpenAIResponsesComplete(t *testing.T) {
 		}
 		_, _ = io.WriteString(w, `{"id":"resp_1","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"summary"}]}],"usage":{"input_tokens":4,"output_tokens":2}}`)
 	}))
-	defer srv.Close()
 
 	msg, usage, err := client.complete(context.Background(), Request{Model: "grok-test", Messages: []Message{{Role: "user", Content: "summarize"}}, MaxTokens: 12}, EventSink{})
 	if err != nil {
@@ -204,7 +198,7 @@ func TestOpenAIResponsesComplete(t *testing.T) {
 }
 
 func TestOpenAIResponsesProbeAndModels(t *testing.T) {
-	client, srv := responsesClientForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	client := responsesClientForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer responses-test-key" {
 			t.Errorf("authorization = %q", r.Header.Get("Authorization"))
 		}
@@ -229,7 +223,6 @@ func TestOpenAIResponsesProbeAndModels(t *testing.T) {
 			http.NotFound(w, r)
 		}
 	}))
-	defer srv.Close()
 
 	models, err := client.Models(context.Background())
 	if err != nil || len(models) != 1 || models[0].ID != "grok-test" {
@@ -241,7 +234,7 @@ func TestOpenAIResponsesProbeAndModels(t *testing.T) {
 }
 
 func TestOpenAIresponsesCodexSubscriptionModels(t *testing.T) {
-	client, srv := responsesClientForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	client := responsesClientForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/models" {
 			http.NotFound(w, r)
 			return
@@ -274,7 +267,6 @@ func TestOpenAIresponsesCodexSubscriptionModels(t *testing.T) {
 			]
 		}`)
 	}))
-	defer srv.Close()
 
 	client.flavor = responsesCodexSubscription
 	models, err := client.Models(context.Background())
@@ -298,10 +290,9 @@ func TestOpenAIresponsesCodexSubscriptionModels(t *testing.T) {
 
 func TestOpenAIResponsesModelsRejectsUnknownShape(t *testing.T) {
 	t.Run("CodexSubscriptionMissingModels", func(t *testing.T) {
-		client, srv := responsesClientForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		client := responsesClientForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			_, _ = io.WriteString(w, `{"unrelated": true}`)
 		}))
-		defer srv.Close()
 
 		client.flavor = responsesCodexSubscription
 		_, err := client.Models(context.Background())
@@ -314,10 +305,9 @@ func TestOpenAIResponsesModelsRejectsUnknownShape(t *testing.T) {
 	})
 
 	t.Run("StandardResponsesMissingData", func(t *testing.T) {
-		client, srv := responsesClientForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		client := responsesClientForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			_, _ = io.WriteString(w, `{"unrelated": true}`)
 		}))
-		defer srv.Close()
 
 		client.flavor = responsesPublicAPI
 		_, err := client.Models(context.Background())

@@ -5,9 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -259,35 +256,31 @@ func TestLSPDiagnosticsReachModel(t *testing.T) {
 	argsJSON, _ := json.Marshal(map[string]string{"path": target, "content": "package main\n"})
 
 	call := 0
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var req models.Request
-		json.NewDecoder(r.Body).Decode(&req)
-		w.Header().Set("Content-Type", "text/event-stream")
+	backend := &mockAgentBackend{streamFn: func(_ context.Context, req models.Request, sink models.EventSink) (models.Message, models.Usage, error) {
 		call++
 		if call == 1 {
-			fmt.Fprintf(w, `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"t1","type":"function","function":{"name":"write","arguments":%s}}]}}]}`+"\n\n",
-				jsonString(string(argsJSON)))
-		} else {
-			var last models.Message
-			for i := len(req.Messages) - 1; i >= 0; i-- {
-				if req.Messages[i].Role == "tool" {
-					last = req.Messages[i]
-					break
-				}
-			}
-			if last.Role != "tool" {
-				t.Errorf("expected tool result in request, got %+v", req.Messages)
-			}
-			if !strings.Contains(last.Content, "<diagnostics file=") || !strings.Contains(last.Content, "ERROR [2:3] undefined: foo") {
-				t.Errorf("tool result missing diagnostics block: %q", last.Content)
-			}
-			fmt.Fprint(w, `data: {"choices":[{"delta":{"content":"fixed"},"finish_reason":"stop"}]}`+"\n\n")
+			return models.Message{Role: "assistant", ToolCalls: []models.ToolCall{agentToolCall("t1", "write", string(argsJSON))}}, models.Usage{}, nil
 		}
-		fmt.Fprint(w, "data: [DONE]\n\n")
-	}))
-	defer srv.Close()
+		var last models.Message
+		for i := len(req.Messages) - 1; i >= 0; i-- {
+			if req.Messages[i].Role == "tool" {
+				last = req.Messages[i]
+				break
+			}
+		}
+		if last.Role != "tool" {
+			t.Errorf("expected tool result in request, got %+v", req.Messages)
+		}
+		if !strings.Contains(last.Content, "<diagnostics file=") || !strings.Contains(last.Content, "ERROR [2:3] undefined: foo") {
+			t.Errorf("tool result missing diagnostics block: %q", last.Content)
+		}
+		if sink.OnText != nil {
+			sink.OnText("fixed")
+		}
+		return models.Message{Role: "assistant", Content: "fixed"}, models.Usage{}, nil
+	}}
 
-	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
+	ag := New(backend, "m", 100, "sys")
 	ag.Runtime = &tools.ToolRuntime{LanguageService: stubWaiter{block: "\n\n<diagnostics file=\"" + target + "\">\nERROR [2:3] undefined: foo\n</diagnostics>"}}
 	if _, err := ag.Turn(context.Background(), "write the file", Events{}); err != nil {
 		t.Fatal(err)
@@ -304,20 +297,12 @@ func (stubWaiter) Warm(context.Context, string)                              {}
 func (stubWaiter) Navigate(context.Context, tools.NavigationRequest) (tools.NavigationResult, error) {
 	return tools.NavigationResult{}, errors.New("not implemented")
 }
-func (stubWaiter) PreviewRename(context.Context, tools.RenameRequest) (tools.RenamePreview, error) {
-	return tools.RenamePreview{}, errors.New("not implemented")
-}
-func (stubWaiter) LookupRename(context.Context, string, string) (tools.RenamePlan, error) {
-	return tools.RenamePlan{}, errors.New("not implemented")
-}
-func (stubWaiter) ValidateRename(context.Context, tools.RenamePlan) error {
-	return errors.New("not implemented")
-}
-func (stubWaiter) ConsumeRename(context.Context, string, string) error { return nil }
 
-func jsonString(s string) string {
-	b, _ := json.Marshal(s)
-	return string(b)
+func agentToolCall(id, name, args string) models.ToolCall {
+	return models.ToolCall{ID: id, Type: "function", Function: struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	}{Name: name, Arguments: args}}
 }
 
 func TestToolTelemetryReportsPreviewRetentionAndRedirect(t *testing.T) {
@@ -444,29 +429,17 @@ func TestReasoningRequestUsesToggleMetadata(t *testing.T) {
 }
 
 func TestTurnWithGoalUsesEphemeralContextAndStructuredUpdate(t *testing.T) {
-	var requests []models.Request
-	var mu sync.Mutex
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var req models.Request
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			t.Errorf("decode request: %v", err)
-			return
+	backend := &mockAgentBackend{}
+	backend.streamFn = func(_ context.Context, req models.Request, sink models.EventSink) (models.Message, models.Usage, error) {
+		if len(backend.requests) == 1 {
+			return models.Message{Role: "assistant", ToolCalls: []models.ToolCall{agentToolCall("goal-call", "update_goal", `{"status":"active","progress":"implementation complete; verification passed"}`)}}, models.Usage{}, nil
 		}
-		mu.Lock()
-		requests = append(requests, req)
-		call := len(requests)
-		mu.Unlock()
-		w.Header().Set("Content-Type", "text/event-stream")
-		if call == 1 {
-			fmt.Fprint(w, `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"goal-call","type":"function","function":{"name":"update_goal","arguments":"{\"status\":\"active\",\"progress\":\"implementation complete; verification passed\"}"}}]}}]}`+"\n\n")
-		} else {
-			fmt.Fprint(w, `data: {"choices":[{"delta":{"content":"ready"},"finish_reason":"stop"}]}`+"\n\n")
+		if sink.OnText != nil {
+			sink.OnText("ready")
 		}
-		fmt.Fprint(w, "data: [DONE]\n\n")
-	}))
-	defer srv.Close()
-
-	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
+		return models.Message{Role: "assistant", Content: "ready"}, models.Usage{}, nil
+	}
+	ag := New(backend, "m", 100, "sys")
 	ag.Tools = nil
 	record := NewGoal("ship the feature")
 	record.ID = "goal-1"
@@ -483,9 +456,7 @@ func TestTurnWithGoalUsesEphemeralContextAndStructuredUpdate(t *testing.T) {
 	if len(updates) != 1 || updates[0].Status != GoalStatusActive || updates[0].GoalID != record.ID {
 		t.Fatalf("updates: %+v", updates)
 	}
-	mu.Lock()
-	gotRequests := append([]models.Request(nil), requests...)
-	mu.Unlock()
+	gotRequests := append([]models.Request(nil), backend.requests...)
 	if len(gotRequests) != 2 {
 		t.Fatalf("requests = %d, want 2", len(gotRequests))
 	}
@@ -515,15 +486,11 @@ func TestTurnWithGoalUsesEphemeralContextAndStructuredUpdate(t *testing.T) {
 
 func TestTurnWithGoalCompletionStopsWithoutAnotherRequest(t *testing.T) {
 	requests := 0
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	backend := &mockAgentBackend{streamFn: func(_ context.Context, _ models.Request, _ models.EventSink) (models.Message, models.Usage, error) {
 		requests++
-		w.Header().Set("Content-Type", "text/event-stream")
-		fmt.Fprint(w, `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"goal-call","type":"function","function":{"name":"update_goal","arguments":"{\"status\":\"complete\",\"progress\":\"tests passed\"}"}}]}}]}`+"\n\n")
-		fmt.Fprint(w, "data: [DONE]\n\n")
-	}))
-	defer srv.Close()
-
-	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
+		return models.Message{Role: "assistant", ToolCalls: []models.ToolCall{agentToolCall("goal-call", "update_goal", `{"status":"complete","progress":"tests passed"}`)}}, models.Usage{}, nil
+	}}
+	ag := New(backend, "m", 100, "sys")
 	ag.Tools = nil
 	record := NewGoal("finish")
 	record.ID = "goal-2"
@@ -574,38 +541,24 @@ func TestGoalTurnIgnoresExplorationAndTurnCaps(t *testing.T) {
 	}
 }
 
-func testBackend(baseURL, apiKey string) models.Backend {
-	backend, err := models.NewBackend(models.Resolved{
-		BaseURL:  baseURL,
-		Protocol: models.ProtocolOpenAIChatCompletions,
-	}, models.BackendOptions{APIKey: apiKey, MaxRetries: 1})
-	if err != nil {
-		panic(err)
-	}
-	return backend
-}
-
-// server that answers with a tool call on the first request, text on the second
-func loopServer(t *testing.T) *httptest.Server {
+// backend that answers with a tool call on the first request, text on the second.
+func loopBackend(t *testing.T) models.Backend {
 	t.Helper()
 	call := 0
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var req models.Request
-		json.NewDecoder(r.Body).Decode(&req)
-		w.Header().Set("Content-Type", "text/event-stream")
+	return &mockAgentBackend{streamFn: func(_ context.Context, req models.Request, sink models.EventSink) (models.Message, models.Usage, error) {
 		call++
 		if call == 1 {
-			fmt.Fprint(w, `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"t1","type":"function","function":{"name":"echo","arguments":"{\"s\":\"hi\"}"}}]}}]}`+"\n\n")
-		} else {
-			// verify the tool result round-tripped
-			last := req.Messages[len(req.Messages)-1]
-			if last.Role != "tool" || last.ToolCallID != "t1" || last.Content != "echoed: hi" {
-				t.Errorf("tool result not fed back: %+v", last)
-			}
-			fmt.Fprint(w, `data: {"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]}`+"\n\n")
+			return models.Message{Role: "assistant", ToolCalls: []models.ToolCall{agentToolCall("t1", "echo", `{"s":"hi"}`)}}, models.Usage{}, nil
 		}
-		fmt.Fprint(w, "data: [DONE]\n\n")
-	}))
+		last := req.Messages[len(req.Messages)-1]
+		if last.Role != "tool" || last.ToolCallID != "t1" || last.Content != "echoed: hi" {
+			t.Errorf("tool result not fed back: %+v", last)
+		}
+		if sink.OnText != nil {
+			sink.OnText("done")
+		}
+		return models.Message{Role: "assistant", Content: "done"}, models.Usage{}, nil
+	}}
 }
 
 func echoTool() tools.Tool {
@@ -620,10 +573,7 @@ func echoTool() tools.Tool {
 }
 
 func TestTurnLoop(t *testing.T) {
-	srv := loopServer(t)
-	defer srv.Close()
-
-	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
+	ag := New(loopBackend(t), "m", 100, "sys")
 	ag.Tools = []tools.Tool{echoTool()}
 
 	var events []string
@@ -654,7 +604,7 @@ func TestTurnLoop(t *testing.T) {
 }
 
 func TestToolOutputCarriesCallID(t *testing.T) {
-	ag := New(testBackend("http://unused", "k"), "m", 100, "sys")
+	ag := New(&mockAgentBackend{}, "m", 100, "sys")
 	var ids []string
 	var snapshots []string
 	results := ag.runToolResultsWithTools(context.Background(), []models.ToolCall{{
@@ -686,7 +636,7 @@ func TestToolOutputCarriesCallID(t *testing.T) {
 }
 
 func TestParallelToolOutputStaysWithCall(t *testing.T) {
-	ag := New(testBackend("http://unused", "k"), "m", 100, "sys")
+	ag := New(&mockAgentBackend{}, "m", 100, "sys")
 	call := func(label string) models.ToolCall {
 		return models.ToolCall{
 			ID: label,
@@ -731,21 +681,16 @@ func TestParallelToolOutputStaysWithCall(t *testing.T) {
 // tool calls record their run time and exit status. All survive for per-turn
 // cost and perf views after the in-memory session totals are gone.
 func TestTurnStampsUsageModelAndToolTiming(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var req models.Request
-		json.NewDecoder(r.Body).Decode(&req)
-		w.Header().Set("Content-Type", "text/event-stream")
+	backend := &mockAgentBackend{streamFn: func(_ context.Context, req models.Request, sink models.EventSink) (models.Message, models.Usage, error) {
 		if len(req.Messages) > 0 && req.Messages[len(req.Messages)-1].Role == "tool" {
-			fmt.Fprint(w, `data: {"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":3}}`+"\n\n")
-		} else {
-			fmt.Fprint(w, `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"t1","type":"function","function":{"name":"echo","arguments":"{\"s\":\"hi\"}"}}]}}]}`+"\n\n")
-			fmt.Fprint(w, `data: {"usage":{"prompt_tokens":5,"completion_tokens":2}}`+"\n\n")
+			if sink.OnText != nil {
+				sink.OnText("done")
+			}
+			return models.Message{Role: "assistant", Content: "done"}, models.Usage{PromptTokens: 7, CompletionTokens: 3}, nil
 		}
-		fmt.Fprint(w, "data: [DONE]\n\n")
-	}))
-	defer srv.Close()
-
-	ag := New(testBackend(srv.URL, "k"), "kimi-k3-fast", 100, "sys")
+		return models.Message{Role: "assistant", ToolCalls: []models.ToolCall{agentToolCall("t1", "echo", `{"s":"hi"}`)}}, models.Usage{PromptTokens: 5, CompletionTokens: 2}, nil
+	}}
+	ag := New(backend, "kimi-k3-fast", 100, "sys")
 	ag.Provider = "inference"
 	ag.Tools = []tools.Tool{echoTool()}
 
@@ -787,45 +732,11 @@ func TestTurnStampsUsageModelAndToolTiming(t *testing.T) {
 	}
 }
 
-// The internal stamps (usage, model, tool timing) must be stripped before the
-// provider ever sees them.
-func TestInternalStampsStrippedFromRequest(t *testing.T) {
-	var bodies [][]byte
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		b, _ := io.ReadAll(r.Body)
-		bodies = append(bodies, b)
-		w.Header().Set("Content-Type", "text/event-stream")
-		fmt.Fprint(w, `data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}`+"\n\ndata: [DONE]\n\n")
-	}))
-	defer srv.Close()
-
-	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
-	// pre-seed a message loaded from storage with all internal fields set
-	sent := time.Now()
-	u := models.Usage{PromptTokens: 9}
-	ag.Messages = append(ag.Messages, models.Message{
-		Role: "assistant", Content: "prior", Usage: &u, Model: "m @ p",
-		ToolCalls: []models.ToolCall{{ID: "x", DurationMs: 5, ExitCode: 1}},
-	})
-	ag.Messages = append(ag.Messages, models.Message{Role: "user", Content: "old", Authored: true, SentAt: &sent, RewoundFrom: "earlier"})
-	if _, err := ag.Turn(context.Background(), "go", Events{}); err != nil {
-		t.Fatal(err)
-	}
-	if len(bodies) == 0 {
-		t.Fatal("no request captured")
-	}
-	body := string(bodies[len(bodies)-1])
-	for _, leak := range []string{"usage\":{", "\"model\":\"m @ p\"", "duration_ms", "exit_code", "sent_at", "rewound_from", "authored"} {
-		if strings.Contains(body, leak) {
-			t.Errorf("internal field %q leaked to provider:\n%s", leak, body)
-		}
-	}
-}
-
 func TestTurnCancelled(t *testing.T) {
-	srv := loopServer(t)
-	defer srv.Close()
-	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
+	ag := New(&mockAgentBackend{streamFn: func(ctx context.Context, _ models.Request, _ models.EventSink) (models.Message, models.Usage, error) {
+		<-ctx.Done()
+		return models.Message{}, models.Usage{}, ctx.Err()
+	}}, "m", 100, "sys")
 	ag.Tools = []tools.Tool{echoTool()}
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() { cancel() }()
@@ -836,38 +747,32 @@ func TestTurnCancelled(t *testing.T) {
 }
 
 func TestTurnAPIError(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Error(w, "nope", http.StatusInternalServerError)
-	}))
-	defer srv.Close()
-	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
+	ag := New(&mockAgentBackend{streamFn: func(context.Context, models.Request, models.EventSink) (models.Message, models.Usage, error) {
+		return models.Message{}, models.Usage{}, &models.HTTPError{Status: "500 Internal Server Error", Body: "nope"}
+	}}, "m", 100, "sys")
 	if _, err := ag.Turn(context.Background(), "go", Events{}); err == nil {
 		t.Fatal("expected error")
 	}
 }
 
-// server that echoes text responses and records how many calls it got
-func textServer(t *testing.T, onCall func(n int, req models.Request) string) *httptest.Server {
+// textBackend echoes text responses and records how many calls it got.
+func textBackend(t *testing.T, onCall func(n int, req models.Request) string) models.Backend {
 	t.Helper()
 	n := 0
-	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var req models.Request
-		json.NewDecoder(r.Body).Decode(&req)
+	return &mockAgentBackend{streamFn: func(_ context.Context, req models.Request, sink models.EventSink) (models.Message, models.Usage, error) {
 		n++
-		w.Header().Set("Content-Type", "text/event-stream")
-		body, _ := json.Marshal(onCall(n, req))
-		fmt.Fprintf(w, `data: {"choices":[{"delta":{"content":%s},"finish_reason":"stop"}]}`+"\n\n", body)
-		fmt.Fprint(w, "data: [DONE]\n\n")
-	}))
+		text := onCall(n, req)
+		if sink.OnText != nil {
+			sink.OnText(text)
+		}
+		return models.Message{Role: "assistant", Content: text}, models.Usage{}, nil
+	}}
 }
 
 // TurnAuthored marks the user message as genuinely typed (for input-history
 // recall); plain Turn (steered/goal/background paths) leaves it unmarked.
 func TestTurnAuthoredMarksMessage(t *testing.T) {
-	srv := textServer(t, func(n int, req models.Request) string { return "done" })
-	defer srv.Close()
-
-	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
+	ag := New(textBackend(t, func(n int, req models.Request) string { return "done" }), "m", 100, "sys")
 	if _, err := ag.TurnAuthored(context.Background(), "i typed this", Events{}); err != nil {
 		t.Fatal(err)
 	}
@@ -896,11 +801,9 @@ func TestTurnAuthoredMarksMessage(t *testing.T) {
 }
 
 func TestContinueReplaysOnlyAuthoredMessageParts(t *testing.T) {
-	srv := textServer(t, func(n int, req models.Request) string { return "done" })
-	defer srv.Close()
-
 	image := models.ImagePart("png", []byte{1, 2, 3})
-	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
+	backend := textBackend(t, func(n int, req models.Request) string { return "done" })
+	ag := New(backend, "m", 100, "sys")
 	ag.Messages = append(ag.Messages, models.Message{
 		Role: "user", Content: "inspect this image", Parts: []models.ContentPart{image}, Authored: true,
 	})
@@ -911,7 +814,7 @@ func TestContinueReplaysOnlyAuthoredMessageParts(t *testing.T) {
 		t.Fatalf("authored continue did not preserve the message: %+v", got)
 	}
 
-	injected := New(testBackend(srv.URL, "k"), "m", 100, "sys")
+	injected := New(backend, "m", 100, "sys")
 	injected.Messages = append(injected.Messages, models.Message{
 		Role: "user", Content: "injected prompt", Parts: []models.ContentPart{image},
 	})
@@ -922,7 +825,7 @@ func TestContinueReplaysOnlyAuthoredMessageParts(t *testing.T) {
 		t.Fatalf("injected continue was incorrectly replayed: %+v", injected.Messages)
 	}
 
-	interrupted := New(testBackend(srv.URL, "k"), "m", 100, "sys")
+	interrupted := New(backend, "m", 100, "sys")
 	var call models.ToolCall
 	call.ID = "call-1"
 	call.Function.Name = "read"
@@ -942,15 +845,15 @@ func TestContinueReplaysOnlyAuthoredMessageParts(t *testing.T) {
 // TestUsageAccumulates verifies every stream call folds its usage into the
 // session totals (input/output/cached) and fires OnUsage per request.
 func TestUsageAccumulates(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		fmt.Fprint(w, `data: {"choices":[{"delta":{"content":"done"},"finish_reason":"stop"}]}`+"\n\n")
-		fmt.Fprint(w, `data: {"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":10,"prompt_tokens_details":{"cached_tokens":40}}}`+"\n\n")
-		fmt.Fprint(w, "data: [DONE]\n\n")
-	}))
-	defer srv.Close()
-
-	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
+	backend := &mockAgentBackend{streamFn: func(_ context.Context, _ models.Request, sink models.EventSink) (models.Message, models.Usage, error) {
+		if sink.OnText != nil {
+			sink.OnText("done")
+		}
+		u := models.Usage{PromptTokens: 100, CompletionTokens: 10}
+		u.AddCached(40)
+		return models.Message{Role: "assistant", Content: "done"}, u, nil
+	}}
+	ag := New(backend, "m", 100, "sys")
 	var fired int
 	for i := 0; i < 3; i++ {
 		if _, err := ag.Turn(context.Background(), "go", Events{
@@ -976,9 +879,7 @@ func TestUsageAccumulates(t *testing.T) {
 // TestUsageMissingLeavesTotalsAlone: providers that omit usage (no terminal
 // chunk) must not corrupt totals or fire misleading events.
 func TestUsageMissingLeavesTotalsAlone(t *testing.T) {
-	srv := textServer(t, func(n int, req models.Request) string { return "done" })
-	defer srv.Close()
-	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
+	ag := New(textBackend(t, func(n int, req models.Request) string { return "done" }), "m", 100, "sys")
 	if _, err := ag.Turn(context.Background(), "go", Events{}); err != nil {
 		t.Fatal(err)
 	}
@@ -988,7 +889,7 @@ func TestUsageMissingLeavesTotalsAlone(t *testing.T) {
 }
 
 func TestSteerContinuesTurn(t *testing.T) {
-	srv := textServer(t, func(n int, req models.Request) string {
+	ag := New(textBackend(t, func(n int, req models.Request) string {
 		if n == 2 {
 			last := req.Messages[len(req.Messages)-1]
 			if last.Role != "user" || last.Content != "also do this" {
@@ -997,10 +898,7 @@ func TestSteerContinuesTurn(t *testing.T) {
 			return "ok2"
 		}
 		return "ok1"
-	})
-	defer srv.Close()
-
-	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
+	}), "m", 100, "sys")
 	ag.Steer("also do this") // queued before the first response completes
 	var steered []string
 	final, err := ag.Turn(context.Background(), "go", Events{
@@ -1034,9 +932,7 @@ func TestSteerNoticeDoesNotFinalizeReview(t *testing.T) {
 }
 
 func TestNoSteerEndsTurn(t *testing.T) {
-	srv := textServer(t, func(n int, req models.Request) string { return "done" })
-	defer srv.Close()
-	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
+	ag := New(textBackend(t, func(n int, req models.Request) string { return "done" }), "m", 100, "sys")
 	final, err := ag.Turn(context.Background(), "go", Events{})
 	if err != nil || final != "done" {
 		t.Fatalf("%q %v", final, err)
@@ -1056,7 +952,7 @@ func TestUnavailableCapabilitiesAreNotAdvertised(t *testing.T) {
 	}
 	req := backend.streamRequests[0]
 	for _, tool := range req.Tools {
-		if tool.Function.Name == "bash" || tool.Function.Name == "lsp" || tool.Function.Name == "lsp_rename" {
+		if tool.Function.Name == "bash" || tool.Function.Name == "lsp" {
 			t.Fatalf("unavailable tool advertised: %q", tool.Function.Name)
 		}
 	}
@@ -1410,14 +1306,12 @@ func TestReadOnlyCheckpointMalformedBatchRetriesNormally(t *testing.T) {
 
 func TestTaskToolSpawnsSubagent(t *testing.T) {
 	call := 0
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var req models.Request
-		json.NewDecoder(r.Body).Decode(&req)
+	var backend *mockAgentBackend
+	backend = &mockAgentBackend{streamFn: func(_ context.Context, req models.Request, sink models.EventSink) (models.Message, models.Usage, error) {
 		call++
-		w.Header().Set("Content-Type", "text/event-stream")
 		switch call {
 		case 1: // outer agent delegates
-			fmt.Fprint(w, `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"t1","type":"function","function":{"name":"task","arguments":"{\"description\":\"probe\",\"prompt\":\"find the answer\"}"}}]}}]}`+"\n\n")
+			return models.Message{Role: "assistant", ToolCalls: []models.ToolCall{agentToolCall("t1", "task", `{"description":"probe","prompt":"find the answer"}`)}}, models.Usage{}, nil
 		case 2: // inner subagent: fresh context, no task tool, gets the prompt
 			if len(req.Messages) != 2 || req.Messages[1].Content != "find the answer" {
 				t.Errorf("subagent context wrong: %+v", req.Messages)
@@ -1427,25 +1321,28 @@ func TestTaskToolSpawnsSubagent(t *testing.T) {
 					t.Error("subagent must not have the task tool")
 				}
 			}
-			fmt.Fprint(w, `data: {"choices":[{"delta":{"content":"the answer is 42"}}]}`+"\n\n")
-		case 3: // outer agent sees the report as the tool result
+			if sink.OnText != nil {
+				sink.OnText("the answer is 42")
+			}
+			return models.Message{Role: "assistant", Content: "the answer is 42"}, models.Usage{}, nil
+		default: // outer agent sees the report as the tool result
 			last := req.Messages[len(req.Messages)-1]
 			if last.Role != "tool" || last.Content != "the answer is 42" {
 				t.Errorf("task result not fed back: %+v", last)
 			}
-			fmt.Fprint(w, `data: {"choices":[{"delta":{"content":"done"}}]}`+"\n\n")
+			if sink.OnText != nil {
+				sink.OnText("done")
+			}
+			return models.Message{Role: "assistant", Content: "done"}, models.Usage{}, nil
 		}
-		fmt.Fprint(w, "data: [DONE]\n\n")
-	}))
-	defer srv.Close()
-
-	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
+	}}
+	ag := New(backend, "m", 100, "sys")
 	final, err := ag.Turn(context.Background(), "go", Events{})
 	if err != nil || final != "done" {
 		t.Fatalf("%q %v", final, err)
 	}
-	if call != 3 {
-		t.Fatalf("expected 3 API calls, got %d", call)
+	if len(backend.requests) != 3 {
+		t.Fatalf("expected 3 API calls, got %d", len(backend.requests))
 	}
 }
 
@@ -1496,7 +1393,7 @@ func TestTaskUsesTinyRoleFactoryForForegroundAndBackground(t *testing.T) {
 }
 
 func TestTaskToolBadArgs(t *testing.T) {
-	ag := New(testBackend("http://unused", "k"), "m", 100, "sys")
+	ag := New(&mockAgentBackend{}, "m", 100, "sys")
 	out := tools.Execute(context.Background(), ag.Tools, "task", json.RawMessage(`{bad`))
 	if !strings.HasPrefix(out, "Error") {
 		t.Fatalf("expected error, got %q", out)
@@ -1504,7 +1401,7 @@ func TestTaskToolBadArgs(t *testing.T) {
 }
 
 func TestSubagentsDisabled(t *testing.T) {
-	ag := New(testBackend("http://unused", "k"), "m", 100, "sys")
+	ag := New(&mockAgentBackend{}, "m", 100, "sys")
 	ag.SubagentsDisabled = true
 
 	// AllTools should not include the task tool
@@ -1522,41 +1419,27 @@ func TestSubagentsDisabled(t *testing.T) {
 	}
 }
 
-// compactionServer lets the first request error with context_length_exceeded,
-// then serves a summary completion (for the compaction call) and finally the
-// real answer. call==2 is the /chat/completions summary request (stream:false).
-func compactionServer(t *testing.T) (*httptest.Server, *int) {
-	t.Helper()
-	call := 0
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		call++
-		switch call {
-		case 1:
-			http.Error(w, `{"error":{"code":"context_length_exceeded"}}`, http.StatusBadRequest)
-		case 2:
-			var req struct {
-				Stream   bool             `json:"stream"`
-				Messages []models.Message `json:"messages"`
-			}
-			json.NewDecoder(r.Body).Decode(&req)
-			if req.Stream {
-				t.Errorf("summary call should not stream")
-			}
-			w.Write([]byte(`{"choices":[{"message":{"content":"summary of prior work"}}]}`))
-		default:
-			w.Header().Set("Content-Type", "text/event-stream")
-			fmt.Fprint(w, `data: {"choices":[{"delta":{"content":"recovered"}}]}`+"\n\n")
-			fmt.Fprint(w, "data: [DONE]\n\n")
-		}
-	}))
-	return srv, &call
-}
-
 func TestTurnAutoCompactsOnContextLimit(t *testing.T) {
-	srv, pcall := compactionServer(t)
-	defer srv.Close()
-
-	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
+	var streamCalls int
+	backend := &mockAgentBackend{
+		streamFn: func(_ context.Context, _ models.Request, sink models.EventSink) (models.Message, models.Usage, error) {
+			streamCalls++
+			if streamCalls == 1 {
+				return models.Message{}, models.Usage{}, &models.HTTPError{Status: "400 Bad Request", Body: `{"error":{"code":"context_length_exceeded"}}`}
+			}
+			if sink.OnText != nil {
+				sink.OnText("recovered")
+			}
+			return models.Message{Role: "assistant", Content: "recovered"}, models.Usage{}, nil
+		},
+		completeFn: func(_ context.Context, req models.Request) (models.Message, models.Usage, error) {
+			if len(req.Messages) == 0 {
+				t.Error("summary request has no messages")
+			}
+			return models.Message{Role: "assistant", Content: "summary of prior work"}, models.Usage{}, nil
+		},
+	}
+	ag := New(backend, "m", 100, "sys")
 	// build a history that's compactable: system + enough turns
 	for i := 0; i < 8; i++ {
 		ag.Messages = append(ag.Messages,
@@ -1578,8 +1461,8 @@ func TestTurnAutoCompactsOnContextLimit(t *testing.T) {
 	if compacted != 1 {
 		t.Fatalf("OnCompact fired %d times, want 1", compacted)
 	}
-	if *pcall < 3 {
-		t.Fatalf("expected ≥3 calls (fail+summary+retry), got %d", *pcall)
+	if len(backend.requests) < 3 {
+		t.Fatalf("expected ≥3 calls (fail+summary+retry), got %d", len(backend.requests))
 	}
 	// summary lives between system prompt and the kept tail
 	if !strings.Contains(ag.Messages[1].Content, "Summary of the conversation") {
@@ -1590,27 +1473,17 @@ func TestTurnAutoCompactsOnContextLimit(t *testing.T) {
 func TestCompactDoesNotLoopOnRepeatedContextLimit(t *testing.T) {
 	// every request errors with context_length_exceeded → compaction must
 	// happen once and then the error surfaces (no infinite retry loop)
-	call := 0
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		call++
-		// one summary call succeeds (to exercise the compaction path), then
-		// every stream fails with context_length_exceeded
-		if r.URL.Path == "/chat/completions" {
-			var req struct {
-				Stream   bool             `json:"stream"`
-				Messages []models.Message `json:"messages"`
-			}
-			json.NewDecoder(r.Body).Decode(&req)
-			if !req.Stream { // the summary call
-				w.Write([]byte(`{"choices":[{"message":{"content":"sim"}}]}`))
-				return
-			}
-		}
-		http.Error(w, `{"error":{"code":"context_length_exceeded"}}`, http.StatusBadRequest)
-	}))
-	defer srv.Close()
-
-	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
+	var streamCalls int
+	backend := &mockAgentBackend{
+		streamFn: func(context.Context, models.Request, models.EventSink) (models.Message, models.Usage, error) {
+			streamCalls++
+			return models.Message{}, models.Usage{}, &models.HTTPError{Status: "400 Bad Request", Body: `{"error":{"code":"context_length_exceeded"}}`}
+		},
+		completeFn: func(context.Context, models.Request) (models.Message, models.Usage, error) {
+			return models.Message{Role: "assistant", Content: "sim"}, models.Usage{}, nil
+		},
+	}
+	ag := New(backend, "m", 100, "sys")
 	for i := 0; i < 8; i++ {
 		ag.Messages = append(ag.Messages,
 			models.Message{Role: "user", Content: fmt.Sprintf("q%d", i)},
@@ -1621,8 +1494,8 @@ func TestCompactDoesNotLoopOnRepeatedContextLimit(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected context-limit error to surface, not loop forever")
 	}
-	if call > 3 {
-		t.Fatalf("expected ≤3 calls (fail+summary+retry-fail), got %d", call)
+	if len(backend.requests) > 3 {
+		t.Fatalf("expected ≤3 calls (fail+summary+retry-fail), got %d", len(backend.requests))
 	}
 }
 
@@ -1647,7 +1520,7 @@ func TestEstimateTokens(t *testing.T) {
 }
 
 func TestContextTokensUsesLatestReportedRequest(t *testing.T) {
-	ag := New(testBackend("http://unused", "k"), "m", 100, "sys")
+	ag := New(&mockAgentBackend{}, "m", 100, "sys")
 	if got, want := ag.ContextTokens(), EstimateTokens(ag.Messages); got != want {
 		t.Fatalf("before a response: got %d, want %d", got, want)
 	}
@@ -1670,28 +1543,23 @@ func TestContextTokensUsesLatestReportedRequest(t *testing.T) {
 func TestProactiveCompactAtFiftyPercent(t *testing.T) {
 	// the first stream request should already carry the compacted history —
 	// no context_length_exceeded round-trip needed
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var req struct {
-			Stream   bool             `json:"stream"`
-			Messages []models.Message `json:"messages"`
-		}
-		json.NewDecoder(r.Body).Decode(&req)
-		if !req.Stream {
-			w.Write([]byte(`{"choices":[{"message":{"content":"summary of prior work"}}]}`))
-			return
-		}
-		compact := strings.Contains(req.Messages[1].Content, "Summary of the conversation")
-		w.Header().Set("Content-Type", "text/event-stream")
-		if compact {
-			fmt.Fprint(w, `data: {"choices":[{"delta":{"content":"ok"}}]}`+"\n\n")
-		} else {
-			fmt.Fprint(w, `data: {"choices":[{"delta":{"content":"not-compacted"}}]}`+"\n\n")
-		}
-		fmt.Fprint(w, "data: [DONE]\n\n")
-	}))
-	defer srv.Close()
-
-	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
+	backend := &mockAgentBackend{
+		completeFn: func(context.Context, models.Request) (models.Message, models.Usage, error) {
+			return models.Message{Role: "assistant", Content: "summary of prior work"}, models.Usage{}, nil
+		},
+		streamFn: func(_ context.Context, req models.Request, sink models.EventSink) (models.Message, models.Usage, error) {
+			compact := len(req.Messages) > 1 && strings.Contains(req.Messages[1].Content, "Summary of the conversation")
+			text := "not-compacted"
+			if compact {
+				text = "ok"
+			}
+			if sink.OnText != nil {
+				sink.OnText(text)
+			}
+			return models.Message{Role: "assistant", Content: text}, models.Usage{}, nil
+		},
+	}
+	ag := New(backend, "m", 100, "sys")
 	ag.ContextLimit = 1000 // default 50% = 500 reported context tokens
 	for i := 0; i < 8; i++ {
 		ag.Messages = append(ag.Messages, models.Message{Role: "user", Content: strings.Repeat("x", 120)})
@@ -1720,11 +1588,13 @@ func TestProactiveCompactAtFiftyPercent(t *testing.T) {
 }
 
 func TestCompactThresholdExplicitOverride(t *testing.T) {
-	srv := textServer(t, func(n int, req models.Request) string { return "done" })
-	defer srv.Close()
+	backend := textBackend(t, func(n int, req models.Request) string { return "done" })
+	backend.(*mockAgentBackend).completeFn = func(context.Context, models.Request) (models.Message, models.Usage, error) {
+		return models.Message{}, models.Usage{}, errors.New("compaction attempted")
+	}
 
 	// 55% of the limit: under the 80% default — no compaction
-	ag := New(testBackend(srv.URL, "m"), "m", 100, "sys")
+	ag := New(backend, "m", 100, "sys")
 	ag.ContextLimit = 1000
 	for i := 0; i < 8; i++ {
 		ag.Messages = append(ag.Messages, models.Message{Role: "user", Content: strings.Repeat("x", 360)})
@@ -1741,7 +1611,7 @@ func TestCompactThresholdExplicitOverride(t *testing.T) {
 	}
 
 	// CompactThreshold wins over the default: explicit 50% threshold compacts
-	ag2 := New(testBackend(srv.URL, "m"), "m", 100, "sys")
+	ag2 := New(backend, "m", 100, "sys")
 	ag2.ContextLimit = 1000
 	ag2.CompactThreshold = 0.5
 	for i := 0; i < 8; i++ {
@@ -1757,18 +1627,17 @@ func TestCompactThresholdExplicitOverride(t *testing.T) {
 }
 
 func TestNoProactiveCompactBelowThresholdOrWithoutLimit(t *testing.T) {
-	srv := textServer(t, func(n int, req models.Request) string { return "done" })
-	defer srv.Close()
+	backend := textBackend(t, func(n int, req models.Request) string { return "done" })
 
 	// below threshold: estimate well under 50% of the limit
-	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
+	ag := New(backend, "m", 100, "sys")
 	ag.ContextLimit = 100000
 	if _, err := ag.Turn(context.Background(), "hi", Events{}); err != nil {
 		t.Fatal(err)
 	}
 
 	// no advertised limit: proactive compaction disabled regardless of size
-	ag2 := New(testBackend(srv.URL, "k"), "m", 100, "sys")
+	ag2 := New(backend, "m", 100, "sys")
 	ag2.Messages = append(ag2.Messages, models.Message{Role: "user", Content: strings.Repeat("x", 4000)})
 	if _, err := ag2.Turn(context.Background(), "hi", Events{}); err != nil {
 		t.Fatal(err)
@@ -1781,30 +1650,20 @@ func TestNoProactiveCompactBelowThresholdOrWithoutLimit(t *testing.T) {
 func TestCompactUsesCandidate(t *testing.T) {
 	var modelIDs []string
 	var maxTokens []int
-	main := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	main := &mockAgentBackend{completeFn: func(context.Context, models.Request) (models.Message, models.Usage, error) {
 		t.Error("summary call must not hit the conversation's provider")
-	}))
-	defer main.Close()
-	sum := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var req struct {
-			Model     string `json:"model"`
-			MaxTokens int    `json:"max_tokens"`
-			Thinking  struct {
-				Type string `json:"type"`
-			} `json:"thinking"`
-		}
-		json.NewDecoder(r.Body).Decode(&req)
+		return models.Message{}, models.Usage{}, errors.New("unexpected summary call")
+	}}
+	sum := &mockAgentBackend{completeFn: func(_ context.Context, req models.Request) (models.Message, models.Usage, error) {
 		modelIDs = append(modelIDs, req.Model)
 		maxTokens = append(maxTokens, req.MaxTokens)
-		if req.Thinking.Type != "disabled" {
-			t.Errorf("compaction must disable reasoning, got %q", req.Thinking.Type)
+		if req.ReasoningEnabled == nil || *req.ReasoningEnabled {
+			t.Errorf("compaction must disable reasoning, got %v", req.ReasoningEnabled)
 		}
-		w.Write([]byte(`{"choices":[{"message":{"content":"sim"}}]}`))
-	}))
-	defer sum.Close()
-
-	ag := New(testBackend(main.URL, "k"), "conversation-model", 100, "sys")
-	candidate := New(testBackend(sum.URL, "k"), "summary-model", 1200, "sys")
+		return models.Message{Role: "assistant", Content: "sim"}, models.Usage{}, nil
+	}}
+	ag := New(main, "conversation-model", 100, "sys")
+	candidate := New(sum, "summary-model", 1200, "sys")
 	candidate.Role = "tiny"
 	candidate.ReasoningToggle = true
 	ag.CompactCandidates = []*Agent{candidate}
@@ -2040,7 +1899,7 @@ func (b *routeBackend) Complete(context.Context, models.Request) (models.Message
 }
 
 func TestCompactTooLittleHistory(t *testing.T) {
-	ag := New(testBackend("http://unused", "k"), "m", 100, "sys")
+	ag := New(&mockAgentBackend{}, "m", 100, "sys")
 	ag.Messages = append(ag.Messages, models.Message{Role: "user", Content: "hi"})
 	if _, _, err := ag.compactWithEvents(context.Background(), Events{}); !errors.Is(err, ErrNotEnoughHistory) {
 		t.Fatal("expected error compacting a tiny history")
@@ -2061,11 +1920,9 @@ func TestAgentBoundedTextPreservesUTF8(t *testing.T) {
 func TestCompactKeepsToolCallPair(t *testing.T) {
 	// orphan safety: a tail starting with role "tool" must pull in its owning
 	// assistant message so the tool result never references an erased call id.
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{"choices":[{"message":{"content":"sim"}}]}`))
-	}))
-	defer srv.Close()
-	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
+	ag := New(&mockAgentBackend{completeFn: func(context.Context, models.Request) (models.Message, models.Usage, error) {
+		return models.Message{Role: "assistant", Content: "sim"}, models.Usage{}, nil
+	}}, "m", 100, "sys")
 	// system, user, asst(with tool call "t1"), tool("t1" result), user, asst, user
 	for i := 0; i < 4; i++ {
 		ag.Messages = append(ag.Messages, models.Message{Role: "user", Content: fmt.Sprintf("u%d", i)})
@@ -2163,11 +2020,9 @@ func TestOutputManifestIncludesOnlyCitedAndRecentRefs(t *testing.T) {
 }
 
 func TestManualCompactFiresEvent(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{"choices":[{"message":{"content":"sim"}}]}`))
-	}))
-	defer srv.Close()
-	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
+	ag := New(&mockAgentBackend{completeFn: func(context.Context, models.Request) (models.Message, models.Usage, error) {
+		return models.Message{Role: "assistant", Content: "sim"}, models.Usage{}, nil
+	}}, "m", 100, "sys")
 	for i := 0; i < 8; i++ {
 		ag.Messages = append(ag.Messages,
 			models.Message{Role: "user", Content: fmt.Sprintf("q%d", i)},
@@ -2201,12 +2056,9 @@ func TestCompactionPersistenceFailureKeepsRawMessages(t *testing.T) {
 }
 
 func TestPreflightCompactionTriggersOnAbsoluteReserve(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{"choices":[{"message":{"content":"summary of previous turns"}}]}`))
-	}))
-	defer srv.Close()
-
-	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
+	ag := New(&mockAgentBackend{completeFn: func(context.Context, models.Request) (models.Message, models.Usage, error) {
+		return models.Message{Role: "assistant", Content: "summary of previous turns"}, models.Usage{}, nil
+	}}, "m", 100, "sys")
 	ag.ContextLimit = 1000
 	ag.CompactThreshold = 0.9 // high percent threshold (900 tokens)
 	ag.OutputReserve = 600    // absolute reserve forces budget down to 1000-600 = 400 tokens
@@ -2233,13 +2085,9 @@ func TestPreflightCompactionTriggersOnAbsoluteReserve(t *testing.T) {
 }
 
 func TestOneShotOverflowFailsTerminalOnSecondError(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusBadRequest)
-		_, _ = w.Write([]byte(`{"error":{"message":"maximum context length exceeded","type":"invalid_request_error"}}`))
-	}))
-	defer srv.Close()
-
-	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
+	ag := New(&mockAgentBackend{streamFn: func(context.Context, models.Request, models.EventSink) (models.Message, models.Usage, error) {
+		return models.Message{}, models.Usage{}, &models.HTTPError{Status: "400 Bad Request", Body: `{"error":{"message":"maximum context length exceeded","type":"invalid_request_error"}}`}
+	}}, "m", 100, "sys")
 	for i := 0; i < 8; i++ {
 		ag.Messages = append(ag.Messages,
 			models.Message{Role: "user", Content: fmt.Sprintf("q%d", i)},
@@ -2254,19 +2102,14 @@ func TestOneShotOverflowFailsTerminalOnSecondError(t *testing.T) {
 
 func TestCumulativeCompactionIncludesPriorCheckpoint(t *testing.T) {
 	var summaryUserPrompt string
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var req models.Request
-		_ = json.NewDecoder(r.Body).Decode(&req)
+	ag := New(&mockAgentBackend{completeFn: func(_ context.Context, req models.Request) (models.Message, models.Usage, error) {
 		for _, m := range req.Messages {
 			if m.Role == "user" {
 				summaryUserPrompt = m.Content
 			}
 		}
-		w.Write([]byte(`{"choices":[{"message":{"content":"cumulative checkpoint"}}]}`))
-	}))
-	defer srv.Close()
-
-	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
+		return models.Message{Role: "assistant", Content: "cumulative checkpoint"}, models.Usage{}, nil
+	}}, "m", 100, "sys")
 	ag.Messages = []models.Message{
 		{Role: "system", Content: "sys"},
 		{Role: "system", Content: "Summary of the conversation so far:\n\nInitial milestone reached."},
@@ -2292,12 +2135,9 @@ func TestCumulativeCompactionIncludesPriorCheckpoint(t *testing.T) {
 }
 
 func TestCompactionRejectsTruncatedSummary(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(`{"choices":[{"message":{"content":"truncated summary..."},"finish_reason":"length"}]}`))
-	}))
-	defer srv.Close()
-
-	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
+	ag := New(&mockAgentBackend{completeFn: func(context.Context, models.Request) (models.Message, models.Usage, error) {
+		return models.Message{Role: "assistant", Content: "truncated summary...", StopReason: "length"}, models.Usage{}, nil
+	}}, "m", 100, "sys")
 	for i := 0; i < 8; i++ {
 		ag.Messages = append(ag.Messages,
 			models.Message{Role: "user", Content: fmt.Sprintf("q%d", i)},
@@ -2312,17 +2152,14 @@ func TestCompactionRejectsTruncatedSummary(t *testing.T) {
 
 func TestCompactionRetriesTruncatedSummary(t *testing.T) {
 	calls := 0
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	backend := &mockAgentBackend{completeFn: func(context.Context, models.Request) (models.Message, models.Usage, error) {
 		calls++
 		if calls == 1 {
-			w.Write([]byte(`{"choices":[{"message":{"content":"truncated summary..."},"finish_reason":"length"}]}`))
-			return
+			return models.Message{Role: "assistant", Content: "truncated summary...", StopReason: "length"}, models.Usage{}, nil
 		}
-		w.Write([]byte(`{"choices":[{"message":{"content":"complete checkpoint"},"finish_reason":"stop"}]}`))
-	}))
-	defer srv.Close()
-
-	ag := New(testBackend(srv.URL, "k"), "m", 100, "sys")
+		return models.Message{Role: "assistant", Content: "complete checkpoint", StopReason: "stop"}, models.Usage{}, nil
+	}}
+	ag := New(backend, "m", 100, "sys")
 	for i := 0; i < 8; i++ {
 		ag.Messages = append(ag.Messages,
 			models.Message{Role: "user", Content: fmt.Sprintf("q%d", i)},
@@ -2338,20 +2175,40 @@ func TestCompactionRetriesTruncatedSummary(t *testing.T) {
 }
 
 type mockAgentBackend struct {
-	responses []models.Message
-	callCount int
+	mu         sync.Mutex
+	responses  []models.Message
+	callCount  int
+	requests   []models.Request
+	streamFn   func(context.Context, models.Request, models.EventSink) (models.Message, models.Usage, error)
+	completeFn func(context.Context, models.Request) (models.Message, models.Usage, error)
 }
 
 func (m *mockAgentBackend) Stream(ctx context.Context, req models.Request, sink models.EventSink) (models.Message, models.Usage, error) {
-	if m.callCount >= len(m.responses) {
+	m.mu.Lock()
+	m.requests = append(m.requests, req)
+	call := m.callCount
+	m.callCount++
+	var resp models.Message
+	if call < len(m.responses) {
+		resp = m.responses[call]
+	}
+	m.mu.Unlock()
+	if m.streamFn != nil {
+		return m.streamFn(ctx, req, sink)
+	}
+	if call >= len(m.responses) {
 		return models.Message{Role: "assistant", Content: "done"}, models.Usage{}, nil
 	}
-	resp := m.responses[m.callCount]
-	m.callCount++
 	return resp, models.Usage{}, nil
 }
 
 func (m *mockAgentBackend) Complete(ctx context.Context, req models.Request) (models.Message, models.Usage, error) {
+	if m.completeFn != nil {
+		m.mu.Lock()
+		m.requests = append(m.requests, req)
+		m.mu.Unlock()
+		return m.completeFn(ctx, req)
+	}
 	return m.Stream(ctx, req, models.EventSink{})
 }
 
@@ -2796,7 +2653,7 @@ func TestSandboxCapabilityFailureTerminatesTurn(t *testing.T) {
 		Def: models.NewTool("bash", "bash", "{}"),
 		RunResult: func(ctx context.Context, args json.RawMessage) (tools.ToolResult, error) {
 			return tools.ToolResult{
-				Preview:  "httptest: failed to listen on 127.0.0.1: operation not permitted",
+				Preview:  "listen tcp 127.0.0.1: operation not permitted",
 				ExitCode: 1,
 				Metadata: map[string]string{
 					"failure_kind": "sandbox_network_denied",

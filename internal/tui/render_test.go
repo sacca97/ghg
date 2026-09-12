@@ -181,19 +181,6 @@ func TestInputRuleSeparatesInputFromTranscript(t *testing.T) {
 	}
 }
 
-// An interactive bash command hides the input box; a divider with nothing
-// under it would read as a stray line, so that case keeps the blank row.
-func TestInputRuleHiddenWhileInteractive(t *testing.T) {
-	m := frameModel()
-	if m.inputRule() == "" {
-		t.Fatal("expected a divider while the input box is shown")
-	}
-	m.iactive = &interactive{}
-	if got := m.inputRule(); got != "" {
-		t.Errorf("interactive bash hides the input box, so the divider should be blank, got %q", got)
-	}
-}
-
 func TestTruncLineRuneSafe(t *testing.T) {
 	s := "Hello 世界 ⏳"
 	for w := 0; w <= 15; w++ {
@@ -393,7 +380,7 @@ func TestWorkerTextEventsPreserveStreamOrder(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if cmd := m.workerEvent(workerEvent{Kind: "text", Data: data}); cmd != nil {
+		if cmd := m.workerEvent(workerwire.EventEnvelope{Kind: workerwire.EventText, Data: data}); cmd != nil {
 			t.Fatal("text events should be applied synchronously")
 		}
 	}
@@ -410,7 +397,7 @@ func TestThinkingDisplayEphemeralAndCollapsedTranscript(t *testing.T) {
 	t0 := time.Date(2026, 8, 31, 12, 0, 0, 0, time.UTC)
 	currTime := t0
 	m.now = func() time.Time { return currTime }
-	m.workerEvent(workerEvent{Kind: "model_call_start", Data: json.RawMessage(`{"reasoning_effort":"high"}`)})
+	m.workerEvent(workerwire.EventEnvelope{Kind: workerwire.EventModelCallStart, Data: json.RawMessage(`{"reasoning_effort":"high"}`)})
 
 	// Stream multiple lines of reasoning containing sensitive text
 	um, _ := m.Update(thinkMsg("secret reasoning tokens\ninternal model deliberation"))
@@ -481,11 +468,11 @@ func TestThinkingDisplayEphemeralAndCollapsedTranscript(t *testing.T) {
 func TestDynamicEffortUpdatesAndRestoresTUIIndicator(t *testing.T) {
 	m := compactCmdModel()
 	m.effort = "high"
-	m.workerEvent(workerEvent{Kind: "model_call_start", Data: json.RawMessage(`{"purpose":"","configured_effort":"high","dynamic_reasoning":true,"effort_requested_for_call":"low","effort_applied":"low","selection_reason":"model_requested"}`)})
+	m.workerEvent(workerwire.EventEnvelope{Kind: workerwire.EventModelCallStart, Data: json.RawMessage(`{"purpose":"","configured_effort":"high","dynamic_reasoning":true,"effort_requested_for_call":"low","effort_applied":"low","selection_reason":"model_requested"}`)})
 	if m.effort != "low" {
 		t.Fatalf("live effort = %q, want low", m.effort)
 	}
-	m.workerEvent(workerEvent{Kind: "turn_done", Data: json.RawMessage(`{"effort":"high"}`)})
+	m.workerEvent(workerwire.EventEnvelope{Kind: workerwire.EventTurnDone, Data: json.RawMessage(`{"effort":"high"}`)})
 	if m.effort != "high" {
 		t.Fatalf("restored effort = %q, want high", m.effort)
 	}
@@ -630,10 +617,7 @@ func TestTargetURI(t *testing.T) {
 	}
 }
 
-// --- glamour output rewiring (runs through the real renderer) --------------
-
-// renderRaw renders markdown without the link passes so tests can compare
-// against the pre-linkify shape.
+// renderRaw renders markdown without the link passes for testing.
 func renderRaw(t *testing.T, s string, width int) string {
 	t.Helper()
 	out, err := mdRenderer(width).Render(s)
@@ -721,8 +705,6 @@ func TestHyperlinkGlamourLinksWrapSafe(t *testing.T) {
 	}
 }
 
-// --- end-to-end through renderMarkdown --------------------------------------
-
 func TestRenderMarkdownLinksClickable(t *testing.T) {
 	out := renderMarkdown("See [the docs](https://example.com/docs) and https://bare.example.com/x.", 80)
 	if !strings.Contains(out, ansi.SetHyperlink("https://example.com/docs")) {
@@ -761,8 +743,6 @@ func TestRenderMarkdownBareFilePath(t *testing.T) {
 		t.Errorf("plain path text lost: %q", ansi.Strip(out))
 	}
 }
-
-// --- user-facing wiring -----------------------------------------------------
 
 // User messages render as "❯ text" blocks; file refs in them are clickable.
 func TestUserMessageFileLink(t *testing.T) {
@@ -1610,7 +1590,7 @@ func TestWorkerUsageAndCompactionSynchronizeContextTokens(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	m.workerEvent(workerEvent{Kind: "usage", Data: usageJSON})
+	m.workerEvent(workerwire.EventEnvelope{Kind: workerwire.EventUsage, Data: usageJSON})
 
 	if got, want := m.contextStatus(), "ctx 52.0k/128.0k"; got != want {
 		t.Fatalf("post-usage context status = %q, want %q", got, want)
@@ -1626,7 +1606,7 @@ func TestWorkerUsageAndCompactionSynchronizeContextTokens(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	m.workerEvent(workerEvent{Kind: "compact_done", Data: compactJSON})
+	m.workerEvent(workerwire.EventEnvelope{Kind: workerwire.EventCompactDone, Data: compactJSON})
 
 	// Context tokens recomputed from returned compacted messages
 	if m.workerContextTokens >= 52000 || m.workerContextTokens == 0 {

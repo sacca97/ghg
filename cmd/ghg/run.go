@@ -1,8 +1,5 @@
-// `ghg run` — non-interactive (headless) mode: one turn of the agent with
-// no TUI and no trust prompt, for trusted automation and scripting. Piped
-// stdin is appended to the prompt. --format json emits the raw event stream
-// as newline-delimited JSON; the final event is {"type":"done",...} or
-// {"type":"error",...}. Exit code 0 on success, 1 on error.
+// ghg run executes one non-interactive agent turn from arguments or piped input.
+// Supports plain text output and newline-delimited JSON streaming.
 package main
 
 import (
@@ -23,10 +20,8 @@ import (
 	"github.com/sacca97/ghg/internal/agent"
 	"github.com/sacca97/ghg/internal/config"
 	"github.com/sacca97/ghg/internal/export"
-	"github.com/sacca97/ghg/internal/memory"
 	"github.com/sacca97/ghg/internal/models"
 	"github.com/sacca97/ghg/internal/session"
-	"github.com/sacca97/ghg/internal/skills"
 	"github.com/sacca97/ghg/internal/tools"
 )
 
@@ -48,6 +43,7 @@ func runCLI(args []string) error {
 	sandboxFlag := fs.String("sandbox", "", "execution sandbox: read-only, workspace-write, or danger-full-access")
 	networkFlag := fs.String("network", "", "execution network: deny or host")
 	approvalFlag := fs.String("approval", "", "exceptional capability approval: ask, auto, or never")
+	cautiousFlag := fs.Bool("cautious", false, "ask before running commands / writing files")
 	quietFlag := fs.Bool("quiet", false, "suppress the stderr tool/session notes (clean stdout for -format json piping)")
 	noSessionFlag := fs.Bool("no-session", false, "run without persisting a session (one-off jobs don't clutter ghg sessions)")
 	fs.Usage = func() {
@@ -108,10 +104,7 @@ func runCLI(args []string) error {
 		}
 		sys = string(data)
 	}
-	sys = agent.CompileSystemPrompt(sys,
-		skills.PromptBlock(skills.Scan(skills.DefaultDirs()...)),
-		memory.PromptBlock(memory.Installation(), memory.Session(*resumeFlag)),
-	)
+	sys = agent.CompileSystemPrompt(sys, systemPromptAdditions(*resumeFlag, "")...)
 
 	if *roleFlag != "" && !config.IsRole(*roleFlag) {
 		return fmt.Errorf("unknown role %q (roles: %s)", *roleFlag, strings.Join(config.SupportedRoles(), ", "))
@@ -170,6 +163,7 @@ func runCLI(args []string) error {
 	}
 	defer runtimeCleanup()
 	defer lspMgr.Close()
+	runtime.Cautious = *cautiousFlag
 	if emit != nil {
 		status := runtime.Policy.Status()
 		emit(map[string]any{
@@ -304,16 +298,14 @@ func runCLI(args []string) error {
 	ag.Effort = defaultEffort(cfg)
 	ag.MaxTurns = *maxTurnsFlag
 
-	// Output payloads are durable for session runs and private temporary
-	// files for --no-session runs. The latter are cleaned up when this process
-	// exits; the agent's live message slice still makes them readable during
-	// the run.
+	// Output payloads are durable for session runs. Ephemeral runs place them
+	// under the runtime root, which runtimeCleanup removes on exit.
 	var outputStore *session.OutputStore
 	if maxBytes, enabled := outputStoreLimit(cfg); enabled {
 		if *noSessionFlag {
-			outputStore, err = openOutputStore("", true, maxBytes)
+			outputStore, err = openOutputStore(runtime.TempDir, maxBytes)
 		} else if dir, derr := config.Dir(); derr == nil {
-			outputStore, err = openOutputStore(dir, false, maxBytes)
+			outputStore, err = openOutputStore(dir, maxBytes)
 		} else {
 			err = derr
 		}
@@ -321,13 +313,6 @@ func runCLI(args []string) error {
 			config.LogEvent("output.open", "FAILED: "+err.Error())
 			outputStore = nil
 		}
-	}
-	if outputStore != nil {
-		defer func() {
-			if *noSessionFlag {
-				_ = outputStore.Cleanup()
-			}
-		}()
 	}
 	// Session: resume an existing one, or create a fresh one — unless
 	// -no-session (a one-off cron job shouldn't clutter ghg sessions).

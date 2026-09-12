@@ -14,18 +14,8 @@ import (
 	"github.com/sacca97/ghg/internal/mcp"
 )
 
-// mcpCLI implements `ghg mcp <list|add|remove|serve|test|import>`.
-//
-//	list                        merged view of every configured server, its source, and blocked state
-//	add <name> -- <cmd...>      register a stdio server
-//	add <name> --url <url>      register a remote (streamable HTTP) server
-//	remove <name>               drop a server from ghg's own config
-//	import [--dry-run]          materialize imported (claude/codex) servers into ghg's config
-//	serve                       run ghg's tools as an MCP server over stdio
-//
-// add/remove/import write through config.Save (atomic, clobber-guarded).
-// Servers imported from .mcp.json or codex can't be removed here (edit the
-// source file); remove on an imported name explains that.
+// mcpCLI executes MCP subcommands (list, add, remove, serve, test, import).
+// Writes configuration updates atomically to ~/.ghg/config.json.
 func mcpCLI(args []string, version string) error {
 	if len(args) == 0 {
 		return fmt.Errorf("usage: ghg mcp <list|add|remove|import|serve|test>")

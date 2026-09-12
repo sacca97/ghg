@@ -112,7 +112,7 @@ func xselImage() (string, []byte, error) {
 }
 
 func pngpasteImage() (string, []byte, error) {
-	tmp, err := os.CreateTemp("/tmp", "ghg-paste-*.png")
+	tmp, err := os.CreateTemp("", "ghg-paste-*.png")
 	if err != nil {
 		return "", nil, err
 	}

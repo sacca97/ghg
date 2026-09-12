@@ -1031,7 +1031,7 @@ func checkGate(ctx context.Context, tool, command string) string {
 	if runtime == nil || runtime.HumanGate == nil {
 		return ""
 	}
-	if !runtime.Cautious && (tool == "write" || tool == "edit" || tool == "lsp_rename") && runtime.Policy != nil {
+	if !runtime.Cautious && (tool == "write" || tool == "edit") && runtime.Policy != nil {
 		if _, err := runtime.Policy.Authorize(command, sandbox.AccessWrite, true); err == nil {
 			return ""
 		}

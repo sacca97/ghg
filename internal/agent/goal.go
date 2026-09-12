@@ -9,6 +9,7 @@ import (
 
 	"github.com/sacca97/ghg/internal/models"
 	"github.com/sacca97/ghg/internal/session"
+	"github.com/sacca97/ghg/internal/textutil"
 	"github.com/sacca97/ghg/internal/tools"
 )
 
@@ -263,9 +264,9 @@ func truncateField(s string, n int) string {
 	if len(s) > n {
 		const suffix = "…"
 		if n <= len(suffix) {
-			return s[:utf8Prefix(s, n)]
+			return s[:textutil.UTF8Prefix(s, n)]
 		}
-		return s[:utf8Prefix(s, n-len(suffix))] + suffix
+		return s[:textutil.UTF8Prefix(s, n-len(suffix))] + suffix
 	}
 	return s
 }

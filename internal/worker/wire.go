@@ -11,7 +11,6 @@ import (
 	"github.com/sacca97/ghg/internal/models"
 )
 
-// Input starts one agent turn.
 type Input struct {
 	Input        string               `json:"input"`
 	Authored     bool                 `json:"authored"`
@@ -26,11 +25,11 @@ type Input struct {
 	Continue     bool                 `json:"continue,omitempty"`
 }
 
-// TurnResult reports a finished turn.
 type TurnResult struct {
 	SessionID      string            `json:"session_id,omitempty"`
 	Final          string            `json:"final,omitempty"`
 	Error          string            `json:"error,omitempty"`
+	Interrupted    bool              `json:"interrupted,omitempty"`
 	Usage          models.Usage      `json:"usage"`
 	ContextTokens  int               `json:"context_tokens"`
 	ContextLimit   int               `json:"context_limit,omitempty"`
@@ -51,11 +50,11 @@ type TurnResult struct {
 	GoalContinue   bool              `json:"goal_continue,omitempty"`
 }
 
-// CompactResult reports a finished compaction.
 type CompactResult struct {
-	Error    string           `json:"error,omitempty"`
-	Usage    models.Usage     `json:"usage"`
-	Messages []models.Message `json:"messages,omitempty"`
+	Error       string           `json:"error,omitempty"`
+	Interrupted bool             `json:"interrupted,omitempty"`
+	Usage       models.Usage     `json:"usage"`
+	Messages    []models.Message `json:"messages,omitempty"`
 }
 
 // RewindRequest replaces the worker's live prompt view with Messages. Cut is
@@ -100,9 +99,10 @@ type GoalFromContextRequest struct {
 }
 
 type GoalFromContextResult struct {
-	Goal  *agent.GoalRecord `json:"goal,omitempty"`
-	Usage models.Usage      `json:"usage"`
-	Error string            `json:"error,omitempty"`
+	Goal        *agent.GoalRecord `json:"goal,omitempty"`
+	Usage       models.Usage      `json:"usage"`
+	Error       string            `json:"error,omitempty"`
+	Interrupted bool              `json:"interrupted,omitempty"`
 }
 
 // TaskState is one background subagent as seen by the worker.
@@ -117,7 +117,6 @@ type TaskState struct {
 	Restored    bool      `json:"restored,omitempty"`
 }
 
-// Approval is one pending capability gate.
 type Approval struct {
 	ID      string `json:"id"`
 	Tool    string `json:"tool"`
@@ -125,15 +124,13 @@ type Approval struct {
 	Rule    string `json:"rule"`
 }
 
-// ApprovalAnswer answers a pending approval.
 type ApprovalAnswer struct {
 	ID       string `json:"id"`
 	Decision string `json:"decision"`
 	Redirect string `json:"redirect,omitempty"`
 }
 
-// ConfigureRequest retargets the idle worker's model route or changes its
-// live approval mode.
+// ConfigureRequest updates worker model routing or approval mode.
 type ConfigureRequest struct {
 	Model                  string  `json:"model,omitempty"`
 	ModelName              string  `json:"model_name,omitempty"`
@@ -147,6 +144,13 @@ type ConfigureRequest struct {
 	Approval               string  `json:"approval,omitempty"`
 	CompactThreshold       float64 `json:"compact_threshold,omitempty"`
 	UpdateCompactThreshold bool    `json:"update_compact_threshold,omitempty"`
+	// PersistRoleModel stores Model/Provider as Role's configured route before
+	// applying it. The worker owns configuration changes; a controller only
+	// asks for them.
+	PersistRoleModel bool `json:"persist_role_model,omitempty"`
+	// PersistDynamicReasoning stores DynamicReasoning in the config instead of
+	// only applying it to the live agent.
+	PersistDynamicReasoning bool `json:"persist_dynamic_reasoning,omitempty"`
 }
 
 // PermissionRequest announces one pending approval on the event stream.
@@ -208,6 +212,24 @@ type Snapshot struct {
 	LivePlan        string           `json:"live_plan,omitempty"`
 }
 
+type StateEvent struct {
+	State    State  `json:"state"`
+	Detached bool   `json:"detached"`
+	Mode     string `json:"mode"`
+}
+
+type ToolStartEvent struct {
+	ID   string `json:"id"`
+	Name string `json:"name"`
+	Args string `json:"args"`
+}
+
+type ToolEndEvent struct {
+	ID     string `json:"id"`
+	Name   string `json:"name"`
+	Result string `json:"result"`
+}
+
 // AppendRequest carries a local context message (shell-escape output) to the
 // worker-owned conversation.
 type AppendRequest struct {
@@ -248,7 +270,6 @@ type ForkRequest struct {
 	Messages []models.Message `json:"messages,omitempty"`
 }
 
-// ForkResult reports the newly created session.
 type ForkResult struct {
 	NewSessionID string `json:"new_session_id"`
 	OldSessionID string `json:"old_session_id"`
@@ -256,31 +277,26 @@ type ForkResult struct {
 	OldTitle     string `json:"old_title"`
 }
 
-// RenameRequest asks the worker to rename the session.
 type RenameRequest struct {
 	Title string `json:"title"`
 }
 
-// RenameResult reports the renamed session.
 type RenameResult struct {
 	SessionID string `json:"session_id"`
 	Title     string `json:"title"`
 }
 
-// NotifyRequest changes or reports a session's Telegram notification state.
 type NotifyRequest struct {
 	Action   string `json:"action,omitempty"`
 	BotToken string `json:"bot_token,omitempty"`
 	ChatID   string `json:"chat_id,omitempty"`
 }
 
-// NotifyResult reports the persisted notification state.
 type NotifyResult struct {
 	Enabled bool `json:"enabled"`
 }
 
-// SearchProviderRequest manages one configured SearXNG endpoint. API keys are
-// accepted only on add and are never returned in SearchProviderInfo.
+// SearchProviderRequest configures a SearXNG search endpoint.
 type SearchProviderRequest struct {
 	Action  string `json:"action"`
 	Name    string `json:"name,omitempty"`

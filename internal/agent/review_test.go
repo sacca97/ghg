@@ -5,8 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -65,6 +63,10 @@ func TestParseReviewValid(t *testing.T) {
 	stringified, err := ParseReview(`{"summary":"ok","verdict":"approve","findings":[],"checks_performed":"[\"read tests\",\"ran go test\"]"}`)
 	if err != nil || !slices.Equal(stringified.ChecksPerformed, []string{"read tests", "ran go test"}) {
 		t.Fatalf("stringified checks = %v, err=%v", stringified.ChecksPerformed, err)
+	}
+	stringifiedFindings, err := ParseReview(`{"summary":"ok","verdict":"comment","findings":"[{\"title\":\"one\",\"severity\":\"low\"}]"}`)
+	if err != nil || len(stringifiedFindings.Findings) != 1 || stringifiedFindings.Findings[0].Title != "one" {
+		t.Fatalf("stringified findings = %+v, err=%v", stringifiedFindings.Findings, err)
 	}
 }
 
@@ -374,32 +376,23 @@ func TestReviewBudgetUsesLeasesAndFinalEvidence(t *testing.T) {
 }
 
 func TestReviewModeNormalTurn(t *testing.T) {
-	var attempts int
 	reviewArgs := `{"summary":"all clean","verdict":"approve","findings":[]}`
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var req models.Request
-		_ = json.NewDecoder(r.Body).Decode(&req)
+	call := 0
+	var backend *mockAgentBackend
+	backend = &mockAgentBackend{streamFn: func(_ context.Context, req models.Request, _ models.EventSink) (models.Message, models.Usage, error) {
 		for _, tool := range req.Tools {
 			name := tool.Function.Name
 			if name == "write" || name == "edit" || name == "bash" {
 				t.Errorf("mutating tool %s exposed in review mode", name)
 			}
 		}
-		attempts++
-		w.Header().Set("Content-Type", "text/event-stream")
-		if attempts == 1 {
-			// First attempt calls submit_review with invalid JSON
-			fmt.Fprint(w, `data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"rev-invalid","type":"function","function":{"name":"submit_review","arguments":"{invalid json}"}}]}}]}`+"\n\n")
-		} else {
-			// Second attempt corrects and calls submit_review with valid args
-			fmt.Fprintf(w, "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"rev-valid\",\"type\":\"function\",\"function\":{\"name\":\"submit_review\",\"arguments\":%q}}]}}]}\n\n", reviewArgs)
+		call++
+		if call == 1 {
+			return models.Message{Role: "assistant", ToolCalls: []models.ToolCall{agentToolCall("rev-invalid", "submit_review", `{invalid json}`)}}, models.Usage{}, nil
 		}
-		fmt.Fprint(w, "data: [DONE]\n\n")
-	}))
-	defer ts.Close()
-
-	be := testBackend(ts.URL, "test-key")
-	ag := New(be, "test-model", 4096, "sys")
+		return models.Message{Role: "assistant", ToolCalls: []models.ToolCall{agentToolCall("rev-valid", "submit_review", reviewArgs)}}, models.Usage{}, nil
+	}}
+	ag := New(backend, "test-model", 4096, "sys")
 	ag.ReviewMode = true
 
 	final, err := ag.Turn(context.Background(), "review codebase", Events{})
@@ -409,8 +402,8 @@ func TestReviewModeNormalTurn(t *testing.T) {
 	if final != reviewArgs {
 		t.Fatalf("final = %q, want %q", final, reviewArgs)
 	}
-	if attempts != 2 {
-		t.Fatalf("expected 2 attempts, got %d", attempts)
+	if len(backend.requests) != 2 {
+		t.Fatalf("expected 2 attempts, got %d", len(backend.requests))
 	}
 }
 

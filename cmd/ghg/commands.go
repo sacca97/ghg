@@ -6,7 +6,6 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"time"
@@ -130,20 +129,6 @@ func configuredCatalogModels(cfg *config.Config) []catalogModelChoice {
 		return choices[i].Provider < choices[j].Provider
 	})
 	return choices
-}
-
-const installURL = "https://raw.githubusercontent.com/sacca97/ghg/main/install.sh"
-
-func updateCLI() error {
-	fmt.Printf("ghg %s — updating to the latest release via\n  curl -fsSL %s | sh\n\n", version, installURL)
-	cmd := exec.Command("sh", "-c", "curl -fsSL "+installURL+" | sh")
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("update failed: %w", err)
-	}
-	fmt.Println("\nghg updated — restart any running sessions to use the new version.")
-	return nil
 }
 
 func sessionsCLI(args []string) error {

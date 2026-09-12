@@ -158,7 +158,7 @@ func (c *client) respondToServerRequest(msg rpcMessage) {
 	response := rpcMessage{JSONRPC: "2.0", ID: msg.ID}
 	switch msg.Method {
 	case "workspace/applyEdit":
-		response.Result = json.RawMessage(`{"applied":false,"failureReason":"use lsp_rename preview/apply"}`)
+		response.Result = json.RawMessage(`{"applied":false,"failureReason":"workspace edits are not supported"}`)
 	case "workspace/configuration":
 		response.Result = json.RawMessage(`[]`)
 	case "window/workDoneProgress/create", "client/registerCapability":

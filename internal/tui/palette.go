@@ -204,31 +204,31 @@ func (m *model) paletteItems() []paletteItem {
 			command: "/fork"},
 		{title: "Export chat", category: "Session",
 			dynDesc: func(m *model) string { return "export the full conversation to Markdown or JSON" },
-			dynHint: func(m *model) string { return "/export-result chat" },
-			command: "/export-result chat"},
+			dynHint: func(m *model) string { return "/export chat" },
+			command: "/export chat"},
 		{title: "Export latest plan", category: "Session",
 			dynDesc: func(m *model) string { return "export latest plan to Markdown or JSON" },
-			dynHint: func(m *model) string { return "/export-result plan" },
-			command: "/export-result plan"},
+			dynHint: func(m *model) string { return "/export plan" },
+			command: "/export plan"},
 		{title: "Export latest review", category: "Session",
 			dynDesc: func(m *model) string { return "export latest review to Markdown or JSON" },
-			dynHint: func(m *model) string { return "/export-result review" },
-			command: "/export-result review"},
+			dynHint: func(m *model) string { return "/export review" },
+			command: "/export review"},
 		{title: "Export last message", category: "Session",
 			dynDesc: func(m *model) string { return "export last assistant reply to a file" },
-			dynHint: func(m *model) string { return "/export-result last" },
-			command: "/export-result last"},
+			dynHint: func(m *model) string { return "/export last" },
+			command: "/export last"},
 		{title: "Export workflow result", category: "Session",
-			dynDesc: func(m *model) string { return slashHint(m, "/export-result") },
-			dynHint: func(m *model) string { return "/export-result" },
+			dynDesc: func(m *model) string { return slashHint(m, "/export") },
+			dynHint: func(m *model) string { return "/export" },
 			action:  paletteActionExportPrompt},
 		{title: "Rename session", category: "Session",
 			dynDesc: func(m *model) string {
 				if m.sessionID == "" || m.store == nil {
 					return "retitle this session"
 				}
-				if meta, _, err := m.store.Load(m.sessionID); err == nil && meta.Title != "" {
-					return meta.Title
+				if title, err := m.store.Title(m.sessionID); err == nil && title != "" {
+					return title
 				}
 				return "retitle this session"
 			},
@@ -631,7 +631,7 @@ func (m *model) activatePaletteSelection() (tea.Model, tea.Cmd) {
 		}
 	case paletteActionExportPrompt:
 		m.settings = nil
-		m.input.SetValue("/export-result ")
+		m.input.SetValue("/export ")
 		m.input.CursorEnd()
 		m.refreshMenu()
 	case paletteActionToggleThinking:

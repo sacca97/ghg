@@ -69,6 +69,9 @@ func TestServerAttachControllerAndDetach(t *testing.T) {
 	h := &testHandler{disconnected: make(chan bool, 1)}
 	server, err := NewServer(rt, h)
 	if err != nil {
+		if strings.Contains(err.Error(), "operation not permitted") {
+			t.Skip("unix socket listen not permitted by sandbox environment")
+		}
 		t.Fatal(err)
 	}
 	h.onAttached = func() { _ = server.Detached() }
@@ -148,6 +151,9 @@ func TestRequestCacheScopedToControllerConnection(t *testing.T) {
 	h := &testHandler{disconnected: make(chan bool, 1)}
 	server, err := NewServer(rt, h)
 	if err != nil {
+		if strings.Contains(err.Error(), "operation not permitted") {
+			t.Skip("unix socket listen not permitted by sandbox environment")
+		}
 		t.Fatal(err)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -206,7 +212,7 @@ func TestRuntimeRejectsInvalidSessionAndSecondOwner(t *testing.T) {
 	if _, err := NewRuntime(t.TempDir(), "../escape"); !errors.Is(err, ErrInvalidSession) {
 		t.Fatalf("invalid session error = %v, want ErrInvalidSession", err)
 	}
-	baseDir, err := os.MkdirTemp("/tmp", "ghg-worker-")
+	baseDir, err := os.MkdirTemp("", "ghg-worker-")
 	if err != nil {
 		t.Fatal(err)
 	}

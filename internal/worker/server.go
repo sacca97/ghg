@@ -271,7 +271,7 @@ func (s *Server) serveConnection(conn net.Conn) {
 		SessionID: s.runtime.SessionID,
 		Seq:       snapshotSeq,
 		Type:      TypeSnapshot,
-		Payload:   mustPayload(SnapshotEnvelope{State: state}),
+		Payload:   mustPayload(state),
 	}
 	attachedFrame := Frame{
 		Version:   ProtocolVersion,
@@ -325,7 +325,7 @@ func (s *Server) handleCommand(p *peer, frame Frame) {
 		return
 	}
 	var request CommandRequest
-	if err := json.Unmarshal(frame.Payload, &request); err != nil || !knownCommand(request.Name) {
+	if err := json.Unmarshal(frame.Payload, &request); err != nil || !KnownCommand(request.Name) {
 		p.enqueue(s.commandError(frame.RequestID, "unknown worker command"), true)
 		return
 	}

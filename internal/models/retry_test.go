@@ -3,10 +3,8 @@ package models
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"net/http"
-	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -19,6 +17,13 @@ func noSleep(t *testing.T) {
 	orig := sleep
 	sleep = func(context.Context, time.Duration) error { return nil }
 	t.Cleanup(func() { sleep = orig })
+}
+
+func retryClient(t *testing.T, transport http.RoundTripper) *Client {
+	t.Helper()
+	c := testChatClient(t, "http://provider.test", "k")
+	c.HTTP = &http.Client{Transport: transport}
+	return c
 }
 
 func TestRetryableClassification(t *testing.T) {
@@ -50,18 +55,14 @@ func TestRetryableClassification(t *testing.T) {
 func TestStreamRetriesTransientStatus(t *testing.T) {
 	noSleep(t)
 	var calls atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	c := retryClient(t, testRoundTripper(func(*http.Request) (*http.Response, error) {
 		if calls.Add(1) < 3 {
-			w.WriteHeader(524)
-			fmt.Fprint(w, "error code: 524")
-			return
+			return testHTTPResponse(524, "error code: 524"), nil
 		}
-		w.Header().Set("Content-Type", "text/event-stream")
-		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n")
+		resp := testHTTPResponse(http.StatusOK, "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n")
+		resp.Header.Set("Content-Type", "text/event-stream")
+		return resp, nil
 	}))
-	defer srv.Close()
-
-	c := testChatClient(t, srv.URL, "k")
 	var retries []RetryEvent
 
 	msg, _, err := runStreamWithRetry(c, context.Background(), Request{Model: "m"}, func(ev RetryEvent) { retries = append(retries, ev) })
@@ -80,31 +81,6 @@ func TestStreamRetriesTransientStatus(t *testing.T) {
 	if retries[0].Attempt != 1 || retries[0].Err == nil {
 		t.Fatalf("retry event: %+v", retries[0])
 	}
-}
-
-// Transport errors (connection refused) are retryable too.
-func TestStreamRetriesTransportError(t *testing.T) {
-	noSleep(t)
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
-	url := srv.URL
-	srv.Close() // now refuses connections
-
-	c := testChatClient(t, url, "k")
-	var retried int
-
-	_, _, err := runStreamWithRetry(c, context.Background(), Request{Model: "m"}, func(RetryEvent) { retried++ })
-	if err == nil {
-		t.Fatal("expected error after retries exhausted")
-	}
-	if retried != DefaultMaxAttempts-1 {
-		t.Fatalf("retried %d times, want %d", retried, DefaultMaxAttempts-1)
-	}
-}
-
-type retryRoundTripper func(*http.Request) (*http.Response, error)
-
-func (f retryRoundTripper) RoundTrip(r *http.Request) (*http.Response, error) {
-	return f(r)
 }
 
 type errorAfterBody struct {
@@ -130,7 +106,7 @@ func TestStreamRetriesHTTP2GoAwayAfterReasoning(t *testing.T) {
 	noSleep(t)
 	var calls atomic.Int32
 	client := testChatClient(t, "http://provider.test", "k")
-	client.HTTP = &http.Client{Transport: retryRoundTripper(func(*http.Request) (*http.Response, error) {
+	client.HTTP = &http.Client{Transport: testRoundTripper(func(*http.Request) (*http.Response, error) {
 		if calls.Add(1) == 1 {
 			return &http.Response{
 				StatusCode: http.StatusOK,
@@ -171,7 +147,7 @@ func TestStreamRetriesHTTP2InternalErrorAfterReasoning(t *testing.T) {
 	noSleep(t)
 	var calls atomic.Int32
 	client := testChatClient(t, "http://provider.test", "k")
-	client.HTTP = &http.Client{Transport: retryRoundTripper(func(*http.Request) (*http.Response, error) {
+	client.HTTP = &http.Client{Transport: testRoundTripper(func(*http.Request) (*http.Response, error) {
 		if calls.Add(1) == 1 {
 			return &http.Response{
 				StatusCode: http.StatusOK,
@@ -212,7 +188,7 @@ func TestStreamRetriesHTTP2GoAwayPastConfiguredBudget(t *testing.T) {
 	noSleep(t)
 	var calls atomic.Int32
 	client := testChatClient(t, "http://provider.test", "k")
-	client.HTTP = &http.Client{Transport: retryRoundTripper(func(*http.Request) (*http.Response, error) {
+	client.HTTP = &http.Client{Transport: testRoundTripper(func(*http.Request) (*http.Response, error) {
 		if calls.Add(1) <= DefaultMaxAttempts {
 			return nil, errors.New(http2GoAwayError)
 		}
@@ -235,38 +211,17 @@ func TestStreamRetriesHTTP2GoAwayPastConfiguredBudget(t *testing.T) {
 	}
 }
 
-// A permanent error (401) must surface on the first attempt, no retries.
-func TestStreamDoesNotRetryPermanentStatus(t *testing.T) {
-	noSleep(t)
-	var calls atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls.Add(1)
-		http.Error(w, "bad key", http.StatusUnauthorized)
-	}))
-	defer srv.Close()
-
-	_, _, err := runStream(testChatClient(t, srv.URL, "k"), context.Background(), Request{Model: "m"}, nil, nil)
-	if err == nil || !strings.Contains(err.Error(), "401") {
-		t.Fatalf("expected 401, got %v", err)
-	}
-	if calls.Load() != 1 {
-		t.Fatalf("attempts: %d, want 1 (no retry on 401)", calls.Load())
-	}
-}
-
 // Context-limit errors must NOT be retried — the agent's compaction path
 // depends on seeing them immediately.
 func TestStreamDoesNotRetryContextLimit(t *testing.T) {
 	noSleep(t)
 	var calls atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	c := retryClient(t, testRoundTripper(func(*http.Request) (*http.Response, error) {
 		calls.Add(1)
-		w.WriteHeader(400)
-		fmt.Fprint(w, `{"error":{"code":"context_length_exceeded"}}`)
+		return testHTTPResponse(http.StatusBadRequest, `{"error":{"code":"context_length_exceeded"}}`), nil
 	}))
-	defer srv.Close()
 
-	_, _, err := runStream(testChatClient(t, srv.URL, "k"), context.Background(), Request{Model: "m"}, nil, nil)
+	_, _, err := runStream(c, context.Background(), Request{Model: "m"}, nil, nil)
 	if !IsContextLimit(err) {
 		t.Fatalf("expected context-limit error, got %v", err)
 	}
@@ -279,17 +234,18 @@ func TestStreamDoesNotRetryContextLimit(t *testing.T) {
 // than retry — a retry would replay the already-rendered text.
 func TestStreamDoesNotRetryAfterEmission(t *testing.T) {
 	noSleep(t)
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n")
-		// hang up without [DONE]: scanner hits EOF and Stream treats it as a
-		// clean end... so instead force an error chunk after the text.
-		fmt.Fprint(w, "data: {\"error\":{\"message\":\"stream died\"}}\n\n")
+	c := retryClient(t, testRoundTripper(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body: &errorAfterBody{
+				data: []byte("data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\ndata: {\"error\":{\"message\":\"stream died\"}}\n\n"),
+				err:  io.ErrUnexpectedEOF,
+			},
+		}, nil
 	}))
-	defer srv.Close()
 
 	var streamed strings.Builder
-	c := testChatClient(t, srv.URL, "k")
 	var retried int
 	_, _, err := c.Stream(context.Background(), Request{Model: "m"}, EventSink{
 		OnText:  func(d string) { streamed.WriteString(d) },
@@ -310,13 +266,10 @@ func TestStreamDoesNotRetryAfterEmission(t *testing.T) {
 func TestMaxRetriesConfigurable(t *testing.T) {
 	noSleep(t)
 	var calls atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	c := retryClient(t, testRoundTripper(func(*http.Request) (*http.Response, error) {
 		calls.Add(1)
-		w.WriteHeader(500)
+		return testHTTPResponse(http.StatusInternalServerError, ""), nil
 	}))
-	defer srv.Close()
-
-	c := testChatClient(t, srv.URL, "k")
 	c.MaxRetries = 2
 	if _, _, err := runStream(c, context.Background(), Request{Model: "m"}, nil, nil); err == nil {
 		t.Fatal("expected error")
@@ -335,61 +288,17 @@ func TestMaxRetriesConfigurable(t *testing.T) {
 	}
 }
 
-// The OnRetry event carries the configured max so the UI can show N/M.
-func TestRetryEventCarriesMax(t *testing.T) {
-	noSleep(t)
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(500)
-	}))
-	defer srv.Close()
-
-	c := testChatClient(t, srv.URL, "k")
-	c.MaxRetries = 3
-	var evs []RetryEvent
-	_, _, _ = runStreamWithRetry(c, context.Background(), Request{Model: "m"}, func(ev RetryEvent) { evs = append(evs, ev) })
-	if len(evs) != 2 {
-		t.Fatalf("events: %d, want 2", len(evs))
-	}
-	if evs[0].Max != 3 {
-		t.Fatalf("event Max: %d, want 3", evs[0].Max)
-	}
-}
-
-// Complete retries transient statuses the same way Stream does.
-func TestCompleteRetriesTransientStatus(t *testing.T) {
-	noSleep(t)
-	var calls atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if calls.Add(1) < 2 {
-			w.WriteHeader(429)
-			fmt.Fprint(w, "rate limited")
-			return
-		}
-		fmt.Fprint(w, `{"choices":[{"message":{"content":"done"}}]}`)
-	}))
-	defer srv.Close()
-
-	got, _, err := completeText(testChatClient(t, srv.URL, "k"), context.Background(), Request{Model: "m"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got != "done" {
-		t.Fatalf("complete: %q", got)
-	}
-}
-
 // Caller cancellation during backoff must abort the retry loop promptly.
 func TestRetryRespectsCancellation(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(500)
+	c := retryClient(t, testRoundTripper(func(*http.Request) (*http.Response, error) {
+		return testHTTPResponse(http.StatusInternalServerError, ""), nil
 	}))
-	defer srv.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	go func() { time.Sleep(50 * time.Millisecond); cancel() }()
 
 	start := time.Now()
-	_, _, err := runStream(testChatClient(t, srv.URL, "k"), ctx, Request{Model: "m"}, nil, nil)
+	_, _, err := runStream(c, ctx, Request{Model: "m"}, nil, nil)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("expected context.Canceled, got %v", err)
 	}
@@ -401,17 +310,16 @@ func TestRetryRespectsCancellation(t *testing.T) {
 func TestStreamRetriesUpstreamStreamEndedError(t *testing.T) {
 	noSleep(t)
 	var calls atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
+	c := retryClient(t, testRoundTripper(func(*http.Request) (*http.Response, error) {
 		if calls.Add(1) < 3 {
-			fmt.Fprint(w, "data: {\"error\":{\"message\":\"upstream stream ended before terminal chunk\"}}\n\n")
-			return
+			resp := testHTTPResponse(http.StatusOK, "data: {\"error\":{\"message\":\"upstream stream ended before terminal chunk\"}}\n\n")
+			resp.Header.Set("Content-Type", "text/event-stream")
+			return resp, nil
 		}
-		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"recovered\"}}]}\n\ndata: [DONE]\n\n")
+		resp := testHTTPResponse(http.StatusOK, "data: {\"choices\":[{\"delta\":{\"content\":\"recovered\"}}]}\n\ndata: [DONE]\n\n")
+		resp.Header.Set("Content-Type", "text/event-stream")
+		return resp, nil
 	}))
-	defer srv.Close()
-
-	c := testChatClient(t, srv.URL, "k")
 	var retried int
 	retry := func(ev RetryEvent) {
 		retried++

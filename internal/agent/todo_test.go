@@ -70,7 +70,7 @@ func TestTodowriteValidation(t *testing.T) {
 // ephemeral system message each round, and a.Messages stays clean.
 func TestTodowriteEndToEnd(t *testing.T) {
 	var sawBlock bool
-	srv := textServer(t, func(n int, req models.Request) string {
+	a := New(textBackend(t, func(n int, req models.Request) string {
 		for _, m := range req.Messages {
 			if m.Role == "system" && strings.Contains(m.Content, "Your current plan") {
 				sawBlock = true
@@ -83,10 +83,7 @@ func TestTodowriteEndToEnd(t *testing.T) {
 			}
 		}
 		return "done"
-	})
-	defer srv.Close()
-
-	a := New(testBackend(srv.URL, "k"), "m", 100, "sys")
+	}), "m", 100, "sys")
 	callTodowrite(t, a, `{"todos":[
 		{"content":"read the code","status":"completed"},
 		{"content":"write tests","status":"in_progress"}]}`)

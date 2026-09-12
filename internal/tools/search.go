@@ -17,6 +17,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/sacca97/ghg/internal/models"
 	"github.com/sacca97/ghg/internal/sandbox"
@@ -345,6 +346,9 @@ func compileGlobSnapshot(ctx context.Context, args globArgs) (search.Snapshot, e
 		}
 		return collector.add(ctx, search.Item{Path: scope.displayPath(rel)})
 	})
+	if errors.Is(err, errSearchLimit) {
+		collector.stop(fmt.Sprintf("scan limited to %d entries", maxSearchEntries))
+	}
 	if err != nil && !errors.Is(err, errSearchLimit) {
 		return search.Snapshot{}, err
 	}
@@ -553,9 +557,6 @@ func selectSearchPage(snapshot search.Snapshot, chunks [][]search.Item, offset, 
 					lastPath = item.Path
 				}
 				chunkBytes += len(item.Text) + 12 // "  %d:%s\n"
-				if snapshot.Kind == structuralSearchKind {
-					chunkBytes += 64 + len(item.ObservationID)
-				}
 			}
 		} else {
 			for _, item := range chunk {
@@ -630,15 +631,7 @@ func renderSearchPage(kind string, items []search.Item, total, displayed, remain
 					b.WriteString(":\n")
 					lastPath = item.Path
 				}
-				if kind == structuralSearchKind {
-					fmt.Fprintf(&b, "  %s", structuralRange(item))
-					if item.ObservationID != "" {
-						fmt.Fprintf(&b, " [observation %s]", item.ObservationID)
-					}
-					fmt.Fprintf(&b, ": %s\n", item.Text)
-				} else {
-					fmt.Fprintf(&b, "  %d:%s\n", item.Line, item.Text)
-				}
+				fmt.Fprintf(&b, "  %d:%s\n", item.Line, item.Text)
 			}
 		} else {
 			for _, item := range items {
@@ -664,13 +657,6 @@ func searchPatternHeader(snapshot search.Snapshot, pattern int) string {
 		return "pattern:\n"
 	}
 	return fmt.Sprintf("pattern %q:\n", snapshot.Patterns[pattern-1])
-}
-
-func structuralRange(item search.Item) string {
-	if item.StartColumn <= 0 || item.EndLine <= 0 || item.EndColumn <= 0 {
-		return fmt.Sprint(item.Line)
-	}
-	return fmt.Sprintf("%d:%d-%d:%d", item.Line, item.StartColumn, item.EndLine, item.EndColumn)
 }
 
 func truncateMatchText(text string, lineWasTruncated bool) string {
@@ -721,15 +707,6 @@ func rankSearchItems(items []search.Item, scope *searchScope, requested string, 
 		}
 		if a.Line != b.Line {
 			return a.Line < b.Line
-		}
-		if a.StartColumn != b.StartColumn {
-			return a.StartColumn < b.StartColumn
-		}
-		if a.EndLine != b.EndLine {
-			return a.EndLine < b.EndLine
-		}
-		if a.EndColumn != b.EndColumn {
-			return a.EndColumn < b.EndColumn
 		}
 		return a.Pattern < b.Pattern
 	})
@@ -926,6 +903,98 @@ func uncachedGitModifiedPaths(ctx context.Context, root string) map[string]struc
 		set[canonicalPathHintForSearch(filepath.Join(root, name))] = struct{}{}
 	}
 	return set
+}
+
+func cleanFSPath(name string) string {
+	name = strings.ReplaceAll(name, "\\", "/")
+	name = path.Clean(name)
+	if name == "" {
+		return "."
+	}
+	return name
+}
+
+func relativeFSPath(base, name string) (string, bool) {
+	base = cleanFSPath(base)
+	name = cleanFSPath(name)
+	if base == "." {
+		return name, true
+	}
+	if name == base {
+		return ".", true
+	}
+	prefix := base + "/"
+	if !strings.HasPrefix(name, prefix) {
+		return "", false
+	}
+	return strings.TrimPrefix(name, prefix), true
+}
+
+func compileGlobPattern(pattern string) (*regexp.Regexp, error) {
+	var b strings.Builder
+	b.WriteByte('^')
+	for i := 0; i < len(pattern); {
+		switch pattern[i] {
+		case '*':
+			if i+1 < len(pattern) && pattern[i+1] == '*' {
+				i += 2
+				for i < len(pattern) && pattern[i] == '*' {
+					i++
+				}
+				if i < len(pattern) && pattern[i] == '/' {
+					b.WriteString(`(?:.*/)?`)
+					i++
+				} else {
+					b.WriteString(`.*`)
+				}
+				continue
+			}
+			b.WriteString(`[^/]*`)
+			i++
+		case '?':
+			b.WriteString(`[^/]`)
+			i++
+		case '[':
+			end, ok := globClassEnd(pattern, i+1)
+			if !ok {
+				return nil, fmt.Errorf("unterminated character class")
+			}
+			class := pattern[i : end+1]
+			if len(class) > 1 && class[1] == '!' {
+				class = "[^" + class[2:]
+			}
+			b.WriteString(class)
+			i = end + 1
+		case '\\':
+			if i+1 >= len(pattern) {
+				b.WriteString(`\\`)
+				i++
+				continue
+			}
+			r, size := utf8.DecodeRuneInString(pattern[i+1:])
+			b.WriteString(regexp.QuoteMeta(string(r)))
+			i += 1 + size
+		default:
+			r, size := utf8.DecodeRuneInString(pattern[i:])
+			b.WriteString(regexp.QuoteMeta(string(r)))
+			i += size
+		}
+	}
+	b.WriteByte('$')
+	return regexp.Compile(b.String())
+}
+
+func globClassEnd(pattern string, start int) (int, bool) {
+	for i := start; i < len(pattern); i++ {
+		if pattern[i] == '\\' {
+			i++
+			continue
+		}
+		if pattern[i] == ']' && i > start {
+			return i, true
+		}
+	}
+	return 0, false
 }
 
 type searchPattern struct {

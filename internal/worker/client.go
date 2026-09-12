@@ -102,7 +102,7 @@ func (c *Client) Send(name, requestID string, payload any) error {
 	if requestID == "" || len(requestID) > MaxRequestIDBytes {
 		return errors.New("worker request id is invalid")
 	}
-	if !knownCommand(name) {
+	if !KnownCommand(name) {
 		return fmt.Errorf("unknown worker command %q", name)
 	}
 	raw, err := marshalPayload(payload)

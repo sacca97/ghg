@@ -173,8 +173,6 @@ func pipeManager(f *fakeServer) *Manager {
 	return m
 }
 
-// --- tests ---
-
 func TestWaitDiagnosticsEditedFile(t *testing.T) {
 	f := startFakeServer(t, func(uri string, version int) []push {
 		return []push{{version: version, diags: []Diagnostic{
@@ -337,8 +335,6 @@ func TestRootWalk(t *testing.T) {
 		t.Fatalf("fallback root = %q, want file dir", root)
 	}
 }
-
-// --- helpers ---
 
 func writeFile(t *testing.T, path, content string) {
 	t.Helper()

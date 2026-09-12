@@ -26,21 +26,6 @@ import (
 	workerwire "github.com/sacca97/ghg/internal/worker"
 )
 
-const (
-	workerSessionEnv  = "GHG_WORKER_SESSION"
-	workerBaseEnv     = "GHG_WORKER_BASE"
-	workerCWDEnv      = "GHG_WORKER_CWD"
-	workerModelEnv    = "GHG_WORKER_MODEL"
-	workerProviderEnv = "GHG_WORKER_PROVIDER"
-	workerRoleEnv     = "GHG_WORKER_ROLE"
-	workerEffortEnv   = "GHG_WORKER_EFFORT"
-	workerModeEnv     = "GHG_WORKER_MODE"
-	workerCautiousEnv = "GHG_WORKER_CAUTIOUS"
-	workerSandboxEnv  = "GHG_WORKER_SANDBOX"
-	workerNetworkEnv  = "GHG_WORKER_NETWORK"
-	workerApprovalEnv = "GHG_WORKER_APPROVAL"
-)
-
 // Wire payload shapes live in internal/worker (workerwire); these aliases
 // keep the historical local names readable.
 type (
@@ -78,7 +63,6 @@ type workerProcessState struct {
 	state           workerwire.State
 	detached        bool
 	activeCancel    context.CancelFunc
-	shellCancel     context.CancelFunc
 	activeTool      string
 	stopRequested   bool
 	stopInterrupted bool
@@ -100,12 +84,12 @@ type workerProcessState struct {
 }
 
 func runWorkerProcess() error {
-	sessionID := strings.TrimSpace(os.Getenv(workerSessionEnv))
-	baseDir := strings.TrimSpace(os.Getenv(workerBaseEnv))
+	sessionID := strings.TrimSpace(os.Getenv(workerwire.WorkerSessionEnv))
+	baseDir := strings.TrimSpace(os.Getenv(workerwire.WorkerBaseEnv))
 	if sessionID == "" || baseDir == "" {
 		return errors.New("worker session environment is incomplete")
 	}
-	if cwd := os.Getenv(workerCWDEnv); cwd != "" {
+	if cwd := os.Getenv(workerwire.WorkerCWDEnv); cwd != "" {
 		if err := os.Chdir(cwd); err != nil {
 			return fmt.Errorf("worker chdir: %w", err)
 		}
@@ -167,7 +151,7 @@ func newWorkerProcess(runtimeFile workerwire.Runtime) (*workerProcessState, erro
 	if err != nil {
 		return nil, err
 	}
-	if err := cfg.ApplyExecutionOverrides(os.Getenv(workerSandboxEnv), os.Getenv(workerNetworkEnv), os.Getenv(workerApprovalEnv)); err != nil {
+	if err := cfg.ApplyExecutionOverrides(os.Getenv(workerwire.WorkerSandboxEnv), os.Getenv(workerwire.WorkerNetworkEnv), os.Getenv(workerwire.WorkerApprovalEnv)); err != nil {
 		return nil, err
 	}
 	profiles, err := loadProviderProfiles()
@@ -183,9 +167,14 @@ func newWorkerProcess(runtimeFile workerwire.Runtime) (*workerProcessState, erro
 		return nil, err
 	}
 	sessionID := runtimeFile.SessionID
-	modelName := os.Getenv(workerModelEnv)
-	providerName := os.Getenv(workerProviderEnv)
-	if _, _, loadErr := store.Load(sessionID); loadErr != nil {
+	modelName := os.Getenv(workerwire.WorkerModelEnv)
+	providerName := os.Getenv(workerwire.WorkerProviderEnv)
+	exists, existsErr := store.Exists(sessionID)
+	if existsErr != nil {
+		store.Close()
+		return nil, existsErr
+	}
+	if !exists {
 		cwd, cwdErr := os.Getwd()
 		if cwdErr != nil {
 			store.Close()
@@ -207,11 +196,7 @@ func newWorkerProcess(runtimeFile workerwire.Runtime) (*workerProcessState, erro
 	if providerName == "" {
 		providerName = meta.Provider
 	}
-	var telemetry []session.TelemetryEvent
-	if events, telemetryErr := store.ListTelemetry(context.Background(), sessionID); telemetryErr == nil {
-		telemetry = events
-	}
-	role := os.Getenv(workerRoleEnv)
+	role := os.Getenv(workerwire.WorkerRoleEnv)
 	if role == "" {
 		if previous, stateErr := runtimeFile.ReadState(); stateErr == nil {
 			role = previous.Role
@@ -219,16 +204,17 @@ func newWorkerProcess(runtimeFile workerwire.Runtime) (*workerProcessState, erro
 	}
 	// The bridge's fallback role is not authoritative when a session already
 	// has model-call history. Resume with the route that made the last call.
-	for _, event := range telemetry {
-		if event.Kind != "model_call_start" {
-			continue
-		}
+	if event, ok, telemetryErr := store.LatestTelemetry(context.Background(), sessionID, "model_call_start"); telemetryErr == nil && ok {
 		var call agent.ModelCallStart
 		if json.Unmarshal(event.Payload, &call) == nil && call.Purpose == "" && strings.TrimSpace(call.Role) != "" {
 			role = call.Role
 		}
 	}
-	mode := os.Getenv(workerModeEnv)
+	var progressEvents []session.TelemetryEvent
+	if events, telemetryErr := store.ListTelemetryKind(context.Background(), sessionID, "review_progress"); telemetryErr == nil {
+		progressEvents = events
+	}
+	mode := os.Getenv(workerwire.WorkerModeEnv)
 	if mode == "" {
 		if previous, stateErr := runtimeFile.ReadState(); stateErr == nil && previous.Mode != "" {
 			mode = previous.Mode
@@ -256,12 +242,9 @@ func newWorkerProcess(runtimeFile workerwire.Runtime) (*workerProcessState, erro
 	}
 	ag.Messages = append(ag.Messages, loaded...)
 	ag.RebuildTouched(ag.MessagesSnapshot())
-	if telemetry != nil {
+	if len(progressEvents) > 0 {
 		var progress []agent.ReviewProgress
-		for _, event := range telemetry {
-			if event.Kind != "review_progress" {
-				continue
-			}
+		for _, event := range progressEvents {
 			var value agent.ReviewProgress
 			if json.Unmarshal(event.Payload, &value) == nil {
 				progress = append(progress, value)
@@ -284,7 +267,7 @@ func newWorkerProcess(runtimeFile workerwire.Runtime) (*workerProcessState, erro
 	}
 	var outputStore *session.OutputStore
 	if maxBytes, enabled := outputStoreLimit(cfg); enabled {
-		outputStore, err = openOutputStore(dir, false, maxBytes)
+		outputStore, err = openOutputStore(dir, maxBytes)
 		if err != nil {
 			lspMgr.Close()
 			runtimeCleanup()
@@ -310,7 +293,7 @@ func newWorkerProcess(runtimeFile workerwire.Runtime) (*workerProcessState, erro
 	ag.LoadTodosJSON(store.Todos(sessionID))
 	if meta.Effort != "" {
 		ag.Effort = meta.Effort
-	} else if effort := os.Getenv(workerEffortEnv); effort != "" {
+	} else if effort := os.Getenv(workerwire.WorkerEffortEnv); effort != "" {
 		ag.Effort = effort
 	} else {
 		ag.Effort = defaultEffort(cfg)
@@ -345,13 +328,13 @@ func newWorkerProcess(runtimeFile workerwire.Runtime) (*workerProcessState, erro
 			return
 		}
 		_ = store.SaveTask(sessionID, sessionTask(*task))
-		w.publish("task", workerTask(*task), true)
+		w.publish(workerwire.EventTask, workerTask(*task), true)
 	}
 	configuredRuntime.HumanGate = w.humanGate
 	// Keep the reviewer wired for the worker's lifetime; ApprovalMode is
 	// changed live by /approval and decides whether it is used.
 	configuredRuntime.Reviewer = ag.ApproveForMe
-	if cautious, _ := strconv.ParseBool(os.Getenv(workerCautiousEnv)); cautious {
+	if cautious, _ := strconv.ParseBool(os.Getenv(workerwire.WorkerCautiousEnv)); cautious {
 		configuredRuntime.Cautious = true
 	}
 	if wd, wdErr := os.Getwd(); wdErr == nil {
@@ -362,7 +345,7 @@ func newWorkerProcess(runtimeFile workerwire.Runtime) (*workerProcessState, erro
 			w.mcp.SetBlocked(disc.Blocked)
 			w.mcp.SetOnChange(func() {
 				ag.SetMCPTools(w.mcp.Tools())
-				w.publish("mcp", w.mcpStatuses(), true)
+				w.publish(workerwire.EventMCP, w.mcpStatuses(), true)
 			})
 			w.mcp.Start(context.Background())
 			ag.SetMCPTools(w.mcp.Tools())
@@ -433,7 +416,7 @@ func (w *workerProcessState) transition(mutate func() (newState workerwire.State
 		PID:       os.Getpid(),
 		Detail:    detail,
 	})
-	w.publish("state", map[string]any{"state": state, "detached": detached, "mode": mode}, true)
+	w.publish(workerwire.EventState, map[string]any{"state": state, "detached": detached, "mode": mode}, true)
 	return true
 }
 
@@ -446,20 +429,15 @@ func (w *workerProcessState) setState(state workerwire.State, detached bool, det
 func (w *workerProcessState) requestStop(interrupted bool, detail string) {
 	w.stopOnce.Do(func() {
 		var cancel context.CancelFunc
-		var shellCancel context.CancelFunc
 		w.transition(func() (workerwire.State, bool, string, bool) {
 			w.stopRequested = true
 			w.stopInterrupted = interrupted
 			w.stopDetail = detail
 			cancel = w.activeCancel
-			shellCancel = w.shellCancel
 			return workerwire.StateStopping, w.detached, detail, true
 		})
 		if cancel != nil {
 			cancel()
-		}
-		if shellCancel != nil {
-			shellCancel()
 		}
 		if w.ag != nil {
 			for _, task := range w.ag.Tasks().List() {
@@ -523,10 +501,10 @@ func (w *workerProcessState) fireDueSchedule(now time.Time) {
 		return
 	}
 	if err := w.store.MarkFired(w.sessionID, task.ID, task.Slot); err != nil {
-		w.publish("schedule", fmt.Sprintf("scheduled task #%d started, but could not record its fire: %v", task.ID, err), true)
+		w.publish(workerwire.EventSchedule, fmt.Sprintf("scheduled task #%d started, but could not record its fire: %v", task.ID, err), true)
 		return
 	}
-	w.publish("schedule", fmt.Sprintf("⏰ scheduled task #%d fired — %s", task.ID, task.Prompt), true)
+	w.publish(workerwire.EventSchedule, fmt.Sprintf("⏰ scheduled task #%d fired — %s", task.ID, task.Prompt), true)
 }
 
 func (w *workerProcessState) hasLiveWork() bool {

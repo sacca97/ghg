@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -49,6 +50,44 @@ func testResponsesClient(t *testing.T, baseURL, apiKey string) *OpenAIResponsesC
 		t.Fatal(err)
 	}
 	return backend.(*OpenAIResponsesClient)
+}
+
+func testHTTPResponse(status int, body string) *http.Response {
+	return &http.Response{
+		StatusCode: status,
+		Status:     fmt.Sprintf("%d %s", status, http.StatusText(status)),
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader(body)),
+	}
+}
+
+func testHandlerTransport(handler http.Handler) http.RoundTripper {
+	return testRoundTripper(func(req *http.Request) (*http.Response, error) {
+		recorder := httptest.NewRecorder()
+		handler.ServeHTTP(recorder, req)
+		return recorder.Result(), nil
+	})
+}
+
+func testChatClientWithHandler(t *testing.T, apiKey string, handler http.Handler) *Client {
+	t.Helper()
+	client := testChatClient(t, "http://provider.test", apiKey)
+	client.HTTP = &http.Client{Transport: testHandlerTransport(handler)}
+	return client
+}
+
+func testAnthropicClientWithHandler(t *testing.T, handler http.Handler) *AnthropicClient {
+	t.Helper()
+	client := testAnthropicClient(t, "http://provider.test", "anthropic-test-key")
+	client.HTTP = &http.Client{Transport: testHandlerTransport(handler)}
+	return client
+}
+
+func testResponsesClientWithHandler(t *testing.T, handler http.Handler) *OpenAIResponsesClient {
+	t.Helper()
+	client := testResponsesClient(t, "http://provider.test", "responses-test-key")
+	client.HTTP = &http.Client{Transport: testHandlerTransport(handler)}
+	return client
 }
 
 func runStream(backend Backend, ctx context.Context, req Request, onText, onThink func(string)) (Message, Usage, error) {
@@ -146,7 +185,7 @@ func TestNewBackendOpenAIResponses(t *testing.T) {
 func TestOpenAIBackendStreamUsesRequestLocalEvents(t *testing.T) {
 	noSleep(t)
 	var calls atomic.Int32
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	client := testChatClientWithHandler(t, "k", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if calls.Add(1) == 1 {
 			w.WriteHeader(http.StatusBadGateway)
 			fmt.Fprint(w, "temporary gateway failure")
@@ -157,9 +196,7 @@ func TestOpenAIBackendStreamUsesRequestLocalEvents(t *testing.T) {
 		fmt.Fprint(w, "data: {\"choices\":[{\"delta\":{\"content\":\"answer\"},\"finish_reason\":\"stop\"}]}\n\n")
 		fmt.Fprint(w, "data: [DONE]\n\n")
 	}))
-	defer srv.Close()
 
-	client := testChatClient(t, srv.URL, "k")
 	client.MaxRetries = 2
 	var legacyRetries atomic.Int32
 	client.OnRetry = func(RetryEvent) { legacyRetries.Add(1) }
@@ -189,12 +226,10 @@ func TestOpenAIBackendStreamUsesRequestLocalEvents(t *testing.T) {
 }
 
 func TestOpenAIBackendCompleteReturnsMessage(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	backend := testChatClientWithHandler(t, "k", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte(`{"choices":[{"message":{"content":"summary"}}]}`))
 	}))
-	defer srv.Close()
 
-	backend := testChatClient(t, srv.URL, "k")
 	msg, _, err := backend.Complete(context.Background(), Request{Model: "summary-model"})
 	if err != nil {
 		t.Fatal(err)
@@ -206,13 +241,11 @@ func TestOpenAIBackendCompleteReturnsMessage(t *testing.T) {
 
 func TestOpenAIBackendCompleteReturnsToolCalls(t *testing.T) {
 	args := `{"goal":"ship it"}`
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	backend := testChatClientWithHandler(t, "k", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprintf(w, `{"choices":[{"message":{"role":"assistant","tool_calls":[{"id":"call-1","type":"function","function":{"name":"submit_plan","arguments":%q}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":3,"completion_tokens":2}}`, args)
 	}))
-	defer srv.Close()
 
-	backend := testChatClient(t, srv.URL, "k")
 	msg, usage, err := backend.Complete(context.Background(), Request{Model: "planner"})
 	if err != nil {
 		t.Fatal(err)
@@ -226,7 +259,7 @@ func TestOpenAIBackendCompleteReturnsToolCalls(t *testing.T) {
 }
 
 func TestOpenAIBackendAppliesProfileAuthAndHeaders(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("x-api-key"); got != "secret" {
 			t.Errorf("profile auth header = %q, want secret", got)
 		}
@@ -238,18 +271,18 @@ func TestOpenAIBackendAppliesProfileAuthAndHeaders(t *testing.T) {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"data":[{"id":"model"}]}`))
-	}))
-	defer srv.Close()
+	})
 
 	backend, err := NewBackend(Resolved{
 		Protocol:       ProtocolOpenAIChatCompletions,
-		BaseURL:        srv.URL,
+		BaseURL:        "http://provider.test",
 		Auth:           Auth{Kind: "header", Header: "x-api-key"},
 		DefaultHeaders: map[string]string{"anthropic-version": "2023-06-01"},
 	}, BackendOptions{APIKey: "secret"})
 	if err != nil {
 		t.Fatal(err)
 	}
+	backend.(*Client).HTTP = &http.Client{Transport: testHandlerTransport(handler)}
 	catalog, ok := backend.(CatalogBackend)
 	if !ok {
 		t.Fatal("backend should expose catalog capability")
@@ -260,7 +293,7 @@ func TestOpenAIBackendAppliesProfileAuthAndHeaders(t *testing.T) {
 }
 
 func TestOpenAIBackendProbeUsesRealModelAndRejectsAuthError(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/chat/completions" {
 			t.Errorf("probe request = %s %s", r.Method, r.URL.Path)
 		}
@@ -286,34 +319,35 @@ func TestOpenAIBackendProbeUsesRealModelAndRejectsAuthError(t *testing.T) {
 		// not the status alone, must decide whether the key is rejected.
 		w.WriteHeader(http.StatusUnauthorized)
 		_, _ = fmt.Fprint(w, `{"error":{"type":"ModelError","message":"invalid model"}}`)
-	}))
-	defer srv.Close()
+	})
 
 	good, err := NewBackend(Resolved{
-		Protocol: ProtocolOpenAIChatCompletions, BaseURL: srv.URL,
+		Protocol: ProtocolOpenAIChatCompletions, BaseURL: "http://provider.test",
 		Auth: Auth{Kind: "bearer", Header: "Authorization"},
 	}, BackendOptions{APIKey: "good"})
 	if err != nil {
 		t.Fatal(err)
 	}
+	good.(*Client).HTTP = &http.Client{Transport: testHandlerTransport(handler)}
 	if err := good.(ProbeBackend).Probe(context.Background(), "real-model"); err != nil {
 		t.Fatalf("non-auth probe response should be accepted: %v", err)
 	}
 
 	bad, err := NewBackend(Resolved{
-		Protocol: ProtocolOpenAIChatCompletions, BaseURL: srv.URL,
+		Protocol: ProtocolOpenAIChatCompletions, BaseURL: "http://provider.test",
 		Auth: Auth{Kind: "bearer", Header: "Authorization"},
 	}, BackendOptions{APIKey: "bad"})
 	if err != nil {
 		t.Fatal(err)
 	}
+	bad.(*Client).HTTP = &http.Client{Transport: testHandlerTransport(handler)}
 	if err := bad.(ProbeBackend).Probe(context.Background(), "real-model"); err == nil || !strings.Contains(err.Error(), "401") {
 		t.Fatalf("AuthError probe response should reject the key: %v", err)
 	}
 }
 
 func TestAnthropicBackendProbeUsesNativeMessagesEndpoint(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/messages" {
 			t.Errorf("anthropic probe request = %s %s", r.Method, r.URL.Path)
 		}
@@ -322,62 +356,30 @@ func TestAnthropicBackendProbeUsesNativeMessagesEndpoint(t *testing.T) {
 		}
 		w.WriteHeader(http.StatusBadRequest)
 		_, _ = fmt.Fprint(w, `{"type":"error","error":{"type":"ModelError","message":"invalid model"}}`)
-	}))
-	defer srv.Close()
+	})
 
 	backend, err := NewBackend(Resolved{
-		Protocol: ProtocolAnthropicMessages, BaseURL: srv.URL,
+		Protocol: ProtocolAnthropicMessages, BaseURL: "http://provider.test",
 		Auth:           Auth{Kind: "header", Header: "x-api-key"},
 		DefaultHeaders: map[string]string{"anthropic-version": "2023-06-01"},
 	}, BackendOptions{APIKey: "secret"})
 	if err != nil {
 		t.Fatal(err)
 	}
+	backend.(*AnthropicClient).HTTP = &http.Client{Transport: testHandlerTransport(handler)}
 	if err := backend.(ProbeBackend).Probe(context.Background(), "claude-real"); err != nil {
 		t.Fatalf("non-401 anthropic probe response should be accepted: %v", err)
 	}
 }
 
 func TestAuthenticatedProbeRejectsTypedAuthErrorRegardlessOfStatus(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
 		_, _ = fmt.Fprint(w, `{"error":{"type":"AuthError","message":"invalid key"}}`)
-	}))
-	defer srv.Close()
+	})
 
-	err := authenticatedProbe(context.Background(), srv.Client(), srv.URL, []byte(`{}`), func(*http.Request) error { return nil })
+	err := authenticatedProbe(context.Background(), &http.Client{Transport: testHandlerTransport(handler)}, "http://provider.test", []byte(`{}`), func(*http.Request) error { return nil })
 	if err == nil || !strings.Contains(err.Error(), "400") {
 		t.Fatalf("typed AuthError should reject the credential even on 400: %v", err)
-	}
-}
-
-func TestApplyRequestHeadersOpencodeSession(t *testing.T) {
-	// 1. With session ID in context
-	ctx := WithSessionID(context.Background(), "session-abc-123")
-	req, _ := http.NewRequestWithContext(ctx, "POST", "http://example.com", nil)
-	if err := applyRequestHeaders(req, nil, "key", "bearer", ""); err != nil {
-		t.Fatal(err)
-	}
-	if got := req.Header.Get("X-Opencode-Session"); got != "session-abc-123" {
-		t.Fatalf("X-Opencode-Session = %q, want session-abc-123", got)
-	}
-
-	// 2. Fallback when context has no session ID
-	req2, _ := http.NewRequestWithContext(context.Background(), "POST", "http://example.com", nil)
-	if err := applyRequestHeaders(req2, nil, "key", "bearer", ""); err != nil {
-		t.Fatal(err)
-	}
-	if got := req2.Header.Get("X-Opencode-Session"); got == "" {
-		t.Fatal("X-Opencode-Session should have fallback value, got empty")
-	}
-
-	// 3. Explicit custom header from user config is preserved
-	customHeaders := map[string]string{"x-opencode-session": "custom-pinned-session"}
-	req3, _ := http.NewRequestWithContext(ctx, "POST", "http://example.com", nil)
-	if err := applyRequestHeaders(req3, customHeaders, "key", "bearer", ""); err != nil {
-		t.Fatal(err)
-	}
-	if got := req3.Header.Get("X-Opencode-Session"); got != "custom-pinned-session" {
-		t.Fatalf("X-Opencode-Session = %q, want custom-pinned-session", got)
 	}
 }

@@ -67,281 +67,335 @@ func (w *workerProcessState) Snapshot(context.Context) (any, error) {
 func (w *workerProcessState) Command(ctx context.Context, command workerwire.Command) (workerwire.CommandResult, error) {
 	switch command.Name {
 	case workerwire.CommandInput:
-		var input workerInput
-		if err := json.Unmarshal(command.Payload, &input); err != nil || strings.TrimSpace(input.Input) == "" {
-			return workerwire.CommandResult{}, errors.New("worker input is invalid")
-		}
-		if w.ag != nil && w.ag.ReviewPending() && !input.Continue && !input.ReviewMode {
-			return workerwire.CommandResult{}, errors.New("review is interrupted; use continue to resume it or review to start a new review")
-		}
-		if !w.startTurn(input) {
-			return workerwire.CommandResult{}, errors.New("worker is busy or stopping")
-		}
-		return workerwire.CommandResult{Payload: json.RawMessage(`{"accepted":true}`)}, nil
+		return w.commandInput(command)
 	case workerwire.CommandCancel:
-		w.mu.Lock()
-		cancel := w.activeCancel
-		w.mu.Unlock()
-		if cancel != nil {
-			cancel()
-		}
-		return workerwire.CommandResult{Payload: json.RawMessage(`{"cancelled":true}`)}, nil
+		return w.commandCancel()
 	case workerwire.CommandApprove:
-		var answer workerApprovalAnswer
-		if err := json.Unmarshal(command.Payload, &answer); err != nil {
-			return workerwire.CommandResult{}, errors.New("approval answer is invalid")
-		}
-		if !w.answerApproval(answer) {
-			return workerwire.CommandResult{}, errors.New("approval request is no longer pending")
-		}
-		return workerwire.CommandResult{Payload: json.RawMessage(`{"accepted":true}`)}, nil
+		return w.commandApprove(command)
 	case workerwire.CommandAnswerQuestion:
-		var answer workerwire.QuestionAnswerRequest
-		if err := json.Unmarshal(command.Payload, &answer); err != nil {
-			return workerwire.CommandResult{}, errors.New("question answer is invalid")
-		}
-		if !w.answerQuestion(answer) {
-			return workerwire.CommandResult{}, errors.New("question request is no longer pending")
-		}
-		return workerwire.CommandResult{Payload: json.RawMessage(`{"accepted":true}`)}, nil
+		return w.commandAnswerQuestion(command)
 	case workerwire.CommandConfigure:
-		var request workerConfigureRequest
-		if err := json.Unmarshal(command.Payload, &request); err != nil {
-			return workerwire.CommandResult{}, errors.New("worker configuration is invalid")
-		}
-		if err := w.configure(request); err != nil {
-			return workerwire.CommandResult{}, err
-		}
-		return workerwire.CommandResult{Payload: json.RawMessage(`{"accepted":true}`)}, nil
+		return w.commandConfigure(command)
 	case workerwire.CommandCompact:
-		if !w.startCompact() {
-			return workerwire.CommandResult{}, errors.New("worker is busy or stopping")
-		}
-		return workerwire.CommandResult{Payload: json.RawMessage(`{"accepted":true}`)}, nil
+		return w.commandCompact()
 	case workerwire.CommandCompactRetry:
-		result, err := w.compactRetry()
-		if err != nil {
-			return workerwire.CommandResult{}, err
-		}
-		data, err := json.Marshal(result)
-		if err != nil {
-			return workerwire.CommandResult{}, fmt.Errorf("marshal compact retry: %w", err)
-		}
-		return workerwire.CommandResult{Payload: data}, nil
+		return w.commandCompactRetry()
 	case workerwire.CommandRewind:
-		var request workerwire.RewindRequest
-		if err := json.Unmarshal(command.Payload, &request); err != nil {
-			return workerwire.CommandResult{}, errors.New("rewind payload is invalid")
-		}
-		result, err := w.rewind(request)
-		if err != nil {
-			return workerwire.CommandResult{}, err
-		}
-		data, err := json.Marshal(result)
-		if err != nil {
-			return workerwire.CommandResult{}, fmt.Errorf("marshal rewind: %w", err)
-		}
-		return workerwire.CommandResult{Payload: data}, nil
+		return w.commandRewind(command)
 	case workerwire.CommandGoal:
-		var request workerwire.GoalRequest
-		if err := json.Unmarshal(command.Payload, &request); err != nil {
-			return workerwire.CommandResult{}, errors.New("goal payload is invalid")
-		}
-		record, err := w.updateGoal(request)
-		if err != nil {
-			return workerwire.CommandResult{}, err
-		}
-		data, err := json.Marshal(record)
-		if err != nil {
-			return workerwire.CommandResult{}, fmt.Errorf("marshal goal: %w", err)
-		}
-		return workerwire.CommandResult{Payload: data}, nil
+		return w.commandGoal(command)
 	case workerwire.CommandGoalFromContext:
-		var request workerwire.GoalFromContextRequest
-		if err := json.Unmarshal(command.Payload, &request); err != nil {
-			return workerwire.CommandResult{}, errors.New("goal-from-context payload is invalid")
-		}
-		if !w.startGoalFromContext(request.Window) {
-			return workerwire.CommandResult{}, errors.New("worker is busy or stopping")
-		}
-		return workerwire.CommandResult{Payload: json.RawMessage(`{"accepted":true}`)}, nil
+		return w.commandGoalFromContext(command)
 	case workerwire.CommandShell:
-		var request workerwire.ShellRequest
-		if err := json.Unmarshal(command.Payload, &request); err != nil || strings.TrimSpace(request.Command) == "" {
-			return workerwire.CommandResult{}, errors.New("worker shell payload is invalid")
-		}
-		if !w.startShell(strings.TrimSpace(request.Command)) {
-			return workerwire.CommandResult{}, errors.New("worker shell is busy or stopping")
-		}
-		return workerwire.CommandResult{Payload: json.RawMessage(`{"accepted":true}`)}, nil
+		return w.commandShell(command)
 	case workerwire.CommandChdir:
-		if err := w.requireIdleHistory(); err != nil {
-			return workerwire.CommandResult{}, err
-		}
-		var dir string
-		if err := json.Unmarshal(command.Payload, &dir); err != nil || dir == "" {
-			return workerwire.CommandResult{}, errors.New("worker chdir target is invalid")
-		}
-		canonical, err := canonicalDir(dir)
-		if err != nil {
-			return workerwire.CommandResult{}, fmt.Errorf("worker chdir: %w", err)
-		}
-		if err := os.Chdir(canonical); err != nil {
-			return workerwire.CommandResult{}, fmt.Errorf("worker chdir: %w", err)
-		}
-		data, err := json.Marshal(workerwire.ChdirResult{CWD: canonical})
-		if err != nil {
-			return workerwire.CommandResult{}, fmt.Errorf("marshal worker chdir: %w", err)
-		}
-		return workerwire.CommandResult{Payload: data}, nil
+		return w.commandChdir(command)
 	case workerwire.CommandAppend:
-		var request workerwire.AppendRequest
-		if err := json.Unmarshal(command.Payload, &request); err != nil || strings.TrimSpace(request.Content) == "" {
-			return workerwire.CommandResult{}, errors.New("worker append payload is invalid")
-		}
-		w.appendContent(request.Content)
-		return workerwire.CommandResult{Payload: json.RawMessage(`{"accepted":true}`)}, nil
+		return w.commandAppend(command)
 	case workerwire.CommandFork:
-		var request workerwire.ForkRequest
-		if err := json.Unmarshal(command.Payload, &request); err != nil {
-			return workerwire.CommandResult{}, errors.New("fork payload is invalid")
-		}
-		result, err := w.fork(request)
-		if err != nil {
-			return workerwire.CommandResult{}, err
-		}
-		data, err := json.Marshal(result)
-		if err != nil {
-			return workerwire.CommandResult{}, fmt.Errorf("marshal fork: %w", err)
-		}
-		return workerwire.CommandResult{Payload: data}, nil
+		return w.commandFork(command)
 	case workerwire.CommandRename:
-		var request workerwire.RenameRequest
-		if err := json.Unmarshal(command.Payload, &request); err != nil {
-			return workerwire.CommandResult{}, errors.New("rename payload is invalid")
-		}
-		result, err := w.rename(request)
-		if err != nil {
-			return workerwire.CommandResult{}, err
-		}
-		data, err := json.Marshal(result)
-		if err != nil {
-			return workerwire.CommandResult{}, fmt.Errorf("marshal rename: %w", err)
-		}
-		return workerwire.CommandResult{Payload: data}, nil
+		return w.commandRename(command)
 	case workerwire.CommandNotify:
-		var request workerwire.NotifyRequest
-		if err := json.Unmarshal(command.Payload, &request); err != nil {
-			return workerwire.CommandResult{}, errors.New("notify payload is invalid")
-		}
-		result, message, err := w.notifyCommand(ctx, request)
-		if err != nil {
-			return workerwire.CommandResult{}, err
-		}
-		w.publish("notice", message, true)
-		data, err := json.Marshal(result)
-		if err != nil {
-			return workerwire.CommandResult{}, fmt.Errorf("marshal notify result: %w", err)
-		}
-		return workerwire.CommandResult{Payload: data}, nil
+		return w.commandNotify(ctx, command)
 	case workerwire.CommandSearchProvider:
-		var request workerwire.SearchProviderRequest
-		if err := json.Unmarshal(command.Payload, &request); err != nil {
-			return workerwire.CommandResult{}, errors.New("search provider payload is invalid")
-		}
-		providers, err := w.searchProviderCommand(request)
-		if err != nil {
-			return workerwire.CommandResult{}, err
-		}
-		data, err := json.Marshal(providers)
-		if err != nil {
-			return workerwire.CommandResult{}, fmt.Errorf("marshal search providers: %w", err)
-		}
-		return workerwire.CommandResult{Payload: data}, nil
+		return w.commandSearchProvider(command)
 	case workerwire.CommandDetach:
-		w.mu.Lock()
-		allowed := w.state == workerwire.StateRunning || w.state == workerwire.StateWaitingApproval || w.state == workerwire.StateWaitingQuestion || w.hasLiveWork()
-		w.mu.Unlock()
-		if !allowed {
-			return workerwire.CommandResult{}, errors.New("nothing running to detach")
-		}
-		return workerwire.CommandResult{
-			Payload: json.RawMessage(`{"detached":true}`), Detach: true,
-			AfterAck: func() {
-				w.transition(func() (workerwire.State, bool, string, bool) {
-					return w.state, true, "clientless continuation authorized", true
-				})
-			},
-		}, nil
+		return w.commandDetach()
 	case workerwire.CommandStop:
-		w.requestStop(false, "stop requested by client")
-		return workerwire.CommandResult{Payload: json.RawMessage(`{"stopping":true}`)}, nil
+		return w.commandStop()
 	case workerwire.CommandPing:
 		return workerwire.CommandResult{Payload: json.RawMessage(`{"ok":true}`)}, nil
 	case workerwire.CommandLSPStatus:
-		if w.lsp == nil {
-			return workerwire.CommandResult{}, errors.New("worker LSP manager is unavailable")
-		}
-		statuses := w.lsp.Statuses()
-		payload := make([]workerwire.LSPStatus, len(statuses))
-		for i, status := range statuses {
-			payload[i] = workerwire.LSPStatus{
-				Name: status.Name, Root: status.Root, State: status.State, Error: status.Err,
-			}
-		}
-		data, err := json.Marshal(payload)
-		if err != nil {
-			return workerwire.CommandResult{}, fmt.Errorf("marshal worker LSP status: %w", err)
-		}
-		return workerwire.CommandResult{Payload: data}, nil
+		return w.commandLSPStatus()
 	case workerwire.CommandMCPStatus:
-		data, err := json.Marshal(w.mcpStatuses())
-		if err != nil {
-			return workerwire.CommandResult{}, fmt.Errorf("marshal worker MCP status: %w", err)
-		}
-		return workerwire.CommandResult{Payload: data}, nil
+		return w.commandMCPStatus()
 	case workerwire.CommandMCPReconnect, workerwire.CommandMCPEnable, workerwire.CommandMCPDisable:
-		if err := w.requireIdleHistory(); err != nil {
-			return workerwire.CommandResult{}, err
-		}
-		if w.mcp == nil {
-			return workerwire.CommandResult{}, errors.New("worker MCP manager is unavailable")
-		}
-		var request workerwire.MCPRequest
-		if err := json.Unmarshal(command.Payload, &request); err != nil || strings.TrimSpace(request.Name) == "" {
-			return workerwire.CommandResult{}, errors.New("MCP server name is invalid")
-		}
-		var ok bool
-		switch command.Name {
-		case workerwire.CommandMCPReconnect:
-			ok = w.mcp.Reconnect(request.Name)
-		case workerwire.CommandMCPEnable:
-			ok = w.mcp.Enable(request.Name)
-		case workerwire.CommandMCPDisable:
-			ok = w.mcp.Disable(request.Name)
-		}
-		if !ok {
-			return workerwire.CommandResult{}, fmt.Errorf("no MCP server named %s", request.Name)
-		}
-		if command.Name == workerwire.CommandMCPEnable || command.Name == workerwire.CommandMCPDisable {
-			if err := w.persistMCPConfig(request.Name); err != nil {
-				return workerwire.CommandResult{}, err
-			}
-		}
-		data, err := json.Marshal(w.mcpStatuses())
-		if err != nil {
-			return workerwire.CommandResult{}, fmt.Errorf("marshal worker MCP status: %w", err)
-		}
-		return workerwire.CommandResult{Payload: data}, nil
+		return w.commandMCPMutation(command)
 	case workerwire.CommandContextDoctor:
-		data, err := json.Marshal(w.contextDoctorReport())
-		if err != nil {
-			return workerwire.CommandResult{}, fmt.Errorf("marshal context doctor: %w", err)
-		}
-		return workerwire.CommandResult{Payload: data}, nil
+		return w.commandContextDoctor()
 	default:
 		return workerwire.CommandResult{}, fmt.Errorf("worker command %q is not implemented", command.Name)
 	}
+}
+
+func acceptedResult() workerwire.CommandResult {
+	return workerwire.CommandResult{Payload: json.RawMessage(`{"accepted":true}`)}
+}
+
+func marshalResult(label string, value any) (workerwire.CommandResult, error) {
+	data, err := json.Marshal(value)
+	if err != nil {
+		return workerwire.CommandResult{}, fmt.Errorf("marshal %s: %w", label, err)
+	}
+	return workerwire.CommandResult{Payload: data}, nil
+}
+
+func (w *workerProcessState) commandInput(command workerwire.Command) (workerwire.CommandResult, error) {
+	var input workerInput
+	if err := json.Unmarshal(command.Payload, &input); err != nil || strings.TrimSpace(input.Input) == "" {
+		return workerwire.CommandResult{}, errors.New("worker input is invalid")
+	}
+	if w.ag != nil && w.ag.ReviewPending() && !input.Continue && !input.ReviewMode {
+		return workerwire.CommandResult{}, errors.New("review is interrupted; use continue to resume it or review to start a new review")
+	}
+	if !w.startTurn(input) {
+		return workerwire.CommandResult{}, errors.New("worker is busy or stopping")
+	}
+	return acceptedResult(), nil
+}
+
+func (w *workerProcessState) commandCancel() (workerwire.CommandResult, error) {
+	w.mu.Lock()
+	cancel := w.activeCancel
+	w.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	return workerwire.CommandResult{Payload: json.RawMessage(`{"cancelled":true}`)}, nil
+}
+
+func (w *workerProcessState) commandApprove(command workerwire.Command) (workerwire.CommandResult, error) {
+	var answer workerApprovalAnswer
+	if err := json.Unmarshal(command.Payload, &answer); err != nil {
+		return workerwire.CommandResult{}, errors.New("approval answer is invalid")
+	}
+	if !w.answerApproval(answer) {
+		return workerwire.CommandResult{}, errors.New("approval request is no longer pending")
+	}
+	return acceptedResult(), nil
+}
+
+func (w *workerProcessState) commandAnswerQuestion(command workerwire.Command) (workerwire.CommandResult, error) {
+	var answer workerwire.QuestionAnswerRequest
+	if err := json.Unmarshal(command.Payload, &answer); err != nil {
+		return workerwire.CommandResult{}, errors.New("question answer is invalid")
+	}
+	if !w.answerQuestion(answer) {
+		return workerwire.CommandResult{}, errors.New("question request is no longer pending")
+	}
+	return acceptedResult(), nil
+}
+
+func (w *workerProcessState) commandConfigure(command workerwire.Command) (workerwire.CommandResult, error) {
+	var request workerConfigureRequest
+	if err := json.Unmarshal(command.Payload, &request); err != nil {
+		return workerwire.CommandResult{}, errors.New("worker configuration is invalid")
+	}
+	if err := w.configure(request); err != nil {
+		return workerwire.CommandResult{}, err
+	}
+	return acceptedResult(), nil
+}
+
+func (w *workerProcessState) commandCompact() (workerwire.CommandResult, error) {
+	if !w.startCompact() {
+		return workerwire.CommandResult{}, errors.New("worker is busy or stopping")
+	}
+	return acceptedResult(), nil
+}
+
+func (w *workerProcessState) commandCompactRetry() (workerwire.CommandResult, error) {
+	result, err := w.compactRetry()
+	if err != nil {
+		return workerwire.CommandResult{}, err
+	}
+	return marshalResult("compact retry", result)
+}
+
+func (w *workerProcessState) commandRewind(command workerwire.Command) (workerwire.CommandResult, error) {
+	var request workerwire.RewindRequest
+	if err := json.Unmarshal(command.Payload, &request); err != nil {
+		return workerwire.CommandResult{}, errors.New("rewind payload is invalid")
+	}
+	result, err := w.rewind(request)
+	if err != nil {
+		return workerwire.CommandResult{}, err
+	}
+	return marshalResult("rewind", result)
+}
+
+func (w *workerProcessState) commandGoal(command workerwire.Command) (workerwire.CommandResult, error) {
+	var request workerwire.GoalRequest
+	if err := json.Unmarshal(command.Payload, &request); err != nil {
+		return workerwire.CommandResult{}, errors.New("goal payload is invalid")
+	}
+	record, err := w.updateGoal(request)
+	if err != nil {
+		return workerwire.CommandResult{}, err
+	}
+	return marshalResult("goal", record)
+}
+
+func (w *workerProcessState) commandGoalFromContext(command workerwire.Command) (workerwire.CommandResult, error) {
+	var request workerwire.GoalFromContextRequest
+	if err := json.Unmarshal(command.Payload, &request); err != nil {
+		return workerwire.CommandResult{}, errors.New("goal-from-context payload is invalid")
+	}
+	if !w.startGoalFromContext(request.Window) {
+		return workerwire.CommandResult{}, errors.New("worker is busy or stopping")
+	}
+	return acceptedResult(), nil
+}
+
+func (w *workerProcessState) commandShell(command workerwire.Command) (workerwire.CommandResult, error) {
+	var request workerwire.ShellRequest
+	if err := json.Unmarshal(command.Payload, &request); err != nil || strings.TrimSpace(request.Command) == "" {
+		return workerwire.CommandResult{}, errors.New("worker shell payload is invalid")
+	}
+	if !w.startShell(strings.TrimSpace(request.Command)) {
+		return workerwire.CommandResult{}, errors.New("worker shell is busy or stopping")
+	}
+	return acceptedResult(), nil
+}
+
+func (w *workerProcessState) commandChdir(command workerwire.Command) (workerwire.CommandResult, error) {
+	if err := w.requireIdleHistory(); err != nil {
+		return workerwire.CommandResult{}, err
+	}
+	var dir string
+	if err := json.Unmarshal(command.Payload, &dir); err != nil || dir == "" {
+		return workerwire.CommandResult{}, errors.New("worker chdir target is invalid")
+	}
+	canonical, err := canonicalDir(dir)
+	if err != nil {
+		return workerwire.CommandResult{}, fmt.Errorf("worker chdir: %w", err)
+	}
+	if err := os.Chdir(canonical); err != nil {
+		return workerwire.CommandResult{}, fmt.Errorf("worker chdir: %w", err)
+	}
+	return marshalResult("worker chdir", workerwire.ChdirResult{CWD: canonical})
+}
+
+func (w *workerProcessState) commandAppend(command workerwire.Command) (workerwire.CommandResult, error) {
+	var request workerwire.AppendRequest
+	if err := json.Unmarshal(command.Payload, &request); err != nil || strings.TrimSpace(request.Content) == "" {
+		return workerwire.CommandResult{}, errors.New("worker append payload is invalid")
+	}
+	w.appendContent(request.Content)
+	return acceptedResult(), nil
+}
+
+func (w *workerProcessState) commandFork(command workerwire.Command) (workerwire.CommandResult, error) {
+	var request workerwire.ForkRequest
+	if err := json.Unmarshal(command.Payload, &request); err != nil {
+		return workerwire.CommandResult{}, errors.New("fork payload is invalid")
+	}
+	result, err := w.fork(request)
+	if err != nil {
+		return workerwire.CommandResult{}, err
+	}
+	return marshalResult("fork", result)
+}
+
+func (w *workerProcessState) commandRename(command workerwire.Command) (workerwire.CommandResult, error) {
+	var request workerwire.RenameRequest
+	if err := json.Unmarshal(command.Payload, &request); err != nil {
+		return workerwire.CommandResult{}, errors.New("rename payload is invalid")
+	}
+	result, err := w.rename(request)
+	if err != nil {
+		return workerwire.CommandResult{}, err
+	}
+	return marshalResult("rename", result)
+}
+
+func (w *workerProcessState) commandNotify(ctx context.Context, command workerwire.Command) (workerwire.CommandResult, error) {
+	var request workerwire.NotifyRequest
+	if err := json.Unmarshal(command.Payload, &request); err != nil {
+		return workerwire.CommandResult{}, errors.New("notify payload is invalid")
+	}
+	result, message, err := w.notifyCommand(ctx, request)
+	if err != nil {
+		return workerwire.CommandResult{}, err
+	}
+	w.publish(workerwire.EventNotice, message, true)
+	return marshalResult("notify result", result)
+}
+
+func (w *workerProcessState) commandSearchProvider(command workerwire.Command) (workerwire.CommandResult, error) {
+	var request workerwire.SearchProviderRequest
+	if err := json.Unmarshal(command.Payload, &request); err != nil {
+		return workerwire.CommandResult{}, errors.New("search provider payload is invalid")
+	}
+	providers, err := w.searchProviderCommand(request)
+	if err != nil {
+		return workerwire.CommandResult{}, err
+	}
+	return marshalResult("search providers", providers)
+}
+
+func (w *workerProcessState) commandDetach() (workerwire.CommandResult, error) {
+	w.mu.Lock()
+	allowed := w.state == workerwire.StateRunning || w.state == workerwire.StateWaitingApproval || w.state == workerwire.StateWaitingQuestion || w.hasLiveWork()
+	w.mu.Unlock()
+	if !allowed {
+		return workerwire.CommandResult{}, errors.New("nothing running to detach")
+	}
+	return workerwire.CommandResult{
+		Payload: json.RawMessage(`{"detached":true}`), Detach: true,
+		AfterAck: func() {
+			w.transition(func() (workerwire.State, bool, string, bool) {
+				return w.state, true, "clientless continuation authorized", true
+			})
+		},
+	}, nil
+}
+
+func (w *workerProcessState) commandStop() (workerwire.CommandResult, error) {
+	w.requestStop(false, "stop requested by client")
+	return workerwire.CommandResult{Payload: json.RawMessage(`{"stopping":true}`)}, nil
+}
+
+func (w *workerProcessState) commandLSPStatus() (workerwire.CommandResult, error) {
+	if w.lsp == nil {
+		return workerwire.CommandResult{}, errors.New("worker LSP manager is unavailable")
+	}
+	statuses := w.lsp.Statuses()
+	payload := make([]workerwire.LSPStatus, len(statuses))
+	for i, status := range statuses {
+		payload[i] = workerwire.LSPStatus{Name: status.Name, Root: status.Root, State: status.State, Error: status.Err}
+	}
+	return marshalResult("worker LSP status", payload)
+}
+
+func (w *workerProcessState) commandMCPStatus() (workerwire.CommandResult, error) {
+	return marshalResult("worker MCP status", w.mcpStatuses())
+}
+
+func (w *workerProcessState) commandMCPMutation(command workerwire.Command) (workerwire.CommandResult, error) {
+	if err := w.requireIdleHistory(); err != nil {
+		return workerwire.CommandResult{}, err
+	}
+	if w.mcp == nil {
+		return workerwire.CommandResult{}, errors.New("worker MCP manager is unavailable")
+	}
+	var request workerwire.MCPRequest
+	if err := json.Unmarshal(command.Payload, &request); err != nil || strings.TrimSpace(request.Name) == "" {
+		return workerwire.CommandResult{}, errors.New("MCP server name is invalid")
+	}
+	var ok bool
+	switch command.Name {
+	case workerwire.CommandMCPReconnect:
+		ok = w.mcp.Reconnect(request.Name)
+	case workerwire.CommandMCPEnable:
+		ok = w.mcp.Enable(request.Name)
+	case workerwire.CommandMCPDisable:
+		ok = w.mcp.Disable(request.Name)
+	}
+	if !ok {
+		return workerwire.CommandResult{}, fmt.Errorf("no MCP server named %s", request.Name)
+	}
+	if command.Name == workerwire.CommandMCPEnable || command.Name == workerwire.CommandMCPDisable {
+		if err := w.persistMCPConfig(request.Name); err != nil {
+			return workerwire.CommandResult{}, err
+		}
+	}
+	return marshalResult("worker MCP status", w.mcpStatuses())
+}
+
+func (w *workerProcessState) commandContextDoctor() (workerwire.CommandResult, error) {
+	return marshalResult("context doctor", w.contextDoctorReport())
 }
 
 func (w *workerProcessState) mcpStatuses() []workerwire.MCPStatus {
@@ -406,6 +460,9 @@ func (w *workerProcessState) configure(request workerConfigureRequest) error {
 	if strings.TrimSpace(request.Approval) != "" {
 		return w.configureApproval(request.Approval)
 	}
+	if err := w.persistConfigure(request); err != nil {
+		return err
+	}
 	w.mu.Lock()
 	if w.activeCancel != nil || w.stopRequested || w.state == workerwire.StateStopping {
 		w.mu.Unlock()
@@ -419,6 +476,16 @@ func (w *workerProcessState) configure(request workerConfigureRequest) error {
 	role := strings.TrimSpace(request.Role)
 	if role == "" {
 		role = w.role
+	}
+	// A controller that names only a role (the /model and role-switch paths)
+	// expects the worker to resolve it, the way the bridge used to.
+	if modelName == "" && strings.TrimSpace(request.Role) != "" {
+		target, err := w.cfg.ResolveRole(role)
+		if err != nil {
+			w.mu.Unlock()
+			return err
+		}
+		modelName, providerName = target.Model, target.Provider
 	}
 	systemPrompt := ""
 	if messages := w.ag.MessagesSnapshot(); len(messages) > 0 {
@@ -474,12 +541,50 @@ func (w *workerProcessState) configure(request workerConfigureRequest) error {
 			_ = w.store.SetEffort(w.sessionID, effort)
 		}
 	}
-	w.publish("route", workerConfigureRequest{
+	w.publish(workerwire.EventRoute, workerConfigureRequest{
 		Model: modelID, ModelName: resolvedModel, Provider: resolvedProvider,
 		Role: role, Protocol: protocol, Effort: effort, UpdateEffort: true,
 		Mode: mode,
 	}, true)
 	w.setState(state, detached, "route changed")
+	return nil
+}
+
+// persistConfigure applies the durable half of a request: a controller may ask
+// for a role's model or the dynamic-reasoning switch to be configured, but the
+// worker owns the config file and performs the write. It runs before the live
+// route changes, so a validation or save failure leaves the worker untouched.
+func (w *workerProcessState) persistConfigure(request workerConfigureRequest) error {
+	role := strings.TrimSpace(request.Role)
+	model := strings.TrimSpace(request.Model)
+	persistModel := request.PersistRoleModel && model != ""
+	persistDynamic := request.PersistDynamicReasoning && request.DynamicReasoning != nil
+	if !persistModel && !persistDynamic {
+		return nil
+	}
+	if persistModel && !config.IsRole(role) {
+		return fmt.Errorf("unknown role %q", role)
+	}
+	w.mu.Lock()
+	cfg := w.cfg
+	if cfg == nil {
+		w.mu.Unlock()
+		return errors.New("worker configuration is unavailable")
+	}
+	if persistModel {
+		if cfg.Roles == nil {
+			cfg.Roles = make(map[string]config.RoleConfig)
+		}
+		cfg.Roles[role] = config.RoleConfig{Model: model, Provider: strings.TrimSpace(request.Provider)}
+	}
+	if persistDynamic {
+		value := *request.DynamicReasoning
+		cfg.DynamicReasoning = &value
+	}
+	w.mu.Unlock()
+	if err := cfg.Save(); err != nil {
+		return fmt.Errorf("save worker configuration: %w", err)
+	}
 	return nil
 }
 
@@ -505,7 +610,7 @@ func (w *workerProcessState) configureApproval(value string) error {
 	if err := cfg.Save(); err != nil {
 		return fmt.Errorf("save approval mode: %w", err)
 	}
-	w.publish("route", workerConfigureRequest{Approval: string(mode)}, true)
+	w.publish(workerwire.EventRoute, workerConfigureRequest{Approval: string(mode)}, true)
 	return nil
 }
 
@@ -518,39 +623,7 @@ func workerEffortForModel(provider, model, current string, toggle bool) string {
 	if info == nil || (!info.ReasoningKnown && len(info.ReasoningEfforts) == 0 && !info.ReasoningToggle && !toggle) {
 		return current
 	}
-	levels := []string{""}
-	if info.ReasoningToggle && len(info.ReasoningEfforts) == 0 {
-		levels = append(levels, "on")
-	} else {
-		for _, effort := range info.ReasoningEfforts {
-			effort = strings.TrimSpace(effort)
-			if effort == "" || strings.EqualFold(effort, "off") || strings.EqualFold(effort, "none") {
-				continue
-			}
-			seen := false
-			for _, level := range levels {
-				if level == effort {
-					seen = true
-					break
-				}
-			}
-			if !seen {
-				levels = append(levels, effort)
-			}
-		}
-	}
-	for _, level := range levels {
-		if current != "" && strings.EqualFold(level, current) {
-			return level
-		}
-	}
-	// An explicit off setting stays off. For a configured level the model does
-	// not advertise, use its least expensive advertised level; never silently
-	// escalate a session to the maximum.
-	if current == "" || len(levels) == 1 {
-		return ""
-	}
-	return levels[1]
+	return info.NormalizeEffort(current)
 }
 
 func (w *workerProcessState) Attached(context.Context) {
@@ -580,7 +653,7 @@ func (w *workerProcessState) humanGate(ctx context.Context, req tools.GateReques
 		w.pending[id] = flight
 		return workerwire.StateWaitingApproval, w.detached, "approval requested", true
 	})
-	w.publish("permission_request", workerPermissionRequest{Approval: *pending}, true)
+	w.publish(workerwire.EventPermissionRequest, workerPermissionRequest{Approval: *pending}, true)
 	select {
 	case <-flight.done:
 	case <-ctx.Done():
@@ -772,11 +845,11 @@ func (w *workerProcessState) appendLive(kind, value string) {
 	}
 	w.liveMu.Lock()
 	switch kind {
-	case "text":
+	case workerwire.EventText:
 		w.liveText = appendWorkerTail(w.liveText, value)
-	case "think":
+	case workerwire.EventThink:
 		w.liveThink = appendWorkerTail(w.liveThink, value)
-	case "tool_output":
+	case workerwire.EventToolOutput:
 		w.liveToolOutput = appendWorkerTail(w.liveToolOutput, value)
 	case "plan":
 		w.livePlan = appendWorkerTail(w.livePlan, value)

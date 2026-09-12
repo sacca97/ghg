@@ -31,8 +31,8 @@ func systemPrompt() string {
 func systemPromptForProject(projectTrusted bool) string {
 	wd, _ := os.Getwd()
 	prompt := strings.TrimRight(embeddedSystemPrompt, "\n") + "\n\nCurrent working directory: " + wd
-	if extra := config.MeInstructions(); extra != "" {
-		prompt += "\n\nStanding instructions from the user (~/.ghg/me.md — treat as user rules):\n" + extra
+	if extra := config.UserInstructions(); extra != "" {
+		prompt += "\n\nStanding instructions from the user (~/.ghg/AGENTS.md — treat as user rules):\n" + extra
 	}
 	if project := config.ProjectInstructions(wd, projectTrusted); project != "" {
 		prompt += "\n\n" + project
@@ -98,8 +98,7 @@ commands:
   outputs   collect unreferenced output payloads
   mcp       manage MCP servers
   auth      configure provider credentials
-  export    export session results
-  update    update ghg`)
+  export    export session results`)
 	}
 	flag.Parse()
 	die := func(err error) {
@@ -111,17 +110,28 @@ commands:
 		fmt.Println("ghg", version)
 		return
 	}
+	if *continueFlag && *resumeFlag != "" {
+		die(fmt.Errorf("--continue and --resume are mutually exclusive"))
+	}
+	resumeID := *resumeFlag
+	if *continueFlag {
+		var err error
+		resumeID, err = continueSessionID()
+		if err != nil {
+			die(err)
+		}
+	}
 
 	if flag.NArg() > 0 {
 		args := flag.Args()[1:]
 		switch flag.Arg(0) {
 		case "run":
-			if err := runCLI(args); err != nil {
+			if err := runCLI(forwardRootArgs(args, "run", *modelFlag, *providerFlag, resumeID, *cautiousFlag, *sandboxFlag, *networkFlag, *approvalFlag)); err != nil {
 				die(err)
 			}
 			return
 		case "bridge":
-			if err := bridgeCLI(args); err != nil {
+			if err := bridgeCLI(forwardRootArgs(args, "bridge", *modelFlag, *providerFlag, resumeID, *cautiousFlag, *sandboxFlag, *networkFlag, *approvalFlag)); err != nil {
 				die(err)
 			}
 			return
@@ -170,11 +180,6 @@ commands:
 				die(err)
 			}
 			return
-		case "update":
-			if err := updateCLI(); err != nil {
-				die(err)
-			}
-			return
 		default:
 			die(fmt.Errorf("unknown command %q (see ghg --help)", flag.Arg(0)))
 		}
@@ -212,22 +217,33 @@ commands:
 		}
 		return
 	}
-	if *continueFlag && *resumeFlag != "" {
-		fmt.Fprintln(os.Stderr, "ghg: --continue and --resume are mutually exclusive")
-		os.Exit(1)
-	}
-	resumeID := *resumeFlag
-	if *continueFlag {
-		resumeID, err = continueSessionID()
-		if err != nil {
-			fmt.Fprintln(os.Stderr, "ghg:", err)
-			os.Exit(1)
-		}
-	}
 	tui.Version = version // /report names the build in the bug-report bundle
 	_, err = tui.Run(cfg, *modelFlag, *providerFlag, systemPrompt(), resumeID, *cautiousFlag)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "ghg:", err)
 		os.Exit(1)
 	}
+}
+
+func forwardRootArgs(args []string, command, model, provider, resume string, cautious bool, sandbox, network, approval string) []string {
+	out := append([]string(nil), args...)
+	prepend := func(name, value string) {
+		if value != "" {
+			out = append([]string{name, value}, out...)
+		}
+	}
+	prepend("--approval", approval)
+	prepend("--network", network)
+	prepend("--sandbox", sandbox)
+	if cautious {
+		out = append([]string{"--cautious"}, out...)
+	}
+	if command == "bridge" {
+		prepend("--session", resume)
+	} else {
+		prepend("--resume", resume)
+	}
+	prepend("-p", provider)
+	prepend("-m", model)
+	return out
 }

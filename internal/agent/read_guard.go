@@ -214,16 +214,8 @@ func normalizeReadRange(path string, offset, limit int) (readRequest, bool) {
 
 func potentiallyMutatingReadGuardTool(name, args string) bool {
 	switch name {
-	case "read", "grep", "structural_search", "glob", "find_files", "lsp", "output_list", "output_read", "artifact_list", "artifact_read", "history_search", "history_read", "submit_review":
+	case "read", "grep", "glob", "find_files", "lsp", "output_list", "output_read", "artifact_list", "artifact_read", "history_search", "history_read", "submit_review":
 		return false
-	case "lsp_rename":
-		var input struct {
-			Operation string `json:"operation"`
-		}
-		if json.Unmarshal([]byte(args), &input) == nil && strings.EqualFold(strings.TrimSpace(input.Operation), "preview") {
-			return false
-		}
-		return true
 	default:
 		// Unknown and MCP tools are opaque to the agent and may mutate files.
 		return true
@@ -436,11 +428,6 @@ func (t *readCoverageTracker) apply(a *Agent, ev Events, calls []models.ToolCall
 			}
 			for _, path := range paths {
 				t.invalidatePath(path)
-			}
-		case "lsp_rename":
-			// A rename can publish changes to more files than the request path.
-			if potentiallyMutatingReadGuardTool(call.Function.Name, call.Function.Arguments) {
-				t.clear()
 			}
 		default:
 			if potentiallyMutatingReadGuardTool(call.Function.Name, call.Function.Arguments) {

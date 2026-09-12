@@ -3,7 +3,6 @@ package lsp
 import (
 	"context"
 	"encoding/json"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -63,51 +62,6 @@ func TestNavigationNormalizesUTF16AndAllReadOnlyOperations(t *testing.T) {
 				t.Fatalf("hover normalization: %+v", result)
 			}
 		}
-	}
-}
-
-func TestRenamePreviewApplyIsSessionBoundAndExact(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "main.go")
-	writeFile(t, path, "package p\nvar café = 1\n")
-	onRequest := func(method string, _ json.RawMessage) json.RawMessage {
-		if method != "textDocument/rename" {
-			return nil
-		}
-		return json.RawMessage(`{"changes":{"` + fileURI(path) + `":[{"range":{"start":{"line":1,"character":4},"end":{"line":1,"character":8}},"newText":"name"}]}}`)
-	}
-	f := startFakeServerWithRequest(t, nil, onRequest)
-	m := pipeManager(f)
-	defer m.Close()
-	if err := m.SetWorkspace(dir); err != nil {
-		t.Fatal(err)
-	}
-
-	preview, err := m.PreviewRename(context.Background(), tools.RenameRequest{SessionID: "session-1", Path: path, Line: 2, Column: 5, NewName: "name"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.HasPrefix(preview.ID, "rn_") || len(preview.Files) != 1 {
-		t.Fatalf("preview = %+v", preview)
-	}
-	if _, err := m.LookupRename(context.Background(), "other-session", preview.ID); err == nil {
-		t.Fatal("foreign session inspected rename preview")
-	}
-
-	ctx := tools.WithSessionID(tools.WithRuntime(context.Background(), &tools.ToolRuntime{LanguageService: m}), "session-1")
-	result := tools.ExecuteResult(ctx, tools.All(), "lsp_rename", json.RawMessage(`{"operation":"apply","rename_id":"`+preview.ID+`"}`))
-	if result.ExitCode != 0 || strings.HasPrefix(result.Preview, "Error:") {
-		t.Fatalf("apply result = %+v", result)
-	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(data) != "package p\nvar name = 1\n" {
-		t.Fatalf("content after rename = %q", data)
-	}
-	if _, err := m.LookupRename(context.Background(), "session-1", preview.ID); err == nil {
-		t.Fatal("successful rename preview was not consumed")
 	}
 }
 

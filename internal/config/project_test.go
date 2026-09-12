@@ -29,7 +29,7 @@ func TestProjectInstructionsTrustAndBounds(t *testing.T) {
 		t.Fatalf("empty instructions should be absent: %q", got)
 	}
 
-	if err := os.WriteFile(path, []byte(strings.Repeat("x", maxProjectInstructions+1)), 0o644); err != nil {
+	if err := os.WriteFile(path, []byte(strings.Repeat("x", maxInstructions+1)), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if got := ProjectInstructions(root, true); got != "" {

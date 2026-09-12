@@ -20,7 +20,6 @@ flowchart TB
         GLOB["glob<br/>exact path search"]
         FIND["find_files<br/>fuzzy path search"]
         LSP["lsp<br/>definition, references, symbols, hover"]
-        LSPR["lsp_rename<br/>preview and atomic rename"]
         SUGGEST["suggest<br/>file completions"]
     end
 
@@ -173,7 +172,7 @@ Config styles and management: README §MCP,
 - `document_symbol` — retrieve a high-level symbol outline of large files without reading the full file.
 - `hover` — inspect types, signatures, and documentation comments.
 
-`lsp_rename` performs safe, cross-file symbol renames with a preview step and atomic locked multi-file publication. After any `edit` or `write`, gopls diagnostics for touched files are attached to the tool result.
+After any `edit` or `write`, gopls diagnostics for touched files are attached to the tool result.
 
 ## History recall (`history_search` and `history_read`)
 

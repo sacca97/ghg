@@ -34,18 +34,12 @@ type outputListArgs struct {
 }
 
 func outputListTool(cfg OutputToolConfig) Tool {
-	return Tool{
-		Def: models.NewTool("output_list",
-			"List retained tool output for the current session. Results are metadata only; use output_read with an id and byte range to rehydrate evidence. The list is bounded and never exposes filesystem paths.",
-			`{"type":"object","properties":{"tool":{"type":"string","description":"Exact originating tool name, such as bash or read"},"call_id":{"type":"string","description":"Exact originating tool-call id"},"query":{"type":"string","description":"Match an output id, tool name, call id, or media type"},"since":{"type":"string","description":"Only outputs created at or after this RFC3339 timestamp"},"until":{"type":"string","description":"Only outputs created at or before this RFC3339 timestamp"},"limit":{"type":"integer","description":"Maximum entries (default 100, maximum 1000)"}}}`),
-		Run: func(ctx context.Context, args json.RawMessage) (string, error) {
-			result, err := runOutputList(ctx, cfg, args)
-			return result.Preview, err
-		},
-		RunResult: func(ctx context.Context, args json.RawMessage) (ToolResult, error) {
+	return resultTool(models.NewTool("output_list",
+		"List retained tool output for the current session. Results are metadata only; use output_read with an id and byte range to rehydrate evidence. The list is bounded and never exposes filesystem paths.",
+		`{"type":"object","properties":{"tool":{"type":"string","description":"Exact originating tool name, such as bash or read"},"call_id":{"type":"string","description":"Exact originating tool-call id"},"query":{"type":"string","description":"Match an output id, tool name, call id, or media type"},"since":{"type":"string","description":"Only outputs created at or after this RFC3339 timestamp"},"until":{"type":"string","description":"Only outputs created at or before this RFC3339 timestamp"},"limit":{"type":"integer","description":"Maximum entries (default 100, maximum 1000)"}}}`),
+		func(ctx context.Context, args json.RawMessage) (ToolResult, error) {
 			return runOutputList(ctx, cfg, args)
-		},
-	}
+		})
 }
 
 func runOutputList(ctx context.Context, cfg OutputToolConfig, args json.RawMessage) (ToolResult, error) {
@@ -105,18 +99,12 @@ type outputReadArgs struct {
 }
 
 func outputReadTool(cfg OutputToolConfig) Tool {
-	return Tool{
-		Def: models.NewTool("output_read",
-			"Read a bounded byte range from retained tool output in the current session. Pass the output id returned by output_list or shown in a tool result; paths and cross-session access are not accepted.",
-			`{"type":"object","properties":{"id":{"type":"string","description":"Output id, for example sha256:<64 hex characters>"},"offset":{"type":"integer","description":"Zero-based byte offset (default 0)"},"limit":{"type":"integer","description":"Maximum bytes to return (default 65536, maximum 1048576)"}},"required":["id"]}`),
-		Run: func(ctx context.Context, args json.RawMessage) (string, error) {
-			result, err := runOutputRead(ctx, cfg, args)
-			return result.Preview, err
-		},
-		RunResult: func(ctx context.Context, args json.RawMessage) (ToolResult, error) {
+	return resultTool(models.NewTool("output_read",
+		"Read a bounded byte range from retained tool output in the current session. Pass the output id returned by output_list or shown in a tool result; paths and cross-session access are not accepted.",
+		`{"type":"object","properties":{"id":{"type":"string","description":"Output id, for example sha256:<64 hex characters>"},"offset":{"type":"integer","description":"Zero-based byte offset (default 0)"},"limit":{"type":"integer","description":"Maximum bytes to return (default 65536, maximum 1048576)"}},"required":["id"]}`),
+		func(ctx context.Context, args json.RawMessage) (ToolResult, error) {
 			return runOutputRead(ctx, cfg, args)
-		},
-	}
+		})
 }
 
 func runOutputRead(ctx context.Context, cfg OutputToolConfig, args json.RawMessage) (ToolResult, error) {

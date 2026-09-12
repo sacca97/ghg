@@ -21,44 +21,6 @@ import (
 	workerwire "github.com/sacca97/ghg/internal/worker"
 )
 
-const (
-	workerSessionEnv  = "GHG_WORKER_SESSION"
-	workerBaseEnv     = "GHG_WORKER_BASE"
-	workerCWDEnv      = "GHG_WORKER_CWD"
-	workerModelEnv    = "GHG_WORKER_MODEL"
-	workerProviderEnv = "GHG_WORKER_PROVIDER"
-	workerRoleEnv     = "GHG_WORKER_ROLE"
-	workerEffortEnv   = "GHG_WORKER_EFFORT"
-	workerModeEnv     = "GHG_WORKER_MODE"
-	workerCautiousEnv = "GHG_WORKER_CAUTIOUS"
-	workerSandboxEnv  = "GHG_WORKER_SANDBOX"
-	workerNetworkEnv  = "GHG_WORKER_NETWORK"
-	workerApprovalEnv = "GHG_WORKER_APPROVAL"
-)
-
-type workerEvent struct {
-	Kind string          `json:"kind"`
-	Data json.RawMessage `json:"data"`
-}
-
-type workerStateEvent struct {
-	State    workerwire.State `json:"state"`
-	Detached bool             `json:"detached"`
-	Mode     string           `json:"mode"`
-}
-
-type workerToolStartEvent struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
-	Args string `json:"args"`
-}
-
-type workerToolEndEvent struct {
-	ID     string `json:"id"`
-	Name   string `json:"name"`
-	Result string `json:"result"`
-}
-
 func decodeEvent[T any](data json.RawMessage) (T, bool) {
 	var value T
 	if err := json.Unmarshal(data, &value); err != nil {
@@ -178,25 +140,25 @@ func startWorkerProcess(spec workerStartSpec) workerStartedMsg {
 		return workerStartedMsg{err: err}
 	}
 	workerEnv := map[string]string{
-		"GHG_INTERNAL_WORKER": "1",
-		workerSessionEnv:      spec.sessionID,
-		workerBaseEnv:         dir,
-		workerCWDEnv:          spec.cwd,
-		workerModelEnv:        spec.modelName,
-		workerProviderEnv:     spec.provName,
-		workerRoleEnv:         spec.role,
-		workerEffortEnv:       spec.effort,
-		workerModeEnv:         spec.mode,
-		workerCautiousEnv:     strconv.FormatBool(spec.cautious),
+		"GHG_INTERNAL_WORKER":        "1",
+		workerwire.WorkerSessionEnv:  spec.sessionID,
+		workerwire.WorkerBaseEnv:     dir,
+		workerwire.WorkerCWDEnv:      spec.cwd,
+		workerwire.WorkerModelEnv:    spec.modelName,
+		workerwire.WorkerProviderEnv: spec.provName,
+		workerwire.WorkerRoleEnv:     spec.role,
+		workerwire.WorkerEffortEnv:   spec.effort,
+		workerwire.WorkerModeEnv:     spec.mode,
+		workerwire.WorkerCautiousEnv: strconv.FormatBool(spec.cautious),
 	}
 	if spec.sandbox != "" {
-		workerEnv[workerSandboxEnv] = spec.sandbox
+		workerEnv[workerwire.WorkerSandboxEnv] = spec.sandbox
 	}
 	if spec.network != "" {
-		workerEnv[workerNetworkEnv] = spec.network
+		workerEnv[workerwire.WorkerNetworkEnv] = spec.network
 	}
 	if spec.approval != "" {
-		workerEnv[workerApprovalEnv] = spec.approval
+		workerEnv[workerwire.WorkerApprovalEnv] = spec.approval
 	}
 	proc, err := workerwire.Launch(context.Background(), os.Args[0], workerEnv)
 	if err != nil {
@@ -413,6 +375,24 @@ func workerRequestID(prefix string) string {
 	return fmt.Sprintf("%s-%d", prefix, time.Now().UnixNano())
 }
 
+// sendWorkerCommand sends one canonical worker command: it starts the worker
+// when a client-backed command needs one, and reports a failure in the
+// transcript under label. requestPrefix selects the reply handler, because the
+// frame switch routes acknowledgements by request-id prefix. The returned
+// request id is empty when nothing was sent.
+func (m *model) sendWorkerCommand(label, requestPrefix, name string, payload any) string {
+	if m.workerClient == nil && !m.ensureWorker() {
+		m.append(errStyle.Render(label + ": worker unavailable: " + m.workerStartError))
+		return ""
+	}
+	requestID := workerRequestID(requestPrefix)
+	if err := m.workerClient.Send(name, requestID, payload); err != nil {
+		m.append(errStyle.Render(label + ": " + err.Error()))
+		return ""
+	}
+	return requestID
+}
+
 func (m *model) submitWorkerTurn(text string, authored bool, prepared string, parts []models.ContentPart, at int, snap string, goalCtx *agent.GoalRecord, ask, continuation bool) (tea.Model, tea.Cmd) {
 	if m.workerClient == nil {
 		return m, nil
@@ -456,12 +436,8 @@ func (m *model) submitWorkerTurn(text string, authored bool, prepared string, pa
 func (m *model) handleWorkerFrame(frame workerwire.Frame) (tea.Model, tea.Cmd) {
 	switch frame.Type {
 	case workerwire.TypeSnapshot:
-		var envelope workerwire.SnapshotEnvelope
-		if err := json.Unmarshal(frame.Payload, &envelope); err != nil {
-			return m, nil
-		}
 		var snapshot workerwire.Snapshot
-		if err := json.Unmarshal(envelope.State, &snapshot); err != nil {
+		if err := json.Unmarshal(frame.Payload, &snapshot); err != nil {
 			return m, nil
 		}
 		m.applyWorkerSnapshot(snapshot)
@@ -576,7 +552,7 @@ func (m *model) handleWorkerFrame(frame workerwire.Frame) (tea.Model, tea.Cmd) {
 			m.append(errStyle.Render(payload.Message))
 		}
 	case workerwire.TypeEvent:
-		var event workerEvent
+		var event workerwire.EventEnvelope
 		if err := json.Unmarshal(frame.Payload, &event); err != nil {
 			return m, nil
 		}
@@ -652,12 +628,12 @@ func (m *model) applyWorkerSnapshot(snapshot workerwire.Snapshot) {
 	}
 }
 
-func (m *model) workerEvent(event workerEvent) tea.Cmd {
+func (m *model) workerEvent(event workerwire.EventEnvelope) tea.Cmd {
 	// Ordered stream events must be applied before the next worker frame is
 	// handled. Returning one tea.Cmd per chunk lets Bubble Tea run those
 	// commands concurrently, which can reorder text and tool rows.
 	switch event.Kind {
-	case "route":
+	case workerwire.EventRoute:
 		if value, ok := decodeEvent[workerwire.ConfigureRequest](event.Data); ok {
 			if value.Model != "" {
 				m.modelID = value.Model
@@ -682,8 +658,8 @@ func (m *model) workerEvent(event workerEvent) tea.Cmd {
 			}
 		}
 		return nil
-	case "state":
-		if value, ok := decodeEvent[workerStateEvent](event.Data); ok {
+	case workerwire.EventState:
+		if value, ok := decodeEvent[workerwire.StateEvent](event.Data); ok {
 			m.workerState = value.State
 			m.workerDetached = value.Detached
 			if value.Mode != "" {
@@ -696,7 +672,7 @@ func (m *model) workerEvent(event workerEvent) tea.Cmd {
 			m.workerLiveWork = m.busy || m.workerHasLiveTask()
 		}
 		return nil
-	case "task":
+	case workerwire.EventTask:
 		search.InvalidateFileIndex(m.workingDirectory())
 		if value, ok := decodeEvent[workerwire.TaskState](event.Data); ok {
 			if m.workerTasks == nil {
@@ -707,15 +683,15 @@ func (m *model) workerEvent(event workerEvent) tea.Cmd {
 			return func() tea.Msg { return taskUpdateMsg{} }
 		}
 		return nil
-	case "mcp":
+	case workerwire.EventMCP:
 		if value, ok := decodeEvent[[]workerwire.MCPStatus](event.Data); ok {
 			return m.applyWorkerMsg(mcpStatusMsg{statuses: value})
 		}
-	case "text":
+	case workerwire.EventText:
 		if value, ok := decodeEvent[string](event.Data); ok {
 			return m.applyWorkerMsg(textMsg(value))
 		}
-	case "think":
+	case workerwire.EventThink:
 		if value, ok := decodeEvent[string](event.Data); ok {
 			return m.applyWorkerMsg(thinkMsg(value))
 		}
@@ -728,15 +704,15 @@ func (m *model) workerEvent(event workerEvent) tea.Cmd {
 		if value, ok := decodeEvent[workerwire.ShellResult](event.Data); ok {
 			return m.applyWorkerMsg(shellDoneMsg{cmd: value.Command, out: value.Output})
 		}
-	case "steer":
+	case workerwire.EventSteer:
 		if value, ok := decodeEvent[string](event.Data); ok {
 			return m.applyWorkerMsg(steeredMsg(value))
 		}
-	case "notice":
+	case workerwire.EventNotice:
 		if value, ok := decodeEvent[string](event.Data); ok {
 			return m.applyWorkerMsg(noticeMsg(value))
 		}
-	case "model_call_start":
+	case workerwire.EventModelCallStart:
 		if value, ok := decodeEvent[agent.ModelCallStart](event.Data); ok {
 			effort := strings.TrimSpace(value.ReasoningEffort)
 			if value.Purpose == "" && (value.ConfiguredEffort != "" || value.EffortApplied != "" || value.SelectionReason != "") {
@@ -762,40 +738,40 @@ func (m *model) workerEvent(event workerEvent) tea.Cmd {
 			}
 		}
 		return nil
-	case "review_progress":
+	case workerwire.EventReviewProgress:
 		var envelope struct {
 			Progress agent.ReviewProgress `json:"progress"`
 		}
 		if err := json.Unmarshal(event.Data, &envelope); err == nil {
 			return m.applyWorkerMsg(reviewProgressMsg{progress: envelope.Progress})
 		}
-	case "tool_start":
-		if value, ok := decodeEvent[workerToolStartEvent](event.Data); ok {
+	case workerwire.EventToolStart:
+		if value, ok := decodeEvent[workerwire.ToolStartEvent](event.Data); ok {
 			return m.applyWorkerMsg(toolStartMsg{value.ID, value.Name, value.Args})
 		}
-	case "tool_end":
-		if value, ok := decodeEvent[workerToolEndEvent](event.Data); ok {
+	case workerwire.EventToolEnd:
+		if value, ok := decodeEvent[workerwire.ToolEndEvent](event.Data); ok {
 			return m.applyWorkerMsg(toolEndMsg{value.ID, value.Name, value.Result})
 		}
-	case "goal_update":
+	case workerwire.EventGoalUpdate:
 		if value, ok := decodeEvent[agent.GoalUpdate](event.Data); ok {
 			return m.applyWorkerMsg(goalUpdateMsg{update: value})
 		}
-	case "retry":
+	case workerwire.EventRetry:
 		if value, ok := decodeEvent[models.RetryEvent](event.Data); ok {
 			return m.applyWorkerMsg(noticeMsg(fmt.Sprintf("⚠ request failed (%s) — retrying in %s (attempt %d/%d)", value.Err, value.Delay.Round(time.Millisecond), value.Attempt+1, value.Max)))
 		}
-	case "goal":
+	case workerwire.EventGoal:
 		if value, ok := decodeEvent[agent.GoalRecord](event.Data); ok {
 			return m.applyWorkerMsg(goalUpdateRecordMsg{record: value})
 		}
-	case "schedule":
+	case workerwire.EventSchedule:
 		if value, ok := decodeEvent[string](event.Data); ok {
 			return m.applyWorkerMsg(noticeMsg(value))
 		}
-	case "compact":
+	case workerwire.EventCompact:
 		return m.applyWorkerMsg(noticeMsg("◎ compacted — raw history preserved"))
-	case "permission_request":
+	case workerwire.EventPermissionRequest:
 		if value, ok := decodeEvent[workerwire.PermissionRequest](event.Data); ok {
 			return m.applyWorkerMsg(workerPermissionMsg{approval: value.Approval})
 		}
@@ -803,7 +779,7 @@ func (m *model) workerEvent(event workerEvent) tea.Cmd {
 		if value, ok := decodeEvent[workerwire.QuestionRequest](event.Data); ok {
 			return m.applyWorkerMsg(workerQuestionMsg{request: value})
 		}
-	case "usage":
+	case workerwire.EventUsage:
 		if value, ok := decodeEvent[models.Usage](event.Data); ok {
 			m.usage.Add(value)
 			if total := value.PromptTokens + value.CompletionTokens; total > 0 {
@@ -811,10 +787,10 @@ func (m *model) workerEvent(event workerEvent) tea.Cmd {
 			}
 			return nil
 		}
-	case "goal_from_context":
+	case workerwire.EventGoalFromContext:
 		if value, ok := decodeEvent[workerwire.GoalFromContextResult](event.Data); ok {
 			var err error
-			if value.Error != "" {
+			if value.Error != "" && !value.Interrupted {
 				err = errors.New(value.Error)
 			}
 			var record *agent.GoalRecord
@@ -827,12 +803,15 @@ func (m *model) workerEvent(event workerEvent) tea.Cmd {
 				goalText = record.Objective
 			}
 			return func() tea.Msg {
-				return goalFromContextMsg{goal: goalText, record: record, usage: value.Usage, err: err}
+				return goalFromContextMsg{goal: goalText, record: record, usage: value.Usage, err: err, interrupted: value.Interrupted}
 			}
 		}
-	case "compact_done":
+	case workerwire.EventCompactDone:
 		if value, ok := decodeEvent[workerwire.CompactResult](event.Data); ok {
-			err := workerError(value.Error)
+			var err error
+			if !value.Interrupted {
+				err = workerError(value.Error)
+			}
 			if len(value.Messages) > 0 {
 				m.setMessages(value.Messages)
 				m.workerContextTokens = agent.EstimateTokens(value.Messages)
@@ -842,10 +821,13 @@ func (m *model) workerEvent(event workerEvent) tea.Cmd {
 				return workerCompactDoneMsg{err: err, usage: value.Usage, contextTokens: contextTokens}
 			}
 		}
-	case "turn_done":
+	case workerwire.EventTurnDone:
 		search.InvalidateFileIndex(m.workingDirectory())
 		if value, ok := decodeEvent[workerwire.TurnResult](event.Data); ok {
-			err := workerError(value.Error)
+			var err error
+			if !value.Interrupted {
+				err = workerError(value.Error)
+			}
 			if len(value.Messages) > 0 {
 				m.setMessages(value.Messages)
 			}
@@ -877,7 +859,7 @@ func (m *model) workerEvent(event workerEvent) tea.Cmd {
 			return func() tea.Msg {
 				return turnDoneMsg{
 					final: value.Final, err: err, plan: value.Plan, reviewMarkdown: value.ReviewMarkdown,
-					goal: goal, goalContinue: value.GoalContinue,
+					interrupted: value.Interrupted, goal: goal, goalContinue: value.GoalContinue,
 				}
 			}
 		}

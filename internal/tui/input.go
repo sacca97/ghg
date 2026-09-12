@@ -5,119 +5,12 @@ import (
 	"regexp"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/textarea"
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
-	"github.com/sacca97/ghg/internal/tools/bashrun"
 )
-
-type interactive struct {
-	keys    chan []byte
-	output  string
-	await   bool
-	awaitcd int
-}
-
-type interactiveStartMsg struct{ keys chan []byte }
-type interactiveOutMsg struct{ chunk string }
-type interactiveAwaitMsg struct{ secsLeft int }
-type interactiveDoneMsg struct {
-	output string
-	exit   string
-}
-
-func (m *model) iactiveKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.Type {
-	case tea.KeyCtrlC:
-		if !m.interrupt1 {
-			m.interrupt1 = true
-			return m, nil
-		}
-		if m.cancel != nil {
-			m.cancel()
-		}
-		return m, nil
-	case tea.KeyEsc:
-		m.sendKeys([]byte{0x1b})
-		return m, nil
-	case tea.KeyEnter:
-		m.sendKeys([]byte("\r"))
-		return m, nil
-	case tea.KeyTab:
-		m.sendKeys([]byte("\t"))
-		return m, nil
-	case tea.KeyBackspace, tea.KeyDelete:
-		m.sendKeys([]byte{0x7f})
-		return m, nil
-	case tea.KeyUp, tea.KeyDown, tea.KeyLeft, tea.KeyRight:
-		m.sendKeys([]byte(arrowBytes(msg.Type)))
-		return m, nil
-	case tea.KeyCtrlJ:
-		m.sendKeys([]byte("\r"))
-		return m, nil
-	}
-	if msg.Type == tea.KeyRunes || msg.Type == tea.KeySpace {
-		var buf []byte
-		if msg.Alt {
-			buf = append(buf, 0x1b)
-		}
-		for _, r := range msg.Runes {
-			var rb [4]byte
-			n := utf8.EncodeRune(rb[:], r)
-			buf = append(buf, rb[:n]...)
-		}
-		if len(buf) > 0 {
-			m.sendKeys(buf)
-		}
-	}
-	return m, nil
-}
-
-func (m *model) sendKeys(b []byte) {
-	if m.iactive == nil {
-		return
-	}
-	select {
-	case m.iactive.keys <- b:
-	default:
-	}
-}
-
-func arrowBytes(t tea.KeyType) string {
-	switch t {
-	case tea.KeyUp:
-		return bashrun.KeyUp
-	case tea.KeyDown:
-		return bashrun.KeyDown
-	case tea.KeyLeft:
-		return bashrun.KeyLeft
-	case tea.KeyRight:
-		return bashrun.KeyRight
-	}
-	return ""
-}
-
-func (m *model) interactiveView() string {
-	if m.iactive == nil {
-		return ""
-	}
-	const maxLines = 12
-	lines := strings.Split(strings.TrimRight(m.iactive.output, "\n"), "\n")
-	if len(lines) > maxLines {
-		lines = lines[len(lines)-maxLines:]
-	}
-	rendered := dimStyle.Render("  " + strings.Join(lines, "\n  "))
-	header := toolStyle.Render("⚒ bash (interactive)")
-	if m.iactive.await {
-		header += errStyle.Render(fmt.Sprintf("  ⏳ waiting for input — cancels in %ds", m.iactive.awaitcd))
-	} else {
-		header += dimStyle.Render("  (type to respond; ctrl+c ctrl+c to cancel)")
-	}
-	return header + "\n" + rendered
-}
 
 type namePrompt struct {
 	label    string
@@ -244,12 +137,6 @@ func (m *model) growInput() {
 }
 
 func (m *model) key(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	// interactive passthrough: forward keystrokes to the child's PTY instead
-	// of editing the input box. ctrl+c ctrl+c breaks out (cancel), esc forwards
-	// a single esc to the child (many prompts use esc to cancel).
-	if m.iactive != nil {
-		return m.iactiveKey(msg)
-	}
 	if m.questionDialog != nil {
 		m.questionKey(msg)
 		return m, nil
@@ -571,7 +458,7 @@ func (m *model) key(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			c := m.menu.cands[m.menu.idx]
 			// A bare command previewed by tab cycling runs immediately, same
 			// as picking it with arrows + enter (one-keystroke settings)
-			if m.menu.cyc && m.menu.head == "" && registryImmediate(c.Text) {
+			if m.menu.cyc && m.menu.head == "" && registryFind(c.Text) != nil {
 				m.menu = nil
 				m.input.Reset()
 				return m.command(c.Text)
@@ -583,7 +470,7 @@ func (m *model) key(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m, nil
 			}
 			// Bare commands that act without further args run immediately.
-			if m.menu.head == "" && registryImmediate(c.Text) {
+			if m.menu.head == "" && registryFind(c.Text) != nil {
 				m.menu = nil
 				m.input.Reset()
 				return m.command(c.Text)

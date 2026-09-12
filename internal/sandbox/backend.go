@@ -9,6 +9,8 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/sacca97/ghg/internal/sys"
 )
 
 func compilePolicy(p *Policy) *compiledPolicy {
@@ -103,10 +105,8 @@ func buildSeatbeltProfile(p *Policy) string {
 	for _, root := range readRoots {
 		seatbeltRule(&b, "allow", "file-read*", root)
 	}
-	// Seatbelt needs access to the root inode and metadata access to every other
-	// directory on the way to an explicitly allowed root. Literal rules keep
-	// traversal possible without turning an ancestor such as /Users or /private
-	// into a readable subtree.
+	// Permit metadata read access to ancestor paths for Seatbelt traversal.
+	// Does not permit recursive read access to parent directory contents.
 	for _, root := range seatbeltAncestorRoots(readRoots) {
 		if root == string(filepath.Separator) {
 			seatbeltLiteralRule(&b, "allow", "file-read*", root)
@@ -363,7 +363,7 @@ func trustedExecutable(path string) (string, error) {
 	if info.Mode().Perm()&0o111 == 0 {
 		return "", fmt.Errorf("%s is not executable", resolved)
 	}
-	if !rootOwned(info) || info.Mode().Perm()&0o022 != 0 {
+	if !sys.RootOwned(info) || info.Mode().Perm()&0o022 != 0 {
 		return "", fmt.Errorf("%s is not root-owned and non-writable", resolved)
 	}
 	for current := filepath.Dir(resolved); ; current = filepath.Dir(current) {
@@ -371,7 +371,7 @@ func trustedExecutable(path string) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		if !parentInfo.IsDir() || !rootOwned(parentInfo) || parentInfo.Mode().Perm()&0o022 != 0 {
+		if !parentInfo.IsDir() || !sys.RootOwned(parentInfo) || parentInfo.Mode().Perm()&0o022 != 0 {
 			return "", fmt.Errorf("backend parent %s is not root-owned and non-writable", current)
 		}
 		parent := filepath.Dir(current)

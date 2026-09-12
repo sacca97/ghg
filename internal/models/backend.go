@@ -87,37 +87,17 @@ func NewBackend(resolved Resolved, opts BackendOptions) (Backend, error) {
 	switch protocol {
 	case "", ProtocolOpenAIChatCompletions:
 		client := newClient(resolved.BaseURL, opts.APIKey)
-		if opts.HTTP != nil {
-			client.HTTP = opts.HTTP
-		}
-		client.MaxRetries = opts.MaxRetries
-		client.Headers = maps.Clone(resolved.DefaultHeaders)
-		client.AuthKind = resolved.Auth.Kind
-		client.AuthHeader = resolved.Auth.Header
+		configureTransport(&client.transport, resolved, opts)
 		client.Authorizer = opts.Authorizer
 		return client, nil
 	case ProtocolAnthropicMessages:
 		client := newAnthropicClient(resolved.BaseURL, opts.APIKey)
-		if opts.HTTP != nil {
-			client.HTTP = opts.HTTP
-		}
-		client.MaxRetries = opts.MaxRetries
-		if resolved.DefaultHeaders != nil {
-			client.Headers = maps.Clone(resolved.DefaultHeaders)
-		}
-		client.AuthKind = resolved.Auth.Kind
-		client.AuthHeader = resolved.Auth.Header
+		configureTransport(&client.transport, resolved, opts)
 		client.Authorizer = opts.Authorizer
 		return client, nil
 	case ProtocolOpenAIResponses:
 		client := newOpenAIResponses(resolved.BaseURL, opts.APIKey)
-		if opts.HTTP != nil {
-			client.HTTP = opts.HTTP
-		}
-		client.MaxRetries = opts.MaxRetries
-		client.Headers = maps.Clone(resolved.DefaultHeaders)
-		client.AuthKind = resolved.Auth.Kind
-		client.AuthHeader = resolved.Auth.Header
+		configureTransport(&client.transport, resolved, opts)
 		client.Authorizer = opts.Authorizer
 		if resolved.Auth.Kind == AuthCodexSubscription {
 			client.flavor = responsesCodexSubscription
@@ -126,4 +106,16 @@ func NewBackend(resolved Resolved, opts BackendOptions) (Backend, error) {
 	default:
 		return nil, fmt.Errorf("models: protocol %q has no adapter", protocol)
 	}
+}
+
+func configureTransport(transport *transport, resolved Resolved, opts BackendOptions) {
+	if opts.HTTP != nil {
+		transport.HTTP = opts.HTTP
+	}
+	transport.MaxRetries = opts.MaxRetries
+	if resolved.DefaultHeaders != nil {
+		transport.Headers = maps.Clone(resolved.DefaultHeaders)
+	}
+	transport.AuthKind = resolved.Auth.Kind
+	transport.AuthHeader = resolved.Auth.Header
 }

@@ -7,7 +7,7 @@ Go GHG Go
 </pre>
 </div>
 
-An LLM tool-use loop (bash / read / write / edit / grep / structural_search / glob / find_files / lsp / task), an interactive
+An LLM tool-use loop (bash / read / write / edit / grep / glob / find_files / lsp / task), an interactive
 bubbletea session, and provider-routable models. One binary, no runtime,
 config you can read.
 
@@ -53,8 +53,6 @@ config):
 ghg auth openrouter   # masked key prompt — or /auth openrouter in-session
 ```
 
-To update to the latest release later, run `ghg update` — it re-runs the
-install script above.
 
 ## First things to try
 

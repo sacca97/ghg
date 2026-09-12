@@ -6,8 +6,6 @@ import (
 	"strings"
 
 	"github.com/sacca97/ghg/internal/agent"
-	"github.com/sacca97/ghg/internal/memory"
-	"github.com/sacca97/ghg/internal/skills"
 	workerwire "github.com/sacca97/ghg/internal/worker"
 )
 
@@ -46,6 +44,6 @@ func (w *workerProcessState) contextDoctorReport() workerwire.ContextDoctorResul
 }
 
 func (w *workerProcessState) currentSkillsBlock() string {
-	return skills.PromptBlock(skills.Scan(skills.DefaultDirs()...)) +
-		memory.PromptBlock(memory.Installation(), memory.Session(w.sessionID))
+	additions := systemPromptAdditions(w.sessionID, "")
+	return additions[0] + additions[1]
 }

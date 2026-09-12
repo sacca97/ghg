@@ -53,7 +53,7 @@ ghg -m example-model -p example     # pick model AND provider
 
 `task --list` shows the rest (build, test, fmt, vet, tidy).
 
-In-session: `/model <name> [provider]`, `/tasks` (background subagents), `/clear`, `/help`, `/quit`. ctrl+c once interrupts; ctrl+c twice quits (and kills any agent-spawned child processes).
+In-session: `/model <name> [provider]`, `/tasks` (background subagents), `/clear`, `/help`, `/quit`. ctrl+c once interrupts; ctrl+c twice quits (and kills any agent-spawned child processes). `/help` in the TUI and the VS Code extension renders the same command catalogue (`internal/worker/commands.go`) — one canonical name, usage hint, and owner per command.
 
 The `task` tool runs tool calls in **parallel** (per-path file-mutation locks keep edits to the same file serial) and supports `background: true` to launch a subagent that works concurrently and reports back when done.
 

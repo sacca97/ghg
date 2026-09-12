@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -24,7 +25,6 @@ type Meta struct {
 	Model       string
 	Provider    string
 	CWD         string
-	Goal        string
 	Notify      bool     // completion notifications enabled for this session
 	ForkedFrom  string   // source session id when created by /fork ("" = root)
 	ForkSeq     int      // conversation index the fork branched at
@@ -37,7 +37,13 @@ type Meta struct {
 	UpdatedAt   time.Time
 }
 
-const sessionMetaColumns = `id, title, model, provider, cwd, goal, notify, forked_from, fork_seq, tags, pinned, effort, usage_in, usage_cached, usage_out, updated_at`
+const sessionMetaColumns = `id, title, model, provider, cwd, notify, forked_from, fork_seq, tags, pinned, effort, usage_in, usage_cached, usage_out, updated_at`
+
+var sessionChildTables = [...]string{
+	"artifacts", "messages", "history_fts", "tasks", "snapshots",
+	"schedules", "compactions", "goal_checkpoints", "goals",
+	"observations", "search_snapshots", "workflow_results", "telemetry_events",
+}
 
 type Store struct {
 	db      *sql.DB
@@ -67,6 +73,22 @@ func Open(path string) (*Store, error) {
 		return nil, err
 	}
 	return &Store{db: db}, nil
+}
+
+func (s *Store) Exists(id string) (bool, error) {
+	var found int
+	err := s.db.QueryRow(`SELECT 1 FROM sessions WHERE id=?`, id).Scan(&found)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	return err == nil, err
+}
+
+// Title returns only a session's title without loading its message history.
+func (s *Store) Title(id string) (string, error) {
+	var title string
+	err := s.db.QueryRow(`SELECT title FROM sessions WHERE id=?`, id).Scan(&title)
+	return title, err
 }
 
 // SetGoal stores the session's active goal ("" clears it).
@@ -188,11 +210,8 @@ func (s *Store) Save(id string, from int, msgs []models.Message, model, provider
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	// Once a compaction event exists, Agent.Messages is a derived prompt view:
-	// its indexes no longer match the raw message sequence in SQLite. New
-	// messages must append after the raw tail instead of replacing an older
-	// row at the same derived index. The placeholder convention below keeps
-	// this compatible with callers that pass the old view as padding.
+	// For compacted sessions, append new messages after the raw SQLite log tail.
+	// Prevents overwriting older messages mapped to identical prompt-view indexes.
 	var compacted int
 	if err := tx.QueryRow(`SELECT EXISTS(SELECT 1 FROM compactions WHERE session_id=?)`, id).Scan(&compacted); err != nil {
 		return err
@@ -329,7 +348,7 @@ func (s *Store) DeleteSession(id string) error {
 	if err := rows.Err(); err != nil {
 		return err
 	}
-	for _, table := range []string{"artifacts", "messages", "history_fts", "tasks", "snapshots", "schedules", "compactions", "goal_checkpoints", "goals", "observations", "search_snapshots", "workflow_results", "telemetry_events"} {
+	for _, table := range sessionChildTables {
 		if _, err := tx.Exec(`DELETE FROM `+table+` WHERE session_id=?`, id); err != nil {
 			return err
 		}
@@ -413,6 +432,41 @@ func (s *Store) Load(idOrPrefix string) (Meta, []models.Message, error) {
 	return meta, answerDanglingToolCalls(applyCompactionRows(s.db, meta.ID, stored)), mrows.Err()
 }
 
+// answerDanglingToolCalls repairs a history interrupted after tool calls.
+func answerDanglingToolCalls(msgs []models.Message) []models.Message {
+	index := models.IndexToolHistory(msgs)
+	dangling := false
+	for _, m := range msgs {
+		if m.Role == "assistant" {
+			for _, tc := range m.ToolCalls {
+				dangling = dangling || !index.HasResult(tc.ID)
+			}
+		}
+	}
+	if !dangling {
+		return msgs
+	}
+	out := make([]models.Message, 0, len(msgs)+4)
+	for _, m := range msgs {
+		out = append(out, m)
+		if m.Role != "assistant" {
+			continue
+		}
+		for _, tc := range m.ToolCalls {
+			if !index.HasResult(tc.ID) {
+				out = append(out, models.Message{
+					Role:       "tool",
+					Content:    "Error: tool call interrupted — the session ended before a result was recorded",
+					ToolCallID: tc.ID,
+					Name:       tc.Function.Name,
+					Source:     interruptedToolResultSource,
+				})
+			}
+		}
+	}
+	return out
+}
+
 func nextPrefix(prefix string) (string, bool) {
 	bytes := []byte(prefix)
 	for i := len(bytes) - 1; i >= 0; i-- {
@@ -456,14 +510,8 @@ func (s *Store) MostRecentForCWD(cwd string) (Meta, error) {
 	return metas[0], nil
 }
 
-// UserHistory returns user-message contents across ALL sessions (every folder),
-// newest first and de-duplicated, for up-arrow input recall. Order is by the
-// session's last activity then the message's position within it, so the most
-// recently typed input comes first. Only messages the human actually typed are
-// recalled: steered background-task
-// results and goal-continuation prompts are stored as role "user" too, but
-// they're injected by ghg, not written by the user. Those carry Authored=false
-// and are skipped; only Authored=true messages come back.
+// UserHistory returns deduplicated user messages across all sessions, newest first.
+// Ignores synthetic injected messages with Authored=false.
 func (s *Store) UserHistory(limit int) ([]string, error) {
 	query := `SELECT m.content FROM messages m
 		JOIN sessions s ON s.id = m.session_id
@@ -634,7 +682,7 @@ func scanMetas(rows *sql.Rows) ([]Meta, error) {
 		var m Meta
 		var updated, tags string
 		var notify, pinned int
-		if err := rows.Scan(&m.ID, &m.Title, &m.Model, &m.Provider, &m.CWD, &m.Goal, &notify,
+		if err := rows.Scan(&m.ID, &m.Title, &m.Model, &m.Provider, &m.CWD, &notify,
 			&m.ForkedFrom, &m.ForkSeq, &tags, &pinned, &m.Effort,
 			&m.UsageIn, &m.UsageCached, &m.UsageOut, &updated); err != nil {
 			return nil, err

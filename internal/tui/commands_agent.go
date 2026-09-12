@@ -525,12 +525,12 @@ func (m *model) askCommand(text string) (tea.Model, tea.Cmd) {
 	return m.submitAsk(question)
 }
 
-// /me — open ~/.ghg/me.md in $EDITOR. The file is appended to every
+// /me — open ~/.ghg/AGENTS.md in $EDITOR. The file is appended to every
 // session's system prompt (the built-in operating rules stay — they carry
 // the safety rails), so this is the user's standing-instructions surface.
 // tea.ExecProcess suspends the renderer for the edit, then resumes.
 func (m *model) openMe() tea.Cmd {
-	path := config.MePath()
+	path := config.UserInstructionsPath()
 	if path == "" {
 		m.append(errStyle.Render("/me: cannot locate ~/.ghg"))
 		return nil
@@ -589,12 +589,7 @@ func (m *model) setGoal(objective string) {
 }
 
 func (m *model) sendWorkerGoal(record agent.GoalRecord, action string) {
-	if m.workerClient == nil {
-		return
-	}
-	if err := m.workerClient.Send(workerwire.CommandGoal, workerRequestID("goal"), workerwire.GoalRequest{Action: action, Record: &record}); err != nil {
-		m.append(errStyle.Render("goal: worker: " + err.Error()))
-	}
+	m.sendWorkerCommand("goal", "goal", workerwire.CommandGoal, workerwire.GoalRequest{Action: action, Record: &record})
 }
 
 // resumeGoal is the only path that turns a persisted non-active goal back into

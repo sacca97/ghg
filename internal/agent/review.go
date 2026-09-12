@@ -815,14 +815,31 @@ func (r *Review) UnmarshalJSON(data []byte) error {
 	type reviewWire struct {
 		Summary         string          `json:"summary"`
 		Verdict         string          `json:"verdict"`
-		Findings        []ReviewFinding `json:"findings"`
+		Findings        json.RawMessage `json:"findings"`
 		ChecksPerformed json.RawMessage `json:"checks_performed"`
 	}
 	var wire reviewWire
 	if err := json.Unmarshal(data, &wire); err != nil {
 		return err
 	}
-	*r = Review{Summary: wire.Summary, Verdict: wire.Verdict, Findings: wire.Findings}
+	var findings []ReviewFinding
+	rawFindings := bytes.TrimSpace(wire.Findings)
+	if len(rawFindings) > 0 && !bytes.Equal(rawFindings, []byte("null")) {
+		if rawFindings[0] == '"' {
+			var encoded string
+			if err := json.Unmarshal(rawFindings, &encoded); err != nil {
+				return fmt.Errorf("findings must be an array or JSON-encoded array: %w", err)
+			}
+			rawFindings = bytes.TrimSpace([]byte(encoded))
+			if len(rawFindings) == 0 || rawFindings[0] != '[' {
+				return errors.New("findings string is not a JSON array")
+			}
+		}
+		if err := json.Unmarshal(rawFindings, &findings); err != nil {
+			return fmt.Errorf("findings must contain review objects: %w", err)
+		}
+	}
+	*r = Review{Summary: wire.Summary, Verdict: wire.Verdict, Findings: findings}
 	raw := bytes.TrimSpace(wire.ChecksPerformed)
 	if len(raw) == 0 || bytes.Equal(raw, []byte("null")) {
 		return nil
@@ -938,7 +955,7 @@ func submitReviewTool() tools.Tool {
 	return tools.Tool{
 		Def: models.NewTool("submit_review",
 			"Submit the validated code review. This is the reviewer's terminal tool; call it once when inspection is complete.",
-			`{"type":"object","properties":{"summary":{"type":"string","description":"Executive summary of the review"},"verdict":{"type":"string","enum":["approve","request_changes","comment"],"description":"Review verdict"},"findings":{"type":"array","description":"Structured findings","items":{"type":"object","properties":{"title":{"type":"string"},"severity":{"type":"string","enum":["critical","high","medium","low","info"]},"file":{"type":"string"},"line":{"type":"integer"},"evidence":{"type":"string"},"recommendation":{"type":"string"}},"required":["title","severity"]}},"checks_performed":{"oneOf":[{"type":"array","items":{"type":"string"}},{"type":"string","description":"JSON-encoded array of check strings"}]}},"required":["summary","verdict","findings"]}`),
+			`{"type":"object","properties":{"summary":{"type":"string","description":"Executive summary of the review"},"verdict":{"type":"string","enum":["approve","request_changes","comment"],"description":"Review verdict"},"findings":{"oneOf":[{"type":"array","description":"Structured findings","items":{"type":"object","properties":{"title":{"type":"string"},"severity":{"type":"string","enum":["critical","high","medium","low","info"]},"file":{"type":"string"},"line":{"type":"integer"},"evidence":{"type":"string"},"recommendation":{"type":"string"}},"required":["title","severity"]}},{"type":"string","description":"JSON-encoded array of structured findings"}]},"checks_performed":{"oneOf":[{"type":"array","items":{"type":"string"}},{"type":"string","description":"JSON-encoded array of check strings"}]}},"required":["summary","verdict","findings"]}`),
 		Run: func(_ context.Context, args json.RawMessage) (string, error) {
 			if _, err := ParseReview(string(args)); err != nil {
 				return "", err

@@ -7,6 +7,8 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+
+	"github.com/sacca97/ghg/internal/sys"
 )
 
 type Process struct {
@@ -24,7 +26,7 @@ func Launch(ctx context.Context, executable string, env map[string]string) (*Pro
 		return nil, fmt.Errorf("worker executable is empty")
 	}
 	cmd := exec.CommandContext(ctx, executable)
-	isolateProcess(cmd)
+	sys.IsolateProcess(cmd)
 	values := make(map[string]string)
 	for _, pair := range os.Environ() {
 		key, value, ok := strings.Cut(pair, "=")

@@ -1034,7 +1034,7 @@ func TestWorkerTurnSubmissionAndDoneVerticalSlice(t *testing.T) {
 		At:            input.At,
 		Clean:         true,
 	})
-	cmd := m.workerEvent(workerEvent{Kind: "turn_done", Data: turnResultData})
+	cmd := m.workerEvent(workerwire.EventEnvelope{Kind: workerwire.EventTurnDone, Data: turnResultData})
 	if cmd == nil {
 		t.Fatal("expected command from turn_done")
 	}
@@ -1056,7 +1056,7 @@ func TestWorkerTurnSubmissionAndDoneVerticalSlice(t *testing.T) {
 		Final: "Here is the plan.",
 		Plan:  "# Step 1\n\nRun the test",
 	})
-	cmdPlan := m.workerEvent(workerEvent{Kind: "turn_done", Data: turnWithPlan})
+	cmdPlan := m.workerEvent(workerwire.EventEnvelope{Kind: workerwire.EventTurnDone, Data: turnWithPlan})
 	donePlanMsg := cmdPlan()
 	m.mode = uiModePlan
 	m.handleTurnDone(donePlanMsg.(turnDoneMsg))

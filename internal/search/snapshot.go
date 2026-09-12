@@ -1,6 +1,6 @@
-// Package search owns stable snapshots, the fuzzy file index, and the bounded,
-// filesystem-free structural query seam. Filesystem traversal, ranking,
-// pagination rendering, and observation issuance remain in internal/tools.
+// Package search owns stable snapshots and the fuzzy file index. Filesystem
+// traversal, ranking, pagination rendering, and observation issuance remain in
+// internal/tools.
 package search
 
 import (
@@ -18,16 +18,10 @@ import (
 // Item is one stable search result. Line is zero for path-only results such as
 // glob and find_files.
 type Item struct {
-	Path          string `json:"path"`
-	Line          int    `json:"line,omitempty"`
-	Text          string `json:"text,omitempty"`
-	StartColumn   int    `json:"start_column,omitempty"`
-	EndLine       int    `json:"end_line,omitempty"`
-	EndColumn     int    `json:"end_column,omitempty"`
-	StartByte     int    `json:"start_byte,omitempty"`
-	EndByte       int    `json:"end_byte,omitempty"`
-	Pattern       int    `json:"pattern,omitempty"`
-	ObservationID string `json:"-"`
+	Path    string `json:"path"`
+	Line    int    `json:"line,omitempty"`
+	Text    string `json:"text,omitempty"`
+	Pattern int    `json:"pattern,omitempty"`
 }
 
 // Snapshot is the bounded result set behind a pagination cursor. It is

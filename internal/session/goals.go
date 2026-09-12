@@ -103,9 +103,8 @@ type GoalCheckpoint struct {
 	CreatedAt        time.Time
 }
 
-// migrateLegacyGoals gives pre-Phase-2.5 sessions a stable goal identity. The
-// old sessions.goal column remains a compatibility mirror; new code reads the
-// structured ledger first.
+// migrateLegacyGoals gives pre-Phase-2.5 sessions a stable goal identity from
+// the legacy sessions.goal column retained for database migration.
 func migrateLegacyGoals(db *sql.DB) error {
 	stamp := formatGoalTime(time.Now())
 	_, err := db.Exec(`INSERT OR IGNORE INTO goals
@@ -182,8 +181,7 @@ func (s *Store) SaveGoal(sessionID string, record GoalRecord) error {
 }
 
 // CheckpointGoal atomically updates the current state and appends a durable
-// progress/blocker checkpoint. The session's legacy goal column is updated as
-// a compatibility mirror for old pickers and databases.
+// progress/blocker checkpoint.
 func (s *Store) CheckpointGoal(sessionID string, record GoalRecord) error {
 	return s.writeGoal(sessionID, record, true)
 }
@@ -222,13 +220,6 @@ func (s *Store) writeGoal(sessionID string, record GoalRecord, checkpoint bool) 
 		formatGoalTime(record.UpdatedAt)); err != nil {
 		return fmt.Errorf("save goal: %w", err)
 	}
-	legacyObjective := record.Objective
-	if record.Status != GoalStatusActive {
-		legacyObjective = ""
-	}
-	if _, err := tx.Exec(`UPDATE sessions SET goal=? WHERE id=?`, legacyObjective, sessionID); err != nil {
-		return fmt.Errorf("mirror goal: %w", err)
-	}
 	if checkpoint {
 		if _, err := tx.Exec(`INSERT INTO goal_checkpoints
 			(session_id, goal_id, seq, status, rounds, usage_in, usage_cached,
@@ -245,17 +236,16 @@ func (s *Store) writeGoal(sessionID string, record GoalRecord, checkpoint bool) 
 	return tx.Commit()
 }
 
-// ClearGoal records an explicit user drop as paused, then clears the legacy
-// active-goal mirror. Keeping the paused record preserves an auditable state
-// and lets an explicit future resume restore the same goal identity.
+// ClearGoal records an explicit user drop as paused. Keeping the paused record
+// preserves an auditable state and lets an explicit future resume restore the
+// same goal identity.
 func (s *Store) ClearGoal(sessionID string) error {
 	record, ok, err := s.LoadGoal(sessionID)
 	if err != nil {
 		return err
 	}
 	if !ok {
-		_, err := s.db.Exec(`UPDATE sessions SET goal='' WHERE id=?`, sessionID)
-		return err
+		return nil
 	}
 	record.Status = GoalStatusPaused
 	record.Blocker = "cleared by user"

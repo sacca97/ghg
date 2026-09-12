@@ -33,9 +33,9 @@ func (s *Store) Fork(srcID string, uptoSeq int, title string, before []models.Me
 	}
 	defer func() { _ = tx.Rollback() }()
 	result, err := tx.Exec(`INSERT INTO sessions
-		(id, created_at, updated_at, cwd, model, provider, title, goal, forked_from,
+		(id, created_at, updated_at, cwd, model, provider, title, forked_from,
 		 fork_seq, tags, pinned, effort, usage_in, usage_cached, usage_out, todos)
-		SELECT ?, ?, ?, cwd, model, provider, ?, goal, ?, ?, tags, pinned, effort,
+		SELECT ?, ?, ?, cwd, model, provider, ?, ?, ?, tags, pinned, effort,
 		 usage_in, usage_cached, usage_out, todos FROM sessions WHERE id=?`,
 		newID, now(), now(), title, srcID, viewCutoff, srcID)
 	if err != nil {

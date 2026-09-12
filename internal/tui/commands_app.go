@@ -11,17 +11,8 @@ import (
 	workerwire "github.com/sacca97/ghg/internal/worker"
 )
 
-// /report — a bug-report bundle: one transcript block with a clickable OSC 8
-// link to a prefilled GitHub issue and a copy-pastable environment snippet.
-// The audience is someone (often not the ghg developer) hitting a terminal
-// rendering problem — wrong colors, mangled glyphs, tmux weirdness — so the
-// bundle leads with terminal identity. Strict
-// whitelist: only the env vars named below are read, never API keys/secrets,
-// never conversation content. Live-only: nothing is persisted or submitted;
-// the user clicks the link or pastes the snippet themselves.
-//
-// Version is the ghg build version, set by cmd/ghg (ldflags -X main.version)
-// before tui.Run.
+// /report creates a diagnostics block with terminal environment details and an issue link.
+// Reads only permitted non-secret environment variables and excludes conversation text.
 var Version = "dev"
 
 const issueBase = "https://github.com/sacca97/ghg/issues/new"
@@ -172,13 +163,7 @@ func (m *model) startShell(text string, echo bool) {
 		m.flushCurrent() // don't split the in-flight assistant line with the echo
 		m.append(youStyle.Render("❯ ") + text)
 	}
-	if m.workerClient == nil && !m.ensureWorker() {
-		m.append(errStyle.Render("shell unavailable: worker unavailable: " + m.workerStartError))
-		return
-	}
-	if err := m.workerClient.Send(workerwire.CommandShell, workerRequestID("shell"), workerwire.ShellRequest{Command: cmdLine}); err != nil {
-		m.append(errStyle.Render("shell failed: " + err.Error()))
-	}
+	m.sendWorkerCommand("shell", "shell", workerwire.CommandShell, workerwire.ShellRequest{Command: cmdLine})
 }
 
 // applyShellDone lands a finished command in the transcript and sends its
@@ -187,13 +172,7 @@ func (m *model) applyShellDone(msg shellDoneMsg) {
 	// transcript: a tool-style block (collapsed preview, ctrl+e/click expand)
 	m.appendRaw(blockTool, msg.out)
 	content := "$ " + msg.cmd + "\n" + msg.out
-	if m.workerClient == nil && !m.ensureWorker() {
-		m.append(errStyle.Render("shell output not shared with the model: worker unavailable: " + m.workerStartError))
-		return
-	}
-	if err := m.workerClient.Send(workerwire.CommandAppend, workerRequestID("append"), workerwire.AppendRequest{Content: content}); err != nil {
-		m.append(errStyle.Render("shell output not shared with the model: " + err.Error()))
-	}
+	m.sendWorkerCommand("shell output not shared with the model", "append", workerwire.CommandAppend, workerwire.AppendRequest{Content: content})
 }
 
 func (m *model) saveConfig() error {

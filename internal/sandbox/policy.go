@@ -1,9 +1,5 @@
-// Package sandbox contains the execution policy shared by ghg's tools.
-//
-// The policy is deliberately independent from the TUI and from the operating
-// system backend. Native tools use it for canonical path authorization even
-// when no OS sandbox is available; subprocess tools use the same policy to
-// build a restricted child process.
+// Package sandbox defines file path authorization and process execution policies.
+// Native tools use policies for path validation; runners use them to restrict subprocesses.
 package sandbox
 
 import (
