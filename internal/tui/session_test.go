@@ -59,6 +59,12 @@ func TestExportResultCommand(t *testing.T) {
 	m := compactCmdModel()
 	m.store = st
 	m.sessionID = sessionID
+	m.messages = []models.Message{{Role: "system", Content: "system prompt"}}
+	emptyChat := filepath.Join(tempDir, "empty-chat.md")
+	m.exportResultCommand("/export-result chat " + emptyChat)
+	if _, err := os.Stat(emptyChat); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("empty chat export created %s", emptyChat)
+	}
 
 	// 1. When no results exist, it should report a friendly message
 	m.exportResultCommand("/export-result")
@@ -548,21 +554,21 @@ func (m *model) sessionIDC(t *testing.T) string {
 	return id
 }
 
-func esc(m *model) tea.KeyMsg { return tea.KeyMsg{Type: tea.KeyEsc} }
+func esc() tea.KeyMsg { return tea.KeyMsg{Type: tea.KeyEsc} }
 
 func TestDoubleEscOpensRewind(t *testing.T) {
 	m := rewindModel(t,
 		models.Message{Role: "user", Content: "q1", Authored: true},
 		models.Message{Role: "assistant", Content: "a1"},
 	)
-	press(t, m, esc(m)) // first: arms
+	press(t, m, esc()) // first: arms
 	if m.rew != nil {
 		t.Fatal("single esc must not open the picker")
 	}
 	if !m.esc1 {
 		t.Fatal("first idle esc should arm")
 	}
-	press(t, m, esc(m)) // second: opens
+	press(t, m, esc()) // second: opens
 	if m.rew == nil {
 		t.Fatal("double esc should open the rewind picker")
 	}
@@ -576,7 +582,7 @@ func TestBusyEscStillInterrupts(t *testing.T) {
 	m.busy = true
 	called := false
 	m.cancel = func() { called = true }
-	press(t, m, esc(m))
+	press(t, m, esc())
 	if !called || m.rew != nil {
 		t.Fatal("busy esc must interrupt, never open rewind")
 	}
@@ -591,7 +597,7 @@ func TestBusyEscWithDraftClearsInputNotAgent(t *testing.T) {
 	m.cancel = func() { called = true }
 	m.input.SetValue("half-written follow-up")
 
-	press(t, m, esc(m)) // first: arms the clear, warning shows
+	press(t, m, esc()) // first: arms the clear, warning shows
 	if called {
 		t.Fatal("esc with a draft must not interrupt the agent")
 	}
@@ -602,7 +608,7 @@ func TestBusyEscWithDraftClearsInputNotAgent(t *testing.T) {
 		t.Fatal("first esc must not clear the draft yet")
 	}
 
-	press(t, m, esc(m)) // second: clears the draft into input history
+	press(t, m, esc()) // second: clears the draft into input history
 	if called {
 		t.Fatal("double-esc with a draft must never interrupt the agent")
 	}
@@ -628,8 +634,8 @@ func TestBusyEscWithDraftClearsInputNotAgent(t *testing.T) {
 func TestClearedDraftRecallsWithUp(t *testing.T) {
 	m := rewindModel(t, models.Message{Role: "user", Content: "q1", Authored: true})
 	m.input.SetValue("oops i cleared it")
-	press(t, m, esc(m))
-	press(t, m, esc(m))
+	press(t, m, esc())
+	press(t, m, esc())
 	if m.input.Value() != "" {
 		t.Fatal("double-esc should clear the draft")
 	}
@@ -645,7 +651,7 @@ func TestClearedDraftRecallsWithUp(t *testing.T) {
 func TestSingleEscKeepsDraft(t *testing.T) {
 	m := rewindModel(t, models.Message{Role: "user", Content: "q1", Authored: true})
 	m.input.SetValue("still thinking")
-	press(t, m, esc(m))
+	press(t, m, esc())
 	if !m.escClr {
 		t.Fatal("first esc should arm the clear")
 	}
@@ -666,14 +672,14 @@ func TestDoubleEscWithoutDraftStillRewinds(t *testing.T) {
 		models.Message{Role: "user", Content: "q1", Authored: true},
 		models.Message{Role: "assistant", Content: "a1"},
 	)
-	press(t, m, esc(m))
+	press(t, m, esc())
 	if m.escClr {
 		t.Fatal("no draft: the draft-clear arm must stay off")
 	}
 	if !m.esc1 {
 		t.Fatal("first idle esc should arm the rewind")
 	}
-	press(t, m, esc(m))
+	press(t, m, esc())
 	if m.rew == nil {
 		t.Fatal("double esc with no draft should open the rewind picker")
 	}
@@ -685,7 +691,7 @@ func TestEscDismissalDoesNotArm(t *testing.T) {
 	m := rewindModel(t, models.Message{Role: "user", Content: "q1", Authored: true})
 	m.input.SetValue("/mo")
 	m.menu = &menu{head: "/", cands: []cand{{Text: "/model"}}}
-	press(t, m, esc(m))
+	press(t, m, esc())
 	if m.menu != nil {
 		t.Fatal("esc should dismiss the menu")
 	}
@@ -709,8 +715,8 @@ func TestRewindPickerOrderAndArrows(t *testing.T) {
 		models.Message{Role: "assistant", Content: "a2"},
 		models.Message{Role: "user", Content: "q3", Authored: true},
 	)
-	press(t, m, esc(m))
-	press(t, m, esc(m))
+	press(t, m, esc())
+	press(t, m, esc())
 
 	// entries are chronological; the selection starts on the LATEST (bottom)
 	if got := len(m.rew.entries); got != 3 {
@@ -777,8 +783,8 @@ func TestRewindPickerShowsTimestamps(t *testing.T) {
 		models.Message{Role: "assistant", Content: "a2"},
 		models.Message{Role: "user", Content: "q3-old", Authored: true}, // no SentAt: legacy row
 	)
-	press(t, m, esc(m))
-	press(t, m, esc(m))
+	press(t, m, esc())
+	press(t, m, esc())
 
 	view := m.rewindView()
 	for _, ts := range []string{"2025-06-01 14:30", "2025-06-01 15:45"} {
@@ -846,10 +852,10 @@ func TestRewindCancelLeavesConversation(t *testing.T) {
 		models.Message{Role: "assistant", Content: "a1"},
 	)
 	before := len(m.messages)
-	press(t, m, esc(m))
-	press(t, m, esc(m))
+	press(t, m, esc())
+	press(t, m, esc())
 	press(t, m, tea.KeyMsg{Type: tea.KeyUp})
-	press(t, m, esc(m)) // cancel
+	press(t, m, esc()) // cancel
 	if m.rew != nil || len(m.messages) != before || len(m.future) != 0 {
 		t.Fatal("cancel must not touch the conversation")
 	}
@@ -857,13 +863,13 @@ func TestRewindCancelLeavesConversation(t *testing.T) {
 
 func TestEscArmDoesNotLeakAcrossModalDismiss(t *testing.T) {
 	m := forkModel(t)
-	press(t, m, esc(m))  // arm
+	press(t, m, esc())   // arm
 	m.command("/rename") // opens the name prompt
-	press(t, m, esc(m))  // dismisses the prompt — must not count toward rewind
+	press(t, m, esc())   // dismisses the prompt — must not count toward rewind
 	if m.esc1 {
 		t.Fatal("modal dismissal must clear the esc arm")
 	}
-	press(t, m, esc(m)) // one more: arms again, picker must NOT open
+	press(t, m, esc()) // one more: arms again, picker must NOT open
 	if m.rew != nil {
 		t.Fatal("picker opened from a stale arm")
 	}
@@ -876,7 +882,7 @@ func TestNamePromptPreservesDraft(t *testing.T) {
 	if m.input.Value() == "my half-typed thought" {
 		t.Fatal("prompt should replace the input")
 	}
-	press(t, m, esc(m)) // cancel: the draft comes back
+	press(t, m, esc()) // cancel: the draft comes back
 	if m.input.Value() != "my half-typed thought" {
 		t.Fatalf("draft lost: %q", m.input.Value())
 	}

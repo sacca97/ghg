@@ -120,10 +120,18 @@ func registryImmediate(name string) bool {
 func helpText() string {
 	var b strings.Builder
 	for _, e := range slashRegistry() {
-		b.WriteString(e.Name + " " + e.Hint + "\n")
+		b.WriteString(e.Name)
+		b.WriteByte(' ')
+		b.WriteString(e.Hint)
+		b.WriteByte('\n')
 	}
-	b.WriteString(palHintRewind + " — " + palDescRewind + "\n")
-	b.WriteString("!cmd " + registryFind("!cmd").Hint + "\n")
+	b.WriteString(palHintRewind)
+	b.WriteString(" — ")
+	b.WriteString(palDescRewind)
+	b.WriteByte('\n')
+	b.WriteString("!cmd ")
+	b.WriteString(registryFind("!cmd").Hint)
+	b.WriteByte('\n')
 	b.WriteString("tab — complete")
 	for _, hint := range []string{
 		"ctrl+k — clear the conversation",
@@ -139,7 +147,8 @@ func helpText() string {
 		"PgUp/PgDn — scroll · wheel — scroll · drag — select/copy text",
 		palHintQuit + " — quit",
 	} {
-		b.WriteString(" · " + hint)
+		b.WriteString(" · ")
+		b.WriteString(hint)
 	}
 	return b.String()
 }
@@ -175,8 +184,9 @@ func (m *model) command(text string) (tea.Model, tea.Cmd) {
 	if len(fields) == 0 {
 		return m, nil
 	}
-	switch fields[0] {
-	case "/quit", "/exit", "/q":
+	command := workerwire.CommandName(fields[0])
+	switch command {
+	case "/quit":
 		return m, tea.Quit
 	case "/detach":
 		live := m.busy || m.workerState == workerwire.StateRunning || m.workerState == workerwire.StateWaitingApproval || m.workerState == workerwire.StateWaitingQuestion || m.workerLiveWork
@@ -250,7 +260,7 @@ func (m *model) command(text string) (tea.Model, tea.Cmd) {
 		m.memoryCommand(fields[1:])
 	case "/schedule":
 		m.scheduleCommand(fields[1:])
-	case "/me", "/agents":
+	case "/me":
 		return m, m.openMe()
 	case "/compact":
 		if len(fields) == 1 {
@@ -401,11 +411,11 @@ func (m *model) command(text string) (tea.Model, tea.Cmd) {
 		return m.executeCommand(text)
 	case "/review":
 		return m.reviewCommand(text)
-	case "/export", "/export-result":
+	case "/export":
+		if fields[0] == "/export-chat" || fields[0] == "/export-log" {
+			text = "/export chat " + strings.TrimSpace(strings.TrimPrefix(text, fields[0]))
+		}
 		return m.exportResultCommand(text)
-	case "/export-chat", "/export-log":
-		args := strings.TrimSpace(strings.TrimPrefix(strings.TrimPrefix(text, "/export-chat"), "/export-log"))
-		return m.exportResultCommand("/export-result chat " + args)
 	case "/goal":
 		switch {
 		case len(fields) == 1:
@@ -480,7 +490,7 @@ func (m *model) command(text string) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "/report":
 		m.append(m.reportBlock())
-	case "/help", "/commands":
+	case "/help":
 		m.append(dimStyle.Render(helpText()))
 	case "/auth":
 		m.authCommand(fields[1:])
@@ -570,11 +580,14 @@ func (m *model) renderLSPStatuses(servers []lsp.Status) {
 		line := fmt.Sprintf("  %s %-16s %s", icon, s.Name, detail)
 		switch s.State {
 		case "failed":
-			b.WriteString(errStyle.Render(line) + "\n")
+			b.WriteString(errStyle.Render(line))
+			b.WriteByte('\n')
 		case "not started":
-			b.WriteString(dimStyle.Render(line) + "\n")
+			b.WriteString(dimStyle.Render(line))
+			b.WriteByte('\n')
 		default:
-			b.WriteString(line + "\n")
+			b.WriteString(line)
+			b.WriteByte('\n')
 		}
 	}
 	m.append(strings.TrimRight(b.String(), "\n"))
@@ -645,11 +658,14 @@ func renderMCPStatuses(servers []mcp.Server) string {
 		line := fmt.Sprintf("  %s %-20s %s", icon, s.Name, detail)
 		switch s.Status {
 		case mcp.StatusReady:
-			b.WriteString(line + "\n")
+			b.WriteString(line)
+			b.WriteByte('\n')
 		case mcp.StatusFailed:
-			b.WriteString(errStyle.Render(line) + "\n")
+			b.WriteString(errStyle.Render(line))
+			b.WriteByte('\n')
 		default:
-			b.WriteString(dimStyle.Render(line) + "\n")
+			b.WriteString(dimStyle.Render(line))
+			b.WriteByte('\n')
 		}
 	}
 	return strings.TrimRight(b.String(), "\n")

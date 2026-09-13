@@ -5,6 +5,7 @@ import (
 	"regexp"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/textarea"
@@ -18,6 +19,29 @@ type namePrompt struct {
 	mask     bool
 	onOK     func(string)
 	onCancel func()
+}
+
+func handleLineEdit(msg tea.KeyMsg, text *string, maxLen int) bool {
+	switch msg.Type {
+	case tea.KeyBackspace, tea.KeyDelete:
+		if len(*text) == 0 {
+			return false
+		}
+		_, size := utf8.DecodeLastRuneInString(*text)
+		*text = (*text)[:len(*text)-size]
+		return true
+	case tea.KeyRunes, tea.KeySpace:
+		value := string(msg.Runes)
+		if msg.Type == tea.KeySpace {
+			value = " "
+		}
+		if maxLen > 0 && len(*text)+len(value) > maxLen {
+			return false
+		}
+		*text += value
+		return true
+	}
+	return false
 }
 
 func restoreCollapsedPaste(text, paste string) string {

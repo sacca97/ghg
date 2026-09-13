@@ -323,7 +323,9 @@ func hyperlinkGlamourLinks(s string, exists func(string) bool) string {
 		// label+href: clickable label, href and gap dropped
 		var label strings.Builder
 		for _, l := range g.labels {
-			label.WriteString(l.sgr + l.text + sgrReset)
+			label.WriteString(l.sgr)
+			label.WriteString(l.text)
+			label.WriteString(sgrReset)
 		}
 		repls = append(repls, repl{g.start, g.end, hyperlink(uri, label.String())})
 	}

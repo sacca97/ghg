@@ -59,7 +59,8 @@ func authResolved(t *testing.T, m *model, id string) models.Resolved {
 func (m *model) transcriptText() string {
 	var sb strings.Builder
 	for _, b := range m.blocks {
-		sb.WriteString(b.text + "\n")
+		sb.WriteString(b.text)
+		sb.WriteByte('\n')
 	}
 	return sb.String()
 }
@@ -985,8 +986,8 @@ func TestEffortBareOpensSelector(t *testing.T) {
 	if pp == nil || pp.kind != panelEffort {
 		t.Fatalf("expected the effort panel, got %+v", pp)
 	}
-	if len(pp.levels) != len(defaultEfforts) || pp.levels[pp.lidx] != m.effort {
-		t.Fatalf("effort panel should list the model's levels on the current one: %v @%d", pp.levels, pp.lidx)
+	if len(pp.rows) != len(defaultEfforts) || pp.rows[pp.selected].value != m.effort {
+		t.Fatalf("effort panel should list the model's levels on the current one: %v @%d", pp.rows, pp.selected)
 	}
 	// scroll down to low and apply with enter
 	tm, _ := m.paletteKey(tea.KeyMsg{Type: tea.KeyDown})
@@ -1615,8 +1616,8 @@ func TestModelPaletteEnterOpensPicker(t *testing.T) {
 	if pp == nil || pp.kind != panelRole {
 		t.Fatalf("settings Model + enter should push the model-role panel; input=%q", m.input.Value())
 	}
-	if len(pp.list) != 4 || pp.list[1] != "smart" {
-		t.Fatalf("model-role panel should list default, smart, fast, tiny: %+v", pp.list)
+	if len(pp.rows) != 4 || pp.rows[1].value != "smart" {
+		t.Fatalf("model-role panel should list default, smart, fast, tiny: %+v", pp.rows)
 	}
 	m.cfg.Roles = map[string]config.RoleConfig{
 		config.RoleDefault: {Model: "kimi-k3-fast", Provider: "inference"},
@@ -1639,7 +1640,7 @@ func TestModelPaletteEnterOpensPicker(t *testing.T) {
 	if pp := m.settings.top(); pp == nil || pp.kind != panelModel {
 		t.Fatal("selecting a role should open its model panel")
 	}
-	if len(m.settings.top().items) == 0 {
+	if len(m.settings.top().rows) == 0 {
 		t.Fatal("model panel should list the configured routes")
 	}
 }

@@ -136,7 +136,6 @@ func (m *model) startupReport() {
 	m.skillsCache = sk
 	m.skillsLoaded = len(sk)
 	var warnLines []string
-	var infoLines []string
 
 	for _, s := range sk {
 		if s.Warning != "" {
@@ -149,15 +148,12 @@ func (m *model) startupReport() {
 	if m.modelName == "" || m.provName == "" {
 		warnLines = append(warnLines, m.degradedProviderNote())
 	}
-	if len(warnLines) == 0 && len(infoLines) == 0 {
+	if len(warnLines) == 0 {
 		return
 	}
 	var out []string
 	for _, w := range warnLines {
 		out = append(out, errStyle.Render(w))
-	}
-	for _, inf := range infoLines {
-		out = append(out, dimStyle.Render(inf))
 	}
 	m.append(strings.Join(out, "\n"))
 }

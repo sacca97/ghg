@@ -74,7 +74,7 @@ func exportCLI(args []string) error {
 			if err != nil {
 				return err
 			}
-			if len(msgs) == 0 {
+			if !export.HasChatContent(msgs) {
 				return fmt.Errorf("no messages found in session %s", sessionID)
 			}
 			telemetry, err := st.ListTelemetry(ctx, sessionID)

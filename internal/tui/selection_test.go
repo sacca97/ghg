@@ -182,7 +182,7 @@ func TestModelPickerSelectsCatalogRoute(t *testing.T) {
 	if roles == nil || roles.kind != panelRole {
 		t.Fatal("role picker should open")
 	}
-	for roles.list[roles.midx] != "default" {
+	for roles.rows[roles.selected].value != "default" {
 		tm, _ := m.paletteKey(tea.KeyMsg{Type: tea.KeyDown})
 		m = tm.(*model)
 		roles = m.settings.top()
@@ -190,12 +190,12 @@ func TestModelPickerSelectsCatalogRoute(t *testing.T) {
 	tm, _ := m.paletteKey(tea.KeyMsg{Type: tea.KeyEnter})
 	m = tm.(*model)
 	p := m.settings.top()
-	for p.idx < len(p.items)-1 && !p.items[p.idx].fromCatalog {
+	for p.selected < len(p.rows)-1 && !p.rows[p.selected].item.fromCatalog {
 		tm, _ = m.paletteKey(tea.KeyMsg{Type: tea.KeyDown})
 		m = tm.(*model)
 		p = m.settings.top()
 	}
-	if p == nil || p.kind != panelModel || !p.items[p.idx].fromCatalog {
+	if p == nil || p.kind != panelModel || !p.rows[p.selected].item.fromCatalog {
 		t.Fatal("no catalog route in picker")
 	}
 	tm, _ = m.paletteKey(tea.KeyMsg{Type: tea.KeyEnter})

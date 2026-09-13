@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -27,6 +28,20 @@ func TestExportCLI(t *testing.T) {
 	sessionID, err := st.Create(tempDir, "model-test", "prov-test")
 	if err != nil {
 		t.Fatal(err)
+	}
+	emptyID, err := st.Create(tempDir, "model-test", "prov-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Save(emptyID, 0, []models.Message{{Role: "system", Content: "system prompt"}}, "model-test", "prov-test"); err != nil {
+		t.Fatal(err)
+	}
+	emptyOut := filepath.Join(tempDir, "empty-chat.md")
+	if err := exportCLI([]string{"--session", emptyID, "--kind", "chat", "--output", emptyOut}); err == nil {
+		t.Fatal("empty chat export should fail")
+	}
+	if _, err := os.Stat(emptyOut); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("empty chat export created %s", emptyOut)
 	}
 
 	planRes := session.WorkflowResultRecord{

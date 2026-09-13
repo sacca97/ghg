@@ -57,6 +57,16 @@ func TestInputGrowsOnCtrlJ(t *testing.T) {
 	}
 }
 
+func TestHandleLineEditBackspacePreservesUTF8(t *testing.T) {
+	text := "a世界"
+	if !handleLineEdit(tea.KeyMsg{Type: tea.KeyBackspace}, &text, 0) {
+		t.Fatal("backspace should edit non-empty text")
+	}
+	if text != "a世" {
+		t.Fatalf("backspace removed partial UTF-8 rune: %q", text)
+	}
+}
+
 // A single long line that wraps past the content width must also grow the box.
 func TestInputGrowsOnWrap(t *testing.T) {
 	m := newGrowModel()

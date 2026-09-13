@@ -651,9 +651,11 @@ func (m *model) rewindView() string {
 		} else if e.future {
 			b.WriteString(dimStyle.Render("  " + e.text + " (rewound)"))
 		} else {
-			b.WriteString("  " + e.text)
+			b.WriteString("  ")
+			b.WriteString(e.text)
 		}
-		b.WriteString("\n    " + dimStyle.Render(rewindWhen(e.when)))
+		b.WriteString("\n    ")
+		b.WriteString(dimStyle.Render(rewindWhen(e.when)))
 	}
 	fmt.Fprintf(&b, "\n%s", dimStyle.Render(fmt.Sprintf("  (%d/%d) ↑ older · ↓ newer", r.sel+1, len(r.entries))))
 	return b.String()

@@ -38,14 +38,14 @@
           "group": "navigation@1"
         },
         {
-          "command": "ghg.resumeSession",
-          "icon": "$(history)",
+          "command": "ghg.exportChat",
+          "icon": "$(export)",
           "when": "view == ghg.chatView",
           "group": "navigation@2"
         },
         {
-          "command": "ghg.refreshModels",
-          "icon": "$(sync)",
+          "command": "ghg.resumeSession",
+          "icon": "$(history)",
           "when": "view == ghg.chatView",
           "group": "navigation@3"
         },
@@ -67,6 +67,11 @@
         "command": "ghg.resumeSession",
         "title": "ghg: Resume Session",
         "icon": "$(history)"
+      },
+      {
+        "command": "ghg.exportChat",
+        "title": "ghg: Export Chat",
+        "icon": "$(export)"
       },
       {
         "command": "ghg.refreshModels",

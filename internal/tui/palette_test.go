@@ -218,7 +218,7 @@ func TestDynamicReasoningArrowsAreDirectional(t *testing.T) {
 func TestEmptyEffortPanelKeyDoesNotPanic(t *testing.T) {
 	m := compactCmdModel()
 	m.settings = &settings{stack: []*ppanel{{kind: panelEffort}}}
-	if _, _ = m.panelKey(tea.KeyMsg{Type: tea.KeyDown}, m.settings.top()); m.settings.top().lidx != 0 {
+	if _, _ = m.panelKey(tea.KeyMsg{Type: tea.KeyDown}, m.settings.top()); m.settings.top().selected != 0 {
 		t.Fatal("empty effort panel should remain unchanged")
 	}
 }
@@ -278,8 +278,8 @@ func TestPalettePanelPushPop(t *testing.T) {
 	if pp == nil || pp.kind != panelEffort {
 		t.Fatal("enter should push the effort panel")
 	}
-	if pp.levels[pp.lidx] != m.effort {
-		t.Fatalf("panel should start on the current level, got %q", pp.levels[pp.lidx])
+	if pp.rows[pp.selected].value != m.effort {
+		t.Fatalf("panel should start on the current level, got %q", pp.rows[pp.selected].value)
 	}
 	// filter input is paused inside a panel: typing runes does nothing
 	tm, _ = m.paletteKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'x'}})
@@ -332,17 +332,17 @@ func TestPaletteModelRolePanelSelectsRoute(t *testing.T) {
 	if pp == nil || pp.kind != panelRole {
 		t.Fatal("enter should push the model-role panel")
 	}
-	if len(pp.list) != 4 {
-		t.Fatalf("expected four role choices, got %d", len(pp.list))
+	if len(pp.rows) != 4 {
+		t.Fatalf("expected four role choices, got %d", len(pp.rows))
 	}
 	// The test agent has no role, so it selects default by default.
-	if m.settings.top().list[m.settings.top().midx] != "default" {
-		t.Fatalf("role selector should reach default, got %q", m.settings.top().list[m.settings.top().midx])
+	if m.settings.top().rows[m.settings.top().selected].value != "default" {
+		t.Fatalf("role selector should reach default, got %q", m.settings.top().rows[m.settings.top().selected].value)
 	}
 	tm, _ = m.paletteKey(tea.KeyMsg{Type: tea.KeyEnter}) // open default's models
 	m = tm.(*model)
 	pp = m.settings.top()
-	if pp == nil || pp.kind != panelModel || len(pp.items) != 2 {
+	if pp == nil || pp.kind != panelModel || len(pp.rows) != 2 {
 		t.Fatalf("default model panel should list two keyed routes: %+v", pp)
 	}
 	modelBefore := m.modelName

@@ -3,9 +3,9 @@
 // formatting in util.js; this file owns persisted state, the streaming
 // handles, the event dispatch table, and the DOM wiring.
 import {
-  ROLES, MODES, EFFORT_LEVELS, APPROVALS, SANDBOXES, NETWORKS, BUSY_STATES,
-  ROLE_LABELS, MODE_LABELS, EFFORT_LABELS, APPROVAL_LABELS, SANDBOX_LABELS, NETWORK_LABELS,
-  isRole, isMode, isEffort, isApproval, isSandbox, isNetwork, fillSelect,
+  ROLES, MODES, COMPOSER_MODES, EFFORT_LEVELS, APPROVALS, SANDBOXES, NETWORKS, BUSY_STATES,
+  ROLE_LABELS, MODE_LABELS, COMPOSER_MODE_LABELS, EFFORT_LABELS, APPROVAL_LABELS, SANDBOX_LABELS, NETWORK_LABELS,
+  isRole, isMode, isComposerMode, isEffort, isApproval, isSandbox, isNetwork, fillSelect,
 } from "./constants.js";
 import { text, formatCount, formatDuration } from "./util.js";
 import { renderMarkdown } from "./markdown.js";
@@ -22,7 +22,6 @@ const settingsToggle = document.getElementById("settings-toggle");
 const settingsClose = document.getElementById("settings-close");
 const settingsCloseBottom = document.getElementById("settings-close-bottom");
 const refreshModels = document.getElementById("refresh-models");
-const exportChat = document.getElementById("export-chat");
 const openSettings = document.getElementById("open-settings");
 const openAuth = document.getElementById("open-auth");
 const settingsModels = document.getElementById("settings-models");
@@ -66,7 +65,7 @@ const initialSettings = window.ghgSettings && typeof window.ghgSettings === "obj
 const state = {
   blocks: Array.isArray(saved.blocks) ? saved.blocks : [],
   draft: typeof saved.draft === "string" ? saved.draft : "",
-  mode: isMode(saved.mode) ? saved.mode : isMode(initialSettings.mode) ? initialSettings.mode : "execute",
+  mode: isComposerMode(saved.mode) ? saved.mode : isMode(initialSettings.mode) ? initialSettings.mode : "execute",
   role: isRole(saved.role) ? saved.role : isRole(initialSettings.role) ? initialSettings.role : "fast",
   effort: isEffort(saved.effort) ? saved.effort : isEffort(initialSettings.effort) ? initialSettings.effort : "",
   approval: isApproval(saved.approval) ? saved.approval : isApproval(initialSettings.approval) ? initialSettings.approval : "",
@@ -268,15 +267,16 @@ function setupOptionLists() {
   fillSelect(settingsSandbox, SANDBOXES, SANDBOX_LABELS);
   fillSelect(settingsNetwork, NETWORKS, NETWORK_LABELS);
   fillSelect(settingsApproval, APPROVALS, APPROVAL_LABELS);
+  fillSelect(modeToggle, COMPOSER_MODES, COMPOSER_MODE_LABELS);
   fillSelect(role, ROLES, (name) => state.models[name] || "Configured");
   fillSelect(effort, EFFORT_LEVELS, EFFORT_LABELS);
 }
 
 function syncControls() {
-  const label = MODE_LABELS[state.mode] || MODE_LABELS.execute;
-  modeToggle.textContent = label;
-  modeToggle.setAttribute("aria-label", `Mode: ${label}. Click to switch`);
-  modeToggle.title = `Switch mode (currently ${label})`;
+  const label = COMPOSER_MODE_LABELS[state.mode] || COMPOSER_MODE_LABELS.execute;
+  modeToggle.value = state.mode;
+  modeToggle.setAttribute("aria-label", `Mode: ${label}`);
+  modeToggle.title = `Current mode: ${label}`;
   role.disabled = false;
   role.value = state.role;
   effort.value = state.effort;
@@ -284,7 +284,7 @@ function syncControls() {
     option.textContent = state.models[option.value] || "Configured";
   }
   settingsRole.value = state.role;
-  settingsMode.value = state.mode;
+  settingsMode.value = isMode(state.mode) ? state.mode : "execute";
   settingsEffort.value = state.effort;
   settingsSandbox.value = state.sandbox;
   settingsNetwork.value = state.network;
@@ -980,8 +980,9 @@ prompt.addEventListener("keydown", (event) => {
     composer.requestSubmit();
   }
 });
-modeToggle.addEventListener("click", () => {
-  state.mode = MODES[(MODES.indexOf(state.mode) + 1) % MODES.length];
+modeToggle.addEventListener("change", () => {
+  if (!isComposerMode(modeToggle.value)) return;
+  state.mode = modeToggle.value;
   syncControls();
   save();
   post({ type: "configureRole", role: state.role, mode: state.mode });
@@ -997,7 +998,6 @@ refreshModels.addEventListener("click", () => {
   refreshModels.disabled = true;
   post({ type: "refreshModels" });
 });
-exportChat.addEventListener("click", () => post({ type: "exportChat" }));
 openSettings.addEventListener("click", () => post({ type: "openSettings" }));
 openAuth.addEventListener("click", () => post({ type: "openAuth" }));
 configureSearch?.addEventListener("click", () => post({ type: "configureSearchProvider" }));

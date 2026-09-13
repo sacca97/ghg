@@ -126,12 +126,6 @@ body {
   gap: 8px;
 }
 
-.settings-eyebrow {
-  color: var(--vscode-descriptionForeground);
-  font-size: 0.8em;
-  letter-spacing: 0.04em;
-}
-
 .settings-header h2 {
   margin: 1px 0 0;
   font-size: 1.1em;
@@ -231,6 +225,7 @@ body {
 
 .settings-field select {
   min-width: 0;
+  width: max-content;
   max-width: 62%;
   padding: 4px 7px;
   border: 1px solid var(--vscode-dropdown-border);
@@ -265,33 +260,6 @@ body {
 }
 
 /* --- transcript ------------------------------------------------------------ */
-
-#chat-header {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  min-height: 32px;
-  padding: 4px 10px 0 16px;
-  color: var(--vscode-descriptionForeground);
-}
-
-.chat-brand {
-  color: var(--vscode-foreground);
-  font-weight: 700;
-  letter-spacing: 0.02em;
-}
-
-.chat-header-actions {
-  display: flex;
-  align-items: center;
-  gap: 2px;
-}
-
-.chat-header .settings-icon-button {
-  width: 26px;
-  height: 26px;
-  padding: 4px;
-}
 
 #transcript {
   display: flex;
@@ -739,11 +707,10 @@ body {
   box-shadow: inset 0 0 0 1px var(--vscode-focusBorder);
 }
 
-/* The composer's five controls are placed by area name, so the narrow-screen
-   query below only has to restate the area map instead of five grid slots. */
+/* Keep controls at their intrinsic width; narrow layouts may shrink them. */
 .composer-row {
   display: grid;
-  grid-template-columns: minmax(0, 1.2fr) minmax(0, 1.4fr) minmax(0, 1.1fr) 28px 30px;
+  grid-template-columns: minmax(0, max-content) minmax(0, max-content) minmax(0, max-content) 28px 30px;
   grid-template-areas: "mode role effort settings send";
   align-items: center;
   gap: 6px;
@@ -769,13 +736,11 @@ body {
   background: var(--vscode-button-secondaryHoverBackground);
 }
 
-.composer-row #send,
-.composer-row #mode-toggle {
+.composer-row #send {
   background: var(--vscode-button-background);
 }
 
-.composer-row #send:hover,
-.composer-row #mode-toggle:hover {
+.composer-row #send:hover {
   background: var(--vscode-button-hoverBackground);
 }
 
@@ -833,13 +798,15 @@ body {
   line-height: 1;
 }
 
+#mode-toggle,
 #role,
 #effort {
   min-width: 0;
-  width: 100%;
-  max-width: none;
+  width: max-content;
+  max-width: 100%;
+  justify-self: start;
   overflow: hidden;
-  padding: 4px 7px;
+  padding: 4px 9px;
   border: 1px solid var(--vscode-dropdown-border);
   border-radius: var(--ghg-radius-button);
   color: var(--vscode-dropdown-foreground);
@@ -937,7 +904,7 @@ select:disabled {
   }
 
   .composer-row {
-    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) 28px 30px;
+    grid-template-columns: minmax(0, max-content) minmax(0, max-content) 28px 30px;
     grid-template-areas:
       "mode mode . ."
       "role effort settings send";

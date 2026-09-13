@@ -43,7 +43,7 @@ var commandCatalogue = []CommandSpec{
 	{Name: "/dynamic-reasoning", Hint: "— toggle model per-call reasoning effort selection (default on)", Owner: OwnerWorker},
 	{Name: "/effort", Hint: "[level] — reasoning effort: off·low·medium·high (bare opens selector)", Owner: OwnerWorker},
 	{Name: "/execute", Hint: "[plan] — execute the latest proposal or supplied plan with the fast model", Owner: OwnerWorker},
-	{Name: "/export", Aliases: []string{"/export-result", "/export-chat", "/export-log"}, Hint: "[chat|plan|review|last] [path] [--format json|markdown] [--force] — export chat log or structured result to a file", Owner: OwnerClient},
+	{Name: "/export", Aliases: []string{"/export-result", "/export-chat", "/export-log"}, Hint: "[chat|logs|plan|review|last] [path] [--format json|markdown] [--force] — export chat log or structured result to a file", Owner: OwnerClient},
 	{Name: "/fork", Hint: "[name] — copy the conversation into a new session (pick a point in the rewind picker with f)", Owner: OwnerWorker},
 	{Name: "/goal", Hint: "<text> — keep working until the goal is met (unbounded; resume | clear)", Owner: OwnerWorker},
 	{Name: "/goal-from-context", Hint: "[n] — formulate a goal from the last n messages (default 8) and work until it's met", Owner: OwnerWorker},

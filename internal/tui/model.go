@@ -530,10 +530,16 @@ func (m *model) refreshSkills() []skills.Skill {
 			}
 			info, err := os.Stat(filepath.Join(dir, entry.Name(), "SKILL.md"))
 			if err != nil {
-				sig.WriteString(entry.Name() + ":missing;")
+				sig.WriteString(entry.Name())
+				sig.WriteString(":missing;")
 				continue
 			}
-			sig.WriteString(entry.Name() + ":" + strconv.FormatInt(info.ModTime().UnixNano(), 10) + ":" + strconv.FormatInt(info.Size(), 10) + ";")
+			sig.WriteString(entry.Name())
+			sig.WriteByte(':')
+			sig.WriteString(strconv.FormatInt(info.ModTime().UnixNano(), 10))
+			sig.WriteByte(':')
+			sig.WriteString(strconv.FormatInt(info.Size(), 10))
+			sig.WriteByte(';')
 		}
 	}
 	key := sig.String()

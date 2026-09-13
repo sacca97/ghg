@@ -147,18 +147,22 @@ func (m *model) roleRoute(label string) (config.ResolvedRole, error) {
 func (m *model) roleModelPanel(label string, direct bool) *ppanel {
 	items := m.availableModelItems()
 	items = annotateModelAvailability(m.cfg, m.profiles, items)
+	rows := make([]panelRow, len(items))
+	for i, item := range items {
+		rows[i] = panelRow{label: modelItemLabel(item), item: item}
+	}
 	pp := &ppanel{
 		kind:       panelModel,
 		title:      label + " model",
-		items:      items,
+		rows:       rows,
 		role:       label,
 		staleHints: staleCatalogs(m.cfg, config.LoadCatalogs()),
 		direct:     direct,
 	}
 	if target, err := m.roleRoute(label); err == nil {
-		for i, it := range items {
-			if it.model == target.Model && it.provider == target.Provider {
-				pp.idx = i
+		for i, row := range pp.rows {
+			if row.item.model == target.Model && row.item.provider == target.Provider {
+				pp.selected = i
 				break
 			}
 		}
@@ -175,13 +179,11 @@ func (m *model) modelRolePanel(direct bool) *ppanel {
 			break
 		}
 	}
-	return &ppanel{
-		kind:   panelRole,
-		title:  "Model role",
-		list:   slices.Clone(modelRoleLabels),
-		midx:   idx,
-		direct: direct,
+	rows := make([]panelRow, len(modelRoleLabels))
+	for i, label := range modelRoleLabels {
+		rows[i] = panelRow{label: label, value: label}
 	}
+	return &ppanel{kind: panelRole, title: "Model role", rows: rows, selected: idx, direct: direct}
 }
 
 func (m *model) modePanel(direct bool) *ppanel {
@@ -190,7 +192,11 @@ func (m *model) modePanel(direct bool) *ppanel {
 	if m.uiMode() == uiModeExecute {
 		idx = 1
 	}
-	return &ppanel{kind: panelMode, title: "Mode", list: modes, midx: idx, direct: direct}
+	rows := make([]panelRow, len(modes))
+	for i, mode := range modes {
+		rows[i] = panelRow{label: mode, value: mode}
+	}
+	return &ppanel{kind: panelMode, title: "Mode", rows: rows, selected: idx, direct: direct}
 }
 
 // cycleStatusModel advances through the routes already selected for the four

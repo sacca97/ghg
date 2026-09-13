@@ -1737,7 +1737,9 @@ func TestToolResultFullyVisibleWhenExpanded(t *testing.T) {
 
 	var sb strings.Builder
 	for i := 1; i <= 12; i++ {
-		sb.WriteString("output row " + strings.Repeat("x", i) + "\n")
+		sb.WriteString("output row ")
+		sb.WriteString(strings.Repeat("x", i))
+		sb.WriteByte('\n')
 	}
 	m.appendRaw(blockTool, sb.String())
 	m.refreshVP()
@@ -1797,7 +1799,7 @@ func BenchmarkSeedTranscript(b *testing.B) {
 	msgs := benchTranscript(200)
 	b.ResetTimer()
 	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
+	for b.Loop() {
 		m := compactCmdModel()
 		m.Update(mkWinSize(120, 40))
 		m.seedTranscript(msgs, 1)
@@ -1813,7 +1815,7 @@ func BenchmarkAppendStream(b *testing.B) {
 	m.prog = tea.NewProgram(m, tea.WithoutRenderer())
 	b.ResetTimer()
 	b.ReportAllocs()
-	for i := 0; i < b.N; i++ {
+	for i := 0; b.Loop(); i++ {
 		m.append(fmt.Sprintf("streamed line %d", i))
 	}
 }

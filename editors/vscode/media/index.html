@@ -16,7 +16,6 @@
         <div class="settings-card">
           <div class="settings-header">
             <div>
-              <div class="settings-eyebrow">ghg</div>
               <h2>Settings</h2>
             </div>
             <button type="button" id="settings-close" aria-label="Close settings" title="Close settings">
@@ -33,6 +32,9 @@
                 <h3>Model roles</h3>
                 <p>Choose the model assigned to each role.</p>
               </div>
+              <button type="button" class="settings-action" id="refresh-models" aria-label="Refresh models">
+                Refresh models
+              </button>
             </div>
             <div id="settings-models" class="settings-models"></div>
           </section>
@@ -87,23 +89,6 @@
         </div>
       </section>
       <section id="chat-view">
-        <header id="chat-header">
-          <span class="chat-brand">ghg</span>
-          <div class="chat-header-actions">
-            <button type="button" class="settings-icon-button" id="refresh-models" aria-label="Refresh models"
-              title="Refresh models">
-              <svg viewBox="0 0 16 16" aria-hidden="true">
-                <path d="M13 5V2.5h-2.5M13 2.5A5.5 5.5 0 1 0 14 9" />
-              </svg>
-            </button>
-            <button type="button" class="settings-icon-button" id="export-chat" aria-label="Export chat"
-              title="Export chat">
-              <svg viewBox="0 0 16 16" aria-hidden="true">
-                <path d="M8 2v7M5 6.5l3 3 3-3M3 11.5v2h10v-2" />
-              </svg>
-            </button>
-          </div>
-        </header>
         <section id="transcript"></section>
         <div id="status" role="status" aria-live="polite" aria-atomic="true">Ready</div>
         <div id="references" aria-label="Referenced files"></div>
@@ -112,7 +97,7 @@
           <textarea id="prompt" rows="3" placeholder="Ask ghg anything…" role="combobox" aria-haspopup="listbox"
             aria-autocomplete="list" aria-controls="completion-menu" aria-expanded="false"></textarea>
           <div class="composer-row">
-            <button type="button" id="mode-toggle" aria-label="Mode: Execute" title="Switch mode">Execute</button>
+            <select id="mode-toggle" aria-label="Mode"></select>
             <select id="role" aria-label="Current model"></select>
             <select id="effort" aria-label="Thinking effort"></select>
             <button type="button" id="settings-toggle" aria-label="Open settings" title="Open settings">

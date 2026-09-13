@@ -5,6 +5,7 @@
 // extension.ts and package.json mirror these lists in TypeScript/JSON.
 export const ROLES = ["default", "smart", "fast", "tiny"];
 export const MODES = ["execute", "plan", "review"];
+export const COMPOSER_MODES = ["execute", "plan", "review", "ask"];
 export const EFFORT_LEVELS = ["", "low", "medium", "high"];
 export const APPROVALS = ["", "ask", "auto", "never"];
 export const SANDBOXES = ["", "read-only", "workspace-write", "danger-full-access"];
@@ -12,6 +13,7 @@ export const NETWORKS = ["", "deny", "host"];
 
 export const ROLE_LABELS = { default: "Default", smart: "Smart", fast: "Fast", tiny: "Tiny" };
 export const MODE_LABELS = { execute: "Execute", plan: "Plan", review: "Review" };
+export const COMPOSER_MODE_LABELS = { ...MODE_LABELS, ask: "Ask" };
 export const EFFORT_LABELS = { "": "Off", low: "Low", medium: "Medium", high: "High" };
 export const APPROVAL_LABELS = { "": "Configured default", ask: "Ask", "auto": "Auto", never: "Never" };
 export const SANDBOX_LABELS = { "": "Configured default", "read-only": "Read only", "workspace-write": "Workspace write", "danger-full-access": "Full access" };
@@ -21,6 +23,7 @@ export const BUSY_STATES = new Set(["running", "waiting_approval", "waiting_ques
 
 export const isRole = (value) => ROLES.includes(value);
 export const isMode = (value) => MODES.includes(value);
+export const isComposerMode = (value) => COMPOSER_MODES.includes(value);
 export const isEffort = (value) => EFFORT_LEVELS.includes(value);
 export const isApproval = (value) => APPROVALS.includes(value);
 export const isSandbox = (value) => SANDBOXES.includes(value);

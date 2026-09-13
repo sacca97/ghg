@@ -42,17 +42,8 @@ func (m *model) questionKey(msg tea.KeyMsg) {
 			}
 		case tea.KeyEsc:
 			d.other, d.otherIn = false, ""
-		case tea.KeyBackspace, tea.KeyDelete:
-			if len(d.otherIn) > 0 {
-				d.otherIn = d.otherIn[:len(d.otherIn)-1]
-			}
-		case tea.KeyRunes, tea.KeySpace:
-			if len(d.otherIn) < 4096 {
-				d.otherIn += string(msg.Runes)
-				if msg.Type == tea.KeySpace {
-					d.otherIn += " "
-				}
-			}
+		default:
+			handleLineEdit(msg, &d.otherIn, 4096)
 		}
 		return
 	}
@@ -116,7 +107,9 @@ func (m *model) questionView() string {
 	label := fmt.Sprintf("? %d/%d", d.index+1, len(d.request.Questions))
 	b.WriteString(youStyle.Render(label + " " + question.Question))
 	if d.other {
-		b.WriteString("\n  " + d.otherIn + "█")
+		b.WriteString("\n  ")
+		b.WriteString(d.otherIn)
+		b.WriteString("█")
 		b.WriteString(dimStyle.Render("\n  enter sends · esc back"))
 		return b.String()
 	}
@@ -171,15 +164,8 @@ func (m *model) permKey(msg tea.KeyMsg) bool {
 			answer(tools.GateReject, strings.TrimSpace(d.rejectIn))
 		case tea.KeyEsc:
 			d.rejecting, d.rejectIn = false, "" // back to the buttons
-		case tea.KeyBackspace:
-			if len(d.rejectIn) > 0 {
-				d.rejectIn = d.rejectIn[:len(d.rejectIn)-1]
-			}
-		case tea.KeyRunes, tea.KeySpace:
-			d.rejectIn += string(msg.Runes)
-			if msg.Type == tea.KeySpace {
-				d.rejectIn += " "
-			}
+		default:
+			handleLineEdit(msg, &d.rejectIn, 0)
 		}
 		return true
 	}
@@ -225,14 +211,18 @@ func (m *model) permView() string {
 		title = "Run this command?"
 	}
 	b.WriteString(youStyle.Render("⚠ " + title))
-	b.WriteString("\n  " + ansi.Truncate(d.req.Command, m.width-4, "…"))
+	b.WriteString("\n  ")
+	b.WriteString(ansi.Truncate(d.req.Command, m.width-4, "…"))
 	rule := d.req.Rule
 	if d.req.Tool != "bash" {
 		rule = d.req.Command
 	}
 	b.WriteString(dimStyle.Render("\n  always allows: " + d.req.Tool + ":" + rule))
 	if d.rejecting {
-		b.WriteString("\n" + youStyle.Render("  reject with message: ") + d.rejectIn + "█")
+		b.WriteString("\n")
+		b.WriteString(youStyle.Render("  reject with message: "))
+		b.WriteString(d.rejectIn)
+		b.WriteString("█")
 		b.WriteString(dimStyle.Render("\n  enter sends · esc back"))
 		return b.String()
 	}

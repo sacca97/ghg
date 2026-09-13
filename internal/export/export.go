@@ -143,6 +143,23 @@ func RenderChat(sessionID string, msgs []models.Message) string {
 	return RenderChatWithTelemetry(sessionID, msgs, nil, nil, nil)
 }
 
+// HasChatContent reports whether a conversation contains anything beyond its
+// system prompt.
+func HasChatContent(msgs []models.Message) bool {
+	for _, msg := range msgs {
+		if msg.Role == "system" {
+			if strings.Contains(msg.Content, "Summary") || strings.Contains(msg.Content, "summary") {
+				return true
+			}
+			continue
+		}
+		if strings.TrimSpace(msg.TextContent()) != "" || len(msg.ToolCalls) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
 // RenderChatWithProgress formats a conversation and optional transient review
 // progress for human inspection.
 func RenderChatWithProgress(sessionID string, msgs []models.Message, progress []agent.ReviewProgress) string {

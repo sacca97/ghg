@@ -626,13 +626,15 @@ func (m *model) tasksView() string {
 		if t.Status == agent.TaskRunning {
 			line += dimStyle.Render(fmt.Sprintf("  (%ds)", int(time.Since(t.StartedAt).Seconds())))
 		}
-		b.WriteString("\n" + toolStyle.Render(line))
+		b.WriteString("\n")
+		b.WriteString(toolStyle.Render(line))
 		if t.Status != agent.TaskRunning {
 			report := t.Report
 			if len(report) > 200 {
 				report = report[:200] + "…"
 			}
-			b.WriteString("\n" + dimStyle.Render("      "+strings.ReplaceAll(report, "\n", " ")))
+			b.WriteString("\n")
+			b.WriteString(dimStyle.Render("      " + strings.ReplaceAll(report, "\n", " ")))
 		}
 	}
 	return b.String()
@@ -825,7 +827,8 @@ func (m *model) View() string {
 	if m.width > 0 {
 		left = ansi.Truncate(left, m.width, "…")
 	}
-	b.WriteString(dimStyle.Render(left) + "\n")
+	b.WriteString(dimStyle.Render(left))
+	b.WriteByte('\n')
 	if m.settings != nil {
 		b.WriteString(m.paletteView())
 		return b.String()
@@ -838,18 +841,27 @@ func (m *model) View() string {
 		b.WriteString(m.taskViewView())
 		return b.String()
 	}
-	b.WriteString(m.viewportView() + "\n")
+	b.WriteString(m.viewportView())
+	b.WriteByte('\n')
 	if !m.thinkStart.IsZero() && m.showThinking {
-		b.WriteString("\n" + m.frameThinkingView() + "\n")
+		b.WriteString("\n")
+		b.WriteString(m.frameThinkingView())
+		b.WriteByte('\n')
 	}
 	if m.current != "" {
-		b.WriteString("\n" + m.frameCurrentView() + "\n")
+		b.WriteString("\n")
+		b.WriteString(m.frameCurrentView())
+		b.WriteByte('\n')
 	}
 	if m.permDialog != nil {
-		b.WriteString("\n" + m.framePermissionView() + "\n")
+		b.WriteString("\n")
+		b.WriteString(m.framePermissionView())
+		b.WriteByte('\n')
 	}
 	if m.questionDialog != nil {
-		b.WriteString("\n" + m.frameQuestionView() + "\n")
+		b.WriteString("\n")
+		b.WriteString(m.frameQuestionView())
+		b.WriteByte('\n')
 	}
 	if m.busy {
 		hint := " thinking… (enter queues · /effort run now · esc interrupts · ctrl+c ctrl+c interrupts)"
@@ -859,14 +871,18 @@ func (m *model) View() string {
 		if m.interrupt1 {
 			hint = " thinking… (esc or ctrl+c again to interrupt)"
 		}
-		b.WriteString("\n" + m.spin.View() + dimStyle.Render(m.busyStats()+hint) + "\n")
+		b.WriteString("\n")
+		b.WriteString(m.spin.View())
+		b.WriteString(dimStyle.Render(m.busyStats() + hint))
+		b.WriteByte('\n')
 	}
 	if len(m.queue) > 0 {
 		nav := ""
 		if m.input.Value() == "" {
 			nav = " · ↑/↓ select · del removes"
 		}
-		b.WriteString(dimStyle.Render(fmt.Sprintf(" ⧗ queued (%d) — enter on empty input to steer into this turn%s", len(m.queue), nav)) + "\n")
+		b.WriteString(dimStyle.Render(fmt.Sprintf(" ⧗ queued (%d) — enter on empty input to steer into this turn%s", len(m.queue), nav)))
+		b.WriteByte('\n')
 		for i, q := range m.queue {
 			// one line per queued message: truncate (never wrap) so long
 			// messages don't crowd out the transcript
@@ -874,28 +890,34 @@ func (m *model) View() string {
 			if i == m.queueSel {
 				line = ansi.Truncate(botStyle.Render(" → ")+q+dimStyle.Render("  (del to remove)"), m.width, "…")
 			}
-			b.WriteString(line + "\n")
+			b.WriteString(line)
+			b.WriteByte('\n')
 		}
 	}
-	b.WriteString(m.inputRule() + "\n")
+	b.WriteString(m.inputRule())
+	b.WriteByte('\n')
 	// the persistent background-subagent strip sits just above the input box
 	dock := m.dockView
 	if dock == "" && len(m.dockTasks()) > 0 {
 		dock = m.tasksDock()
 	}
 	if dock != "" {
-		b.WriteString(dock + "\n")
+		b.WriteString(dock)
+		b.WriteByte('\n')
 	}
 	if m.rew != nil {
-		b.WriteString(m.frameRewindView() + "\n\n")
+		b.WriteString(m.frameRewindView())
+		b.WriteString("\n\n")
 	}
 	if m.namePrompt != nil {
-		b.WriteString(m.namePrompt.label + " ")
+		b.WriteString(m.namePrompt.label)
+		b.WriteString(" ")
 		if m.namePrompt.mask {
 			// Secrets never echo: render the mask instead of the input's
 			// live view (which would show the key in the clear). The "┃ "
 			// prompt matches how the textarea renders its own first line.
-			b.WriteString("┃ " + m.namePrompt.maskedValue(m.input.Value()))
+			b.WriteString("┃ ")
+			b.WriteString(m.namePrompt.maskedValue(m.input.Value()))
 		} else {
 			b.WriteString(m.input.View())
 		}
@@ -904,17 +926,22 @@ func (m *model) View() string {
 	}
 	if m.quit1 {
 		// first idle ctrl+c armed the quit; make the second press discoverable
-		b.WriteString("\n" + errStyle.Render("press ctrl+c again to quit"))
+		b.WriteString("\n")
+		b.WriteString(errStyle.Render("press ctrl+c again to quit"))
 	}
 	if m.escClr {
-		b.WriteString("\n" + errStyle.Render("esc again: clear the input (↑ recalls it)"))
+		b.WriteString("\n")
+		b.WriteString(errStyle.Render("esc again: clear the input (↑ recalls it)"))
 	} else if m.esc1 && m.rew == nil && m.namePrompt == nil {
-		b.WriteString("\n" + dimStyle.Render("esc again: rewind the conversation"))
+		b.WriteString("\n")
+		b.WriteString(dimStyle.Render("esc again: rewind the conversation"))
 	}
 	if m.menu != nil {
-		b.WriteString("\n" + m.menuView())
+		b.WriteString("\n")
+		b.WriteString(m.menuView())
 	}
-	b.WriteString("\n\n" + m.statusView()) // persistent status box, with a blank line above
+	b.WriteString("\n\n") // persistent status box, with a blank line above
+	b.WriteString(m.statusView())
 	return b.String()
 }
 
@@ -1160,9 +1187,12 @@ func (m *model) menuView() string {
 		pad := max(0, nameW-ansi.StringWidth(c.Text))
 		line := c.Text + strings.Repeat(" ", pad) + "  "
 		if i == m.menu.idx {
-			b.WriteString(botStyle.Render("→ "+line) + dimStyle.Render(c.Desc))
+			b.WriteString(botStyle.Render("→ " + line))
+			b.WriteString(dimStyle.Render(c.Desc))
 		} else {
-			b.WriteString("  " + line + dimStyle.Render(c.Desc))
+			b.WriteString("  ")
+			b.WriteString(line)
+			b.WriteString(dimStyle.Render(c.Desc))
 		}
 		b.WriteByte('\n')
 	}

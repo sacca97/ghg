@@ -1,7 +1,8 @@
 import { randomBytes } from "node:crypto";
+import { ChildProcess, execFileSync, spawn } from "node:child_process";
 import * as fs from "node:fs";
+import { isAbsolute, resolve } from "node:path";
 import * as readline from "node:readline";
-import { ChildProcess, spawn } from "node:child_process";
 import * as vscode from "vscode";
 
 type Event = { type?: unknown; [key: string]: unknown };
@@ -10,13 +11,14 @@ type Workspace = vscode.WorkspaceFolder | undefined;
 // option order the webview renders are all derived from these tables.
 const roles = ["default", "smart", "fast", "tiny"] as const;
 const modes = ["execute", "plan", "review"] as const;
+const composerModes = ["execute", "plan", "review", "ask"] as const;
 const effortLevels = ["", "low", "medium", "high"] as const;
 const approvals = ["", "ask", "auto", "never"] as const;
 const sandboxes = ["", "read-only", "workspace-write", "danger-full-access"] as const;
 const networks = ["", "deny", "host"] as const;
 
 type Role = (typeof roles)[number];
-type Mode = (typeof modes)[number];
+type Mode = (typeof composerModes)[number];
 
 const oneOf = <T extends string>(values: readonly T[], value: unknown): value is T =>
 	typeof value === "string" && (values as readonly string[]).includes(value);
@@ -45,6 +47,24 @@ const sessionKey = (workspace: Workspace): string =>
 function currentWorkspace(): Workspace {
 	const editor = vscode.window.activeTextEditor;
 	return (editor && vscode.workspace.getWorkspaceFolder(editor.document.uri)) || vscode.workspace.workspaceFolders?.[0];
+}
+
+function displayBinaryPath(binary: string): string {
+	const value = binary.trim() || "ghg";
+	if (isAbsolute(value)) return value;
+	if (value.includes("/") || value.includes("\\")) {
+		return resolve(currentWorkspace()?.uri.fsPath || process.cwd(), value);
+	}
+	try {
+		const resolver = process.platform === "win32" ? "where.exe" : "which";
+		const resolved = execFileSync(resolver, [value], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] })
+			.split(/\r?\n/, 1)[0]
+			?.trim();
+		if (resolved) return resolved;
+	} catch {
+		// Keep the configured command when it is not available on PATH.
+	}
+	return value;
 }
 
 function cleanReferences(value: unknown): string[] {
@@ -332,7 +352,7 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 			sandbox: cfg.get<string>("sandbox", ""),
 			network: cfg.get<string>("network", ""),
 			approval: cfg.get<string>("approval", ""),
-			binary: cfg.get<string>("binaryPath", "ghg"),
+			binary: displayBinaryPath(cfg.get<string>("binaryPath", "ghg")),
 		};
 	}
 
@@ -407,6 +427,8 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 		try {
 			if (request.mode === "review") {
 				await this.submitInput(request.prompt, request.role, "execute", { review: true }, request.references);
+			} else if (request.mode === "ask") {
+				await this.submitInput(request.prompt, request.role, "execute", { ask: true }, request.references);
 			} else {
 				await this.submitInput(request.prompt, request.role, request.mode === "plan" ? "plan" : "execute", {}, request.references);
 			}
@@ -785,6 +807,22 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 		}
 	}
 
+	async exportChat(): Promise<void> {
+		const choice = await vscode.window.showQuickPick(
+			[
+				{ label: "Markdown", value: "markdown" },
+				{ label: "JSON", value: "json" },
+			],
+			{ placeHolder: "Export chat as…" },
+		);
+		if (!choice) return;
+		try {
+			await this.exportResult("chat", "", choice.value);
+		} catch (error) {
+			this.post({ type: "error", error: error instanceof Error ? error.message : String(error) });
+		}
+	}
+
 	private async exportResult(kind = "", destination = "", format = "", force = false): Promise<void> {
 		const workspace = currentWorkspace();
 		if (!workspace) throw new Error("open a workspace before exporting");
@@ -1122,20 +1160,7 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 				await this.refreshModels();
 				break;
 			case "exportChat": {
-				const choice = await vscode.window.showQuickPick(
-					[
-						{ label: "Markdown", value: "markdown" },
-						{ label: "JSON", value: "json" },
-					],
-					{ placeHolder: "Export chat as…" },
-				);
-				if (choice) {
-					try {
-						await this.exportResult("chat", "", choice.value);
-					} catch (error) {
-						this.post({ type: "error", error: error instanceof Error ? error.message : String(error) });
-					}
-				}
+				await this.exportChat();
 				break;
 			}
 			case "exportResult": {
@@ -1249,9 +1274,9 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 		}
 		const prompt = message.prompt.trim();
 		const activeBefore = this.active;
-		const mode = message.mode === "plan" ? "plan" : message.mode === "review" ? "review" : message.mode === "execute" || message.mode === "chat" ? "execute" : undefined;
+		const mode = message.mode === "plan" ? "plan" : message.mode === "review" ? "review" : message.mode === "ask" ? "ask" : message.mode === "execute" || message.mode === "chat" ? "execute" : undefined;
 		if (!mode) {
-			this.post({ type: "error", error: "Choose Execute, Plan, or Review before sending." });
+			this.post({ type: "error", error: "Choose Execute, Plan, Review, or Ask before sending." });
 			return;
 		}
 		const role: Role = oneOf(roles, message.role) ? message.role : "fast";
@@ -1283,6 +1308,8 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 			this.post({ type: "turn_start", mode });
 			if (mode === "review") {
 				await this.submitInput(prompt, role, "execute", { review: true }, cleanReferences(message.references));
+			} else if (mode === "ask") {
+				await this.submitInput(prompt, role, "execute", { ask: true }, cleanReferences(message.references));
 			} else {
 				await this.submitInput(prompt, role, mode === "plan" ? "plan" : "execute", {}, cleanReferences(message.references));
 			}
@@ -1355,6 +1382,7 @@ export function activate(extension: vscode.ExtensionContext): void {
 		}),
 		vscode.commands.registerCommand("ghg.newSession", () => provider.newSession()),
 		vscode.commands.registerCommand("ghg.resumeSession", () => provider.resumeSession()),
+		vscode.commands.registerCommand("ghg.exportChat", () => provider.exportChat()),
 		vscode.commands.registerCommand("ghg.refreshModels", () => provider.refreshModels()),
 		vscode.commands.registerCommand("ghg.openSettings", () => provider.openSettings()),
 		vscode.workspace.onDidChangeConfiguration((event) => {

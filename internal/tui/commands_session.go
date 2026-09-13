@@ -86,7 +86,9 @@ func (m *model) compactLog() {
 		if len(summary) > 80 {
 			summary = summary[:80] + "…"
 		}
-		b.WriteString("\n  " + dimStyle.Render("#"+strconv.Itoa(c.Seq)+" folded through message "+strconv.Itoa(c.Cutoff)+": ") + summary)
+		b.WriteString("\n  ")
+		b.WriteString(dimStyle.Render("#" + strconv.Itoa(c.Seq) + " folded through message " + strconv.Itoa(c.Cutoff) + ": "))
+		b.WriteString(summary)
 	}
 	m.append(b.String())
 }
@@ -300,7 +302,7 @@ func parseExportOptions(text string) exportOptions {
 			}
 		case strings.HasPrefix(arg, "--format="):
 			opts.format = strings.TrimPrefix(arg, "--format=")
-		case arg == "plan" || arg == "review" || arg == "last" || arg == "message" || arg == "response" || arg == "chat" || arg == "log" || arg == "transcript":
+		case arg == "plan" || arg == "review" || arg == "last" || arg == "message" || arg == "response" || arg == "chat" || arg == "log" || arg == "logs" || arg == "transcript":
 			if opts.kind == "" {
 				opts.kind = arg
 			} else if opts.dest == "" {
@@ -316,7 +318,7 @@ func parseExportOptions(text string) exportOptions {
 	switch opts.kind {
 	case "last", "message", "response":
 		opts.kind = "message"
-	case "log", "transcript":
+	case "log", "logs", "transcript":
 		opts.kind = "chat"
 	}
 	if opts.format == "" {
@@ -344,7 +346,7 @@ func newExportRecord(prefix, sessionID, kind string, version int, payload string
 func (m *model) exportRecord(kind string) (session.WorkflowResultRecord, bool, error) {
 	if kind == "chat" {
 		msgs := m.findChatMessages()
-		if len(msgs) == 0 {
+		if !export.HasChatContent(msgs) {
 			return session.WorkflowResultRecord{}, false, nil
 		}
 		var meta session.Meta

@@ -7,7 +7,6 @@ import (
 	"sort"
 	"strings"
 	"time"
-	"unicode/utf8"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/x/ansi"
@@ -71,25 +70,22 @@ const (
 	panelGoal
 )
 
-// ppanel is a settings sub-panel: the interactive editor behind a row. Key
-// handling switches on kind; the slice fields hold whatever that kind lists
-// (models, effort levels, …).
-type ppanel struct {
-	kind  panelKind
-	title string
+type panelRow struct {
+	label string
+	value string
+	item  modelItem
+}
 
-	items      []modelItem // panelModel: flattened provider/model routes
-	idx        int
+// ppanel is a settings sub-panel: the interactive editor behind a row.
+type ppanel struct {
+	kind       panelKind
+	title      string
+	rows       []panelRow
+	selected   int
 	role       string // panelModel: user-facing role whose route is edited; empty is a direct switch
 	staleHints []string
 
-	levels []string // panelEffort: available levels ("" = off)
-	lidx   int
-
 	prepare string // panelGoal: text submitted when the editor closes
-
-	list []string // panelRole/panelMode: selectable rows
-	midx int      // panelRole/panelMode: selected row
 
 	err    string // inline error from a failed apply
 	offset int    // first visible rendered row in a scrollable panel
@@ -127,7 +123,7 @@ const (
 
 // slashHint looks a command's one-liner up in the registry so the settings
 // and /help can never disagree about what a command does.
-func slashHint(m *model, name string) string {
+func slashHint(name string) string {
 	if e := registryFind(name); e != nil {
 		return e.Hint
 	}
@@ -154,13 +150,17 @@ func (m *model) paletteItems() []paletteItem {
 				}
 				return "thinking level for " + m.modelName
 			},
-			dynHint: func(m *model) string { return "/effort " + slashHint(m, "/effort") },
+			dynHint: func(m *model) string { return "/effort " + slashHint("/effort") },
 			panel: func(m *model) *ppanel {
 				levels := m.effortsFor()
-				pp := &ppanel{kind: panelEffort, title: "Reasoning effort", levels: levels}
+				rows := make([]panelRow, len(levels))
+				for i, level := range levels {
+					rows[i] = panelRow{label: effortLabel(level), value: level}
+				}
+				pp := &ppanel{kind: panelEffort, title: "Reasoning effort", rows: rows}
 				for i, e := range levels {
 					if e == m.currentEffort() {
-						pp.lidx = i
+						pp.selected = i
 						break
 					}
 				}
@@ -169,24 +169,24 @@ func (m *model) paletteItems() []paletteItem {
 			stepBack: func(m *model) { m.setEffort(prevEffort(m.effortsFor(), m.currentEffort())) },
 			stepFwd:  func(m *model) { m.setEffort(nextEffort(m.effortsFor(), m.currentEffort())) }},
 		{title: "Dynamic reasoning", category: "Agent",
-			dynDesc:  func(m *model) string { return slashHint(m, "/dynamic-reasoning") },
+			dynDesc:  func(m *model) string { return slashHint("/dynamic-reasoning") },
 			dynHint:  func(m *model) string { return "/dynamic-reasoning" },
 			stepBack: func(m *model) { m.setDynamicReasoning(false) },
 			stepFwd:  func(m *model) { m.setDynamicReasoning(true) }},
 		{title: "Plan", category: "Agent", suggested: true,
-			dynDesc: func(m *model) string { return slashHint(m, "/plan") },
+			dynDesc: func(m *model) string { return slashHint("/plan") },
 			dynHint: func(m *model) string { return "/plan <goal>" },
 			action:  paletteActionPlanPrompt},
 		{title: "Execute plan", category: "Agent", suggested: true,
-			dynDesc: func(m *model) string { return slashHint(m, "/execute") },
+			dynDesc: func(m *model) string { return slashHint("/execute") },
 			dynHint: func(m *model) string { return "/execute" },
 			command: "/execute"},
 		{title: "Review", category: "Agent", suggested: true,
-			dynDesc: func(m *model) string { return slashHint(m, "/review") },
+			dynDesc: func(m *model) string { return slashHint("/review") },
 			dynHint: func(m *model) string { return "/review <target>" },
 			action:  paletteActionReviewPrompt},
 		{title: "Resume session", category: "Session", suggested: true,
-			dynDesc: func(m *model) string { return slashHint(m, "/resume") },
+			dynDesc: func(m *model) string { return slashHint("/resume") },
 			dynHint: func(m *model) string { return "/resume" },
 			command: "/resume"},
 		{title: "Rewind conversation", category: "Session", suggested: true,
@@ -199,13 +199,13 @@ func (m *model) paletteItems() []paletteItem {
 			dynHint: func(m *model) string { return palHintRewind },
 			action:  paletteActionRewind},
 		{title: "Fork session", category: "Session",
-			dynDesc: func(m *model) string { return slashHint(m, "/fork") },
+			dynDesc: func(m *model) string { return slashHint("/fork") },
 			dynHint: func(m *model) string { return "/fork" },
 			command: "/fork"},
-		{title: "Export chat", category: "Session",
-			dynDesc: func(m *model) string { return "export the full conversation to Markdown or JSON" },
-			dynHint: func(m *model) string { return "/export chat" },
-			command: "/export chat"},
+		{title: "Export chat log", category: "Session",
+			dynDesc: func(m *model) string { return "export the conversation and execution logs to Markdown or JSON" },
+			dynHint: func(m *model) string { return "/export logs" },
+			command: "/export logs"},
 		{title: "Export latest plan", category: "Session",
 			dynDesc: func(m *model) string { return "export latest plan to Markdown or JSON" },
 			dynHint: func(m *model) string { return "/export plan" },
@@ -219,7 +219,7 @@ func (m *model) paletteItems() []paletteItem {
 			dynHint: func(m *model) string { return "/export last" },
 			command: "/export last"},
 		{title: "Export workflow result", category: "Session",
-			dynDesc: func(m *model) string { return slashHint(m, "/export") },
+			dynDesc: func(m *model) string { return slashHint("/export") },
 			dynHint: func(m *model) string { return "/export" },
 			action:  paletteActionExportPrompt},
 		{title: "Rename session", category: "Session",
@@ -232,26 +232,26 @@ func (m *model) paletteItems() []paletteItem {
 				}
 				return "retitle this session"
 			},
-			dynHint: func(m *model) string { return "/rename " + slashHint(m, "/rename") },
+			dynHint: func(m *model) string { return "/rename " + slashHint("/rename") },
 			command: "/rename"},
 		{title: "New session", category: "Session",
-			dynDesc: func(m *model) string { return slashHint(m, "/clear") },
+			dynDesc: func(m *model) string { return slashHint("/clear") },
 			dynHint: func(m *model) string { return "/clear" },
 			command: "/clear"},
 		{title: "Compact session", category: "Session", suggested: true,
-			dynDesc: func(m *model) string { return slashHint(m, "/compact") },
+			dynDesc: func(m *model) string { return slashHint("/compact") },
 			dynHint: func(m *model) string { return "/compact" },
 			command: "/compact"},
 		{title: "Context doctor", category: "Session",
-			dynDesc: func(m *model) string { return slashHint(m, "/context-doctor") },
+			dynDesc: func(m *model) string { return slashHint("/context-doctor") },
 			dynHint: func(m *model) string { return "/context-doctor" },
 			command: "/context-doctor"},
 		{title: "Bug report", category: "Session",
-			dynDesc: func(m *model) string { return slashHint(m, "/report") },
+			dynDesc: func(m *model) string { return slashHint("/report") },
 			dynHint: func(m *model) string { return "/report" },
 			command: "/report"},
 		{title: "MCP servers", category: "Session",
-			dynDesc: func(m *model) string { return slashHint(m, "/mcp") }, // live count: [n/n ready] badge
+			dynDesc: func(m *model) string { return slashHint("/mcp") }, // live count: [n/n ready] badge
 			dynHint: func(m *model) string { return "/mcp" },
 			command: "/mcp"},
 		{title: "Compaction level", category: "Session",
@@ -269,7 +269,7 @@ func (m *model) paletteItems() []paletteItem {
 					return truncLine(g, 40)
 				}
 			},
-			dynHint: func(m *model) string { return "/goal " + slashHint(m, "/goal") },
+			dynHint: func(m *model) string { return "/goal " + slashHint("/goal") },
 			panel: func(m *model) *ppanel {
 				pp := &ppanel{kind: panelGoal, title: "Goal", prepare: m.currentGoal()}
 				return pp
@@ -281,7 +281,7 @@ func (m *model) paletteItems() []paletteItem {
 			stepBack: func(m *model) { m.setThinking(false) },
 			stepFwd:  func(m *model) { m.setThinking(true) }},
 		{title: "Help", category: "App",
-			dynDesc: func(m *model) string { return slashHint(m, "/help") },
+			dynDesc: func(m *model) string { return slashHint("/help") },
 			dynHint: func(m *model) string { return "/help" },
 			command: "/help"},
 		{title: "Quit", category: "App",
@@ -458,15 +458,14 @@ func (m *model) paletteKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case tea.KeyEnter:
 		return m.activatePaletteSelection()
 	case tea.KeyBackspace, tea.KeyDelete:
-		if len(p.filter) > 0 {
-			_, size := utf8.DecodeLastRuneInString(p.filter)
-			p.filter = p.filter[:len(p.filter)-size]
+		if handleLineEdit(msg, &p.filter, 0) {
 			p.applyFilter(m)
 		}
-	case tea.KeyRunes:
-		p.filter += string(msg.Runes)
-		p.idx = 0
-		p.applyFilter(m)
+	case tea.KeyRunes, tea.KeySpace:
+		if handleLineEdit(msg, &p.filter, 0) {
+			p.idx = 0
+			p.applyFilter(m)
+		}
 	}
 	if m.settings != nil {
 		m.settings.rootRowsValid = false
@@ -497,16 +496,9 @@ func (m *model) paletteMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	if pp := m.settings.top(); pp != nil {
-		switch pp.kind {
-		case panelModel:
-			pp.idx = paletteClamp(pp.idx+delta, 0, len(pp.items)-1)
-			if len(pp.items) > 0 && pp.role == "" {
-				m.previewModel(pp.items[pp.idx])
-			}
-		case panelRole, panelMode:
-			pp.midx = paletteClamp(pp.midx+delta, 0, len(pp.list)-1)
-		case panelEffort:
-			pp.lidx = paletteClamp(pp.lidx+delta, 0, len(pp.levels)-1)
+		pp.move(delta)
+		if pp.kind == panelModel && len(pp.rows) > 0 && pp.role == "" {
+			m.previewModel(pp.rows[pp.selected].item)
 		}
 	} else if len(m.settings.items) > 0 {
 		m.settings.idx = paletteClamp(m.settings.idx+delta, 0, len(m.settings.items)-1)
@@ -576,21 +568,11 @@ func (m *model) panelMouse(y int, pp *ppanel) (tea.Model, tea.Cmd) {
 	}
 	selected := start + row
 	switch pp.kind {
-	case panelModel:
-		if selected >= len(pp.items) {
-			return m, nil // the empty-state row is not selectable
-		}
-		pp.idx = selected
-	case panelRole, panelMode:
-		if selected >= len(pp.list) {
+	case panelModel, panelRole, panelMode, panelEffort:
+		if selected >= len(pp.rows) {
 			return m, nil
 		}
-		pp.midx = selected
-	case panelEffort:
-		if selected >= len(pp.levels) {
-			return m, nil
-		}
-		pp.lidx = selected
+		pp.selected = selected
 	case panelGoal:
 		return m, nil // the goal row is an editor, not a button
 	}
@@ -650,6 +632,13 @@ func paletteClamp(n, low, high int) int {
 	return min(max(n, low), high)
 }
 
+func (p *ppanel) move(delta int) {
+	if len(p.rows) == 0 {
+		return
+	}
+	p.selected = (paletteClamp(p.selected, 0, len(p.rows)-1) + delta + len(p.rows)) % len(p.rows)
+}
+
 // pushPanel drills into an item's sub-panel. Items whose setting can't be
 // listed (no models configured) fail in place with a transcript note.
 func (m *model) pushPanel(it *paletteItem) {
@@ -675,29 +664,45 @@ func (m *model) panelKey(msg tea.KeyMsg, pp *ppanel) (tea.Model, tea.Cmd) {
 		}
 	}
 
-	switch pp.kind {
-	case panelModel:
-		if len(pp.items) == 0 {
-			if msg.Type == tea.KeyEsc || msg.Type == tea.KeyCtrlC {
-				pop()
-			}
-			break
-		}
+	if pp.kind == panelGoal {
 		switch msg.Type {
 		case tea.KeyEsc, tea.KeyCtrlC:
+			m.commitGoal(pp) // esc applies too — the editor is the goal
 			pop()
-		case tea.KeyUp, tea.KeyCtrlP, tea.KeyShiftTab:
-			pp.idx = (pp.idx - 1 + len(pp.items)) % len(pp.items)
-			if pp.role == "" {
-				m.previewModel(pp.items[pp.idx])
-			}
-		case tea.KeyDown, tea.KeyCtrlN, tea.KeyTab:
-			pp.idx = (pp.idx + 1) % len(pp.items)
-			if pp.role == "" {
-				m.previewModel(pp.items[pp.idx])
-			}
 		case tea.KeyEnter:
-			it := pp.items[pp.idx]
+			m.commitGoal(pp)
+			pop()
+		default:
+			handleLineEdit(msg, &pp.prepare, 0)
+		}
+		return m, nil
+	}
+	if len(pp.rows) == 0 {
+		if msg.Type == tea.KeyEsc || msg.Type == tea.KeyCtrlC {
+			pop()
+		}
+		return m, nil
+	}
+	switch msg.Type {
+	case tea.KeyEsc, tea.KeyCtrlC:
+		pop()
+	case tea.KeyUp, tea.KeyCtrlP, tea.KeyShiftTab:
+		pp.move(-1)
+		if pp.kind == panelModel && pp.role == "" {
+			m.previewModel(pp.rows[pp.selected].item)
+		}
+	case tea.KeyDown, tea.KeyCtrlN, tea.KeyTab:
+		pp.move(1)
+		if pp.kind == panelModel && pp.role == "" {
+			m.previewModel(pp.rows[pp.selected].item)
+		}
+	default:
+		switch pp.kind {
+		case panelModel:
+			if msg.Type != tea.KeyEnter {
+				break
+			}
+			it := pp.rows[pp.selected].item
 			if it.unavailable {
 				pp.err = "model unavailable: " + it.unavailableReason
 				break
@@ -716,43 +721,16 @@ func (m *model) panelKey(msg tea.KeyMsg, pp *ppanel) (tea.Model, tea.Cmd) {
 			} else {
 				pop()
 			}
-		}
-
-	case panelRole:
-		if len(pp.list) == 0 {
-			if msg.Type == tea.KeyEsc || msg.Type == tea.KeyCtrlC {
-				pop()
+		case panelRole:
+			if msg.Type == tea.KeyEnter || msg.Type == tea.KeyRight {
+				row := pp.rows[pp.selected]
+				p.stack = append(p.stack, m.roleModelPanel(row.value, pp.direct))
 			}
-			break
-		}
-		switch msg.Type {
-		case tea.KeyEsc, tea.KeyCtrlC:
-			pop()
-		case tea.KeyUp, tea.KeyCtrlP, tea.KeyShiftTab:
-			pp.midx = (pp.midx - 1 + len(pp.list)) % len(pp.list)
-		case tea.KeyDown, tea.KeyCtrlN, tea.KeyTab:
-			pp.midx = (pp.midx + 1) % len(pp.list)
-		case tea.KeyEnter, tea.KeyRight:
-			child := m.roleModelPanel(pp.list[pp.midx], pp.direct)
-			p.stack = append(p.stack, child)
-		}
-
-	case panelMode:
-		if len(pp.list) == 0 {
-			if msg.Type == tea.KeyEsc || msg.Type == tea.KeyCtrlC {
-				pop()
+		case panelMode:
+			if msg.Type != tea.KeyLeft && msg.Type != tea.KeyRight && msg.Type != tea.KeyEnter {
+				break
 			}
-			break
-		}
-		switch msg.Type {
-		case tea.KeyEsc, tea.KeyCtrlC:
-			pop()
-		case tea.KeyUp, tea.KeyCtrlP, tea.KeyShiftTab:
-			pp.midx = (pp.midx - 1 + len(pp.list)) % len(pp.list)
-		case tea.KeyDown, tea.KeyCtrlN, tea.KeyTab:
-			pp.midx = (pp.midx + 1) % len(pp.list)
-		case tea.KeyLeft, tea.KeyRight, tea.KeyEnter:
-			if err := m.setMode(pp.list[pp.midx]); err != nil {
+			if err := m.setMode(pp.rows[pp.selected].value); err != nil {
 				pp.err = err.Error()
 				break
 			}
@@ -760,45 +738,14 @@ func (m *model) panelKey(msg tea.KeyMsg, pp *ppanel) (tea.Model, tea.Cmd) {
 			if msg.Type == tea.KeyEnter {
 				pop()
 			}
-		}
-
-	case panelEffort:
-		if len(pp.levels) == 0 {
-			if msg.Type == tea.KeyEsc || msg.Type == tea.KeyCtrlC {
-				pop()
+		case panelEffort:
+			if msg.Type != tea.KeyLeft && msg.Type != tea.KeyRight && msg.Type != tea.KeyEnter {
+				break
 			}
-			break
-		}
-		switch msg.Type {
-		case tea.KeyEsc, tea.KeyCtrlC:
-			pop()
-		case tea.KeyUp, tea.KeyCtrlP, tea.KeyShiftTab:
-			pp.lidx = (pp.lidx - 1 + len(pp.levels)) % len(pp.levels)
-		case tea.KeyDown, tea.KeyCtrlN, tea.KeyTab:
-			pp.lidx = (pp.lidx + 1) % len(pp.levels)
-		case tea.KeyLeft, tea.KeyRight, tea.KeyEnter:
-			// ←/→ and enter all apply the highlighted level: selecting is the
-			// point of the panel, so any confirm key is a commitment
-			m.setEffort(pp.levels[pp.lidx])
+			m.setEffort(pp.rows[pp.selected].value)
 			if msg.Type == tea.KeyEnter {
 				pop()
 			}
-		}
-
-	case panelGoal:
-		switch msg.Type {
-		case tea.KeyEsc, tea.KeyCtrlC:
-			m.commitGoal(pp) // esc applies too — the editor is the goal
-			pop()
-		case tea.KeyEnter:
-			m.commitGoal(pp)
-			pop()
-		case tea.KeyBackspace, tea.KeyDelete:
-			if len(pp.prepare) > 0 {
-				pp.prepare = pp.prepare[:len(pp.prepare)-1]
-			}
-		case tea.KeyRunes, tea.KeySpace:
-			pp.prepare += string(msg.Runes)
 		}
 	}
 	return m, nil
@@ -1062,7 +1009,8 @@ func (m *model) panelContent(pp *ppanel) (rows []string, selected int, footer []
 				currentModel, currentProvider = target.Model, target.Provider
 			}
 		}
-		for i, it := range pp.items {
+		for i, row := range pp.rows {
+			it := row.item
 			cur := ""
 			if it.model == currentModel && it.provider == currentProvider {
 				cur = dimStyle.Render("  (current)")
@@ -1071,7 +1019,7 @@ func (m *model) panelContent(pp *ppanel) (rows []string, selected int, footer []
 			if it.fromCatalog || it.unavailable {
 				line = dimStyle.Render(line)
 			}
-			if i == pp.idx {
+			if i == pp.selected {
 				selected = len(rows)
 				rows = append(rows, botStyle.Render(" → "+line)+cur)
 			} else {
@@ -1089,22 +1037,23 @@ func (m *model) panelContent(pp *ppanel) (rows []string, selected int, footer []
 			action = "save"
 		}
 		position := 0
-		if len(pp.items) > 0 {
-			position = pp.idx + 1
+		if len(pp.rows) > 0 {
+			position = pp.selected + 1
 		}
-		footer = append(footer, "", dimStyle.Render(fmt.Sprintf("  (%d/%d) ↑/↓ select · enter %s · esc back", position, len(pp.items), action)))
+		footer = append(footer, "", dimStyle.Render(fmt.Sprintf("  (%d/%d) ↑/↓ select · enter %s · esc back", position, len(pp.rows), action)))
 		if len(pp.staleHints) > 0 {
 			footer = append(footer, dimStyle.Render("  catalog stale for "+strings.Join(pp.staleHints, ", ")+" — /model refresh to pull newly announced models"))
 		}
 
 	case panelRole:
-		for i, label := range pp.list {
+		for i, row := range pp.rows {
+			label := row.value
 			modelName := "(not set)"
 			if target, err := m.roleRoute(label); err == nil && target.Model != "" {
 				modelName = target.Model
 			}
 			line := label + "  " + dimStyle.Render("— "+modelName)
-			if i == pp.midx {
+			if i == pp.selected {
 				selected = len(rows)
 				rows = append(rows, botStyle.Render(" → "+line))
 			} else {
@@ -1114,12 +1063,13 @@ func (m *model) panelContent(pp *ppanel) (rows []string, selected int, footer []
 		footer = []string{"", dimStyle.Render("  ↑/↓ select · enter choose model · esc back")}
 
 	case panelMode:
-		for i, mode := range pp.list {
+		for i, row := range pp.rows {
+			mode := row.value
 			cur := ""
 			if mode == m.uiMode() {
 				cur = dimStyle.Render("  (current)")
 			}
-			if i == pp.midx {
+			if i == pp.selected {
 				selected = len(rows)
 				rows = append(rows, botStyle.Render(" → "+mode)+cur)
 			} else {
@@ -1132,12 +1082,13 @@ func (m *model) panelContent(pp *ppanel) (rows []string, selected int, footer []
 		footer = append(footer, "", dimStyle.Render("  ↑/↓ select · enter apply · esc back"))
 
 	case panelEffort:
-		for i, e := range pp.levels {
+		for i, row := range pp.rows {
+			e := row.value
 			cur := ""
 			if e == m.currentEffort() {
 				cur = dimStyle.Render("  (current)")
 			}
-			if i == pp.lidx {
+			if i == pp.selected {
 				selected = len(rows)
 				rows = append(rows, botStyle.Render(" → "+effortLabel(e))+cur)
 			} else {
