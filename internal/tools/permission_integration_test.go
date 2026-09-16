@@ -47,7 +47,11 @@ func TestBashExplorationRedirectsAndEscapes(t *testing.T) {
 	}
 	for _, tc := range redirectCases {
 		t.Run(tc.command, func(t *testing.T) {
-			got, ok := redirectBashInspection(tc.command)
+			segments, err := SegmentShell(tc.command)
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, ok := redirectBashInspectionSegments(tc.command, segments)
 			if !ok || got.Tool != tc.tool {
 				t.Fatalf("redirect = %#v, %v", got, ok)
 			}
@@ -62,7 +66,11 @@ func TestBashExplorationRedirectsAndEscapes(t *testing.T) {
 		"ls -R",
 		"sed -n '1,20p' internal/agent/agent.go | head",
 	} {
-		if _, ok := redirectBashInspection(command); ok {
+		segments, err := SegmentShell(command)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := redirectBashInspectionSegments(command, segments); ok {
 			t.Fatalf("advanced or outside command was redirected: %q", command)
 		}
 	}
@@ -84,10 +92,18 @@ func TestBashExplorationRedirectsAndEscapes(t *testing.T) {
 	if pipeline.Metadata["bash_redirect"] == "true" || !IsUntrusted(pipeline) || pipeline.Metadata["observation_id"] != "" {
 		t.Fatalf("transformed pipeline was normalized or trusted: %+v", pipeline)
 	}
-	if got := bashPreviewLimit("rg TODO ."); got != 8<<10 {
+	segments, err := SegmentShell("rg TODO .")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := bashPreviewLimitSegments(segments); got != 8<<10 {
 		t.Fatalf("search preview limit = %d, want %d", got, 8<<10)
 	}
-	if got := bashPreviewLimit("git status"); got != 14<<10 {
+	segments, err = SegmentShell("git status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := bashPreviewLimitSegments(segments); got != 14<<10 {
 		t.Fatalf("ordinary preview limit = %d, want %d", got, 14<<10)
 	}
 }
@@ -749,7 +765,7 @@ func TestFabricatedObservationRejectedWithoutModifyingFile(t *testing.T) {
 	}
 }
 
-func TestPostEditObservationChainingAuthorizesConsecutiveEdits(t *testing.T) {
+func TestObservationChainingAuthorizesConsecutiveEdits(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "chain.txt")
 	initial := "line 1\nline 2\nline 3\nline 4\nline 5\n"

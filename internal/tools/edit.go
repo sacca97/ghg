@@ -159,24 +159,13 @@ func runExactEdit(ctx context.Context, request editRequest) (ToolResult, error) 
 	if err := publishEditFiles(ctx, []editPublication{{path: canonical, original: original, updated: updated, mode: info.Mode()}}); err != nil {
 		return ToolResult{}, err
 	}
-	hookReports := runtimePostEditReports(ctx, []string{canonical})
 	final, readErr := os.ReadFile(canonical)
 	if readErr != nil {
-		if os.IsNotExist(readErr) {
-			out := fmt.Sprintf("Replaced %d occurrence(s) in %s\npostEdit removed the file", n, canonical)
-			for _, report := range hookReports {
-				out += "\n\n" + report.note(RuntimeFromContext(ctx))
-			}
-			return textResult(out, Truncate(out), 0), nil
-		}
 		return ToolResult{}, fmt.Errorf("read back %s: %w", canonical, readErr)
 	}
 	out := fmt.Sprintf("Replaced %d occurrence(s) in %s", n, canonical)
 	if d := editDiff(string(original), string(final)); d != "" {
 		out += "\n```diff\n" + d + "\n```"
-	}
-	for _, report := range hookReports {
-		out += "\n\n" + report.note(RuntimeFromContext(ctx))
 	}
 	out += lspDiagnostics(ctx, canonical)
 	return textResult(out, Truncate(out), 0), nil
@@ -336,7 +325,6 @@ func runObservedEdit(ctx context.Context, request editRequest) (ToolResult, erro
 	if err := publishEditFiles(ctx, publications); err != nil {
 		return ToolResult{}, err
 	}
-	hookReports := runtimePostEditReports(ctx, canonicalPaths)
 
 	var out strings.Builder
 	var retained strings.Builder
@@ -350,8 +338,8 @@ func runObservedEdit(ctx context.Context, request editRequest) (ToolResult, erro
 		final, err := os.ReadFile(path)
 		if err != nil {
 			if os.IsNotExist(err) {
-				out.WriteString("(file was removed by postEdit)\n")
-				retained.WriteString("(file was removed by postEdit)\n")
+				out.WriteString("(file was removed before readback)\n")
+				retained.WriteString("(file was removed before readback)\n")
 			} else {
 				out.WriteString("(readback failed: " + err.Error() + ")\n")
 				retained.WriteString("(readback failed: " + err.Error() + ")\n")
@@ -390,24 +378,9 @@ func runObservedEdit(ctx context.Context, request editRequest) (ToolResult, erro
 			retained.WriteString(diag)
 		}
 	}
-	for _, report := range hookReports {
-		note := report.note(RuntimeFromContext(ctx))
-		out.WriteString(note)
-		out.WriteByte('\n')
-		retained.WriteString(note)
-		retained.WriteByte('\n')
-	}
 	preview := strings.TrimSuffix(out.String(), "\n")
 	retainedStr := strings.TrimSuffix(retained.String(), "\n")
 	return textResult(retainedStr, Truncate(preview), 0), nil
-}
-
-func runtimePostEditReports(ctx context.Context, paths []string) []HookReport {
-	runtime := RuntimeFromContext(ctx)
-	if runtime == nil {
-		return nil
-	}
-	return runtime.RunPostEditHooks(ctx, paths)
 }
 
 // publishEditFiles stages every replacement before renaming any of them, then
@@ -789,18 +762,9 @@ func runWriteResult(ctx context.Context, args json.RawMessage) (ToolResult, erro
 	if err := atomicWriteFile(path, []byte(a.Content), mode); err != nil {
 		return ToolResult{}, err
 	}
-	hookReports := runtimePostEditReports(ctx, []string{path})
 	raw := fmt.Sprintf("Wrote %d bytes to %s", len(a.Content), path)
-	if final, readErr := os.ReadFile(path); readErr == nil {
-		if string(final) != a.Content {
-			raw += fmt.Sprintf("\npostEdit final bytes: %d", len(final))
-		}
+	if _, statErr := os.Stat(path); statErr == nil {
 		raw += lspDiagnostics(ctx, path)
-	} else if os.IsNotExist(readErr) {
-		raw += "\npostEdit removed the file"
-	}
-	for _, report := range hookReports {
-		raw += "\n\n" + report.note(RuntimeFromContext(ctx))
 	}
 	return textResult(raw, raw, 0), nil
 }

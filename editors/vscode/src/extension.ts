@@ -12,7 +12,6 @@ type Workspace = vscode.WorkspaceFolder | undefined;
 const roles = ["default", "smart", "fast", "tiny"] as const;
 const modes = ["execute", "plan", "review"] as const;
 const composerModes = ["execute", "plan", "review", "ask"] as const;
-const effortLevels = ["", "low", "medium", "high"] as const;
 const approvals = ["", "ask", "auto", "never"] as const;
 const sandboxes = ["", "read-only", "workspace-write", "danger-full-access"] as const;
 const networks = ["", "deny", "host"] as const;
@@ -22,6 +21,13 @@ type Mode = (typeof composerModes)[number];
 
 const oneOf = <T extends string>(values: readonly T[], value: unknown): value is T =>
 	typeof value === "string" && (values as readonly string[]).includes(value);
+
+function normalizeEffort(value: unknown): string | undefined {
+	if (typeof value !== "string") return undefined;
+	const effort = value.trim().toLowerCase();
+	if (effort === "" || effort === "off" || effort === "none" || effort === "default") return "";
+	return /^[a-z0-9][a-z0-9_-]{0,31}$/.test(effort) ? effort : undefined;
+}
 
 const maxChildOutput = 1024 * 1024;
 const busyStates = new Set(["running", "waiting_approval", "waiting_question", "stopping"]);
@@ -265,7 +271,7 @@ function parseRoleModels(parsed: unknown): Record<string, string> {
 	return models;
 }
 
-type CatalogModel = { model: string; provider: string };
+type CatalogModel = { model: string; provider: string; reasoningEfforts?: string[] };
 
 function listCatalogModels(binary: string, cwd: string | undefined): Promise<CatalogModel[]> {
 	return runJSONCommand(binary, cwd, ["models", "--all", "--format", "json"]).then((parsed) => {
@@ -348,7 +354,7 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 		return {
 			role: oneOf(roles, role) ? role : "fast",
 			mode: oneOf(modes, mode) ? mode : "execute",
-			effort: oneOf(effortLevels, effort) ? effort : "",
+			effort: normalizeEffort(effort) ?? "",
 			sandbox: cfg.get<string>("sandbox", ""),
 			network: cfg.get<string>("network", ""),
 			approval: cfg.get<string>("approval", ""),
@@ -380,7 +386,14 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 		const workspace = currentWorkspace();
 		const binary = vscode.workspace.getConfiguration("ghg").get<string>("binaryPath", "ghg");
 		try {
-			this.post({ type: "models", models: await listModels(binary, workspace?.uri.fsPath) });
+			const models = await listModels(binary, workspace?.uri.fsPath);
+			let capabilities: CatalogModel[] = [];
+			try {
+				capabilities = await listCatalogModels(binary, workspace?.uri.fsPath);
+			} catch {
+				// Model names remain useful when the optional catalog cache is unavailable.
+			}
+			this.post({ type: "models", models, capabilities });
 		} catch (error) {
 			this.post({ type: "notice", text: `model discovery unavailable: ${error instanceof Error ? error.message : String(error)}` });
 		}
@@ -390,7 +403,13 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 		const workspace = currentWorkspace();
 		const binary = vscode.workspace.getConfiguration("ghg").get<string>("binaryPath", "ghg");
 		const parsed = await runJSONCommand(binary, workspace?.uri.fsPath, ["models", "--refresh", "--format", "json"]);
-		this.post({ type: "models", models: parseRoleModels(parsed) });
+		let capabilities: CatalogModel[] = [];
+		try {
+			capabilities = await listCatalogModels(binary, workspace?.uri.fsPath);
+		} catch {
+			// Keep the refreshed role names even if catalog metadata is unavailable.
+		}
+		this.post({ type: "models", models: parseRoleModels(parsed), capabilities });
 		this.post({ type: "notice", text: "model catalogs refreshed" });
 	}
 
@@ -844,6 +863,10 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 		await vscode.commands.executeCommand("workbench.action.openSettings", "@ext:sacca97.ghg-vscode");
 	}
 
+	showSettings(): void {
+		this.post({ type: "showSettings" });
+	}
+
 	async openAuth(): Promise<void> {
 		const cfg = this.extensionSettings();
 		const provider = await vscode.window.showInputBox({
@@ -924,13 +947,10 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 
 	private async setDefaultSetting(name: string, value: string): Promise<void> {
 		if (!defaultSettings.has(name)) throw new Error("unknown default setting");
-		const allowed: Record<string, Set<string>> = {
-			defaultRole: new Set<string>(roles),
-			defaultMode: new Set<string>(modes),
-			defaultEffort: new Set<string>(effortLevels),
-		};
-		if (!allowed[name].has(value)) throw new Error(`invalid ${name} setting`);
-		await vscode.workspace.getConfiguration("ghg").update(name, value, vscode.ConfigurationTarget.Global);
+		const valid = name === "defaultRole" ? oneOf(roles, value) : name === "defaultMode" ? oneOf(modes, value) : normalizeEffort(value) !== undefined;
+		if (!valid) throw new Error(`invalid ${name} setting`);
+		const savedValue = name === "defaultEffort" ? normalizeEffort(value) : value;
+		await vscode.workspace.getConfiguration("ghg").update(name, savedValue, vscode.ConfigurationTarget.Global);
 		this.post({ type: "extensionSettings", settings: this.extensionSettings() });
 	}
 
@@ -1092,10 +1112,10 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 			if (!args) throw new Error("usage: /rename <title>");
 			return this.bridgeCommand("rename", { title: args });
 		case "/effort":
-			if (!args) throw new Error("usage: /effort <off|low|medium|high>");
+			if (!args) throw new Error("usage: /effort <off|model-supported effort>");
 			{
-				const effort = args.toLowerCase() === "off" ? "" : args.toLowerCase();
-				if (!oneOf(effortLevels, effort)) throw new Error("usage: /effort <off|low|medium|high>");
+				const effort = normalizeEffort(args);
+				if (effort === undefined) throw new Error("usage: /effort <off|model-supported effort>");
 				const mode = message.mode === "plan" ? "plan" : "execute";
 				return this.bridgeCommand("configure", { role, mode, effort, update_effort: true }, role, mode);
 			}
@@ -1230,10 +1250,9 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 				const mode = message.mode === "plan" ? "plan" : "execute";
 				try {
 					const updateEffort = message.updateEffort === true || typeof message.effort === "string";
-					const effort = typeof message.effort === "string" ? message.effort.trim().toLowerCase() : "";
-					const normalizedEffort = effort === "off" ? "" : effort;
-					if (updateEffort && !oneOf(effortLevels, normalizedEffort)) {
-						throw new Error("unsupported thinking effort; choose off, low, medium, or high");
+					const normalizedEffort = normalizeEffort(message.effort ?? "");
+					if (updateEffort && normalizedEffort === undefined) {
+						throw new Error("unsupported thinking effort for this model");
 					}
 					await this.bridgeCommand("configure", { role, mode, effort: normalizedEffort, update_effort: updateEffort }, role, mode);
 				} catch (error) {
@@ -1384,7 +1403,7 @@ export function activate(extension: vscode.ExtensionContext): void {
 		vscode.commands.registerCommand("ghg.resumeSession", () => provider.resumeSession()),
 		vscode.commands.registerCommand("ghg.exportChat", () => provider.exportChat()),
 		vscode.commands.registerCommand("ghg.refreshModels", () => provider.refreshModels()),
-		vscode.commands.registerCommand("ghg.openSettings", () => provider.openSettings()),
+		vscode.commands.registerCommand("ghg.openSettings", () => provider.showSettings()),
 		vscode.workspace.onDidChangeConfiguration((event) => {
 			if (event.affectsConfiguration("ghg")) {
 				provider.post({ type: "extensionSettings", settings: provider.extensionSettings() });

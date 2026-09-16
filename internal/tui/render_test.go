@@ -600,7 +600,7 @@ func TestTargetURI(t *testing.T) {
 		{"./docs/features.md", existsAll, "file://"},
 		{"docs/features.md", existsNone, ""},        // missing file: not clickable
 		{"not a path at all", existsNone, ""},       // prose
-		{"/docs/features.md", existsAll, "file://"}, // glamour-normalized ./ form
+		{"/docs/features.md", existsAll, "file://"}, // also checks the CWD-relative fallback
 		{"internal/tui/tui.go:7", existsAll, "file://"},
 	}
 	for _, tt := range tests {
@@ -614,94 +614,6 @@ func TestTargetURI(t *testing.T) {
 		if !strings.Contains(got, tt.want) {
 			t.Errorf("targetURI(%q) = %q, want substring %q", tt.dest, got, tt.want)
 		}
-	}
-}
-
-// renderRaw renders markdown without the link passes for testing.
-func renderRaw(t *testing.T, s string, width int) string {
-	t.Helper()
-	out, err := mdRenderer(width).Render(s)
-	if err != nil {
-		t.Fatalf("render: %v", err)
-	}
-	return stripLinePadding(strings.Trim(out, "\n"))
-}
-
-func TestHyperlinkGlamourLinksMarkdownLink(t *testing.T) {
-	raw := renderRaw(t, "See [the docs](https://example.com/docs) end.", 80)
-	linked := hyperlinkGlamourLinks(raw, existsNone)
-
-	if !strings.Contains(linked, ansi.SetHyperlink("https://example.com/docs")) {
-		t.Errorf("label should open an OSC 8 link to the href:\n%q", linked)
-	}
-	if !strings.Contains(linked, "the docs") {
-		t.Errorf("label text lost: %q", ansi.Strip(linked))
-	}
-	// the href must not render a second time as visible text
-	if strings.Contains(ansi.Strip(linked), "https://example.com/docs") {
-		t.Errorf("href should not be duplicated visibly: %q", ansi.Strip(linked))
-	}
-	// visible text unchanged apart from dropping the appended href
-	if !strings.Contains(ansi.Strip(raw), "the docs https://example.com/docs") {
-		t.Fatalf("fixture assumption broken, raw stripped: %q", ansi.Strip(raw))
-	}
-}
-
-func TestHyperlinkGlamourLinksAutolink(t *testing.T) {
-	raw := renderRaw(t, "Go to https://bare.example.com/x now.", 80)
-	linked := hyperlinkGlamourLinks(raw, existsNone)
-
-	if !strings.Contains(linked, ansi.SetHyperlink("https://bare.example.com/x")) {
-		t.Errorf("autolink should become clickable:\n%q", linked)
-	}
-	// visible text identical: the link was already shown once
-	if ansi.Strip(linked) != ansi.Strip(raw) {
-		t.Errorf("autolink strip mismatch:\nraw:    %q\nlinked: %q", ansi.Strip(raw), ansi.Strip(linked))
-	}
-}
-
-func TestHyperlinkGlamourLinksFileDestination(t *testing.T) {
-	raw := renderRaw(t, "Open [the feature map](./docs/features.md) here.", 80)
-	linked := hyperlinkGlamourLinks(raw, existsAll)
-
-	if !strings.Contains(linked, "]8;;file://") {
-		t.Errorf("existing relative file destination should become file://:\n%q", linked)
-	}
-	if strings.Contains(ansi.Strip(linked), "/docs/features.md") {
-		t.Errorf("file href should not render visibly: %q", ansi.Strip(linked))
-	}
-
-	// missing file: untouched by the rewiring (glamour normalized ./ → /)
-	plain := hyperlinkGlamourLinks(raw, existsNone)
-	if strings.Contains(plain, "]8;") {
-		t.Errorf("missing file must not become a link: %q", plain)
-	}
-	if !strings.Contains(ansi.Strip(plain), "/docs/features.md") {
-		t.Errorf("unlinked href should stay visible: %q", ansi.Strip(plain))
-	}
-}
-
-func TestHyperlinkGlamourLinksAnchorUntouched(t *testing.T) {
-	raw := renderRaw(t, "Jump [below](#section) now.", 80)
-	linked := hyperlinkGlamourLinks(raw, existsAll)
-	if strings.Contains(linked, "]8;") {
-		t.Errorf("anchors are never hyperlinked: %q", linked)
-	}
-}
-
-// The width contract: OSC 8 sequences are zero-width and Hardwrap-safe, so a
-// linkified render wraps identically to the raw one.
-func TestHyperlinkGlamourLinksWrapSafe(t *testing.T) {
-	md := "See [the documentation page](https://example.com/some/long/path) for details."
-	linked := wrapWideLines(hyperlinkGlamourLinks(renderRaw(t, md, 40), existsNone), 40)
-	for i, l := range strings.Split(linked, "\n") {
-		if w := ansi.StringWidth(l); w > 40 {
-			t.Errorf("line %d exceeds width 40 (%d): %q", i, w, l)
-		}
-	}
-	// the click target survives wrapping
-	if !strings.Contains(linked, ansi.SetHyperlink("https://example.com/some/long/path")) {
-		t.Errorf("hyperlink broken by wrapping: %q", linked)
 	}
 }
 
@@ -720,16 +632,19 @@ func TestRenderMarkdownLinksClickable(t *testing.T) {
 	if strings.Count(plain, "https://bare.example.com/x") != 1 {
 		t.Errorf("autolink should render exactly once: %q", plain)
 	}
+	for i, line := range strings.Split(renderMarkdown("See [the documentation page](https://example.com/some/long/path) for details.", 40), "\n") {
+		if width := ansi.StringWidth(line); width > 40 {
+			t.Errorf("line %d exceeds width 40 (%d): %q", i, width, line)
+		}
+	}
 }
 
 func TestRenderMarkdownBareFilePath(t *testing.T) {
-	// real file, resolved against the process CWD (the package dir). Paths
-	// are linkified post-render so the OSC 8 sequences survive wrapping.
+	// Existing files are resolved against the process CWD.
 	out := renderMarkdown("The bug is in render.go and render_test.go.", 80)
 	if !strings.Contains(out, "]8;;file://") {
 		t.Errorf("bare existing file path should be linkified: %q", out)
 	}
-	// glamour splits styled words across atoms; compare on the visible text
 	plain := strings.Join(strings.Fields(ansi.Strip(out)), " ")
 	if !strings.Contains(plain, "render_test.go") {
 		t.Errorf("visible path text lost: %q", plain)
@@ -841,15 +756,14 @@ func TestRenderMarkdownWrapsToWidth(t *testing.T) {
 }
 
 func TestIndentLines(t *testing.T) {
-	// relative shift: glamour's 2-cell document margin becomes n; deeper
-	// lines keep their relative indent (nested bullets, code blocks)
-	in := "  first\n\n    second" // margin + 2 extra
+	// Relative indentation is preserved for nested content.
+	in := "first\n\n  second"
 	want := "  first\n\n    second"
 	if got := indentLines(in, 2); got != want {
 		t.Errorf("indentLines:\ngot  %q\nwant %q", got, want)
 	}
 	// whitespace-only lines become truly empty (no stray styled cells)
-	if got := indentLines("  \n  x", 2); got != "\n  x" {
+	if got := indentLines("  \n  x", 2); got != "\n    x" {
 		t.Errorf("blank line should be empty: %q", got)
 	}
 }

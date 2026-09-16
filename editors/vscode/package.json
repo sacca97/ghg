@@ -106,9 +106,8 @@
         },
         "ghg.defaultEffort": {
           "type": "string",
-          "enum": ["", "low", "medium", "high"],
           "default": "",
-          "description": "Thinking effort selected for new chats."
+          "description": "Thinking effort selected for new chats; available values depend on the selected model."
         },
         "ghg.sandbox": {
           "type": "string",

@@ -49,7 +49,7 @@ type pendingObservedRead struct {
 
 func readTool() Tool {
 	return resultTool(models.NewTool("read",
-		"Read one or more bounded ranges of complete lines and issue observation ids for later range-authorized edits. Prefer the ranges form for every request, including one range; use the legacy path/offset/limit form only for compatibility. Use offset/limit to continue a file. If a batched result lists unprocessed ranges, retry only those ranges.",
+		"Read one or more bounded ranges of complete lines and issue observation ids for later range-authorized edits. Prefer the ranges form for every request, including one range; use the legacy path/offset/limit form only for compatibility. Use offset/limit to continue a file. Every valid range is processed; large batches may return a bounded preview with an observation summary for each range.",
 		fmt.Sprintf(`{"type":"object","properties":{"path":{"type":"string","description":"Legacy single-file form; prefer ranges even for one file"},"offset":{"type":"number","description":"1-based line to start from (default 1)"},"limit":{"type":"number","description":"Max complete lines to return (default 250, maximum 1000)"},"ranges":{"type":"array","minItems":1,"maxItems":%d,"description":"Preferred form: independent ranges returned in request order; use a one-element array for one range","items":{"type":"object","properties":{"path":{"type":"string","description":"Path to the file"},"offset":{"type":"number","description":"1-based line to start from (default 1)"},"limit":{"type":"number","description":"Max complete lines to return (default 250, maximum 1000)"}},"required":["path"]}}},"oneOf":[{"required":["ranges"],"not":{"required":["path"]}},{"required":["path"],"not":{"required":["ranges"]}}]}`, maxReadRanges)),
 		runReadResult)
 }
@@ -163,9 +163,19 @@ func runObservedReadBatch(ctx context.Context, ranges []readRangeArgs) (ToolResu
 			contentBudget = 0
 		}
 	}
-	var omitted []int
+	report := batchReport{
+		LogicalOperations: len(ranges),
+		InternalSubcalls:  len(ranges),
+		Items:             make([]batchItem, len(ranges)),
+	}
+	for index := range report.Items {
+		report.Items[index] = batchItem{Index: index + 1, Status: "failed"}
+	}
+	var summaries []string
 	appendFailure := func(index int, message string) {
 		complete = false
+		report.Items[index].Status = "failed"
+		report.Items[index].Error = message
 		path := strings.NewReplacer("\n", " ", "\r", " ").Replace(ranges[index].Path)
 		message = strings.NewReplacer("\n", " ", "\r", " ").Replace(message)
 		note := fmt.Sprintf("[range %d path=%s error=%s]\n", index+1, path, message)
@@ -183,18 +193,14 @@ func runObservedReadBatch(ctx context.Context, ranges []readRangeArgs) (ToolResu
 		}
 		if !outcome.read.record.Complete {
 			complete = false
-		}
-		text := outcome.read.result.Preview
-		if output.Len()+len(text) > contentBudget {
-			complete = false
-			omitted = append(omitted, index)
-			continue
+			report.Items[index].Status = "partial"
+		} else {
+			report.Items[index].Status = "complete"
 		}
 		if err := persistObservedRead(ctx, outcome.read); err != nil {
 			appendFailure(index, err.Error())
 			continue
 		}
-		output.WriteString(text)
 		selected++
 		observations = append(observations, map[string]any{
 			"id":          outcome.read.record.ID,
@@ -204,37 +210,28 @@ func runObservedReadBatch(ctx context.Context, ranges []readRangeArgs) (ToolResu
 			"next_offset": outcome.read.record.NextOffset,
 			"complete":    outcome.read.record.Complete,
 		})
-	}
-	omissionNote := ""
-	if len(omitted) > 0 {
-		var note strings.Builder
-		note.WriteString("[unprocessed ranges:")
-		for _, index := range omitted {
-			rangeArgs := ranges[index]
-			path := strings.NewReplacer("\n", " ", "\r", " ").Replace(rangeArgs.Path)
-			if len(path) > 128 {
-				path = path[:128] + "..."
+		text := outcome.read.result.Preview
+		if output.Len()+len(text) > contentBudget {
+			report.Items[index].PreviewOmitted = true
+			path := strings.NewReplacer("\n", " ", "\r", " ").Replace(outcome.read.record.Path)
+			if len(path) > 96 {
+				path = path[:96] + "..."
 			}
-			start := rangeArgs.Offset
-			if start <= 0 {
-				start = 1
+			note := fmt.Sprintf("[range %d path=%s status=%s observation=%s lines=%d-%d; preview omitted]\n", index+1, path, report.Items[index].Status, outcome.read.record.ID, outcome.read.record.StartLine, outcome.read.record.EndLine)
+			summaries = append(summaries, note)
+			if output.Len()+len(note) <= maxBatchReadBytes {
+				output.WriteString(note)
 			}
-			limit := rangeArgs.Limit
-			if limit <= 0 {
-				limit = defaultReadLines
-			}
-			fmt.Fprintf(&note, " %d:%s:%d-%d", index+1, path, start, start+limit-1)
+			continue
 		}
-		note.WriteString("]\n")
-		if note.Len() > omissionReserve {
-			noteStr := strings.ToValidUTF8(note.String()[:omissionReserve-len("...\n")], "") + "...\n"
-			note.Reset()
-			note.WriteString(noteStr)
-		}
-		omissionNote = note.String()
+		output.WriteString(text)
 	}
-	raw := omissionNote + output.String()
-	result := TextResultWithSize(raw, raw, int64(len(raw)), complete, 0)
+	raw := output.String()
+	preview := raw
+	if len(raw) > maxOutput && len(summaries) > 0 {
+		preview = TruncateWithSuffix(raw, strings.Join(summaries, ""))
+	}
+	result := TextResultWithSize(raw, preview, int64(len(raw)), complete, 0)
 	if selected == 0 {
 		result.ExitCode = 1
 	}
@@ -246,6 +243,7 @@ func runObservedReadBatch(ctx context.Context, ranges []readRangeArgs) (ToolResu
 		"observations":      string(encoded),
 		"observation_count": fmt.Sprint(selected),
 	}
+	result = applyBatchReport(result, report)
 	return MarkUntrusted(result, "read"), nil
 }
 

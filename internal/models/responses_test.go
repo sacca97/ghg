@@ -197,6 +197,46 @@ func TestOpenAIResponsesComplete(t *testing.T) {
 	}
 }
 
+func TestOpenAIResponsesReportsRequestDiagnostics(t *testing.T) {
+	client := responsesClientForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"id":"resp_1","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":8,"output_tokens":1}}`)
+	}))
+
+	var got RequestDiagnostics
+	called := false
+	_, _, err := client.complete(context.Background(), Request{
+		Model: "gpt-test",
+		Messages: []Message{
+			{Role: "system", Content: "stable instructions"},
+			{Role: "user", Content: "question"},
+		},
+		Tools:     []Tool{NewTool("read", "Read files", `{"type":"object"}`)},
+		SessionID: "session-1",
+		OnRequestDiagnostics: func(value RequestDiagnostics) {
+			got = value
+			called = true
+		},
+	}, EventSink{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !called {
+		t.Fatal("request diagnostics callback was not called")
+	}
+	if got.Protocol != string(ProtocolOpenAIResponses) || got.Stream || got.InputItems != 1 || got.InputPrefixItems != 1 {
+		t.Fatalf("request shape = %+v", got)
+	}
+	if len(got.InputItemTypes) != 1 || got.InputItemTypes[0] != "message:user" || len(got.InputItemSHA256) != 1 || got.InputItemSHA256[0] == "" {
+		t.Fatalf("input prefix diagnostics = %+v", got)
+	}
+	if got.BodySHA256 == "" || got.InstructionsSHA256 == "" || got.ToolsSHA256 == "" || got.InputSHA256 == "" || got.InputPrefixSHA256 == "" {
+		t.Fatalf("missing request hashes = %+v", got)
+	}
+	if !got.CacheKeyPresent || got.CacheKeySHA256 == "" || got.Store == nil || *got.Store {
+		t.Fatalf("cache diagnostics = %+v", got)
+	}
+}
+
 func TestOpenAIResponsesProbeAndModels(t *testing.T) {
 	client := responsesClientForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Authorization") != "Bearer responses-test-key" {

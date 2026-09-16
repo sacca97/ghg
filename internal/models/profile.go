@@ -51,6 +51,7 @@ type Profile struct {
 	Protocol       Protocol          `yaml:"protocol"`
 	BaseURL        string            `yaml:"base_url"`
 	Auth           Auth              `yaml:"auth"`
+	SessionHeader  string            `yaml:"session_header,omitempty"`
 	Docs           Docs              `yaml:"docs"`
 	DefaultHeaders map[string]string `yaml:"default_headers"`
 	Catalog        Catalog           `yaml:"catalog"`
@@ -439,6 +440,10 @@ func validateProfile(profile *Profile) error {
 		}
 	default:
 		return fmt.Errorf("profile %q has unknown auth.kind %q (want bearer, header, none, codex-subscription, claude-subscription, or zai-coding-plan)", profile.ID, profile.Auth.Kind)
+	}
+	profile.SessionHeader = strings.TrimSpace(profile.SessionHeader)
+	if profile.SessionHeader != "" && !validHeaderName(profile.SessionHeader) {
+		return fmt.Errorf("profile %q session_header must be a valid HTTP header name", profile.ID)
 	}
 
 	profile.Docs.KeysURL = strings.TrimSpace(profile.Docs.KeysURL)

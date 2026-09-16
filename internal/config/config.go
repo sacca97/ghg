@@ -73,9 +73,6 @@ type Config struct {
 	// internal/lsp.FromConfigMap for the merge semantics). Entries extend or
 	// disable the built-in registry (gopls).
 	LSPServers map[string]LSPServer `json:"lsp,omitempty"`
-	// PostEdit contains trusted argv-style commands run after successful
-	// mutations and before their final readback.
-	PostEdit []PostEditConfig `json:"postEdit,omitempty"`
 }
 
 // ExecutionConfig controls the shared Phase 3 execution boundary. Empty
@@ -201,69 +198,6 @@ type LSPServer struct {
 	Enabled     *bool             `json:"enabled,omitempty"`
 }
 
-// PostEditConfig describes one trusted post-publication hook. Commands are
-// argv arrays rather than shell strings; an extension without a leading dot
-// is normalized during validation.
-type PostEditConfig struct {
-	Command        []string `json:"command"`
-	Extensions     []string `json:"extensions,omitempty"`
-	TimeoutSeconds int      `json:"timeoutSeconds,omitempty"`
-}
-
-// ValidatePostEdit normalizes and validates the trusted hook configuration.
-func (c *Config) ValidatePostEdit() error {
-	if c == nil {
-		return nil
-	}
-	for i := range c.PostEdit {
-		hook := &c.PostEdit[i]
-		if len(hook.Command) == 0 {
-			return fmt.Errorf("postEdit[%d].command must not be empty", i)
-		}
-		for j, arg := range hook.Command {
-			if arg == "" {
-				return fmt.Errorf("postEdit[%d].command[%d] must not be empty", i, j)
-			}
-			if strings.IndexByte(arg, 0) >= 0 {
-				return fmt.Errorf("postEdit[%d].command[%d] contains NUL", i, j)
-			}
-		}
-		if hook.TimeoutSeconds == 0 {
-			hook.TimeoutSeconds = 10
-		}
-		if hook.TimeoutSeconds < 1 || hook.TimeoutSeconds > 60 {
-			return fmt.Errorf("postEdit[%d].timeoutSeconds must be between 1 and 60", i)
-		}
-		for j, extension := range hook.Extensions {
-			normalized, err := normalizePostEditExtension(extension)
-			if err != nil {
-				return fmt.Errorf("postEdit[%d].extensions[%d]: %w", i, j, err)
-			}
-			hook.Extensions[j] = normalized
-		}
-	}
-	return nil
-}
-
-func normalizePostEditExtension(extension string) (string, error) {
-	extension = strings.TrimSpace(strings.ToLower(extension))
-	if extension == "" {
-		return "", fmt.Errorf("extension must not be empty")
-	}
-	if !strings.HasPrefix(extension, ".") {
-		extension = "." + extension
-	}
-	if len(extension) < 2 || strings.ContainsAny(extension, `/\\`) || strings.IndexByte(extension, 0) >= 0 {
-		return "", fmt.Errorf("invalid extension %q", extension)
-	}
-	for _, r := range extension[1:] {
-		if r == ' ' || r == '\t' || r == '\n' || r == '\r' {
-			return "", fmt.Errorf("invalid extension %q", extension)
-		}
-	}
-	return extension, nil
-}
-
 // MCPImport selects which claude/codex MCP server definitions ghg imports.
 // A nil source entry (or nil Enabled) leaves that source on. Example:
 //
@@ -358,10 +292,6 @@ func Load() (*Config, error) {
 		logf("config.load", "EXECUTION VALIDATION FAILURE %s: %v", p, err)
 		return nil, fmt.Errorf("validate %s: %w", p, err)
 	}
-	if err := cfg.ValidatePostEdit(); err != nil {
-		logf("config.load", "POST-EDIT VALIDATION FAILURE %s: %v", p, err)
-		return nil, fmt.Errorf("validate %s: %w", p, err)
-	}
 	if err := cfg.ValidateSearchProviders(); err != nil {
 		logf("config.load", "SEARCH PROVIDER VALIDATION FAILURE %s: %v", p, err)
 		return nil, fmt.Errorf("validate %s: %w", p, err)
@@ -383,16 +313,12 @@ func Load() (*Config, error) {
 				if restored.MCPImport == nil {
 					restored.MCPImport = cfg.MCPImport // keep import gating too
 				}
-				if len(restored.PostEdit) == 0 && len(cfg.PostEdit) > 0 {
-					restored.PostEdit = cfg.PostEdit // keep trusted hooks too
-				}
 				return &restored, restored.Save()
 			}
 		}
 		def := Default()
 		def.MCPServers = cfg.MCPServers // mcp-only configs are valid; keep them
 		def.MCPImport = cfg.MCPImport
-		def.PostEdit = cfg.PostEdit
 		logf("config.load", "no usable .bak; regenerated defaults (%s), keeping %d mcp entries", def.fingerprint(), len(cfg.MCPServers))
 		return def, def.Save()
 	}
@@ -410,9 +336,6 @@ func (c *Config) Save() error {
 		return err
 	}
 	if err := c.ValidateExecution(); err != nil {
-		return err
-	}
-	if err := c.ValidatePostEdit(); err != nil {
 		return err
 	}
 	if err := c.ValidateSearchProviders(); err != nil {

@@ -261,12 +261,5 @@ func WriteTranscript(b *strings.Builder, msgs []models.Message) {
 func truncateField(s string, n int) string {
 	s = strings.ReplaceAll(s, "\n", " ")
 	s = strings.TrimSpace(s)
-	if len(s) > n {
-		const suffix = "…"
-		if n <= len(suffix) {
-			return s[:textutil.UTF8Prefix(s, n)]
-		}
-		return s[:textutil.UTF8Prefix(s, n-len(suffix))] + suffix
-	}
-	return s
+	return textutil.UTF8Truncate(s, n, "…")
 }

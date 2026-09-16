@@ -3,6 +3,7 @@ package models
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,6 +15,8 @@ import (
 )
 
 const maxOpenAIResponsesSSELine = 10 * 1024 * 1024
+
+const requestDiagnosticsPrefixItems = 16
 
 // responsesFlavor distinguishes public Responses endpoints from the Codex
 // subscription transport.
@@ -209,6 +212,67 @@ func newOpenAIResponsesRequest(req Request, stream bool, flavor ...responsesFlav
 	return wire, nil
 }
 
+func reportOpenAIResponsesDiagnostics(req Request, wire openAIResponsesRequest, body []byte, stream bool) {
+	if req.OnRequestDiagnostics == nil {
+		return
+	}
+
+	toolsJSON, _ := json.Marshal(wire.Tools)
+	inputJSON, _ := json.Marshal(wire.Input)
+	prefixItems := wire.Input
+	if len(prefixItems) > requestDiagnosticsPrefixItems {
+		prefixItems = prefixItems[:requestDiagnosticsPrefixItems]
+	}
+	prefixJSON, _ := json.Marshal(prefixItems)
+
+	diagnostics := RequestDiagnostics{
+		Protocol:           string(ProtocolOpenAIResponses),
+		Stream:             stream,
+		BodySHA256:         requestDigest(body),
+		InstructionsSHA256: requestDigest([]byte(wire.Instructions)),
+		InstructionsBytes:  len(wire.Instructions),
+		ToolsSHA256:        requestDigest(toolsJSON),
+		ToolsBytes:         len(toolsJSON),
+		InputSHA256:        requestDigest(inputJSON),
+		InputBytes:         len(inputJSON),
+		InputPrefixSHA256:  requestDigest(prefixJSON),
+		InputPrefixBytes:   len(prefixJSON),
+		InputItems:         len(wire.Input),
+		InputPrefixItems:   len(prefixItems),
+		InputItemSHA256:    make([]string, 0, len(prefixItems)),
+		InputItemTypes:     make([]string, 0, len(prefixItems)),
+		CacheKeyPresent:    strings.TrimSpace(wire.PromptCacheKey) != "",
+	}
+	if diagnostics.CacheKeyPresent {
+		diagnostics.CacheKeySHA256 = requestDigest([]byte(strings.TrimSpace(wire.PromptCacheKey)))
+	}
+	if wire.Store != nil {
+		store := *wire.Store
+		diagnostics.Store = &store
+	}
+	for _, item := range prefixItems {
+		diagnostics.InputItemSHA256 = append(diagnostics.InputItemSHA256, requestDigest(item))
+		var header struct {
+			Type string `json:"type"`
+			Role string `json:"role"`
+		}
+		label := "invalid"
+		if json.Unmarshal(item, &header) == nil && header.Type != "" {
+			label = header.Type
+			if header.Role != "" {
+				label += ":" + header.Role
+			}
+		}
+		diagnostics.InputItemTypes = append(diagnostics.InputItemTypes, label)
+	}
+	req.OnRequestDiagnostics(diagnostics)
+}
+
+func requestDigest(data []byte) string {
+	sum := sha256.Sum256(data)
+	return fmt.Sprintf("%x", sum[:])
+}
+
 func responsesSystemText(msg Message) (string, error) {
 	parts := make([]string, 0, 1+len(msg.Parts))
 	if msg.Content != "" || len(msg.Parts) == 0 {
@@ -402,6 +466,7 @@ func (c *OpenAIResponsesClient) stream(ctx context.Context, req Request, sink Ev
 	if err != nil {
 		return Message{}, Usage{}, err
 	}
+	reportOpenAIResponsesDiagnostics(req, wire, body, true)
 
 	var last error
 	configuredAttempts := c.attempts()
@@ -423,7 +488,7 @@ func (c *OpenAIResponsesClient) stream(ctx context.Context, req Request, sink Ev
 				sink.OnThink(delta)
 			}
 		}
-		msg, usage, err := c.streamOnce(ctx, body, wrapText, wrapThink)
+		msg, usage, err := c.streamOnce(ctx, body, req.SessionID, wrapText, wrapThink)
 		if err == nil {
 			return msg, usage, nil
 		}
@@ -449,11 +514,11 @@ func (c *OpenAIResponsesClient) stream(ctx context.Context, req Request, sink Ev
 	return Message{}, Usage{}, last
 }
 
-func (c *OpenAIResponsesClient) streamOnce(ctx context.Context, body []byte, onText, onThink func(string)) (Message, Usage, error) {
-	return c.doStreamOnce(ctx, body, onText, onThink, true)
+func (c *OpenAIResponsesClient) streamOnce(ctx context.Context, body []byte, sessionID string, onText, onThink func(string)) (Message, Usage, error) {
+	return c.doStreamOnce(ctx, body, sessionID, onText, onThink, true)
 }
 
-func (c *OpenAIResponsesClient) doStreamOnce(ctx context.Context, body []byte, onText, onThink func(string), canRefresh bool) (Message, Usage, error) {
+func (c *OpenAIResponsesClient) doStreamOnce(ctx context.Context, body []byte, sessionID string, onText, onThink func(string), canRefresh bool) (Message, Usage, error) {
 	endpoint, err := c.endpoint("/responses")
 	if err != nil {
 		return Message{}, Usage{}, err
@@ -466,13 +531,14 @@ func (c *OpenAIResponsesClient) doStreamOnce(ctx context.Context, body []byte, o
 	if err := c.setRequestHeaders(req); err != nil {
 		return Message{}, Usage{}, err
 	}
+	c.setSessionHeader(req, sessionID)
 	resp, err := c.httpClient().Do(req)
 	if err != nil {
 		return Message{}, Usage{}, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode == http.StatusUnauthorized && canRefresh && c.tryForceRefresh(ctx) {
-		return c.doStreamOnce(ctx, body, onText, onThink, false)
+		return c.doStreamOnce(ctx, body, sessionID, onText, onThink, false)
 	}
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		return Message{}, Usage{}, openAIResponsesHTTPError(resp)
@@ -489,12 +555,13 @@ func (c *OpenAIResponsesClient) complete(ctx context.Context, req Request, sink 
 	if err != nil {
 		return Message{}, Usage{}, err
 	}
+	reportOpenAIResponsesDiagnostics(req, wire, body, false)
 
 	var last error
 	configuredAttempts := c.attempts()
 	limit := configuredAttempts
 	for attempt := 1; attempt <= limit; attempt++ {
-		msg, usage, err := c.completeOnce(ctx, body)
+		msg, usage, err := c.completeOnce(ctx, body, req.SessionID)
 		if err == nil {
 			return msg, usage, nil
 		}
@@ -519,11 +586,11 @@ func (c *OpenAIResponsesClient) complete(ctx context.Context, req Request, sink 
 	return Message{}, Usage{}, last
 }
 
-func (c *OpenAIResponsesClient) completeOnce(ctx context.Context, body []byte) (Message, Usage, error) {
-	return c.doCompleteOnce(ctx, body, true)
+func (c *OpenAIResponsesClient) completeOnce(ctx context.Context, body []byte, sessionID string) (Message, Usage, error) {
+	return c.doCompleteOnce(ctx, body, sessionID, true)
 }
 
-func (c *OpenAIResponsesClient) doCompleteOnce(ctx context.Context, body []byte, canRefresh bool) (Message, Usage, error) {
+func (c *OpenAIResponsesClient) doCompleteOnce(ctx context.Context, body []byte, sessionID string, canRefresh bool) (Message, Usage, error) {
 	endpoint, err := c.endpoint("/responses")
 	if err != nil {
 		return Message{}, Usage{}, err
@@ -536,13 +603,14 @@ func (c *OpenAIResponsesClient) doCompleteOnce(ctx context.Context, body []byte,
 	if err := c.setRequestHeaders(req); err != nil {
 		return Message{}, Usage{}, err
 	}
+	c.setSessionHeader(req, sessionID)
 	resp, err := c.httpClient().Do(req)
 	if err != nil {
 		return Message{}, Usage{}, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode == http.StatusUnauthorized && canRefresh && c.tryForceRefresh(ctx) {
-		return c.doCompleteOnce(ctx, body, false)
+		return c.doCompleteOnce(ctx, body, sessionID, false)
 	}
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		return Message{}, Usage{}, openAIResponsesHTTPError(resp)

@@ -247,6 +247,46 @@ func TestAgentUsesBackendContract(t *testing.T) {
 	}
 }
 
+type requestDiagnosticsBackend struct{}
+
+func (requestDiagnosticsBackend) Stream(_ context.Context, req models.Request, _ models.EventSink) (models.Message, models.Usage, error) {
+	if req.OnRequestDiagnostics != nil {
+		req.OnRequestDiagnostics(models.RequestDiagnostics{Protocol: string(models.ProtocolOpenAIResponses), BodySHA256: "wire"})
+	}
+	return models.Message{Role: "assistant", Content: "reply"}, models.Usage{}, nil
+}
+
+func (requestDiagnosticsBackend) Complete(context.Context, models.Request) (models.Message, models.Usage, error) {
+	return models.Message{}, models.Usage{}, nil
+}
+
+func TestModelCallEndIncludesRequestDiagnostics(t *testing.T) {
+	ag := New(requestDiagnosticsBackend{}, "model", 100, "system")
+	var end ModelCallEnd
+	_, _, err := ag.Stream(context.Background(), models.Request{
+		Model: "model", Messages: []models.Message{{Role: "user", Content: "question"}},
+	}, models.EventSink{}, Events{OnModelCallEnd: func(value ModelCallEnd) { end = value }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if end.RequestDiagnostics == nil || end.RequestDiagnostics.BodySHA256 != "wire" {
+		t.Fatalf("request diagnostics = %+v", end.RequestDiagnostics)
+	}
+	if end.RequestSHA256 == "" || end.RequestPrefixSHA256 == "" || end.RequestBytes == 0 || end.RequestPrefixBytes == 0 || end.RequestPrefixMessages != 1 {
+		t.Fatalf("request shape telemetry = %+v", end)
+	}
+}
+
+func TestCurrentToolGuidanceRecommendsPathDiscovery(t *testing.T) {
+	got := currentToolGuidance([]tools.Tool{
+		{Def: models.NewTool("read", "read", `{}`)},
+		{Def: models.NewTool("glob", "glob", `{}`)},
+	}, nil)
+	if !strings.Contains(got, "use glob before read or grep") || !strings.Contains(got, "do not guess directory names") {
+		t.Fatalf("path discovery guidance = %q", got)
+	}
+}
+
 // TestLSPDiagnosticsReachModel pins the end-to-end flow: the model calls
 // write, the LSP hook appends a <diagnostics> block to the tool result, and
 // that block is what the provider receives on the next call.
@@ -1241,6 +1281,9 @@ func TestDynamicReasoningDoesNotChooseEffortAutomatically(t *testing.T) {
 		if !start.DynamicReasoning || start.ConfiguredEffort != "high" || start.EffortRequested != "high" || start.SelectionReason != "configured" {
 			t.Fatalf("call %d effort telemetry = %+v", i, start)
 		}
+		if !start.ReasoningSelectorExposed || !reflect.DeepEqual(start.ReasoningSelectorEfforts, []string{"medium", "high"}) {
+			t.Fatalf("call %d selector telemetry = %+v", i, start)
+		}
 	}
 }
 
@@ -1876,7 +1919,7 @@ func TestCompactionTelemetryUsesSummaryRoute(t *testing.T) {
 		t.Fatalf("compaction telemetry start/end = %d/%d", len(starts), len(ends))
 	}
 	want := ModelCallStart{Role: "tiny", Provider: "tiny-provider", Model: "tiny-model", Protocol: string(summary.protocol), Purpose: "compaction"}
-	if starts[0] != want {
+	if !reflect.DeepEqual(starts[0], want) {
 		t.Fatalf("compaction start route = %+v, want %+v", starts[0], want)
 	}
 	if ends[0].Model != want.Model || ends[0].Provider != want.Provider || ends[0].Protocol != want.Protocol {

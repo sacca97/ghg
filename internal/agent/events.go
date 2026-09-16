@@ -62,18 +62,20 @@ type ToolTelemetry struct {
 // It is deliberately independent of agent-definition loading so callers can
 // use the same telemetry for ordinary turns, planning, and compaction.
 type ModelCallStart struct {
-	Role             string `json:"role,omitempty"`
-	Provider         string `json:"provider,omitempty"`
-	Model            string `json:"model"`
-	Protocol         string `json:"protocol,omitempty"`
-	Purpose          string `json:"purpose,omitempty"`
-	ReasoningEffort  string `json:"reasoning_effort,omitempty"`
-	ReasoningEnabled *bool  `json:"reasoning_enabled,omitempty"`
-	ConfiguredEffort string `json:"configured_effort,omitempty"`
-	DynamicReasoning bool   `json:"dynamic_reasoning"`
-	EffortRequested  string `json:"effort_requested_for_call,omitempty"`
-	EffortApplied    string `json:"effort_applied,omitempty"`
-	SelectionReason  string `json:"selection_reason,omitempty"`
+	Role                     string   `json:"role,omitempty"`
+	Provider                 string   `json:"provider,omitempty"`
+	Model                    string   `json:"model"`
+	Protocol                 string   `json:"protocol,omitempty"`
+	Purpose                  string   `json:"purpose,omitempty"`
+	ReasoningEffort          string   `json:"reasoning_effort,omitempty"`
+	ReasoningEnabled         *bool    `json:"reasoning_enabled,omitempty"`
+	ConfiguredEffort         string   `json:"configured_effort,omitempty"`
+	DynamicReasoning         bool     `json:"dynamic_reasoning"`
+	EffortRequested          string   `json:"effort_requested_for_call,omitempty"`
+	EffortApplied            string   `json:"effort_applied,omitempty"`
+	SelectionReason          string   `json:"selection_reason,omitempty"`
+	ReasoningSelectorExposed bool     `json:"reasoning_selector_exposed"`
+	ReasoningSelectorEfforts []string `json:"reasoning_selector_efforts,omitempty"`
 }
 
 // ModelCallEnd completes a ModelCallStart with request timing, provider
@@ -83,12 +85,18 @@ type ModelCallStart struct {
 // not happen from a zero value.
 type ModelCallEnd struct {
 	ModelCallStart
-	LatencyMS                int64        `json:"latency_ms"`
-	FinishReason             string       `json:"finish_reason,omitempty"`
-	Usage                    models.Usage `json:"usage"`
-	CheckpointLevel          int          `json:"checkpoint_level"`
-	ContinuedAfterCheckpoint bool         `json:"continued_after_checkpoint"`
-	Error                    string       `json:"error,omitempty"`
+	LatencyMS                int64                      `json:"latency_ms"`
+	FinishReason             string                     `json:"finish_reason,omitempty"`
+	Usage                    models.Usage               `json:"usage"`
+	RequestDiagnostics       *models.RequestDiagnostics `json:"request_diagnostics,omitempty"`
+	RequestSHA256            string                     `json:"request_sha256,omitempty"`
+	RequestPrefixSHA256      string                     `json:"request_prefix_sha256,omitempty"`
+	RequestBytes             int                        `json:"request_bytes,omitempty"`
+	RequestPrefixBytes       int                        `json:"request_prefix_bytes,omitempty"`
+	RequestPrefixMessages    int                        `json:"request_prefix_messages,omitempty"`
+	CheckpointLevel          int                        `json:"checkpoint_level"`
+	ContinuedAfterCheckpoint bool                       `json:"continued_after_checkpoint"`
+	Error                    string                     `json:"error,omitempty"`
 }
 
 // ReasoningSelection records the optional one-call effort override after the

@@ -5,10 +5,6 @@ import { text, formatDuration, hideToolDisplayHash } from "./util.js";
 import { renderMarkdown } from "./markdown.js";
 import { copyButton, exportButton } from "./widgets.js";
 
-// A tool preview is already bounded by the worker; this only keeps the DOM from
-// carrying a 16k-character blob into the collapsed output panel.
-const TOOL_RESULT_LIMIT = 4000;
-
 /**
  * @typedef {HTMLElement & { block?: object, body?: HTMLElement }} BlockElement
  * buildBlock returns a BlockElement: the article plus the block record it was
@@ -44,7 +40,7 @@ function compactToolArgs(name, args) {
   return parts.length ? parts.join(" ") : text(args).trim();
 }
 
-export function renderToolContent(element, block, result = "") {
+export function renderToolContent(element, block) {
   element.replaceChildren();
   const label = document.createElement("span");
   label.textContent = `⚒ ${block.name || "tool"}`;
@@ -60,22 +56,6 @@ export function renderToolContent(element, block, result = "") {
     failed.className = "failed";
     failed.textContent = " — failed";
     element.append(failed);
-  }
-  // The worker keeps the model's view of a result; the UI renders a capped copy
-  // the user can open instead of guessing from the one-line chip. It is rendered
-  // into the element rather than stored on the block, so a multi-kilobyte result
-  // never lands in the persisted webview state.
-  const output = text(result).trim();
-  if (output) {
-    const truncated = output.length > TOOL_RESULT_LIMIT;
-    const details = document.createElement("details");
-    details.className = "tool-result";
-    const heading = document.createElement("summary");
-    heading.textContent = truncated ? "Output · truncated" : "Output";
-    const pre = document.createElement("pre");
-    pre.textContent = truncated ? `${output.slice(0, TOOL_RESULT_LIMIT)}\n…` : output;
-    details.append(heading, pre);
-    element.append(details);
   }
 }
 
@@ -150,7 +130,10 @@ export function addExportButton(element, block, post) {
 
 function thinkingLabel(block) {
   let label = block.finished ? "Reasoning" : "Reasoning…";
-  if (Number(block.durationMs) > 0) label += ` · ${formatDuration(block.durationMs)}`;
+  let duration = Number(block.durationMs);
+  const startedAt = Number(block.startedAt);
+  if (!block.finished && startedAt > 0) duration = Math.max(0, Date.now() - startedAt);
+  if (duration > 0 || (!block.finished && startedAt > 0)) label += ` · ${formatDuration(duration)}`;
   if (text(block.effort).trim()) label += ` · ${block.effort}`;
   return label;
 }

@@ -116,14 +116,14 @@ preserve modes/line endings, and return a compact diff, readback, and
 diagnostics. `ToolTelemetry` reports preview/retained/original bytes,
 truncation, and Bash exploration redirects to JSON consumers.
 
-### LSP navigation and post-edit hooks
+### LSP navigation
 
 `internal/lsp/manager.go` owns one lazy language-server manager per TUI or
 headless run. The same `tools.ToolRuntime` is inherited by Plan mode and
-delegated agents, so server processes, document versions, sandbox policy, and
-hook configuration are not duplicated. The manager synchronizes exact file
-bytes before each request, advertises UTF-16 only, and warms covered files
-asynchronously after a successful `read`.
+delegated agents, so server processes, document versions, and sandbox policy
+are not duplicated. The manager synchronizes exact file bytes before each
+request, advertises UTF-16 only, and warms covered files asynchronously after
+a successful `read`.
 
 The read-only `lsp` tool supports only `definition`, `references`,
 `document_symbol`, and `hover`. Results are canonical, policy-authorized,
@@ -131,13 +131,8 @@ sorted, deduplicated, bounded, and marked untrusted: limits are 20
 definitions, 100 references, 200 flattened symbols, and 8 KiB of hover text.
 Plan mode can use `lsp`; language-server workspace edits are not applied.
 
-Root `postEdit` config entries are trusted argv arrays with optional normalized
-extensions and a 1–60 second timeout. After a successful write or edit,
-matching hooks receive sorted canonical paths directly under the
-shared sandbox/runtime; ghg then rereads final bytes and runs diagnostics.
-Hook failures never roll back the mutation or change its exit status, but
-bounded redacted output is reported. `internal/lsp/navigation_test.go` and
-`internal/tools/hooks_test.go` cover the main and failure paths.
+After a successful write or edit, ghg rereads final bytes and runs available
+diagnostics. `internal/lsp/navigation_test.go` covers the navigation path.
 
 ### Project instructions and streamed tool output
 

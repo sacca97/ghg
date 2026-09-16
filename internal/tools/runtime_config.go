@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/sacca97/ghg/internal/config"
 	"github.com/sacca97/ghg/internal/sandbox"
@@ -36,7 +35,7 @@ var standardCacheTargets = []cacheTarget{
 
 // NewConfiguredRuntime builds the process execution boundary for a workspace.
 // Returns an idempotent cleanup function that removes the private temporary root.
-func NewConfiguredRuntime(workspace string, cfg *config.ExecutionConfig, headless bool, postEdit ...[]config.PostEditConfig) (*ToolRuntime, func(), error) {
+func NewConfiguredRuntime(workspace string, cfg *config.ExecutionConfig, headless bool) (*ToolRuntime, func(), error) {
 	mode := sandbox.ModeWorkspaceWrite
 	network := sandbox.NetworkDeny
 	approval := ApprovalAsk
@@ -213,7 +212,6 @@ func NewConfiguredRuntime(workspace string, cfg *config.ExecutionConfig, headles
 	}
 	runtime.TempDir = tempRoot
 	runtime.SecretNames = append([]string(nil), executionSecretNames(cfg)...)
-	runtime.PostEditHooks = configuredPostEditHooks(postEdit...)
 	runtime.envOverrides = envOverrides
 	runtime.envOverrides["TMPDIR"] = tempRoot
 	runtime.envOverrides["TMP"] = tempRoot
@@ -237,25 +235,6 @@ func newRuntimeTempRoot() (string, error) {
 		}
 	}
 	return os.MkdirTemp(base, "ghg-runtime-")
-}
-
-func configuredPostEditHooks(configs ...[]config.PostEditConfig) []PostEditHook {
-	if len(configs) == 0 || len(configs[0]) == 0 {
-		return nil
-	}
-	out := make([]PostEditHook, 0, len(configs[0]))
-	for _, hook := range configs[0] {
-		timeout := hook.TimeoutSeconds
-		if timeout <= 0 {
-			timeout = 10
-		}
-		out = append(out, PostEditHook{
-			Command:    append([]string(nil), hook.Command...),
-			Extensions: append([]string(nil), hook.Extensions...),
-			Timeout:    time.Duration(timeout) * time.Second,
-		})
-	}
-	return out
 }
 
 func discoveredCacheRoots(env map[string]string) []cacheLeaf {
@@ -343,7 +322,7 @@ func configuredSkillsRoot(privateRoot string) string {
 		return ""
 	}
 	canonical, err := sandbox.CanonicalPath(path, false)
-	if err != nil || !strictPathWithin(canonical, privateRoot) {
+	if err != nil || !pathContains(privateRoot, canonical) {
 		return ""
 	}
 	return canonical
@@ -581,7 +560,7 @@ func ensureCacheLeaf(path, allowedBase string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("cache leaf %q: %w", path, err)
 	}
-	if !strictPathWithin(canonical, base) {
+	if !pathContains(base, canonical) {
 		return "", fmt.Errorf("cache leaf %q is not a strict descendant of allowed base %q", path, base)
 	}
 	if broadCacheRoot(canonical) {
@@ -600,7 +579,7 @@ func ensureCacheLeaf(path, allowedBase string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("canonicalize cache leaf %q: %w", path, err)
 	}
-	if !strictPathWithin(canonical, base) {
+	if !pathContains(base, canonical) {
 		return "", fmt.Errorf("cache leaf %q escaped allowed base %q", path, base)
 	}
 	info, err := os.Stat(canonical)
@@ -798,16 +777,11 @@ func broadCacheRoot(path string) bool {
 }
 
 func pathEqualOrWithin(path, root string) bool {
-	return path == root || strictPathWithin(path, root)
+	return path == root || pathContains(root, path)
 }
 
 func pathEqualOrAncestor(path, descendant string) bool {
-	return path == descendant || strictPathWithin(descendant, path)
-}
-
-func strictPathWithin(path, root string) bool {
-	rel, err := filepath.Rel(root, path)
-	return err == nil && rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+	return path == descendant || pathContains(path, descendant)
 }
 
 func cacheRootsOverlap(left, right string) bool {

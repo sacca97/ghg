@@ -102,16 +102,6 @@ func (a *Agent) selectedReasoningEffort(calls []models.ToolCall, results []tools
 	return selected, requested, nil
 }
 
-func withoutReasoningSelector(ts []tools.Tool) []tools.Tool {
-	out := make([]tools.Tool, 0, len(ts))
-	for _, tool := range ts {
-		if tool.Def.Function.Name != nextReasoningEffortToolName {
-			out = append(out, tool)
-		}
-	}
-	return out
-}
-
 func withoutReviewExtension(ts []tools.Tool) []tools.Tool {
 	out := make([]tools.Tool, 0, len(ts))
 	for _, tool := range ts {

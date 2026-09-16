@@ -4,10 +4,10 @@
 // handles, the event dispatch table, and the DOM wiring.
 import {
   ROLES, MODES, COMPOSER_MODES, EFFORT_LEVELS, APPROVALS, SANDBOXES, NETWORKS, BUSY_STATES,
-  ROLE_LABELS, MODE_LABELS, COMPOSER_MODE_LABELS, EFFORT_LABELS, APPROVAL_LABELS, SANDBOX_LABELS, NETWORK_LABELS,
+  ROLE_LABELS, MODE_LABELS, COMPOSER_MODE_LABELS, EFFORT_LABELS, effortLabel, APPROVAL_LABELS, SANDBOX_LABELS, NETWORK_LABELS,
   isRole, isMode, isComposerMode, isEffort, isApproval, isSandbox, isNetwork, fillSelect,
 } from "./constants.js";
-import { text, formatCount, formatDuration } from "./util.js";
+import { text, formatCount } from "./util.js";
 import { renderMarkdown } from "./markdown.js";
 import {
   buildBlock, renderToolContent, updateThinkingSummary, addExportButton, sameBlock,
@@ -72,6 +72,7 @@ const state = {
   sandbox: isSandbox(initialSettings.sandbox) ? initialSettings.sandbox : "",
   network: isNetwork(initialSettings.network) ? initialSettings.network : "",
   models: saved.models && typeof saved.models === "object" ? saved.models : {},
+  modelCapabilities: saved.modelCapabilities && typeof saved.modelCapabilities === "object" && !Array.isArray(saved.modelCapabilities) ? saved.modelCapabilities : {},
   references: Array.isArray(saved.references) ? saved.references.filter((path) => typeof path === "string") : [],
   proposedPlan: typeof saved.proposedPlan === "string" ? saved.proposedPlan : "",
   settingsOpen: saved.settingsOpen === true,
@@ -248,14 +249,32 @@ function setSendButton(running) {
 }
 
 function updateStatus() {
-  const parts = [];
-  // Activity first: #status is nowrap with an ellipsis, so the turn state and
-  // its timer must not be the segment that gets clipped.
-  const elapsed = active && turnSince ? formatDuration(Date.now() - turnSince) : "";
-  parts.push(active && activity === "Thinking" ? `Thinking ${elapsed}` : active && elapsed ? `${activity} · ${elapsed}` : activity);
-  if (model) parts.push(model);
-  if (contextLimit > 0) parts.push(`${formatCount(context)}/${formatCount(contextLimit)} ctx`);
-  status.textContent = parts.join(" · ");
+  status.textContent = contextLimit > 0 ? `${formatCount(context)}/${formatCount(contextLimit)} ctx` : "";
+}
+
+function effortsForCurrentModel() {
+  const modelName = state.models[state.role];
+  const info = state.modelCapabilities[modelName];
+  if (!info || !Array.isArray(info.reasoningEfforts)) return [...EFFORT_LEVELS];
+  const levels = [""];
+  for (const value of info.reasoningEfforts) {
+    if (typeof value !== "string") continue;
+    const effort = value.trim().toLowerCase();
+    if (!effort || effort === "off" || effort === "none" || levels.includes(effort)) continue;
+    levels.push(effort);
+  }
+  if (activeReasoningEffort && isEffort(activeReasoningEffort) && !levels.includes(activeReasoningEffort)) {
+    levels.push(activeReasoningEffort);
+  }
+  return levels;
+}
+
+function normalizeEffortForModel(value, levels = effortsForCurrentModel()) {
+  const current = typeof value === "string" ? value.trim().toLowerCase() : "";
+  if (current === "off" || current === "none" || current === "default") return "";
+  const match = levels.find((level) => level.toLowerCase() === current);
+  if (match) return match;
+  return current === "" || levels.length === 1 ? "" : levels[1];
 }
 
 function setupOptionLists() {
@@ -269,7 +288,6 @@ function setupOptionLists() {
   fillSelect(settingsApproval, APPROVALS, APPROVAL_LABELS);
   fillSelect(modeToggle, COMPOSER_MODES, COMPOSER_MODE_LABELS);
   fillSelect(role, ROLES, (name) => state.models[name] || "Configured");
-  fillSelect(effort, EFFORT_LEVELS, EFFORT_LABELS);
 }
 
 function syncControls() {
@@ -279,12 +297,16 @@ function syncControls() {
   modeToggle.title = `Current mode: ${label}`;
   role.disabled = false;
   role.value = state.role;
-  effort.value = state.effort;
   for (const option of role.options) {
     option.textContent = state.models[option.value] || "Configured";
   }
   settingsRole.value = state.role;
   settingsMode.value = isMode(state.mode) ? state.mode : "execute";
+  const effortLevels = effortsForCurrentModel();
+  state.effort = normalizeEffortForModel(state.effort, effortLevels);
+  fillSelect(effort, effortLevels, effortLabel);
+  fillSelect(settingsEffort, effortLevels, effortLabel);
+  effort.value = state.effort;
   settingsEffort.value = state.effort;
   settingsSandbox.value = state.sandbox;
   settingsNetwork.value = state.network;
@@ -581,7 +603,7 @@ function requestCompletions() {
 const callEffort = (raw) => {
   let effort = text(raw.effort_applied).trim() || text(raw.reasoning_effort).trim();
   if (!effort && raw.reasoning_enabled === true) effort = "on";
-  return effort === "off" || effort === "default" ? "" : effort;
+  return effort === "off" || effort === "none" || effort === "default" ? "" : effort;
 };
 
 const handlers = {
@@ -711,7 +733,7 @@ const handlers = {
     const entry = tools.get(id);
     if (entry) {
       entry.block.failed = typeof raw.result === "string" && /^(error|failed)/i.test(raw.result.trim());
-      renderToolContent(entry.element, entry.block, text(raw.result));
+      renderToolContent(entry.element, entry.block);
       tools.delete(id);
       save();
     }
@@ -802,9 +824,18 @@ const handlers = {
       for (const name of ROLES) {
         if (typeof raw.models[name] === "string" && raw.models[name]) state.models[name] = raw.models[name];
       }
-      syncControls();
-      save();
     }
+    if (Array.isArray(raw.capabilities)) {
+      state.modelCapabilities = {};
+      for (const item of raw.capabilities) {
+        if (!item || typeof item !== "object" || typeof item.model !== "string") continue;
+        state.modelCapabilities[item.model] = {
+          reasoningEfforts: Array.isArray(item.reasoningEfforts) ? item.reasoningEfforts.filter((value) => typeof value === "string") : undefined,
+        };
+      }
+    }
+    syncControls();
+    save();
   },
 
   extensionSettings(raw) {
@@ -914,6 +945,11 @@ const handlers = {
   resume_session() {
     append({ kind: "notice", text: "Session resumed." }, true);
   },
+
+  showSettings() {
+    setSettings(true);
+    settingsClose.focus();
+  },
 };
 
 function handleEvent(raw) {
@@ -1010,6 +1046,7 @@ send.addEventListener("click", (event) => {
 role.addEventListener("change", () => {
   if (!isRole(role.value)) return;
   state.role = role.value;
+  syncControls();
   save();
   post({ type: "configureRole", role: state.role, mode: state.mode });
 });
@@ -1074,7 +1111,11 @@ window.addEventListener("keydown", (event) => {
   if (event.key === "Escape" && !settings.hidden) closeSettings();
 });
 window.addEventListener("message", (event) => handleEvent(event.data));
-setInterval(() => { if (active) updateStatus(); }, 1000);
+setInterval(() => {
+  if (active) updateStatus();
+  const stream = streams.thinking;
+  if (stream) updateThinkingSummary(stream.element, stream.block);
+}, 1000);
 
 setupOptionLists();
 prompt.value = state.draft;

@@ -64,17 +64,7 @@ func boundedHistoryText(value string, limit int) string {
 }
 
 func truncateHistory(value string, limit int) string {
-	if limit <= 0 {
-		return ""
-	}
-	if len(value) <= limit {
-		return value
-	}
-	const suffix = "…"
-	if limit < len(suffix) {
-		return value[:textutil.UTF8Prefix(value, limit)]
-	}
-	return value[:textutil.UTF8Prefix(value, limit-len(suffix))] + suffix
+	return textutil.UTF8Truncate(value, limit, "…")
 }
 
 // backfillHistoryFTS rebuilds the derived index once for databases created

@@ -14,7 +14,6 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"time"
 
 	"github.com/sacca97/ghg/internal/models"
 	"github.com/sacca97/ghg/internal/observation"
@@ -136,7 +135,6 @@ type ToolRuntime struct {
 	HumanGate       func(context.Context, GateRequest) (GateDecision, string)
 	Cautious        bool
 	LanguageService LanguageService
-	PostEditHooks   []PostEditHook
 	Headless        bool
 	Goal            string
 	Justification   string
@@ -146,15 +144,6 @@ type ToolRuntime struct {
 	envOverrides map[string]string
 	state        *runtimeState
 	approvalMu   *sync.RWMutex
-}
-
-// PostEditHook is a trusted, direct-argv command run after a successful
-// publication. Extensions are normalized (for example, ".go") and an empty
-// list matches every mutated file.
-type PostEditHook struct {
-	Command    []string
-	Extensions []string
-	Timeout    time.Duration
 }
 
 type runtimeState struct {
@@ -233,7 +222,6 @@ func (r *ToolRuntime) Child() *ToolRuntime {
 	}
 	child := *r
 	child.SecretNames = slices.Clone(r.SecretNames)
-	child.PostEditHooks = clonePostEditHooks(r.PostEditHooks)
 	child.envOverrides = maps.Clone(r.envOverrides)
 	if child.state == nil {
 		child.state = &runtimeState{approval: make(map[string]*approvalFlight)}

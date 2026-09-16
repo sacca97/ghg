@@ -543,6 +543,53 @@ func newReviewFinalizationBackend(failAt, failures int) *reviewFinalizationBacke
 	return &reviewFinalizationBackend{responses: responses, failAt: failAt, failures: failures}
 }
 
+func TestReviewCheckpointKeepsReasoningSelectorAvailable(t *testing.T) {
+	workspace := t.TempDir()
+	t.Chdir(workspace)
+	if err := os.WriteFile(filepath.Join(workspace, "evidence.go"), []byte("package evidence\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	checkpointSeen := false
+	backend := &mockAgentBackend{}
+	backend.streamFn = func(_ context.Context, req models.Request, _ models.EventSink) (models.Message, models.Usage, error) {
+		if !requestContains(req, "<review_budget_checkpoint>") {
+			return models.Message{Role: "assistant", ToolCalls: []models.ToolCall{agentToolCall("read", "read", `{"path":"evidence.go"}`)}}, models.Usage{}, nil
+		}
+		if !checkpointSeen {
+			checkpointSeen = true
+			for _, tool := range req.Tools {
+				if tool.Function.Name == nextReasoningEffortToolName {
+					return models.Message{Role: "assistant", ToolCalls: []models.ToolCall{agentToolCall("effort", nextReasoningEffortToolName, `{"effort":"high"}`)}}, models.Usage{}, nil
+				}
+			}
+			t.Fatal("review checkpoint omitted the reasoning selector")
+		}
+		return models.Message{Role: "assistant", ToolCalls: []models.ToolCall{agentToolCall("submit", "submit_review", reviewArgsForTest)}}, models.Usage{}, nil
+	}
+
+	ag := New(backend, "model", 100, "system")
+	ag.ReviewMode = true
+	ag.Effort = "low"
+	ag.ReasoningEfforts = []string{"low", "high"}
+	ag.Tools = []tools.Tool{{
+		Def: models.NewTool("read", "read", `{"type":"object"}`),
+		Run: func(context.Context, json.RawMessage) (string, error) { return "evidence", nil },
+	}}
+	var selections []ReasoningSelection
+	if _, err := ag.TurnAuthored(context.Background(), "evidence.go", Events{
+		OnReasoningSelection: func(value ReasoningSelection) { selections = append(selections, value) },
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if !checkpointSeen {
+		t.Fatal("review never reached a budget checkpoint")
+	}
+	if len(selections) != 1 || !selections[0].Applied || selections[0].Requested != "high" {
+		t.Fatalf("selector result = %+v, want one applied high-effort selection", selections)
+	}
+}
+
 type reviewFinalizationBackend struct {
 	responses []models.Message
 	failAt    int

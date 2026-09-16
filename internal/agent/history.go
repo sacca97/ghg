@@ -325,17 +325,7 @@ func historyReadItemFromMessage(item HistoryMessage) historyReadItem {
 
 func boundedHistoryDisplay(value string, limit int) string {
 	value = strings.TrimSpace(value)
-	if limit <= 0 {
-		return ""
-	}
-	if len(value) <= limit {
-		return value
-	}
-	const suffix = "…"
-	if limit < len(suffix) {
-		return value[:textutil.UTF8Prefix(value, limit)]
-	}
-	return value[:textutil.UTF8Prefix(value, limit-len(suffix))] + suffix
+	return textutil.UTF8Truncate(value, limit, "…")
 }
 
 func renderHistoryRead(snapshot search.Snapshot, cursor historyCursor) (tools.ToolResult, bool) {

@@ -14,7 +14,7 @@ import (
 )
 
 func newConfiguredRuntime(cfg *config.Config, trusted bool) (*tools.ToolRuntime, *lsp.Manager, func(), error) {
-	runtime, cleanup, err := tools.NewConfiguredRuntime(".", cfg.Execution, trusted, cfg.PostEdit)
+	runtime, cleanup, err := tools.NewConfiguredRuntime(".", cfg.Execution, trusted)
 	if err != nil {
 		return nil, nil, nil, err
 	}

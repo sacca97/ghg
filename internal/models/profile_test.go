@@ -65,7 +65,7 @@ func TestLoadEmbeddedProfiles(t *testing.T) {
 		t.Fatalf("openrouter auth/docs metadata: %+v / %+v", p.Auth, p.Docs)
 	}
 	opencode, ok := profiles.Lookup("opencode")
-	if !ok || opencode.Protocol != ProtocolOpenAIChatCompletions || !opencode.Catalog.Public || opencode.Catalog.ModelsDev != "opencode-go" || opencode.Auth.Kind != AuthBearer || len(opencode.Routes) != 2 {
+	if !ok || opencode.Protocol != ProtocolOpenAIChatCompletions || !opencode.Catalog.Public || opencode.Catalog.ModelsDev != "opencode-go" || opencode.Auth.Kind != AuthBearer || opencode.SessionHeader != "x-opencode-session" || len(opencode.Routes) != 2 {
 		t.Fatalf("opencode profile: %+v", opencode)
 	}
 	if opencode.Routes[0].Protocol != ProtocolAnthropicMessages || opencode.Routes[0].Auth.Header != "x-api-key" || opencode.Routes[0].DefaultHeaders["anthropic-version"] != "2023-06-01" {

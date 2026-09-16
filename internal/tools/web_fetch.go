@@ -54,7 +54,7 @@ func runWebFetch(ctx context.Context, args json.RawMessage) (ToolResult, error) 
 		return ToolResult{}, err
 	}
 	ctx = WithRuntime(ctx, runtime.WithPolicy(policy))
-	return fetchWeb(ctx, in.URL, newPublicWebClient(defaultWebLookup), defaultWebLookup)
+	return fetchWeb(ctx, in.URL, defaultWebClient, defaultWebLookup)
 }
 
 func defaultWebLookup(ctx context.Context, host string) ([]net.IP, error) {
@@ -93,6 +93,8 @@ func newPublicWebClient(lookup webLookup) *http.Client {
 		},
 	}
 }
+
+var defaultWebClient = newPublicWebClient(defaultWebLookup)
 
 type webDialer struct {
 	lookup webLookup

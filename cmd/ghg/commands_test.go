@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/sacca97/ghg/internal/config"
 	"github.com/sacca97/ghg/internal/models"
 	"github.com/sacca97/ghg/internal/session"
 )
@@ -18,6 +19,11 @@ func TestModelsCLIJSON(t *testing.T) {
 	t.Setenv("GHG_HOME", home)
 	configJSON := `{"defaultModel":"fallback","defaultProvider":"provider","providers":{"provider":{"baseUrl":"https://example.test"}},"models":{"fallback":{"providers":["provider"]},"smart-model":{"providers":["provider"]}},"roles":{"smart":{"model":"smart-model","provider":"provider"}}}`
 	if err := os.WriteFile(filepath.Join(home, "config.json"), []byte(configJSON), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := config.SaveCatalog("provider", "https://example.test", []models.ModelInfo{
+		{ID: "smart-model", ReasoningEfforts: []string{"low", "max"}},
+	}); err != nil {
 		t.Fatal(err)
 	}
 	out := captureStdout(t, func() {
@@ -43,6 +49,9 @@ func TestModelsCLIJSON(t *testing.T) {
 	}
 	if len(choices) != 2 || choices[0].Model != "fallback" || choices[1].Model != "smart-model" {
 		t.Fatalf("catalog models = %#v", choices)
+	}
+	if got := choices[1].ReasoningEfforts; len(got) != 3 || got[0] != "" || got[1] != "low" || got[2] != "max" {
+		t.Fatalf("smart model reasoning efforts = %#v", got)
 	}
 }
 

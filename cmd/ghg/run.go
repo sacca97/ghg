@@ -460,7 +460,8 @@ func setupWireEvents(ev *agent.Events, emit func(any)) {
 			"reasoning_effort": call.ReasoningEffort, "reasoning_enabled": call.ReasoningEnabled,
 			"configured_effort": call.ConfiguredEffort, "dynamic_reasoning": call.DynamicReasoning,
 			"effort_requested_for_call": call.EffortRequested, "effort_applied": call.EffortApplied,
-			"selection_reason": call.SelectionReason,
+			"selection_reason": call.SelectionReason, "reasoning_selector_exposed": call.ReasoningSelectorExposed,
+			"reasoning_selector_efforts": call.ReasoningSelectorEfforts,
 		})
 	}
 	ev.OnModelCallEnd = func(call agent.ModelCallEnd) {
@@ -474,6 +475,14 @@ func setupWireEvents(ev *agent.Events, emit func(any)) {
 			"effort_requested_for_call":  call.EffortRequested,
 			"effort_applied":             call.EffortApplied,
 			"selection_reason":           call.SelectionReason,
+			"reasoning_selector_exposed": call.ReasoningSelectorExposed,
+			"reasoning_selector_efforts": call.ReasoningSelectorEfforts,
+			"request_sha256":             call.RequestSHA256,
+			"request_prefix_sha256":      call.RequestPrefixSHA256,
+			"request_bytes":              call.RequestBytes,
+			"request_prefix_bytes":       call.RequestPrefixBytes,
+			"request_prefix_messages":    call.RequestPrefixMessages,
+			"request_diagnostics":        call.RequestDiagnostics,
 			"checkpoint_level":           call.CheckpointLevel,
 			"continued_after_checkpoint": call.ContinuedAfterCheckpoint,
 			"purpose":                    call.Purpose, "finish_reason": call.FinishReason, "usage": call.Usage, "error": call.Error,
@@ -492,8 +501,9 @@ func setupWireEvents(ev *agent.Events, emit func(any)) {
 			"model": view.Model, "protocol": view.Protocol, "purpose": view.Purpose,
 			"configured_effort": view.ConfiguredEffort, "dynamic_reasoning": view.DynamicReasoning,
 			"effort_requested_for_call": view.EffortRequested, "effort_applied": view.EffortApplied,
-			"selection_reason": view.SelectionReason,
-			"message_count":    view.MessageCount, "estimated_tokens": view.EstimatedTokens,
+			"selection_reason": view.SelectionReason, "reasoning_selector_exposed": view.ReasoningSelectorExposed,
+			"reasoning_selector_efforts": view.ReasoningSelectorEfforts,
+			"message_count":              view.MessageCount, "estimated_tokens": view.EstimatedTokens,
 			"serialized_bytes": view.SerializedBytes, "context_limit": view.ContextLimit,
 		})
 	}

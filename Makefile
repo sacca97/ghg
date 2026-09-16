@@ -1,6 +1,6 @@
 BIN ?= ghg
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
-LDFLAGS ?= -X main.version=$(VERSION)
+LDFLAGS ?= -s -w -X main.version=$(VERSION)
 
 VSCODE_DIR ?= editors/vscode
 VSIX_PATH ?= $(VSCODE_DIR)/ghg.vsix
@@ -11,7 +11,7 @@ all: build
 
 build:
 	@printf 'building %s\n' "$(BIN)"
-	go build -ldflags "$(LDFLAGS)" -o $(BIN) ./cmd/ghg
+	go build -trimpath -ldflags "$(LDFLAGS)" -o $(BIN) ./cmd/ghg
 	@chmod 755 $(BIN)
 
 install:
@@ -33,7 +33,7 @@ install:
 	fi; \
 	mkdir -p "$$(dirname "$$dest")"; \
 	printf 'installing ghg -> %s\n' "$$dest"; \
-	go build -ldflags "$(LDFLAGS)" -o "$$dest" ./cmd/ghg; \
+	go build -trimpath -ldflags "$(LDFLAGS)" -o "$$dest" ./cmd/ghg; \
 	chmod 755 "$$dest"; \
 	printf 'installed ghg at %s\n' "$$dest"
 

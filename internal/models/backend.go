@@ -118,4 +118,5 @@ func configureTransport(transport *transport, resolved Resolved, opts BackendOpt
 	}
 	transport.AuthKind = resolved.Auth.Kind
 	transport.AuthHeader = resolved.Auth.Header
+	transport.SessionHeader = resolved.Profile.SessionHeader
 }

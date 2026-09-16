@@ -26,8 +26,8 @@ const (
 	maxConcurrentTools           = 4
 	reviewFinalEvidenceToolLimit = 4
 
-	planFinalizationToolError   = "Error: exploration is complete for this plan. Tools are disabled; emit the final <proposed_plan> block now."
-	reviewFinalizationToolError = "Error: exploration is complete for this review. Only submit_review is available; submit the best evidence-backed result now."
+	planFinalizationToolError   = "Error: exploration is complete for this plan. Exploration tools are disabled; set_next_reasoning_effort remains available for the next call. Emit the final <proposed_plan> block now."
+	reviewFinalizationToolError = "Error: exploration is complete for this review. Only submit_review and set_next_reasoning_effort are available; submit the best evidence-backed result now."
 	askFinalizationToolError    = "Error: exploration is complete for this answer. Tools are disabled; answer directly using the evidence gathered."
 	malformedToolCallError      = "Error: tool call arguments were malformed (invalid JSON or exceeded the per-call size limit) and were omitted. Reissue the call with valid JSON arguments."
 	oversizedToolBatchError     = "Error: the tool-call batch exceeded the aggregate argument size limit. Split the calls into smaller batches and reissue them with valid JSON arguments."
@@ -836,17 +836,27 @@ func (a *Agent) callStream(ctx context.Context, backend models.Backend, role, pr
 	call.EffortRequested = req.ReasoningEffort
 	call.EffortApplied = req.ReasoningEffort
 	call.SelectionReason = req.ReasoningSelectionReason
+	call.ReasoningSelectorExposed, call.ReasoningSelectorEfforts = a.reasoningSelectorTelemetry(req.Tools)
+	var requestDiagnostics *models.RequestDiagnostics
+	previousDiagnostics := req.OnRequestDiagnostics
+	req.OnRequestDiagnostics = func(value models.RequestDiagnostics) {
+		if previousDiagnostics != nil {
+			previousDiagnostics(value)
+		}
+		copy := value
+		requestDiagnostics = &copy
+	}
 	a.emitPromptView(ev, call, req)
 	if ev.OnModelCallStart != nil {
 		ev.OnModelCallStart(call)
 	}
 	if backend == nil {
 		err := errors.New("agent: nil backend")
-		a.emitCallEnd(ev, call, start, models.Message{}, models.Usage{}, err, checkpointLevel)
+		a.emitCallEnd(ev, call, start, req, models.Message{}, models.Usage{}, err, requestDiagnostics, checkpointLevel)
 		return models.Message{}, models.Usage{}, err
 	}
 	msg, usage, err := backend.Stream(ctx, req, sink)
-	a.emitCallEnd(ev, call, start, msg, usage, err, checkpointLevel)
+	a.emitCallEnd(ev, call, start, req, msg, usage, err, requestDiagnostics, checkpointLevel)
 	return msg, usage, err
 }
 
@@ -863,17 +873,27 @@ func (a *Agent) callCompletePurpose(ctx context.Context, backend models.Backend,
 	call.EffortRequested = req.ReasoningEffort
 	call.EffortApplied = req.ReasoningEffort
 	call.SelectionReason = req.ReasoningSelectionReason
+	call.ReasoningSelectorExposed, call.ReasoningSelectorEfforts = a.reasoningSelectorTelemetry(req.Tools)
+	var requestDiagnostics *models.RequestDiagnostics
+	previousDiagnostics := req.OnRequestDiagnostics
+	req.OnRequestDiagnostics = func(value models.RequestDiagnostics) {
+		if previousDiagnostics != nil {
+			previousDiagnostics(value)
+		}
+		copy := value
+		requestDiagnostics = &copy
+	}
 	a.emitPromptView(ev, call, req)
 	if ev.OnModelCallStart != nil {
 		ev.OnModelCallStart(call)
 	}
 	if backend == nil {
 		err := errors.New("agent: nil backend")
-		a.emitCallEnd(ev, call, start, models.Message{}, models.Usage{}, err, 0)
+		a.emitCallEnd(ev, call, start, req, models.Message{}, models.Usage{}, err, requestDiagnostics, 0)
 		return models.Message{}, models.Usage{}, err
 	}
 	msg, usage, err := backend.Complete(ctx, req)
-	a.emitCallEnd(ev, call, start, msg, usage, err, 0)
+	a.emitCallEnd(ev, call, start, req, msg, usage, err, requestDiagnostics, 0)
 	return msg, usage, err
 }
 
@@ -883,6 +903,15 @@ func requestReasoningTelemetry(req models.Request) (string, *bool) {
 	}
 	enabled := *req.ReasoningEnabled
 	return req.ReasoningEffort, &enabled
+}
+
+func (a *Agent) reasoningSelectorTelemetry(defs []models.Tool) (bool, []string) {
+	for _, def := range defs {
+		if def.Function.Name == nextReasoningEffortToolName {
+			return true, advertisedReasoningEfforts(a.ReasoningEfforts)
+		}
+	}
+	return false, nil
 }
 
 func (a *Agent) emitPromptView(ev Events, call ModelCallStart, req models.Request) {
@@ -899,15 +928,22 @@ func (a *Agent) emitPromptView(ev Events, call ModelCallStart, req models.Reques
 	})
 }
 
-func (a *Agent) emitCallEnd(ev Events, call ModelCallStart, start time.Time, msg models.Message, usage models.Usage, err error, checkpointLevel int) {
+func (a *Agent) emitCallEnd(ev Events, call ModelCallStart, start time.Time, req models.Request, msg models.Message, usage models.Usage, err error, requestDiagnostics *models.RequestDiagnostics, checkpointLevel int) {
 	if ev.OnModelCallEnd == nil {
 		return
 	}
+	requestShape := requestShapeTelemetry(req)
 	end := ModelCallEnd{
 		ModelCallStart:           call,
 		LatencyMS:                time.Since(start).Milliseconds(),
 		FinishReason:             msg.StopReason,
 		Usage:                    usage,
+		RequestDiagnostics:       requestDiagnostics,
+		RequestSHA256:            requestShape.Hash,
+		RequestPrefixSHA256:      requestShape.PrefixHash,
+		RequestBytes:             requestShape.Bytes,
+		RequestPrefixBytes:       requestShape.PrefixBytes,
+		RequestPrefixMessages:    requestShape.PrefixMessages,
 		CheckpointLevel:          checkpointLevel,
 		ContinuedAfterCheckpoint: checkpointLevel > 0 && len(msg.ToolCalls) > 0,
 	}
@@ -915,6 +951,95 @@ func (a *Agent) emitCallEnd(ev Events, call ModelCallStart, start time.Time, msg
 		end.Error = err.Error()
 	}
 	ev.OnModelCallEnd(end)
+}
+
+const requestTelemetryPrefixMessages = 16
+
+type requestTelemetryMessage struct {
+	Role           string                 `json:"role"`
+	Content        string                 `json:"content"`
+	Parts          []models.ContentPart   `json:"parts,omitempty"`
+	ToolCalls      []requestTelemetryCall `json:"tool_calls,omitempty"`
+	ToolCallID     string                 `json:"tool_call_id,omitempty"`
+	ProviderBlocks []json.RawMessage      `json:"provider_blocks,omitempty"`
+	Name           string                 `json:"name,omitempty"`
+}
+
+type requestTelemetryCall struct {
+	ID       string `json:"id"`
+	Type     string `json:"type"`
+	Function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	} `json:"function"`
+}
+
+type requestShape struct {
+	Model           string                    `json:"model"`
+	Messages        []requestTelemetryMessage `json:"messages"`
+	Tools           []models.Tool             `json:"tools,omitempty"`
+	ReasoningEffort string                    `json:"reasoning_effort,omitempty"`
+}
+
+type requestShapeInfo struct {
+	Hash           string
+	PrefixHash     string
+	Bytes          int
+	PrefixBytes    int
+	PrefixMessages int
+}
+
+func requestShapeTelemetry(req models.Request) requestShapeInfo {
+	messages := make([]requestTelemetryMessage, len(req.Messages))
+	for i, msg := range req.Messages {
+		messages[i] = requestTelemetryMessage{
+			Role:           msg.Role,
+			Content:        msg.Content,
+			Parts:          msg.Parts,
+			ToolCallID:     msg.ToolCallID,
+			ProviderBlocks: msg.ProviderBlocks,
+			Name:           msg.Name,
+		}
+		if len(msg.ToolCalls) > 0 {
+			messages[i].ToolCalls = make([]requestTelemetryCall, len(msg.ToolCalls))
+			for j, call := range msg.ToolCalls {
+				messages[i].ToolCalls[j].ID = call.ID
+				messages[i].ToolCalls[j].Type = call.Type
+				messages[i].ToolCalls[j].Function.Name = call.Function.Name
+				messages[i].ToolCalls[j].Function.Arguments = call.Function.Arguments
+			}
+		}
+	}
+	shape := requestShape{
+		Model:           req.Model,
+		Messages:        messages,
+		Tools:           req.Tools,
+		ReasoningEffort: req.ReasoningEffort,
+	}
+	full, err := json.Marshal(shape)
+	if err != nil {
+		return requestShapeInfo{}
+	}
+	prefix := shape
+	if len(prefix.Messages) > requestTelemetryPrefixMessages {
+		prefix.Messages = prefix.Messages[:requestTelemetryPrefixMessages]
+	}
+	prefixJSON, err := json.Marshal(prefix)
+	if err != nil {
+		return requestShapeInfo{}
+	}
+	return requestShapeInfo{
+		Hash:           requestHash(full),
+		PrefixHash:     requestHash(prefixJSON),
+		Bytes:          len(full),
+		PrefixBytes:    len(prefixJSON),
+		PrefixMessages: len(prefix.Messages),
+	}
+}
+
+func requestHash(data []byte) string {
+	sum := sha256.Sum256(data)
+	return hex.EncodeToString(sum[:])
 }
 
 func isRepositoryNavigationTool(name string) bool {
@@ -1040,6 +1165,7 @@ func (a *Agent) collaborationPrompt() string {
 func currentToolGuidance(ts []tools.Tool, notices []string) string {
 	names := make([]string, 0, len(ts))
 	hasBash, hasLSP := false, false
+	discoveryTools := make([]string, 0, 2)
 	for _, tool := range ts {
 		name := tool.Def.Function.Name
 		names = append(names, name)
@@ -1048,6 +1174,8 @@ func currentToolGuidance(ts []tools.Tool, notices []string) string {
 			hasBash = true
 		case "lsp":
 			hasLSP = true
+		case "glob", "find_files":
+			discoveryTools = append(discoveryTools, name)
 		}
 	}
 	var b strings.Builder
@@ -1066,6 +1194,11 @@ func currentToolGuidance(ts []tools.Tool, notices []string) string {
 	}
 	if hasLSP {
 		b.WriteString("\n- Use lsp for semantic identity, references, and symbol context.")
+	}
+	if len(discoveryTools) > 0 {
+		b.WriteString("\n- For paths not established by evidence, use ")
+		b.WriteString(strings.Join(discoveryTools, " or "))
+		b.WriteString(" before read or grep; do not guess directory names or platform-specific paths.")
 	}
 	return b.String()
 }
@@ -1238,7 +1371,9 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 	if a.Runtime != nil {
 		turnTools, capabilityNotices = tools.FilterAvailable(turnTools, a.Runtime)
 	}
+	var reasoningSelector tools.Tool
 	if selector, ok := a.reasoningSelectorTool(); ok {
+		reasoningSelector = selector
 		knownTools = append(knownTools, selector)
 		turnTools = append(turnTools, selector)
 	}
@@ -1360,18 +1495,27 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 		available := turnTools
 		if reviewCheckpointRequest && !budgetFinalizing {
 			available = append([]tools.Tool(nil), turnTools...)
-			available = withoutReasoningSelector(available)
 			if reviewBudget.Allocation >= reviewBudget.HardLimit {
 				available = withoutReviewExtension(available)
 			}
 		} else if reviewBudget != nil && reviewClosed {
 			available = []tools.Tool{submitReviewTool()}
+			if reasoningSelector.Def.Function.Name != "" {
+				available = append(available, reasoningSelector)
+			}
 		} else if a.readOnlyCollaborationMode() && finalizing {
 			if a.ReviewMode {
 				available = []tools.Tool{submitReviewTool()}
+				if reasoningSelector.Def.Function.Name != "" {
+					available = append(available, reasoningSelector)
+				}
 			} else {
 				reqDefs = nil
-				available = nil // Reserve crossed: disable tools for final synthesis request
+				available = nil // Reserve crossed: disable exploration tools for final synthesis request
+				if reasoningSelector.Def.Function.Name != "" {
+					available = []tools.Tool{reasoningSelector}
+					reqDefs = tools.Defs(available)
+				}
 			}
 		} else if a.ReviewMode {
 			available = withoutReviewExtension(available)
@@ -1382,7 +1526,7 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 		}
 		msgs := a.assembleRequestMessages(a.Messages, todoContent, goalContent, budgetReminder, requestCapabilityGuidance, requestExplorationReminder, scopePreflight)
 		if reviewClosed && reviewFinalizationRetryUsed {
-			msgs = append(msgs, models.Message{Role: "system", Content: "<review_finalization_retry> Only submit_review is available. Submit the complete review now; do not describe what you would do next. </review_finalization_retry>", Transient: true})
+			msgs = append(msgs, models.Message{Role: "system", Content: "<review_finalization_retry> Only submit_review and set_next_reasoning_effort are available. Submit the complete review now; do not describe what you would do next. </review_finalization_retry>", Transient: true})
 		}
 		// Surface transient-request retries through the event hook so the UI
 		// shows "retrying" instead of looking hung. The sink is request-local;

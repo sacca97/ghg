@@ -207,7 +207,7 @@ Use grep for text, lsp for semantic symbol questions, and read only for the exac
 
 Inspect only the code necessary to understand requirements, locate relevant components, and resolve ambiguity. Reuse evidence already gathered and do not reread unchanged source. Once the remaining uncertainties cannot materially change the implementation decisions, stop exploring and produce the plan.
 
-If clarification is unavailable, make reasonable assumptions and state them in the plan.
+If clarification is unavailable, make reasonable assumptions and state them in the plan. The set_next_reasoning_effort tool is available when the model advertises multiple efforts; use it when a different advertised effort would be useful for the next model call, otherwise keep the configured effort. Select only an advertised effort.
 
 When the user message contains a tagged-path note, treat its paths as the authoritative scope inventory. Inspect those paths directly; do not use glob or find_files to rediscover them, and do not call both for the same target.
 
@@ -363,7 +363,7 @@ func planTaggedScopePrompt(a *Agent, target string) string {
 
 const askModePrompt = `You are answering the user's question in a read-only mode. Answer the question directly; it may be about the repository or a general subject, and infer which from the question.
 
-If the question concerns the repository, inspect only the files and evidence needed to answer accurately. Use only the read-only tools currently exposed in this request. You cannot write or edit files, run shell commands, spawn tasks, update goals, or otherwise mutate anything. Do not propose an implementation plan unless the user explicitly asks for one.`
+If the question concerns the repository, inspect only the files and evidence needed to answer accurately. Use only the read-only tools currently exposed in this request. You cannot write or edit files, run shell commands, spawn tasks, update goals, or otherwise mutate anything. The set_next_reasoning_effort tool is available when the model advertises multiple efforts; use it when a different advertised effort would be useful for the next model call, otherwise keep the configured effort. Select only an advertised effort. Do not propose an implementation plan unless the user explicitly asks for one.`
 
 // planSafeTools is the read-only allowlist shared by Plan and Ask modes. Enforcement
 // happens when building "available", not only through prompting, so mutating

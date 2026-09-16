@@ -274,9 +274,34 @@ type Request struct {
 	ReasoningEnabled *bool `json:"-"`
 	// The remaining fields are internal telemetry context for the selected
 	// foreground call. They never cross the provider boundary.
-	ConfiguredReasoningEffort string `json:"-"`
-	DynamicReasoning          bool   `json:"-"`
-	ReasoningSelectionReason  string `json:"-"`
+	ConfiguredReasoningEffort string                   `json:"-"`
+	DynamicReasoning          bool                     `json:"-"`
+	ReasoningSelectionReason  string                   `json:"-"`
+	OnRequestDiagnostics      func(RequestDiagnostics) `json:"-"`
+}
+
+// RequestDiagnostics identifies the rendered wire request without retaining
+// prompt contents. Input item hashes are limited to the first 16 items so a
+// long session cannot turn telemetry into a second copy of the transcript.
+type RequestDiagnostics struct {
+	Protocol           string   `json:"protocol"`
+	Stream             bool     `json:"stream"`
+	BodySHA256         string   `json:"body_sha256"`
+	InstructionsSHA256 string   `json:"instructions_sha256"`
+	InstructionsBytes  int      `json:"instructions_bytes"`
+	ToolsSHA256        string   `json:"tools_sha256"`
+	ToolsBytes         int      `json:"tools_bytes"`
+	InputSHA256        string   `json:"input_sha256"`
+	InputBytes         int      `json:"input_bytes"`
+	InputPrefixSHA256  string   `json:"input_prefix_sha256"`
+	InputPrefixBytes   int      `json:"input_prefix_bytes"`
+	InputItems         int      `json:"input_items"`
+	InputPrefixItems   int      `json:"input_prefix_items"`
+	InputItemSHA256    []string `json:"input_item_sha256,omitempty"`
+	InputItemTypes     []string `json:"input_item_types,omitempty"`
+	CacheKeyPresent    bool     `json:"cache_key_present"`
+	CacheKeySHA256     string   `json:"cache_key_sha256,omitempty"`
+	Store              *bool    `json:"store,omitempty"`
 }
 
 // openAIRequest is the OpenAI wire shape for a provider-neutral Request.
@@ -532,7 +557,7 @@ func (c *Client) stream(ctx context.Context, req Request, sink EventSink) (Messa
 		if sink.OnThink != nil {
 			wrapThink = func(s string) { emitted = true; sink.OnThink(s) }
 		}
-		msg, usage, err := c.streamOnce(ctx, body, wrapText, wrapThink)
+		msg, usage, err := c.streamOnce(ctx, body, req.SessionID, wrapText, wrapThink)
 		if err == nil {
 			return msg, usage, nil
 		}
@@ -564,7 +589,7 @@ func (c *Client) stream(ctx context.Context, req Request, sink EventSink) (Messa
 // streamOnce performs a single streaming request attempt; the Stream retry
 // wrapper calls it per attempt and reads its own `emitted` flag (set by the
 // wrapped callbacks) to decide whether a retry would replay visible output.
-func (c *Client) streamOnce(ctx context.Context, body []byte, onText, onThink func(string)) (Message, Usage, error) {
+func (c *Client) streamOnce(ctx context.Context, body []byte, sessionID string, onText, onThink func(string)) (Message, Usage, error) {
 	hr, err := http.NewRequestWithContext(ctx, "POST", c.BaseURL+"/chat/completions", bytes.NewReader(body))
 	if err != nil {
 		return Message{}, Usage{}, err
@@ -573,6 +598,7 @@ func (c *Client) streamOnce(ctx context.Context, body []byte, onText, onThink fu
 	if err := c.setRequestHeaders(hr); err != nil {
 		return Message{}, Usage{}, err
 	}
+	c.setSessionHeader(hr, sessionID)
 	resp, err := c.httpClient().Do(hr)
 	if err != nil {
 		return Message{}, Usage{}, err
@@ -684,7 +710,7 @@ func (c *Client) complete(ctx context.Context, req Request, sink EventSink) (Mes
 	for attempt := 1; attempt <= limit; attempt++ {
 		var msg Message
 		var usage Usage
-		msg, usage, err = c.completeOnce(ctx, body)
+		msg, usage, err = c.completeOnce(ctx, body, req.SessionID)
 		if err == nil {
 			return msg, usage, nil
 		}
@@ -710,7 +736,7 @@ func (c *Client) complete(ctx context.Context, req Request, sink EventSink) (Mes
 }
 
 // completeOnce performs one non-streaming request attempt.
-func (c *Client) completeOnce(ctx context.Context, body []byte) (Message, Usage, error) {
+func (c *Client) completeOnce(ctx context.Context, body []byte, sessionID string) (Message, Usage, error) {
 	hr, err := http.NewRequestWithContext(ctx, "POST", c.BaseURL+"/chat/completions", bytes.NewReader(body))
 	if err != nil {
 		return Message{}, Usage{}, err
@@ -719,6 +745,7 @@ func (c *Client) completeOnce(ctx context.Context, body []byte) (Message, Usage,
 	if err := c.setRequestHeaders(hr); err != nil {
 		return Message{}, Usage{}, err
 	}
+	c.setSessionHeader(hr, sessionID)
 	resp, err := c.httpClient().Do(hr)
 	if err != nil {
 		return Message{}, Usage{}, err

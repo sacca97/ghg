@@ -15,21 +15,24 @@ import (
 )
 
 type transport struct {
-	BaseURL    string
-	APIKey     string
-	HTTP       *http.Client
-	Headers    map[string]string
-	AuthKind   string
-	AuthHeader string
-	MaxRetries int
-	OnRetry    func(RetryEvent)
+	BaseURL       string
+	APIKey        string
+	HTTP          *http.Client
+	Headers       map[string]string
+	AuthKind      string
+	AuthHeader    string
+	SessionHeader string
+	MaxRetries    int
+	OnRetry       func(RetryEvent)
 }
+
+const defaultModelRequestTimeout = 3 * time.Minute
 
 func newTransport(baseURL, apiKey string) transport {
 	return transport{
 		BaseURL: strings.TrimRight(baseURL, "/"),
 		APIKey:  apiKey,
-		HTTP:    &http.Client{Timeout: 10 * time.Minute},
+		HTTP:    &http.Client{Timeout: defaultModelRequestTimeout},
 	}
 }
 
@@ -49,6 +52,12 @@ func (t transport) httpClient() *http.Client {
 
 func (t transport) setRequestHeaders(req *http.Request) error {
 	return applyRequestHeaders(req, t.Headers, t.APIKey, t.AuthKind, t.AuthHeader)
+}
+
+func (t transport) setSessionHeader(req *http.Request, sessionID string) {
+	if t.SessionHeader != "" && strings.TrimSpace(sessionID) != "" {
+		req.Header.Set(t.SessionHeader, sessionID)
+	}
 }
 
 func applyRequestHeaders(req *http.Request, headers map[string]string, apiKey, authKind, authHeader string) error {

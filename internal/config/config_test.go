@@ -183,33 +183,6 @@ func TestLoadJSONCCommentsAndTrailingCommas(t *testing.T) {
 	}
 }
 
-func TestPostEditConfigValidation(t *testing.T) {
-	cfg := &Config{PostEdit: []PostEditConfig{{
-		Command:    []string{"gofmt", "-w"},
-		Extensions: []string{" GO ", ".Go"},
-	}}}
-	if err := cfg.ValidatePostEdit(); err != nil {
-		t.Fatal(err)
-	}
-	hook := cfg.PostEdit[0]
-	if hook.TimeoutSeconds != 10 || hook.Extensions[0] != ".go" || hook.Extensions[1] != ".go" {
-		t.Fatalf("normalized hook = %+v", hook)
-	}
-
-	invalid := []PostEditConfig{
-		{Command: nil},
-		{Command: []string{""}},
-		{Command: []string{"echo\x00bad"}},
-		{Command: []string{"echo"}, Extensions: []string{"dir/go"}},
-		{Command: []string{"echo"}, TimeoutSeconds: 61},
-	}
-	for i, hook := range invalid {
-		if err := (&Config{PostEdit: []PostEditConfig{hook}}).ValidatePostEdit(); err == nil {
-			t.Fatalf("invalid hook %d was accepted", i)
-		}
-	}
-}
-
 // TestMCPImportRoundTrip pins the mcpImport block's JSONC shape: absent stays
 // nil (import-everything default), and a full block round-trips through
 // Save/Load unchanged — including exclude beating only at policy level.

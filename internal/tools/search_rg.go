@@ -81,6 +81,8 @@ func grepSnapshotRG(ctx context.Context, args grepArgs, scope *searchScope, matc
 	if err != nil {
 		return fmt.Errorf("rg stdout pipe: %w", err)
 	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("rg start: %w", err)
 	}
@@ -164,6 +166,9 @@ func grepSnapshotRG(ctx context.Context, args grepArgs, scope *searchScope, matc
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
+		if message := strings.TrimSpace(stderr.String()); message != "" {
+			return fmt.Errorf("rg: %s", message)
+		}
 		return fmt.Errorf("rg: %w", waitErr)
 	}
 
@@ -193,6 +198,8 @@ func listFilesRG(ctx context.Context, scope *searchScope, visit func(string) err
 	if err != nil {
 		return fmt.Errorf("rg stdout pipe: %w", err)
 	}
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("rg start: %w", err)
 	}
@@ -241,6 +248,9 @@ func listFilesRG(ctx context.Context, scope *searchScope, visit func(string) err
 	if waitErr != nil {
 		if ctx.Err() != nil {
 			return ctx.Err()
+		}
+		if message := strings.TrimSpace(stderr.String()); message != "" {
+			return fmt.Errorf("rg: %s", message)
 		}
 		return fmt.Errorf("rg: %w", waitErr)
 	}

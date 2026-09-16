@@ -8,40 +8,24 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/charmbracelet/glamour"
-	glamouransi "github.com/charmbracelet/glamour/ansi"
-	"github.com/charmbracelet/glamour/styles"
 	"github.com/charmbracelet/x/ansi"
 )
 
-// Post-render passes convert glamour links and existing disk paths to terminal OSC 8 hyperlinks.
-// Terminals without OSC 8 support ignore these escape sequences.
-
-// fileRefRE matches a file path with at least one slash and an optional :line suffix.
-// Bare filenames without slashes are not matched.
 var fileRefRE = regexp.MustCompile(
-	`/?[\w@+~-][\w@+~.-]*(?:/[\w@+~-][\w@+~.-]*)+(?::\d+)?` + // path with slashes
-		`|/?[\w@+~-][\w@+~.-]*\.[A-Za-z]{2,10}(?::\d+)?` + // bare multi-letter ext
-		`|\.{1,2}/[\w@+~-][\w@+~.-]*(?:/[\w@+~-][\w@+~.-]*)*(?::\d+)?`) // ./ ../
+	`/?[\w@+~-][\w@+~.-]*(?:/[\w@+~-][\w@+~.-]*)+(?::\d+)?` +
+		`|/?[\w@+~-][\w@+~.-]*\.[A-Za-z]{2,10}(?::\d+)?` +
+		`|\.{1,2}/[\w@+~-][\w@+~.-]*(?:/[\w@+~-][\w@+~.-]*)*(?::\d+)?`)
+
+var markdownURLRE = regexp.MustCompile(`https?://[^\s<>()]+`)
 
 var fileExistsCache struct {
 	sync.Mutex
 	paths map[string]bool
 }
 
-// linkifyFilePaths wraps mentions of existing local files in OSC 8 file://
-// hyperlinks. exists decides whether a candidate path names a real file
-// (injectable for tests). Markdown link internals are skipped: a match
-// immediately preceded by '(' or ']' is part of [text](target) and gets
-// handled after rendering instead. Extensionless and bare single-letter-ext
-// matches are ignored — prose, not file refs.
+// linkifyFilePaths wraps existing local files in OSC 8 hyperlinks.
 func linkifyFilePaths(s string, exists func(string) bool) string {
 	return replaceMatches(s, fileRefRE, func(m string, before byte) string {
-		// Skip markdown link internals, URL tails, code spans, quotes. A
-		// parenthesized path in prose — "(see tui.go)" — is not linkified:
-		// '(' also opens a markdown [text](target), which the one-byte
-		// lookahead can't distinguish. The markdown path is covered after
-		// rendering instead.
 		if strings.ContainsRune("([]/:;\"`", rune(before)) {
 			return m
 		}
@@ -53,28 +37,22 @@ func linkifyFilePaths(s string, exists func(string) bool) string {
 	})
 }
 
-// isFileRef rejects extension dots that belong to a directory segment. The
-// regex handles the multi-letter minimum for bare filenames.
 func isFileRef(path string) bool {
 	dot := strings.LastIndexByte(path, '.')
 	if dot < 0 {
-		// no extension: only a slashed path counts (internal/tui, /etc/hostname)
 		return strings.Contains(path, "/")
 	}
 	ext := path[dot+1:]
 	if strings.ContainsRune(ext, '/') {
-		return false // dot was in a directory segment
+		return false
 	}
 	return len(ext) >= 1
 }
 
-// hyperlink wraps text in an OSC 8 hyperlink to uri.
 func hyperlink(uri, text string) string {
 	return ansi.SetHyperlink(uri) + text + ansi.ResetHyperlink()
 }
 
-// replaceMatches applies fn to each regex match; fn also receives the byte
-// preceding the match (0 at string start) for cheap context checks.
 func replaceMatches(s string, re *regexp.Regexp, fn func(m string, before byte) string) string {
 	var b strings.Builder
 	b.Grow(len(s) + len(s)/4)
@@ -92,8 +70,6 @@ func replaceMatches(s string, re *regexp.Regexp, fn func(m string, before byte) 
 	return b.String()
 }
 
-// realFileExists stats path relative to the process working directory (ghg
-// runs at the project root) and reports whether it is a regular file.
 func realFileExists(path string) bool {
 	if !filepath.IsAbs(path) {
 		wd, err := os.Getwd()
@@ -120,8 +96,6 @@ func realFileExists(path string) bool {
 	return found
 }
 
-// splitLineRef separates a trailing :N line number and any absorbed trailing
-// sentence punctuation from a file reference.
 func splitLineRef(ref string) (path, line string) {
 	i := strings.LastIndexByte(ref, ':')
 	if i > 0 && i < len(ref)-1 && isDigits(ref[i+1:]) {
@@ -139,9 +113,6 @@ func isDigits(s string) bool {
 	return len(s) > 0
 }
 
-// absFileURI builds an absolute file:// URI. The :line suffix stays in the
-// URI path: handlers that understand it jump to the line, the rest still
-// open the file or its directory. Returns "" only when the CWD is unknown.
 func absFileURI(path, line string) string {
 	if !filepath.IsAbs(path) {
 		wd, err := os.Getwd()
@@ -156,264 +127,9 @@ func absFileURI(path, line string) string {
 	return "file://" + (&url.URL{Path: path}).String()
 }
 
-// hyperlinkGlamourLinks groups label and href atoms across wraps and rewrites them into OSC 8 links.
-const (
-	linkTextSGRDark  = "\x1b[38;5;35;1m"
-	linkTextSGRLight = "\x1b[38;5;29;1m"
-	linkSGRDark      = "\x1b[38;5;30;4m"
-	linkSGRLight     = "\x1b[38;5;36;4m"
-	linkTextSGRANSI  = "\x1b[35;1m"
-	linkSGRANSI      = "\x1b[36;4m"
-	sgrReset         = "\x1b[0m"
-)
-
-// linkAtom is one parsed glamour word atom: its SGR span, visible text, and
-// byte range in the source. text ends at an embedded newline (word wrap).
-type linkAtom struct {
-	start, end int // byte range of the whole atom (span + text + reset)
-	sgr        string
-	kind       byte // 't' label (LinkText), 'h' href (Link)
-	text       string
-}
-
-// parseLinkAtoms extracts every link atom (label or href) in order.
-func parseLinkAtoms(s string) []linkAtom {
-	var atoms []linkAtom
-	for i := 0; i < len(s); {
-		sgr, kind := linkAtomAt(s[i:])
-		if kind == 0 {
-			i++
-			continue
-		}
-		end, text := scanAtom(s, i, sgr)
-		if end < 0 {
-			i++
-			continue
-		}
-		atoms = append(atoms, linkAtom{start: i, end: end, sgr: sgr, kind: kind, text: text})
-		i = end
-	}
-	return atoms
-}
-
-// linkGroup is one logical link: the label atom(s) and the href atom(s) that
-// follow them, with the byte range covering the whole group (so the gap can
-// be dropped when the link is rewired).
-type linkGroup struct {
-	labels     []linkAtom
-	hrefs      []linkAtom
-	start, end int // from the first label atom to the last href atom
-	hasLabel   bool
-}
-
-// groupLinkAtoms merges consecutive label atoms + following href atoms into
-// logical links. Only whitespace/newlines/styling may separate the label from
-// its href; any other visible text ends the group. A run of href atoms with
-// no preceding label is one autolink (glamour splits a wrapped URL into
-// several fragments and emits empty placeholder atoms around the break).
-func groupLinkAtoms(s string, atoms []linkAtom) []linkGroup {
-	var groups []linkGroup
-	i := 0
-	for i < len(atoms) {
-		a := atoms[i]
-		if a.kind == 'h' {
-			// href run (autolink or wrap-split fragments): accumulate while
-			// the gap stays whitespace/styling
-			g := linkGroup{start: a.start}
-			for i < len(atoms) && atoms[i].kind == 'h' &&
-				(len(g.hrefs) == 0 || gapOK(s[g.hrefs[len(g.hrefs)-1].end:atoms[i].start])) {
-				g.hrefs = append(g.hrefs, atoms[i])
-				g.end = atoms[i].end
-				i++
-			}
-			groups = append(groups, g)
-			continue
-		}
-		// label run
-		g := linkGroup{hasLabel: true, start: a.start}
-		for i < len(atoms) && atoms[i].kind == 't' {
-			g.labels = append(g.labels, atoms[i])
-			i++
-		}
-		// href run after the label: same whitespace/styling gap rule
-		prevEnd := g.labels[len(g.labels)-1].end
-		for i < len(atoms) && atoms[i].kind == 'h' && gapOK(s[prevEnd:atoms[i].start]) {
-			g.hrefs = append(g.hrefs, atoms[i])
-			prevEnd = atoms[i].end
-			i++
-		}
-		if len(g.hrefs) > 0 {
-			g.end = g.hrefs[len(g.hrefs)-1].end
-		} else {
-			g.end = g.labels[len(g.labels)-1].end
-		}
-		groups = append(groups, g)
-	}
-	return groups
-}
-
-// gapOK reports whether the bytes between two atoms are only whitespace,
-// newlines, and SGR spans — the gap glamour leaves inside one link.
-func gapOK(gap string) bool {
-	for i := 0; i < len(gap); {
-		c := gap[i]
-		if c == ' ' || c == '\n' || c == '\t' {
-			i++
-			continue
-		}
-		if c == 0x1b {
-			// skip one SGR span
-			j := i + 1
-			for j < len(gap) && gap[j] != 'm' {
-				j++
-			}
-			if j >= len(gap) {
-				return false
-			}
-			i = j + 1
-			continue
-		}
-		return false // visible text in the gap
-	}
-	return true
-}
-
-// hyperlinkGlamourLinks rewrites glamour's rendered links into OSC 8
-// hyperlinks. A [label](href) group collapses to the clickable label (the
-// href stops printing); a standalone href (autolink) becomes clickable in
-// place. Hrefs that don't map to a clickable target (anchors, missing files)
-// keep glamour's plain output.
-func hyperlinkGlamourLinks(s string, exists func(string) bool) string {
-	atoms := parseLinkAtoms(s)
-	if len(atoms) == 0 {
-		return s
-	}
-	groups := groupLinkAtoms(s, atoms)
-
-	// Decide each group's replacement and target before splicing.
-	type repl struct {
-		start, end int
-		out        string
-	}
-	var repls []repl
-	for _, g := range groups {
-		if len(g.hrefs) == 0 {
-			continue // label with no href (anchor-only link): glamour already
-			// prints just the label; nothing to rewire
-		}
-		var hrefText string
-		for _, h := range g.hrefs {
-			hrefText += strings.ReplaceAll(h.text, "\n", "")
-		}
-		uri := targetURI(hrefText, exists)
-		if uri == "" {
-			continue // leave glamour's output untouched
-		}
-		if !g.hasLabel {
-			// autolink: every fragment stays visible, wrapped in one target.
-			// Glamour may have split the URL across lines; rejoin it so the
-			// click target is the whole URL, not a fragment.
-			var out strings.Builder
-			for _, h := range g.hrefs {
-				out.WriteString(hyperlink(uri, h.sgr+h.text+sgrReset))
-			}
-			repls = append(repls, repl{g.start, g.end, out.String()})
-			continue
-		}
-		// label+href: clickable label, href and gap dropped
-		var label strings.Builder
-		for _, l := range g.labels {
-			label.WriteString(l.sgr)
-			label.WriteString(l.text)
-			label.WriteString(sgrReset)
-		}
-		repls = append(repls, repl{g.start, g.end, hyperlink(uri, label.String())})
-	}
-
-	// Splice replacements back, copying untouched regions verbatim.
-	var b strings.Builder
-	b.Grow(len(s) + len(s)/4)
-	last := 0
-	for _, r := range repls {
-		b.WriteString(s[last:r.start])
-		b.WriteString(r.out)
-		last = r.end
-	}
-	b.WriteString(s[last:])
-	return b.String()
-}
-
-// linkAtomAt reports whether s starts with a link SGR span, returning the
-// span and 't' (LinkText/label) or 'h' (Link/href).
-func linkAtomAt(s string) (string, byte) {
-	for _, cand := range []struct {
-		sgr  string
-		kind byte
-	}{
-		{linkTextSGRDark, 't'}, {linkTextSGRLight, 't'},
-		{linkTextSGRANSI, 't'},
-		{linkSGRDark, 'h'}, {linkSGRLight, 'h'}, {linkSGRANSI, 'h'},
-	} {
-		if strings.HasPrefix(s, cand.sgr) {
-			return cand.sgr, cand.kind
-		}
-	}
-	return "", 0
-}
-
-// scanAtom returns the end offset (exclusive) and visible text of the atom
-// opened at s[start] with the given SGR span: a newline inside the atom ends
-// the visible text (glamour's word wrap), and the atom closes at the first
-// following reset.
-func scanAtom(s string, start int, sgr string) (end int, text string) {
-	body := start + len(sgr)
-	if body > len(s) {
-		return -1, ""
-	}
-	rest := s[body:]
-	nl := strings.IndexByte(rest, '\n')
-	rs := strings.Index(rest, sgrReset)
-	if rs < 0 {
-		if nl >= 0 {
-			return body + nl + 1, rest[:nl+1]
-		}
-		return len(s), rest
-	}
-	if nl >= 0 && nl < rs {
-		// Glamour can leave a link span open across a wrapped line and emit
-		// the reset after the next line's placeholder span. Keep this atom at
-		// the newline so the following span remains independently parseable.
-		return body + nl + 1, rest[:nl+1]
-	}
-	return body + rs + len(sgrReset), rest[:rs]
-}
-
-// linkifyRenderedFilePaths is linkifyFilePaths for glamour's output: the
-// renderer splits text into word atoms separated by SGR sequences, so the
-// pre-render injection would wrap mid-sequence. Runs on the rendered string
-// where every file ref appears contiguous inside one word atom. The same
-// preceding-byte skips apply (ESC from styling, hrefs already handled by
-// hyperlinkGlamourLinks).
-func linkifyRenderedFilePaths(s string, exists func(string) bool) string {
-	return replaceMatches(s, fileRefRE, func(m string, before byte) string {
-		if before == 0x1b || strings.ContainsRune("([]/:;\"`m", rune(before)) {
-			// ESC or 'm': inside an SGR/OSC 8 sequence (an atom's text starts
-			// right after its span's closing 'm'). Others: markdown internals,
-			// code spans, quotes.
-			return m
-		}
-		path, line := splitLineRef(m)
-		if !exists(path) {
-			return m
-		}
-		return hyperlink(absFileURI(path, line), m)
-	})
-}
-
-// targetURI maps a link destination to a clickable URI: absolute URLs pass
-// through; existing local files become file://; anything else (anchors,
-// missing files) returns "" so the caller keeps the unlinked rendering.
+// targetURI maps web URLs and existing local paths to clickable URIs.
 func targetURI(dest string, exists func(string) bool) string {
+	dest = strings.TrimSpace(dest)
 	low := strings.ToLower(dest)
 	if strings.HasPrefix(low, "http://") || strings.HasPrefix(low, "https://") ||
 		strings.HasPrefix(low, "mailto:") || strings.HasPrefix(low, "file://") {
@@ -423,180 +139,268 @@ func targetURI(dest string, exists func(string) bool) string {
 		return ""
 	}
 	path, line := splitLineRef(dest)
-	// Resolve in order: as written (absolute or CWD-relative), then — for a
-	// leading "/" — glamour's normalization of "./x" as CWD-relative. The
-	// model writes "./docs/features.md"; glamour renders the href "/docs/…",
-	// so the dot-relative reading is what makes those clickable.
 	candidates := []string{path}
 	if strings.HasPrefix(path, "/") && !strings.HasPrefix(path, "//") {
 		candidates = append(candidates, "."+path)
 	}
-	for _, c := range candidates {
-		if exists(c) {
-			return absFileURI(c, line)
+	for _, candidate := range candidates {
+		if exists(candidate) {
+			return absFileURI(candidate, line)
 		}
 	}
 	return ""
 }
 
-// renderMarkdown renders assistant message text as rich terminal markdown
-// (glamour): headings, bold/italic, lists, fenced code blocks, tables.
-// Falls back to the raw input when parsing fails — a degraded transcript is
-// never worth a broken one.
-//
-// The style is a hardcoded dark variant (never WithEnvironmentConfig): an
-// OSC background query mid-session can hang over mosh/tmux, and the TUI
-// already commits to plain ANSI colors everywhere else.
+const (
+	markdownHeadingSGR = "\x1b[1;35m"
+	markdownBoldSGR    = "\x1b[1m"
+	markdownItalicSGR  = "\x1b[3m"
+	markdownCodeSGR    = "\x1b[2m"
+	markdownResetSGR   = "\x1b[0m"
+)
+
+func markdownStyle(sgr, text string) string {
+	return sgr + text + markdownResetSGR
+}
+
+// renderMarkdown implements the small markdown subset used in the transcript.
 func renderMarkdown(s string, width int) string {
 	if strings.TrimSpace(s) == "" {
 		return s
 	}
-	width = max(width, 8) // glamour treats width<=0 as its ~80-col default
-	out, err := mdRenderer(width).Render(s)
-	if err != nil {
-		return s
+	width = max(width, 8)
+	lines := strings.Split(s, "\n")
+	rendered := make([]string, 0, len(lines))
+	inFence := false
+	for i := 0; i < len(lines); i++ {
+		line := lines[i]
+		trimmed := strings.TrimSpace(line)
+		if isFence(trimmed) {
+			inFence = !inFence
+			continue
+		}
+		if inFence {
+			rendered = append(rendered, markdownStyle(markdownCodeSGR, "│ "+line))
+			continue
+		}
+		if cells, ok := tableCells(line); ok && i+1 < len(lines) {
+			separatorCells, separator := tableCells(lines[i+1])
+			if separator && tableSeparator(separatorCells) {
+				end := i + 2
+				for end < len(lines) {
+					if _, ok := tableCells(lines[end]); !ok {
+						break
+					}
+					end++
+				}
+				rendered = append(rendered, renderTable(cells, lines[i+2:end], width)...)
+				i = end - 1
+				continue
+			}
+		}
+		if heading, ok := headingText(line); ok {
+			rendered = append(rendered, markdownStyle(markdownHeadingSGR, renderInline(heading)))
+			continue
+		}
+		if prefix, item, ok := listItem(line); ok {
+			rendered = append(rendered, prefix+"• "+renderInline(item))
+			continue
+		}
+		rendered = append(rendered, renderInline(line))
 	}
-	rendered := stripLinePadding(strings.Trim(out, "\n"))
-	linked := hyperlinkGlamourLinks(rendered, realFileExists)
-	linked = linkifyRenderedFilePaths(linked, realFileExists)
-	return wrapWideLines(linked, width)
+	return wrapWideLines(strings.Trim(strings.Join(rendered, "\n"), "\n"), width)
 }
 
-// wrapWideLines hard-wraps any rendered line still wider than width.
-// Glamour never breaks code-fence or table content, so a long line overflows
-// the terminal; ansi.Hardwrap is cell- and escape-aware (styles stay intact).
-func wrapWideLines(s string, width int) string {
-	lines := strings.Split(s, "\n")
-	for i, l := range lines {
-		if ansi.StringWidth(l) > width {
-			lines[i] = ansi.Hardwrap(l, width, true) // ANSI-aware, breaks mid-word
+func isFence(line string) bool {
+	return strings.HasPrefix(line, "```") || strings.HasPrefix(line, "~~~")
+}
+
+func headingText(line string) (string, bool) {
+	trimmed := strings.TrimLeft(line, " \t")
+	space := strings.IndexByte(trimmed, ' ')
+	if space < 1 || space > 6 || strings.Trim(trimmed[:space], "#") != "" {
+		return "", false
+	}
+	return strings.TrimSpace(trimmed[space+1:]), true
+}
+
+func listItem(line string) (prefix, item string, ok bool) {
+	trimmed := strings.TrimLeft(line, " \t")
+	prefix = line[:len(line)-len(trimmed)]
+	for _, marker := range []string{"- ", "* ", "+ "} {
+		if strings.HasPrefix(trimmed, marker) {
+			return prefix, trimmed[len(marker):], true
 		}
 	}
-	return strings.Join(lines, "\n")
-}
-
-// padStripRE matches glamour's right-padding at end of line: runs of (SGR
-// sequence [empty params allowed — bare \x1b[m], spaces), optionally closed
-// by a final SGR reset. The reset is kept (captured group) so a line's
-// styling never bleeds into the next block.
-var padStripRE = regexp.MustCompile(`(?:\x1b\[[0-9;]*m[ \t]*)+(\x1b\[[0-9;]*m)?$`)
-
-// stripLinePadding removes glamour's right-padding: it pads every line to
-// the full render width with individually styled spaces, which bloats the
-// transcript 10-20x and breaks terminal select/copy. Lines whose visible
-// content is empty (blank separators) become truly empty — no styled blank
-// rows. Leading indentation and styled content are untouched.
-func stripLinePadding(s string) string {
-	lines := strings.Split(s, "\n")
-	for i, l := range lines {
-		l = padStripRE.ReplaceAllString(l, "$1")
-		l = strings.TrimRight(l, " \t")
-		if ansi.StringWidth(l) == 0 || strings.TrimSpace(ansi.Strip(l)) == "" {
-			l = "" // blank separator line: drop any leftover styling entirely
-		}
-		lines[i] = l
-	}
-	return strings.Join(lines, "\n")
-}
-
-var (
-	mdMu          sync.Mutex
-	mdRenderers   = make(map[int]*glamour.TermRenderer)
-	mdRendererErr bool
-)
-
-// mdStyle keeps body text and backgrounds at terminal defaults. Only semantic
-// accents use the standard ANSI palette.
-func mdStyle() glamouransi.StyleConfig {
-	st := styles.DarkStyleConfig
-	for _, primitive := range []*glamouransi.StylePrimitive{
-		&st.Document.StylePrimitive, &st.BlockQuote.StylePrimitive, &st.Paragraph.StylePrimitive,
-		&st.List.StylePrimitive, &st.Heading.StylePrimitive,
-		&st.H1.StylePrimitive, &st.H2.StylePrimitive, &st.H3.StylePrimitive,
-		&st.H4.StylePrimitive, &st.H5.StylePrimitive, &st.H6.StylePrimitive,
-		&st.Text, &st.Strikethrough, &st.Emph, &st.Strong, &st.HorizontalRule,
-		&st.Item, &st.Enumeration, &st.Task.StylePrimitive, &st.Link, &st.LinkText,
-		&st.Image, &st.ImageText, &st.Code.StylePrimitive, &st.CodeBlock.StylePrimitive,
-		&st.Table.StylePrimitive, &st.DefinitionList.StylePrimitive,
-		&st.DefinitionTerm, &st.DefinitionDescription, &st.HTMLBlock.StylePrimitive,
-		&st.HTMLSpan.StylePrimitive,
-	} {
-		primitive.Color = nil
-		primitive.BackgroundColor = nil
-	}
-	st.CodeBlock.Chroma = nil
-	st.CodeBlock.Theme = ""
-	bold, italic, underline := true, true, true
-	cyan := "6"
-	magenta := "5"
-	st.Heading.Bold = &bold
-	st.Link.Color = &cyan
-	st.Link.Underline = &underline
-	st.LinkText.Color = &magenta
-	st.LinkText.Bold = &bold
-	st.Strong.Bold = &bold
-	st.Emph.Italic = &italic
-	st.Table.ColumnSeparator = strPtr("│")
-	st.Table.CenterSeparator = strPtr("┼")
-	st.Table.RowSeparator = strPtr("─")
-	zero := uint(0)
-	st.Table.Margin = &zero
-	return st
-}
-
-func strPtr(s string) *string { return &s }
-
-// mdRenderer returns a cached renderer per width (glamour builds a
-// style-traversed renderer per Render call otherwise).
-func mdRenderer(width int) *glamour.TermRenderer {
-	mdMu.Lock()
-	defer mdMu.Unlock()
-	if mdRendererErr {
-		return nil
-	}
-	if r, ok := mdRenderers[width]; ok {
-		return r
-	}
-	st := mdStyle()
-	margin := uint(2)
-	st.Document.Margin = &margin
-	r, err := glamour.NewTermRenderer(
-		glamour.WithStyles(st),
-		glamour.WithWordWrap(width),
-		glamour.WithPreservedNewLines(), // streamed text keeps its line breaks verbatim
-	)
-	if err != nil { // style is built-in; only reachable on a broken build
-		mdRendererErr = true
-		return nil
-	}
-	if len(mdRenderers) >= 8 {
-		for cachedWidth := range mdRenderers {
-			delete(mdRenderers, cachedWidth)
+	for i := 0; i < len(trimmed); i++ {
+		if trimmed[i] < '0' || trimmed[i] > '9' {
 			break
 		}
+		if i+2 < len(trimmed) && (trimmed[i+1] == '.' || trimmed[i+1] == ')') && trimmed[i+2] == ' ' {
+			return prefix, trimmed[i+3:], true
+		}
 	}
-	mdRenderers[width] = r
-	return r
+	return "", "", false
 }
 
-// bareSGR is the empty SGR escape (\x1b[m) lipgloss' Width().Render appends
-// before its right-padding; some terminals render the empty parameter list
-// inconsistently, and the styled pad shows up as visual smear. Normalize it
-// to a proper reset.
+func tableCells(line string) ([]string, bool) {
+	trimmed := strings.TrimSpace(line)
+	if !strings.HasPrefix(trimmed, "|") || !strings.HasSuffix(trimmed, "|") {
+		return nil, false
+	}
+	body := strings.Trim(trimmed, "|")
+	if body == "" {
+		return nil, false
+	}
+	parts := strings.Split(body, "|")
+	for i := range parts {
+		parts[i] = strings.TrimSpace(parts[i])
+	}
+	return parts, true
+}
+
+func tableSeparator(cells []string) bool {
+	if len(cells) == 0 {
+		return false
+	}
+	for _, cell := range cells {
+		cell = strings.Trim(strings.TrimSpace(cell), ":")
+		if len(cell) < 3 || strings.Trim(cell, "-") != "" {
+			return false
+		}
+	}
+	return true
+}
+
+func renderTable(header []string, rows []string, width int) []string {
+	out := []string{renderInline(strings.Join(header, " │ "))}
+	ruleWidth := min(width, max(1, ansi.StringWidth(out[0])))
+	out = append(out, markdownStyle(markdownCodeSGR, strings.Repeat("─", ruleWidth)))
+	for _, row := range rows {
+		cells, ok := tableCells(row)
+		if !ok || tableSeparator(cells) {
+			continue
+		}
+		out = append(out, renderInline(strings.Join(cells, " │ ")))
+	}
+	return out
+}
+
+func renderInline(s string) string {
+	var b strings.Builder
+	plainStart := 0
+	flushPlain := func(end int) {
+		if end > plainStart {
+			b.WriteString(linkifyURLs(linkifyFilePaths(s[plainStart:end], realFileExists)))
+		}
+	}
+	for i := 0; i < len(s); {
+		if s[i] == '`' {
+			end := strings.IndexByte(s[i+1:], '`')
+			if end >= 0 {
+				end += i + 1
+				flushPlain(i)
+				b.WriteString(markdownStyle(markdownCodeSGR, s[i+1:end]))
+				i = end + 1
+				plainStart = i
+				continue
+			}
+		}
+		if strings.HasPrefix(s[i:], "**") || strings.HasPrefix(s[i:], "__") {
+			marker := s[i : i+2]
+			if end := strings.Index(s[i+2:], marker); end >= 0 {
+				end += i + 2
+				flushPlain(i)
+				b.WriteString(markdownStyle(markdownBoldSGR, renderInline(s[i+2:end])))
+				i = end + 2
+				plainStart = i
+				continue
+			}
+		}
+		if s[i] == '*' || s[i] == '_' {
+			marker := s[i]
+			if end := strings.IndexByte(s[i+1:], marker); end >= 0 {
+				end += i + 1
+				flushPlain(i)
+				b.WriteString(markdownStyle(markdownItalicSGR, renderInline(s[i+1:end])))
+				i = end + 1
+				plainStart = i
+				continue
+			}
+		}
+		if s[i] == '[' {
+			label, dest, end, ok := markdownLinkAt(s, i)
+			if ok {
+				flushPlain(i)
+				label = renderInline(label)
+				if uri := targetURI(dest, realFileExists); uri != "" {
+					b.WriteString(hyperlink(uri, label))
+				} else {
+					b.WriteString(label)
+				}
+				i = end
+				plainStart = i
+				continue
+			}
+		}
+		i++
+	}
+	flushPlain(len(s))
+	return b.String()
+}
+
+func markdownLinkAt(s string, start int) (label, dest string, end int, ok bool) {
+	closeLabel := strings.IndexByte(s[start+1:], ']')
+	if closeLabel < 0 {
+		return "", "", 0, false
+	}
+	closeLabel += start + 1
+	if closeLabel+1 >= len(s) || s[closeLabel+1] != '(' {
+		return "", "", 0, false
+	}
+	closeDest := strings.IndexByte(s[closeLabel+2:], ')')
+	if closeDest < 0 {
+		return "", "", 0, false
+	}
+	closeDest += closeLabel + 2
+	return s[start+1 : closeLabel], s[closeLabel+2 : closeDest], closeDest + 1, true
+}
+
+func linkifyURLs(s string) string {
+	return replaceMatches(s, markdownURLRE, func(m string, _ byte) string {
+		urlText := strings.TrimRight(m, ".,;:!?")
+		return hyperlink(urlText, urlText) + m[len(urlText):]
+	})
+}
+
+func wrapWideLines(s string, width int) string {
+	lines := strings.Split(s, "\n")
+	for i, line := range lines {
+		lines[i] = ansi.Wordwrap(line, width, " \t")
+		parts := strings.Split(lines[i], "\n")
+		for j, part := range parts {
+			if ansi.StringWidth(part) > width {
+				parts[j] = ansi.Hardwrap(part, width, true)
+			}
+		}
+		lines[i] = strings.Join(parts, "\n")
+	}
+	return strings.Join(lines, "\n")
+}
+
+var trailingSGRRE = regexp.MustCompile(`(?:\x1b\[[0-9;]*m[ \t]*)+(\x1b\[[0-9;]*m)?$`)
+
 var bareSGR = strings.NewReplacer("\x1b[m", "\x1b[0m")
 
-// sanitizeView cleans one rendered screen: bare SGR escapes become real
-// resets and trailing style+space tails (lipgloss/viewport padding) are
-// trimmed from each line.
 func sanitizeView(s string) string {
 	if !strings.Contains(s, "\x1b[") {
 		return s
 	}
 	s = bareSGR.Replace(s)
 	lines := strings.Split(s, "\n")
-	for i, l := range lines {
-		if strings.Contains(l, "\x1b[") {
-			lines[i] = padStripRE.ReplaceAllString(l, "$1")
+	for i, line := range lines {
+		if strings.Contains(line, "\x1b[") {
+			lines[i] = trailingSGRRE.ReplaceAllString(line, "$1")
 		}
 	}
 	return strings.Join(lines, "\n")

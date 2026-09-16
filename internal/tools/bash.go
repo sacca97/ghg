@@ -172,14 +172,6 @@ func isSandboxNetworkDenied(output string) bool {
 	return strings.Contains(lower, "listen tcp") && strings.Contains(lower, "operation not permitted")
 }
 
-func bashPreviewLimit(command string) int {
-	segments, err := SegmentShell(command)
-	if err == nil && isBashExplorationSegments(segments) {
-		return 8 << 10
-	}
-	return 14 << 10
-}
-
 func bashPreviewLimitSegments(segments []CommandSegment) int {
 	if isBashExplorationSegments(segments) {
 		return 8 << 10
@@ -217,14 +209,6 @@ type bashRedirect struct {
 	Tool    string
 	Args    json.RawMessage
 	Command string
-}
-
-func redirectBashInspection(command string) (bashRedirect, bool) {
-	segments, err := SegmentShell(command)
-	if err != nil {
-		return bashRedirect{}, false
-	}
-	return redirectBashInspectionSegments(command, segments)
 }
 
 func redirectBashInspectionSegments(command string, segments []CommandSegment) (bashRedirect, bool) {

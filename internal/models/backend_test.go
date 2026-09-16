@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func testChatClient(t *testing.T, baseURL, apiKey string) *Client {
@@ -98,6 +99,12 @@ func runStreamWithRetry(backend Backend, ctx context.Context, req Request, onRet
 	return backend.Stream(ctx, req, EventSink{OnRetry: onRetry})
 }
 
+func TestNewTransportUsesBoundedDefaultTimeout(t *testing.T) {
+	if got := newTransport("http://provider.test", "key").HTTP.Timeout; got != 3*time.Minute {
+		t.Fatalf("default request timeout = %s, want 3m", got)
+	}
+}
+
 func completeText(backend Backend, ctx context.Context, req Request) (string, Usage, error) {
 	msg, usage, err := backend.Complete(ctx, req)
 	return msg.TextContent(), usage, err
@@ -179,6 +186,34 @@ func TestNewBackendOpenAIResponses(t *testing.T) {
 	}
 	if responses.AuthKind != "bearer" || responses.AuthHeader != "Authorization" || responses.MaxRetries != 1 || responses.Headers["x-provider"] != "test" || responses.flavor != responsesPublicAPI {
 		t.Fatalf("factory config not applied: %+v", responses)
+	}
+}
+
+func TestBackendSendsConfiguredSessionHeader(t *testing.T) {
+	var got string
+	backend, err := NewBackend(Resolved{
+		Profile:  Profile{SessionHeader: "x-opencode-session"},
+		Protocol: ProtocolOpenAIChatCompletions,
+		BaseURL:  "http://provider.test",
+		Auth:     Auth{Kind: AuthBearer, Header: "Authorization"},
+	}, BackendOptions{APIKey: "key", MaxRetries: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := backend.(*Client)
+	client.HTTP = &http.Client{Transport: testHandlerTransport(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Get("x-opencode-session")
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"role":"assistant","content":"ok"}}]}`)
+	}))}
+	if _, _, err := client.Complete(context.Background(), Request{
+		Model:     "model",
+		Messages:  []Message{{Role: "user", Content: "hello"}},
+		SessionID: "session-1",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got != "session-1" {
+		t.Fatalf("x-opencode-session = %q, want session-1", got)
 	}
 }
 

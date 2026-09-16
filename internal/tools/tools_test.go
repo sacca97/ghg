@@ -203,7 +203,7 @@ func TestReadBatchKeepsSuccessfulSiblingsWhenOneRangeFails(t *testing.T) {
 	}
 }
 
-func TestReadBatchReportsUnprocessedRanges(t *testing.T) {
+func TestReadBatchReportsRetainedRanges(t *testing.T) {
 	dir := t.TempDir()
 	paths := make([]string, 3)
 	content := strings.Repeat(strings.Repeat("x", 100)+"\n", 300)
@@ -223,10 +223,31 @@ func TestReadBatchReportsUnprocessedRanges(t *testing.T) {
 		t.Fatal(err)
 	}
 	result := ExecuteResult(context.Background(), All(), "read", raw)
-	if !strings.Contains(result.Preview, "unprocessed ranges:") ||
-		!strings.Contains(result.Preview, "2:"+paths[1]+":41-340") ||
-		!strings.Contains(result.Preview, "3:"+paths[2]+":81-380") {
-		t.Fatalf("batched omission report = %q", result.Preview)
+	unprocessed := strings.Contains(result.Preview, "unprocessed ranges:")
+	previewOmitted := strings.Contains(result.Preview, "preview omitted")
+	if unprocessed || !previewOmitted || result.Metadata["observation_count"] != "3" {
+		t.Fatalf("batched omission report = unprocessed=%t preview_omitted=%t count=%q preview_tail=%q", unprocessed, previewOmitted, result.Metadata["observation_count"], result.Preview[max(0, len(result.Preview)-300):])
+	}
+	var observations []struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal([]byte(result.Metadata["observations"]), &observations); err != nil {
+		t.Fatal(err)
+	}
+	if len(observations) != 3 {
+		t.Fatalf("batched observations = %+v", observations)
+	}
+	var report batchReport
+	if err := json.Unmarshal([]byte(result.Metadata["batch"]), &report); err != nil {
+		t.Fatal(err)
+	}
+	if report.LogicalOperations != 3 || report.InternalSubcalls != 3 || len(report.Items) != 3 {
+		t.Fatalf("batch report = %+v", report)
+	}
+	for index, item := range report.Items {
+		if item.Status == "failed" || (index > 0 && !item.PreviewOmitted) {
+			t.Fatalf("batch item = %+v", item)
+		}
 	}
 }
 

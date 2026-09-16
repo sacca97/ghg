@@ -15,6 +15,7 @@ export const ROLE_LABELS = { default: "Default", smart: "Smart", fast: "Fast", t
 export const MODE_LABELS = { execute: "Execute", plan: "Plan", review: "Review" };
 export const COMPOSER_MODE_LABELS = { ...MODE_LABELS, ask: "Ask" };
 export const EFFORT_LABELS = { "": "Off", low: "Low", medium: "Medium", high: "High" };
+export const effortLabel = (value) => EFFORT_LABELS[value] || value.replace(/[-_]+/g, " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
 export const APPROVAL_LABELS = { "": "Configured default", ask: "Ask", "auto": "Auto", never: "Never" };
 export const SANDBOX_LABELS = { "": "Configured default", "read-only": "Read only", "workspace-write": "Workspace write", "danger-full-access": "Full access" };
 export const NETWORK_LABELS = { "": "Configured default", deny: "Denied", host: "Host" };
@@ -24,7 +25,7 @@ export const BUSY_STATES = new Set(["running", "waiting_approval", "waiting_ques
 export const isRole = (value) => ROLES.includes(value);
 export const isMode = (value) => MODES.includes(value);
 export const isComposerMode = (value) => COMPOSER_MODES.includes(value);
-export const isEffort = (value) => EFFORT_LEVELS.includes(value);
+export const isEffort = (value) => typeof value === "string" && (value === "" || /^[a-z0-9][a-z0-9_-]{0,31}$/i.test(value));
 export const isApproval = (value) => APPROVALS.includes(value);
 export const isSandbox = (value) => SANDBOXES.includes(value);
 export const isNetwork = (value) => NETWORKS.includes(value);

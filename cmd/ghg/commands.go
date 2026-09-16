@@ -86,13 +86,15 @@ func modelsCLI(args []string) error {
 }
 
 type catalogModelChoice struct {
-	Model    string `json:"model"`
-	Provider string `json:"provider"`
+	Model            string   `json:"model"`
+	Provider         string   `json:"provider"`
+	ReasoningEfforts []string `json:"reasoningEfforts,omitempty"`
 }
 
 func configuredCatalogModels(cfg *config.Config) []catalogModelChoice {
 	seen := map[string]struct{}{}
 	var choices []catalogModelChoice
+	catalogs := config.LoadCatalogs()
 	add := func(model, provider string) {
 		if model == "" || provider == "" {
 			return
@@ -105,7 +107,11 @@ func configuredCatalogModels(cfg *config.Config) []catalogModelChoice {
 			return
 		}
 		seen[key] = struct{}{}
-		choices = append(choices, catalogModelChoice{Model: model, Provider: provider})
+		choice := catalogModelChoice{Model: model, Provider: provider}
+		if info := catalogs[provider].Find(model); info != nil {
+			choice.ReasoningEfforts = info.SupportedEfforts()
+		}
+		choices = append(choices, choice)
 	}
 	for model, definition := range cfg.Models {
 		for _, provider := range definition.Providers {
@@ -117,7 +123,7 @@ func configuredCatalogModels(cfg *config.Config) []catalogModelChoice {
 			add(target.Model, target.Provider)
 		}
 	}
-	for provider, catalog := range config.LoadCatalogs() {
+	for provider, catalog := range catalogs {
 		for _, model := range catalog.Models {
 			add(model.ID, provider)
 		}

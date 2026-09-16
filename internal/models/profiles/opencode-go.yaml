@@ -7,6 +7,7 @@ auth:
   kind: bearer
   header: Authorization
   env_var: OPENCODE_API_KEY
+session_header: x-opencode-session
 docs:
   keys_url: https://opencode.ai/zen
 routes:

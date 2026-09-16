@@ -19,7 +19,7 @@ import (
 )
 
 // blockKind classifies a transcript block so a resize can re-render it at
-// the new width. Assistant text reflows through glamour (markdown); tool
+// the new width. Assistant text reflows through the markdown renderer; tool
 // results hold raw output and expand/collapse; every other block — user
 // input, tool calls, status lines — re-wraps plainly (its styling is baked
 // in at append time; only the wrap changes).
@@ -27,7 +27,7 @@ type blockKind int
 
 const (
 	blockText      blockKind = iota // already-styled line(s): re-wrap on resize
-	blockAssistant                  // raw markdown: re-render through glamour
+	blockAssistant                  // raw markdown: re-render on resize
 	blockTool                       // raw tool result: collapsed preview, expandable
 	blockToolRun                    // a running tool call: verb line, collapses on completion
 	blockPlan                       // proposed plan markdown: re-render with plan styling
@@ -282,10 +282,8 @@ func (m *model) appendRaw(kind blockKind, text string) {
 
 // refreshVP rebuilds the viewport content, bottom-anchored: short transcripts
 // are padded from the top so messages grow upward from the input. Block
-// renders are cached per width (renderAt), so the expensive glamour markdown
-// render only happens for blocks that are new, mutated, or hit by a width
-// change. The viewport still needs its complete content string after an
-// append, but avoids reparsing unchanged markdown.
+// renders are cached per width (renderAt), so markdown rendering only happens
+// for blocks that are new, mutated, or hit by a width change.
 func (m *model) refreshVP() {
 	if m.width == 0 {
 		return // tea hasn't started (resume path): the first WindowSizeMsg renders once at the real width
@@ -641,7 +639,7 @@ func (m *model) tasksView() string {
 }
 
 // appendAssistant writes assistant text into the transcript, rendering it as
-// markdown (glamour) and prefixing the first line of each segment with "● ".
+// markdown and prefixing the first line of each segment with "● ".
 // Consecutive segments of one message merge into a single block so the whole
 // message re-renders as one markdown document on resize.
 func (m *model) appendAssistant(s string) {
@@ -664,12 +662,9 @@ func (m *model) appendAssistant(s string) {
 }
 
 // indentLines shifts rendered markdown right by n columns so the body sits
-// under the transcript's "● " marker. Glamour indents every block from its
-// 2-cell document margin; we subtract that margin and add n, preserving
-// *relative* indentation (hanging list text, nested bullets, code blocks).
+// under the transcript's "● " marker, preserving relative indentation.
 // Whitespace-only lines become truly empty so no stray dim cells render.
 func indentLines(s string, n int) string {
-	const docMargin = 2 // glamour styles.DarkStyleConfig Document.Margin
 	lines := strings.Split(s, "\n")
 	for i, l := range lines {
 		if strings.TrimSpace(ansi.Strip(l)) == "" {
@@ -677,10 +672,7 @@ func indentLines(s string, n int) string {
 			continue
 		}
 		lead := len(l) - len(strings.TrimLeft(l, " "))
-		shift := n + lead - docMargin
-		if shift < 0 {
-			shift = 0
-		}
+		shift := n + lead
 		lines[i] = strings.Repeat(" ", shift) + strings.TrimLeft(l, " ")
 	}
 	return strings.Join(lines, "\n")
