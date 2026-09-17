@@ -224,11 +224,8 @@ func (m *model) paletteItems() []paletteItem {
 			action:  paletteActionExportPrompt},
 		{title: "Rename session", category: "Session",
 			dynDesc: func(m *model) string {
-				if m.sessionID == "" || m.store == nil {
-					return "retitle this session"
-				}
-				if title, err := m.store.Title(m.sessionID); err == nil && title != "" {
-					return title
+				if m.sessionTitle != "" {
+					return m.sessionTitle
 				}
 				return "retitle this session"
 			},
@@ -292,9 +289,20 @@ func (m *model) paletteItems() []paletteItem {
 }
 
 func (m *model) openPalette() {
+	m.refreshSessionTitle()
 	all := m.paletteItems()
 	m.settings = &settings{all: all}
 	m.settings.applyFilter(m)
+}
+
+func (m *model) refreshSessionTitle() {
+	if m.store == nil || m.sessionID == "" {
+		m.sessionTitle = ""
+		return
+	}
+	if title, err := m.store.Title(m.sessionID); err == nil {
+		m.sessionTitle = title
+	}
 }
 
 // openPaletteOn opens the settings and drills straight into the named row's
@@ -1348,17 +1356,12 @@ func (m *model) modelsDevProviderIDs(instanceName string) []string {
 	return config.ModelsDevProviderIDs(m.profiles, instanceName, prov)
 }
 
-func (m *model) fetchCatalogs(force bool, providers map[string]config.Provider) {
-	if m.cfg == nil {
-		return
-	}
-	cfg := *m.cfg
-	cfg.Providers = providers
+func fetchCatalogs(force bool, cfg config.Config, profiles models.Profiles) catalogsMsg {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	cats, err := config.FetchCatalogs(ctx, &cfg, m.profiles, force, config.CatalogBackendFactory(auth.NewBackend))
+	cats, err := config.FetchCatalogs(ctx, &cfg, profiles, force, config.CatalogBackendFactory(auth.NewBackend))
 	if err != nil {
 		config.LogEvent("catalog.fetch", err.Error())
 	}
-	sendProg(m.prog, catalogsMsg(cats))
+	return catalogsMsg(cats)
 }

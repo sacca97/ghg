@@ -100,8 +100,22 @@ func runStreamWithRetry(backend Backend, ctx context.Context, req Request, onRet
 }
 
 func TestNewTransportUsesBoundedDefaultTimeout(t *testing.T) {
-	if got := newTransport("http://provider.test", "key").HTTP.Timeout; got != 3*time.Minute {
-		t.Fatalf("default request timeout = %s, want 3m", got)
+	if got := newTransport("http://provider.test", "key").HTTP.Timeout; got != 5*time.Minute {
+		t.Fatalf("default request timeout = %s, want 5m", got)
+	}
+}
+
+func TestHTTPClientForOverridesTimeoutWithoutMutatingBase(t *testing.T) {
+	transport := newTransport("http://provider.test", "key")
+	client := transport.httpClientFor(4 * time.Minute)
+	if client == transport.HTTP {
+		t.Fatal("request timeout should use a cloned client")
+	}
+	if client.Timeout != 4*time.Minute {
+		t.Fatalf("request timeout = %s, want 4m", client.Timeout)
+	}
+	if transport.HTTP.Timeout != 5*time.Minute {
+		t.Fatalf("base timeout = %s, want 5m", transport.HTTP.Timeout)
 	}
 }
 

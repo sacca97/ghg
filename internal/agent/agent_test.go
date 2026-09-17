@@ -874,10 +874,11 @@ func TestContinueReplaysOnlyAuthoredMessageParts(t *testing.T) {
 		models.Message{Role: "assistant", StopReason: "interrupted", ToolCalls: []models.ToolCall{call}},
 		models.Message{Role: "tool", Name: "read", ToolCallID: "call-1", Content: "Error: tool call interrupted — the turn was canceled by user before execution completed"},
 	)
-	if _, err := interrupted.Continue(context.Background(), Events{}); err != nil {
+	if _, err := interrupted.ContinueWithInstruction(context.Background(), "run tests", Events{}); err != nil {
 		t.Fatal(err)
 	}
-	if len(interrupted.Messages) != 3 || interrupted.Messages[1].Content != "retry this turn" || interrupted.Messages[2].Content != "done" {
+	wantPrompt := "retry this turn\n\nAdditional instruction for this continuation:\nrun tests"
+	if len(interrupted.Messages) != 3 || interrupted.Messages[1].Content != wantPrompt || interrupted.Messages[2].Content != "done" {
 		t.Fatalf("interrupted continue should replay without its stale tail: %+v", interrupted.Messages)
 	}
 }

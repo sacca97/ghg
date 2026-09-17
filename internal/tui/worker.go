@@ -522,6 +522,7 @@ func (m *model) handleWorkerFrame(frame workerwire.Frame) (tea.Model, tea.Cmd) {
 		if strings.HasPrefix(frame.RequestID, "rename-") {
 			var result workerwire.RenameResult
 			if err := json.Unmarshal(frame.Payload, &result); err == nil && result.Title != "" {
+				m.sessionTitle = result.Title
 				m.append(dimStyle.Render("✎ session renamed: " + result.Title))
 			}
 		}

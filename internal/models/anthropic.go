@@ -13,6 +13,7 @@ import (
 	"net/url"
 	"slices"
 	"strings"
+	"time"
 )
 
 const (
@@ -548,7 +549,7 @@ func (c *AnthropicClient) stream(ctx context.Context, req Request, sink EventSin
 				sink.OnThink(delta)
 			}
 		}
-		msg, usage, err := c.streamOnce(ctx, body, req.SessionID, wrapText, wrapThink)
+		msg, usage, err := c.streamOnce(ctx, body, req.SessionID, wrapText, wrapThink, req.RequestTimeout)
 		if err == nil {
 			return msg, usage, nil
 		}
@@ -574,11 +575,11 @@ func (c *AnthropicClient) stream(ctx context.Context, req Request, sink EventSin
 	return Message{}, Usage{}, last
 }
 
-func (c *AnthropicClient) streamOnce(ctx context.Context, body []byte, sessionID string, onText, onThink func(string)) (Message, Usage, error) {
-	return c.doStreamOnce(ctx, body, sessionID, onText, onThink, true)
+func (c *AnthropicClient) streamOnce(ctx context.Context, body []byte, sessionID string, onText, onThink func(string), requestTimeout time.Duration) (Message, Usage, error) {
+	return c.doStreamOnce(ctx, body, sessionID, onText, onThink, requestTimeout, true)
 }
 
-func (c *AnthropicClient) doStreamOnce(ctx context.Context, body []byte, sessionID string, onText, onThink func(string), canRefresh bool) (Message, Usage, error) {
+func (c *AnthropicClient) doStreamOnce(ctx context.Context, body []byte, sessionID string, onText, onThink func(string), requestTimeout time.Duration, canRefresh bool) (Message, Usage, error) {
 	endpoint, err := c.endpoint("/messages")
 	if err != nil {
 		return Message{}, Usage{}, err
@@ -592,14 +593,14 @@ func (c *AnthropicClient) doStreamOnce(ctx context.Context, body []byte, session
 		return Message{}, Usage{}, err
 	}
 	c.setSessionHeader(req, sessionID)
-	resp, err := c.httpClient().Do(req)
+	resp, err := c.httpClientFor(requestTimeout).Do(req)
 	if err != nil {
 		return Message{}, Usage{}, err
 	}
 	if resp.StatusCode == http.StatusUnauthorized && canRefresh {
 		_ = resp.Body.Close()
 		if c.tryForceRefresh(ctx) {
-			return c.doStreamOnce(ctx, body, sessionID, onText, onThink, false)
+			return c.doStreamOnce(ctx, body, sessionID, onText, onThink, requestTimeout, false)
 		}
 	}
 	defer func() { _ = resp.Body.Close() }()
@@ -624,7 +625,7 @@ func (c *AnthropicClient) complete(ctx context.Context, req Request, sink EventS
 	configuredAttempts := c.attempts()
 	limit := configuredAttempts
 	for attempt := 1; attempt <= limit; attempt++ {
-		msg, usage, err := c.completeOnce(ctx, body, req.SessionID)
+		msg, usage, err := c.completeOnce(ctx, body, req.SessionID, req.RequestTimeout)
 		if err == nil {
 			return msg, usage, nil
 		}
@@ -649,11 +650,11 @@ func (c *AnthropicClient) complete(ctx context.Context, req Request, sink EventS
 	return Message{}, Usage{}, last
 }
 
-func (c *AnthropicClient) completeOnce(ctx context.Context, body []byte, sessionID string) (Message, Usage, error) {
-	return c.doCompleteOnce(ctx, body, sessionID, true)
+func (c *AnthropicClient) completeOnce(ctx context.Context, body []byte, sessionID string, requestTimeout time.Duration) (Message, Usage, error) {
+	return c.doCompleteOnce(ctx, body, sessionID, requestTimeout, true)
 }
 
-func (c *AnthropicClient) doCompleteOnce(ctx context.Context, body []byte, sessionID string, canRefresh bool) (Message, Usage, error) {
+func (c *AnthropicClient) doCompleteOnce(ctx context.Context, body []byte, sessionID string, requestTimeout time.Duration, canRefresh bool) (Message, Usage, error) {
 	endpoint, err := c.endpoint("/messages")
 	if err != nil {
 		return Message{}, Usage{}, err
@@ -667,14 +668,14 @@ func (c *AnthropicClient) doCompleteOnce(ctx context.Context, body []byte, sessi
 		return Message{}, Usage{}, err
 	}
 	c.setSessionHeader(req, sessionID)
-	resp, err := c.httpClient().Do(req)
+	resp, err := c.httpClientFor(requestTimeout).Do(req)
 	if err != nil {
 		return Message{}, Usage{}, err
 	}
 	if resp.StatusCode == http.StatusUnauthorized && canRefresh {
 		_ = resp.Body.Close()
 		if c.tryForceRefresh(ctx) {
-			return c.doCompleteOnce(ctx, body, sessionID, false)
+			return c.doCompleteOnce(ctx, body, sessionID, requestTimeout, false)
 		}
 	}
 	defer func() { _ = resp.Body.Close() }()

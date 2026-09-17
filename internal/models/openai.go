@@ -278,6 +278,8 @@ type Request struct {
 	DynamicReasoning          bool                     `json:"-"`
 	ReasoningSelectionReason  string                   `json:"-"`
 	OnRequestDiagnostics      func(RequestDiagnostics) `json:"-"`
+	// RequestTimeout overrides the client's HTTP timeout for this call.
+	RequestTimeout time.Duration `json:"-"`
 }
 
 // RequestDiagnostics identifies the rendered wire request without retaining
@@ -557,7 +559,7 @@ func (c *Client) stream(ctx context.Context, req Request, sink EventSink) (Messa
 		if sink.OnThink != nil {
 			wrapThink = func(s string) { emitted = true; sink.OnThink(s) }
 		}
-		msg, usage, err := c.streamOnce(ctx, body, req.SessionID, wrapText, wrapThink)
+		msg, usage, err := c.streamOnce(ctx, body, req.SessionID, wrapText, wrapThink, req.RequestTimeout)
 		if err == nil {
 			return msg, usage, nil
 		}
@@ -589,7 +591,7 @@ func (c *Client) stream(ctx context.Context, req Request, sink EventSink) (Messa
 // streamOnce performs a single streaming request attempt; the Stream retry
 // wrapper calls it per attempt and reads its own `emitted` flag (set by the
 // wrapped callbacks) to decide whether a retry would replay visible output.
-func (c *Client) streamOnce(ctx context.Context, body []byte, sessionID string, onText, onThink func(string)) (Message, Usage, error) {
+func (c *Client) streamOnce(ctx context.Context, body []byte, sessionID string, onText, onThink func(string), requestTimeout time.Duration) (Message, Usage, error) {
 	hr, err := http.NewRequestWithContext(ctx, "POST", c.BaseURL+"/chat/completions", bytes.NewReader(body))
 	if err != nil {
 		return Message{}, Usage{}, err
@@ -599,7 +601,7 @@ func (c *Client) streamOnce(ctx context.Context, body []byte, sessionID string, 
 		return Message{}, Usage{}, err
 	}
 	c.setSessionHeader(hr, sessionID)
-	resp, err := c.httpClient().Do(hr)
+	resp, err := c.httpClientFor(requestTimeout).Do(hr)
 	if err != nil {
 		return Message{}, Usage{}, err
 	}
@@ -710,7 +712,7 @@ func (c *Client) complete(ctx context.Context, req Request, sink EventSink) (Mes
 	for attempt := 1; attempt <= limit; attempt++ {
 		var msg Message
 		var usage Usage
-		msg, usage, err = c.completeOnce(ctx, body, req.SessionID)
+		msg, usage, err = c.completeOnce(ctx, body, req.SessionID, req.RequestTimeout)
 		if err == nil {
 			return msg, usage, nil
 		}
@@ -736,7 +738,7 @@ func (c *Client) complete(ctx context.Context, req Request, sink EventSink) (Mes
 }
 
 // completeOnce performs one non-streaming request attempt.
-func (c *Client) completeOnce(ctx context.Context, body []byte, sessionID string) (Message, Usage, error) {
+func (c *Client) completeOnce(ctx context.Context, body []byte, sessionID string, requestTimeout time.Duration) (Message, Usage, error) {
 	hr, err := http.NewRequestWithContext(ctx, "POST", c.BaseURL+"/chat/completions", bytes.NewReader(body))
 	if err != nil {
 		return Message{}, Usage{}, err
@@ -746,7 +748,7 @@ func (c *Client) completeOnce(ctx context.Context, body []byte, sessionID string
 		return Message{}, Usage{}, err
 	}
 	c.setSessionHeader(hr, sessionID)
-	resp, err := c.httpClient().Do(hr)
+	resp, err := c.httpClientFor(requestTimeout).Do(hr)
 	if err != nil {
 		return Message{}, Usage{}, err
 	}

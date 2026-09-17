@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"slices"
 	"strings"
+	"time"
 )
 
 const maxOpenAIResponsesSSELine = 10 * 1024 * 1024
@@ -488,7 +489,7 @@ func (c *OpenAIResponsesClient) stream(ctx context.Context, req Request, sink Ev
 				sink.OnThink(delta)
 			}
 		}
-		msg, usage, err := c.streamOnce(ctx, body, req.SessionID, wrapText, wrapThink)
+		msg, usage, err := c.streamOnce(ctx, body, req.SessionID, wrapText, wrapThink, req.RequestTimeout)
 		if err == nil {
 			return msg, usage, nil
 		}
@@ -514,11 +515,11 @@ func (c *OpenAIResponsesClient) stream(ctx context.Context, req Request, sink Ev
 	return Message{}, Usage{}, last
 }
 
-func (c *OpenAIResponsesClient) streamOnce(ctx context.Context, body []byte, sessionID string, onText, onThink func(string)) (Message, Usage, error) {
-	return c.doStreamOnce(ctx, body, sessionID, onText, onThink, true)
+func (c *OpenAIResponsesClient) streamOnce(ctx context.Context, body []byte, sessionID string, onText, onThink func(string), requestTimeout time.Duration) (Message, Usage, error) {
+	return c.doStreamOnce(ctx, body, sessionID, onText, onThink, requestTimeout, true)
 }
 
-func (c *OpenAIResponsesClient) doStreamOnce(ctx context.Context, body []byte, sessionID string, onText, onThink func(string), canRefresh bool) (Message, Usage, error) {
+func (c *OpenAIResponsesClient) doStreamOnce(ctx context.Context, body []byte, sessionID string, onText, onThink func(string), requestTimeout time.Duration, canRefresh bool) (Message, Usage, error) {
 	endpoint, err := c.endpoint("/responses")
 	if err != nil {
 		return Message{}, Usage{}, err
@@ -532,13 +533,13 @@ func (c *OpenAIResponsesClient) doStreamOnce(ctx context.Context, body []byte, s
 		return Message{}, Usage{}, err
 	}
 	c.setSessionHeader(req, sessionID)
-	resp, err := c.httpClient().Do(req)
+	resp, err := c.httpClientFor(requestTimeout).Do(req)
 	if err != nil {
 		return Message{}, Usage{}, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode == http.StatusUnauthorized && canRefresh && c.tryForceRefresh(ctx) {
-		return c.doStreamOnce(ctx, body, sessionID, onText, onThink, false)
+		return c.doStreamOnce(ctx, body, sessionID, onText, onThink, requestTimeout, false)
 	}
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		return Message{}, Usage{}, openAIResponsesHTTPError(resp)
@@ -561,7 +562,7 @@ func (c *OpenAIResponsesClient) complete(ctx context.Context, req Request, sink 
 	configuredAttempts := c.attempts()
 	limit := configuredAttempts
 	for attempt := 1; attempt <= limit; attempt++ {
-		msg, usage, err := c.completeOnce(ctx, body, req.SessionID)
+		msg, usage, err := c.completeOnce(ctx, body, req.SessionID, req.RequestTimeout)
 		if err == nil {
 			return msg, usage, nil
 		}
@@ -586,11 +587,11 @@ func (c *OpenAIResponsesClient) complete(ctx context.Context, req Request, sink 
 	return Message{}, Usage{}, last
 }
 
-func (c *OpenAIResponsesClient) completeOnce(ctx context.Context, body []byte, sessionID string) (Message, Usage, error) {
-	return c.doCompleteOnce(ctx, body, sessionID, true)
+func (c *OpenAIResponsesClient) completeOnce(ctx context.Context, body []byte, sessionID string, requestTimeout time.Duration) (Message, Usage, error) {
+	return c.doCompleteOnce(ctx, body, sessionID, requestTimeout, true)
 }
 
-func (c *OpenAIResponsesClient) doCompleteOnce(ctx context.Context, body []byte, sessionID string, canRefresh bool) (Message, Usage, error) {
+func (c *OpenAIResponsesClient) doCompleteOnce(ctx context.Context, body []byte, sessionID string, requestTimeout time.Duration, canRefresh bool) (Message, Usage, error) {
 	endpoint, err := c.endpoint("/responses")
 	if err != nil {
 		return Message{}, Usage{}, err
@@ -604,13 +605,13 @@ func (c *OpenAIResponsesClient) doCompleteOnce(ctx context.Context, body []byte,
 		return Message{}, Usage{}, err
 	}
 	c.setSessionHeader(req, sessionID)
-	resp, err := c.httpClient().Do(req)
+	resp, err := c.httpClientFor(requestTimeout).Do(req)
 	if err != nil {
 		return Message{}, Usage{}, err
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode == http.StatusUnauthorized && canRefresh && c.tryForceRefresh(ctx) {
-		return c.doCompleteOnce(ctx, body, sessionID, false)
+		return c.doCompleteOnce(ctx, body, sessionID, requestTimeout, false)
 	}
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		return Message{}, Usage{}, openAIResponsesHTTPError(resp)

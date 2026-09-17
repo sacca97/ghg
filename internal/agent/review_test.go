@@ -425,6 +425,11 @@ func TestReviewFinalizationRetriesWithoutReopeningExploration(t *testing.T) {
 	if backend.calls != 11 {
 		t.Fatalf("model calls = %d, want 11", backend.calls)
 	}
+	for _, request := range backend.requests[9:] {
+		if request.RequestTimeout != finalizationRequestTimeout {
+			t.Fatalf("finalization timeout = %s, want %s", request.RequestTimeout, finalizationRequestTimeout)
+		}
+	}
 	if len(ag.Messages) != 22 {
 		t.Fatalf("messages after retry = %d, want 22", len(ag.Messages))
 	}

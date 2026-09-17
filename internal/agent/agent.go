@@ -44,6 +44,7 @@ const (
 	explorationCheckpointFinalLevel = 3
 	executionExplorationCheckpoint  = 8
 	goalAttentionCheckpoint         = 50
+	finalizationRequestTimeout      = 10 * time.Minute
 )
 
 // HistoryCatalog is the durable session boundary for bounded history recall.
@@ -1105,7 +1106,20 @@ func (a *Agent) TurnAuthored(ctx context.Context, input string, ev Events) (stri
 
 // Continue resumes the interrupted turn through an explicit command intent.
 func (a *Agent) Continue(ctx context.Context, ev Events) (string, error) {
-	return a.turn(ctx, "continue", nil, true, true, nil, ev)
+	return a.continueTurn(ctx, "", ev)
+}
+
+// ContinueWithInstruction resumes the interrupted turn with an optional
+// user-supplied instruction.
+func (a *Agent) ContinueWithInstruction(ctx context.Context, instruction string, ev Events) (string, error) {
+	return a.continueTurn(ctx, instruction, ev)
+}
+
+func (a *Agent) continueTurn(ctx context.Context, instruction string, ev Events) (string, error) {
+	if strings.TrimSpace(instruction) == "" {
+		instruction = "continue"
+	}
+	return a.turn(ctx, instruction, nil, true, true, nil, ev)
 }
 
 // TurnWithImages is TurnAuthored for a submission that attaches images. Each
@@ -1279,7 +1293,7 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 		if promptAt >= 0 && (promptAt == len(a.Messages)-1 || interruptedTail(a.Messages[promptAt+1:])) {
 			prev := a.Messages[promptAt]
 			a.Messages = a.Messages[:promptAt+1]
-			msg.Content = prev.Content
+			msg.Content = continuedPrompt(prev.Content, input)
 			msg.Parts = append([]models.ContentPart(nil), prev.Parts...)
 			a.Messages[promptAt] = msg
 		} else {
@@ -1536,6 +1550,10 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 			reasoningEffort, reasoningReason = nextEffort, "model_requested"
 		}
 		reasoningEffort, reasoningEnabled := a.reasoningRequest(reasoningEffort)
+		requestTimeout := time.Duration(0)
+		if finalizing || (reviewBudget != nil && reviewClosed) {
+			requestTimeout = finalizationRequestTimeout
+		}
 		var parser *planStreamParser
 		sink := models.EventSink{
 			OnThink: ev.OnThink,
@@ -1562,6 +1580,7 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 			DynamicReasoning:          a.DynamicReasoning == nil || *a.DynamicReasoning,
 			ReasoningSelectionReason:  reasoningReason,
 			SessionID:                 a.currentSessionID(),
+			RequestTimeout:            requestTimeout,
 		}, sink, ev, requestCheckpointLevel)
 		if a.PlanMode && parser != nil {
 			parser.close()
@@ -1982,6 +2001,14 @@ func interruptedTail(messages []models.Message) bool {
 		return false
 	}
 	return sawInterrupted
+}
+
+func continuedPrompt(previous, instruction string) string {
+	instruction = strings.TrimSpace(instruction)
+	if instruction == "" || instruction == "continue" {
+		return previous
+	}
+	return previous + "\n\nAdditional instruction for this continuation:\n" + instruction
 }
 
 func (a *Agent) reviewTerminal(msg models.Message, results []tools.ToolResult) (string, bool) {

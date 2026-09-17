@@ -620,6 +620,41 @@ func TestAskCommandSendsReadOnlyWorkerTurn(t *testing.T) {
 	}
 }
 
+func TestContinueCommandSendsOptionalInstruction(t *testing.T) {
+	serverConn, clientConn := net.Pipe()
+	defer serverConn.Close()
+	defer clientConn.Close()
+
+	m := compactCmdModel()
+	m.workerClient = workerwire.NewClient(clientConn, "test-continue")
+
+	frameCh := make(chan workerwire.Frame, 1)
+	go func() {
+		frame, err := workerwire.NewDecoder(serverConn).Read()
+		if err == nil {
+			frameCh <- frame
+		}
+	}()
+
+	m.command("/continue run the tests")
+	select {
+	case frame := <-frameCh:
+		var command workerwire.CommandRequest
+		if err := json.Unmarshal(frame.Payload, &command); err != nil {
+			t.Fatal(err)
+		}
+		var input workerwire.Input
+		if err := json.Unmarshal(command.Payload, &input); err != nil {
+			t.Fatal(err)
+		}
+		if command.Name != workerwire.CommandInput || input.Input != "run the tests" || !input.Continue {
+			t.Fatalf("unexpected continue input: command=%q input=%+v", command.Name, input)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for continue worker input")
+	}
+}
+
 func TestDetachCommandStopsWorkerBeforeExit(t *testing.T) {
 	serverConn, clientConn := net.Pipe()
 	defer serverConn.Close()

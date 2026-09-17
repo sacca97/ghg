@@ -7,7 +7,7 @@ import {
   ROLE_LABELS, MODE_LABELS, COMPOSER_MODE_LABELS, EFFORT_LABELS, effortLabel, APPROVAL_LABELS, SANDBOX_LABELS, NETWORK_LABELS,
   isRole, isMode, isComposerMode, isEffort, isApproval, isSandbox, isNetwork, fillSelect,
 } from "./constants.js";
-import { text, formatCount } from "./util.js";
+import { text, formatCount, formatDuration } from "./util.js";
 import { renderMarkdown } from "./markdown.js";
 import {
   buildBlock, renderToolContent, updateThinkingSummary, addExportButton, sameBlock,
@@ -80,6 +80,8 @@ const state = {
 
 function save() {
   state.draft = prompt.value;
+  state.context = context;
+  state.contextLimit = contextLimit;
   vscode.setState(state);
 }
 
@@ -87,8 +89,8 @@ let active = false;
 let pendingUser = false;
 let planDeltaSeen = false;
 let model = "";
-let context = 0;
-let contextLimit = 0;
+let context = Number.isFinite(saved.context) ? saved.context : 0;
+let contextLimit = Number.isFinite(saved.contextLimit) ? saved.contextLimit : 0;
 let activity = "Ready";
 let turnSince = 0;
 let activeReasoningEffort = "";
@@ -249,7 +251,17 @@ function setSendButton(running) {
 }
 
 function updateStatus() {
-  status.textContent = contextLimit > 0 ? `${formatCount(context)}/${formatCount(contextLimit)} ctx` : "";
+  const parts = [contextLimit > 0
+    ? `${formatCount(context)}/${formatCount(contextLimit)} ctx`
+    : `${formatCount(context)} ctx`];
+  let thinkingMs = state.blocks.reduce((total, block) => total + (block.kind === "thinking" ? Math.max(0, Number(block.durationMs) || 0) : 0), 0);
+  const current = streams.thinking;
+  if (current) {
+    const startedAt = Number(current.block.startedAt);
+    if (startedAt > 0) thinkingMs += Math.max(0, Date.now() - startedAt);
+  }
+  if (thinkingMs > 0 || current) parts.push(`${formatDuration(thinkingMs)} thinking`);
+  status.textContent = parts.join(" · ");
 }
 
 function effortsForCurrentModel() {
@@ -760,6 +772,7 @@ const handlers = {
   usage(raw) {
     if (typeof raw.prompt_tokens === "number" || typeof raw.completion_tokens === "number") {
       context = (Number(raw.prompt_tokens) || 0) + (Number(raw.completion_tokens) || 0);
+      save();
       updateStatus();
     }
   },
@@ -792,6 +805,7 @@ const handlers = {
     if (typeof raw.model === "string") model = raw.model;
     if (typeof raw.estimated_tokens === "number") context = raw.estimated_tokens;
     if (typeof raw.context_limit === "number") contextLimit = raw.context_limit;
+    save();
     updateStatus();
   },
 
@@ -849,6 +863,8 @@ const handlers = {
   },
 
   turn_done(raw) {
+    if (typeof raw.context_tokens === "number") context = raw.context_tokens;
+    if (typeof raw.context_limit === "number") contextLimit = raw.context_limit;
     const visible = state.blocks.filter((block) => block.kind !== "tool" || !isInternalReviewTool(block.name));
     if (visible.length !== state.blocks.length) {
       state.blocks = visible;
@@ -882,13 +898,11 @@ const handlers = {
     const interrupted = raw.interrupted === true || (typeof raw.error === "string" && /context canceled|interrupted/i.test(raw.error));
     if (!interrupted && typeof raw.error === "string" && raw.error) {
       append({ kind: "error", text: raw.error }, true);
-    } else if (!interrupted) {
-      append({ kind: "notice", text: "Context compacted." }, true);
     }
   },
 
   compact() {
-    append({ kind: "notice", text: "Context compaction completed; raw history preserved." }, true);
+    append({ kind: "notice", text: "Context compacted." }, true);
   },
 
   goal_from_context(raw) {
@@ -1112,8 +1126,8 @@ window.addEventListener("keydown", (event) => {
 });
 window.addEventListener("message", (event) => handleEvent(event.data));
 setInterval(() => {
-  if (active) updateStatus();
   const stream = streams.thinking;
+  if (active || stream) updateStatus();
   if (stream) updateThinkingSummary(stream.element, stream.block);
 }, 1000);
 

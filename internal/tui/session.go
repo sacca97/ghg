@@ -270,6 +270,7 @@ func (m *model) applyResumeData(data resumeData) error {
 	}
 	m.setMessages(msgs)
 	m.sessionID = meta.ID
+	m.sessionTitle = meta.Title
 	m.usage = usageFromMeta(meta, msgs)
 	m.workerContextTokens = 0
 	m.reviewProgressHistory = nil
@@ -687,6 +688,7 @@ func (m *model) resetSessionState() {
 	m.workerTasks = nil
 	m.workerStartError = ""
 	m.workerContextTokens = 0
+	m.sessionTitle = ""
 	m.blocks = nil
 	m.msgBlock = nil
 	m.future = nil

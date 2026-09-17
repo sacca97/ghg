@@ -1041,13 +1041,12 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 			return this.exportResult(kind, destination, format, force);
 		}
 		case "/continue": {
-			if (args) throw new Error("usage: /continue");
 			if (this.active) throw new Error("A ghg turn is already running.");
 			const continueMode = message.mode === "plan" ? "plan" : "execute";
 			this.setActive(true);
 			this.post({ type: "turn_start", mode: continueMode });
 			await this.bridgeCommand("input", {
-				input: "continue",
+				input: promptWithReferences(args || "continue", cleanReferences(message.references)),
 				authored: true,
 				continue: true,
 				plan_mode: continueMode === "plan",
@@ -1059,6 +1058,7 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 			if (args === "retry") return this.bridgeCommand("compact_retry");
 			if (args === "log") throw new Error("/compact log is not available in the extension yet");
 			if (args) throw new Error("usage: /compact [retry]");
+			this.post({ type: "notice", text: "Compacting context…" });
 			return this.bridgeCommand("compact");
 		case "/approval":
 			if (args !== "ask" && args !== "auto" && args !== "never") throw new Error("usage: /approval <ask|auto|never>");

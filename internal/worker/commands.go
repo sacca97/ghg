@@ -38,7 +38,7 @@ var commandCatalogue = []CommandSpec{
 	{Name: "/clear", Hint: "— reset conversation", Owner: OwnerClient},
 	{Name: "/compact", Hint: "— compact now using tiny → fast → default → smart; retry undoes the last compaction, log lists them; compaction level: ctrl+p › Compaction level", Owner: OwnerWorker},
 	{Name: "/context-doctor", Hint: "— audit what a fresh session injects (skills, MCP, tool schemas) and its token cost", Owner: OwnerWorker},
-	{Name: "/continue", Hint: "— continue the interrupted turn using the current session history", Owner: OwnerWorker},
+	{Name: "/continue", Hint: "[instruction] — continue the interrupted turn, optionally with an extra instruction", Owner: OwnerWorker},
 	{Name: "/detach", Hint: "— stop the worker and exit; resume later (ctrl+d)", Owner: OwnerWorker},
 	{Name: "/dynamic-reasoning", Hint: "— toggle model per-call reasoning effort selection (default on)", Owner: OwnerWorker},
 	{Name: "/effort", Hint: "[level] — reasoning effort: off·low·medium·high (bare opens selector)", Owner: OwnerWorker},

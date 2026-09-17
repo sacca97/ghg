@@ -151,8 +151,9 @@ type model struct {
 	cancel       context.CancelFunc
 	prog         *tea.Program
 
-	store     *session.Store
-	sessionID string
+	store        *session.Store
+	sessionID    string
+	sessionTitle string
 
 	hist                []string         // submitted inputs, for up/down recall
 	pasteBuf            string           // held paste text for the [Pasted ~N lines] placeholder (config collapsePaste)
@@ -627,8 +628,11 @@ func (m *model) submit(text string) (tea.Model, tea.Cmd) {
 	return m.submitTurn(text, true)
 }
 
-func (m *model) submitContinue() (tea.Model, tea.Cmd) {
-	return m.submitTurnMode("continue", true, false, true)
+func (m *model) submitContinue(extra string) (tea.Model, tea.Cmd) {
+	if strings.TrimSpace(extra) == "" {
+		extra = "continue"
+	}
+	return m.submitTurnMode(extra, true, false, true)
 }
 
 func (m *model) submitAsk(text string) (tea.Model, tea.Cmd) {

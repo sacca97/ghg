@@ -132,8 +132,11 @@ func (m *model) authProvider(name string, resolved models.Resolved, key string, 
 	if m.prog == nil {
 		return // tests drive applyAuthResult directly; no program to report to
 	}
+	profiles := m.profiles
+	maxRetries := m.cfg.MaxRetries
+	p := m.prog
 	go func() {
-		result, err := auth.Authenticate(context.Background(), m.profiles, name, key, m.cfg.MaxRetries)
+		result, err := auth.Authenticate(context.Background(), profiles, name, key, maxRetries)
 		msg := authResultMsg{
 			name:        name,
 			profile:     resolved,
@@ -151,7 +154,7 @@ func (m *model) authProvider(name string, resolved models.Resolved, key string, 
 			msg.profile = result.Profile
 		}
 		msg.models = result.Models
-		sendProg(m.prog, msg)
+		sendProg(p, msg)
 	}()
 }
 
@@ -306,18 +309,19 @@ func (m *model) startOAuthLogin(name string, resolved models.Resolved) {
 	if m.prog == nil {
 		return
 	}
+	p := m.prog
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 		defer cancel()
 		opts := auth.LoginOptions{
 			OpenBrowser: true,
 			Printer: func(url string) {
-				sendProg(m.prog, authOAuthWaitingMsg{name: name, url: url})
+				sendProg(p, authOAuthWaitingMsg{name: name, url: url})
 			},
 			Prompt: func(label string) (string, error) {
 				reply := make(chan string, 1)
 				cancelled := make(chan struct{}, 1)
-				sendProg(m.prog, authOAuthCodeRequestMsg{name: name, label: label, reply: reply, cancel: cancelled})
+				sendProg(p, authOAuthCodeRequestMsg{name: name, label: label, reply: reply, cancel: cancelled})
 				select {
 				case value := <-reply:
 					return value, nil
@@ -330,7 +334,7 @@ func (m *model) startOAuthLogin(name string, resolved models.Resolved) {
 		}
 		_, err := auth.LoginFor(ctx, resolved, opts)
 		if err != nil {
-			sendProg(m.prog, authOAuthResultMsg{name: name, profile: resolved, err: err})
+			sendProg(p, authOAuthResultMsg{name: name, profile: resolved, err: err})
 			return
 		}
 		var modelInfos []models.ModelInfo
@@ -343,7 +347,7 @@ func (m *model) startOAuthLogin(name string, resolved models.Resolved) {
 			defer mcancel()
 			modelInfos, modelErr = cat.Models(mctx)
 		}
-		sendProg(m.prog, authOAuthResultMsg{
+		sendProg(p, authOAuthResultMsg{
 			name:     name,
 			profile:  resolved,
 			models:   modelInfos,

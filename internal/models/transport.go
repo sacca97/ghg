@@ -26,7 +26,7 @@ type transport struct {
 	OnRetry       func(RetryEvent)
 }
 
-const defaultModelRequestTimeout = 3 * time.Minute
+const defaultModelRequestTimeout = 5 * time.Minute
 
 func newTransport(baseURL, apiKey string) transport {
 	return transport{
@@ -48,6 +48,16 @@ func (t transport) httpClient() *http.Client {
 		return t.HTTP
 	}
 	return http.DefaultClient
+}
+
+func (t transport) httpClientFor(timeout time.Duration) *http.Client {
+	client := t.httpClient()
+	if timeout <= 0 || client.Timeout == timeout {
+		return client
+	}
+	clone := *client
+	clone.Timeout = timeout
+	return &clone
 }
 
 func (t transport) setRequestHeaders(req *http.Request) error {

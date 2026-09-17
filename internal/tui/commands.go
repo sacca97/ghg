@@ -219,7 +219,8 @@ func (m *model) command(text string) (tea.Model, tea.Cmd) {
 			m.append(dimStyle.Render("(busy — /continue after this turn)"))
 			return m, nil
 		}
-		return m.submitContinue()
+		extra := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(text), fields[0]))
+		return m.submitContinue(extra)
 	case "/approval":
 		if len(fields) == 1 {
 			m.append(dimStyle.Render("approval mode: " + m.currentApprovalMode()))
@@ -503,10 +504,13 @@ func (m *model) command(text string) (tea.Model, tea.Cmd) {
 		}
 		if fields[1] == "refresh" {
 			m.append(dimStyle.Render("refreshing model catalogs…"))
-			providers := maps.Clone(m.cfg.Providers)
+			cfg := *m.cfg
+			cfg.Providers = maps.Clone(m.cfg.Providers)
+			profiles := m.profiles
+			p := m.prog
 			go func() {
-				m.fetchCatalogs(true, providers)
-				sendProg(m.prog, noticeMsg("model catalogs refreshed — /model shows newly announced models"))
+				sendProg(p, fetchCatalogs(true, cfg, profiles))
+				sendProg(p, noticeMsg("model catalogs refreshed — /model shows newly announced models"))
 			}()
 			break
 		}

@@ -416,7 +416,7 @@ func (w *workerProcessState) runTurn(ctx context.Context, input workerInput) {
 	var err error
 	switch {
 	case input.Continue:
-		final, err = w.ag.Continue(ctx, ev)
+		final, err = w.ag.ContinueWithInstruction(ctx, input.Input, ev)
 	case len(input.Parts) > 0 && input.Goal != nil:
 		final, err = w.ag.TurnWithImagesAndGoal(ctx, input.Input, input.Parts, *input.Goal, ev)
 	case len(input.Parts) > 0:
