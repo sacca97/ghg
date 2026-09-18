@@ -18,7 +18,6 @@ const vscode = acquireVsCodeApi();
 const post = (message) => vscode.postMessage(message);
 
 const settings = document.getElementById("settings");
-const settingsToggle = document.getElementById("settings-toggle");
 const settingsClose = document.getElementById("settings-close");
 const settingsCloseBottom = document.getElementById("settings-close-bottom");
 const refreshModels = document.getElementById("refresh-models");
@@ -82,9 +81,25 @@ function save() {
   state.draft = prompt.value;
   state.context = context;
   state.contextLimit = contextLimit;
+  if (saveTimer !== undefined) clearTimeout(saveTimer);
+  saveTimer = setTimeout(() => {
+    saveTimer = undefined;
+    vscode.setState(state);
+  }, 250);
+}
+
+function flushSave() {
+  if (saveTimer !== undefined) {
+    clearTimeout(saveTimer);
+    saveTimer = undefined;
+  }
+  state.draft = prompt.value;
+  state.context = context;
+  state.contextLimit = contextLimit;
   vscode.setState(state);
 }
 
+let saveTimer;
 let active = false;
 let pendingUser = false;
 let planDeltaSeen = false;
@@ -96,6 +111,7 @@ let turnSince = 0;
 let activeReasoningEffort = "";
 let turnConfiguredEffort;
 let completionRequest = 0;
+let completionTimer;
 let completionToken;
 let completionItems = [];
 let completionIndex = 0;
@@ -348,7 +364,6 @@ function renderSettingsModels() {
 function setSettings(open) {
   settings.hidden = !open;
   chatView.hidden = open;
-  settingsToggle.setAttribute("aria-expanded", String(open));
   state.settingsOpen = open;
   save();
   if (open) hideCompletions();
@@ -356,7 +371,7 @@ function setSettings(open) {
 
 function closeSettings() {
   setSettings(false);
-  settingsToggle.focus();
+  prompt.focus();
 }
 
 // --- snapshots -------------------------------------------------------------
@@ -503,6 +518,10 @@ function referenceToken() {
 }
 
 function hideCompletions() {
+  if (completionTimer !== undefined) {
+    clearTimeout(completionTimer);
+    completionTimer = undefined;
+  }
   completionMenu.hidden = true;
   prompt.setAttribute("aria-expanded", "false");
   prompt.removeAttribute("aria-activedescendant");
@@ -586,7 +605,7 @@ function commandToken() {
   return { query: match[1], start: before.length - match[1].length, end: before.length };
 }
 
-function requestCompletions() {
+function requestCompletionsNow() {
   const command = commandToken();
   if (command) {
     completionToken = { ...command, kind: "command" };
@@ -606,6 +625,20 @@ function requestCompletions() {
   completionToken = token;
   const requestId = ++completionRequest;
   post({ type: "completeReferences", requestId, query: token.query });
+}
+
+function requestCompletions() {
+  if (completionTimer !== undefined) clearTimeout(completionTimer);
+  const command = commandToken();
+  if (command || !referenceToken()) {
+    completionTimer = undefined;
+    requestCompletionsNow();
+    return;
+  }
+  completionTimer = setTimeout(() => {
+    completionTimer = undefined;
+    requestCompletionsNow();
+  }, 150);
 }
 
 // --- worker events ---------------------------------------------------------
@@ -694,7 +727,6 @@ const handlers = {
     if (typeof raw.delta !== "string") return;
     appendDelta("text", raw.delta);
     activity = "Responding";
-    updateStatus();
   },
 
   plan_delta(raw) {
@@ -702,14 +734,12 @@ const handlers = {
     planDeltaSeen = true;
     appendDelta("plan", raw.delta);
     activity = "Responding";
-    updateStatus();
   },
 
   think(raw) {
     if (typeof raw.delta !== "string") return;
     appendDelta("thinking", raw.delta);
     activity = "Thinking";
-    updateStatus();
   },
 
   tool_start(raw) {
@@ -1037,11 +1067,6 @@ modeToggle.addEventListener("change", () => {
   save();
   post({ type: "configureRole", role: state.role, mode: state.mode });
 });
-settingsToggle.addEventListener("click", () => {
-  const open = settings.hidden;
-  setSettings(open);
-  if (open) settingsClose.focus();
-});
 settingsClose.addEventListener("click", closeSettings);
 settingsCloseBottom.addEventListener("click", closeSettings);
 refreshModels.addEventListener("click", () => {
@@ -1124,6 +1149,10 @@ transcript.addEventListener("scroll", () => {
 window.addEventListener("keydown", (event) => {
   if (event.key === "Escape" && !settings.hidden) closeSettings();
 });
+document.addEventListener("visibilitychange", () => {
+  if (document.visibilityState === "hidden") flushSave();
+});
+window.addEventListener("pagehide", flushSave);
 window.addEventListener("message", (event) => handleEvent(event.data));
 setInterval(() => {
   const stream = streams.thinking;

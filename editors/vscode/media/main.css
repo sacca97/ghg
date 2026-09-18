@@ -53,7 +53,6 @@ body {
 
 /* --- icon buttons --------------------------------------------------------- */
 
-#settings-toggle,
 #settings-close,
 .settings-icon-button {
   display: grid;
@@ -70,7 +69,6 @@ body {
 
 .settings-actions svg,
 .copy svg,
-#settings-toggle svg,
 #settings-close svg,
 .settings-icon-button svg {
   fill: none;
@@ -86,14 +84,12 @@ body {
   height: 14px;
 }
 
-#settings-toggle svg,
 #settings-close svg,
 .settings-icon-button svg {
   width: 15px;
   height: 15px;
 }
 
-#settings-toggle:hover,
 #settings-close:hover,
 .settings-icon-button:hover {
   color: var(--vscode-foreground);
@@ -678,8 +674,8 @@ body {
 /* Keep controls at their intrinsic width; narrow layouts may shrink them. */
 .composer-row {
   display: grid;
-  grid-template-columns: minmax(0, max-content) minmax(0, max-content) minmax(0, max-content) 28px 30px;
-  grid-template-areas: "mode role effort settings send";
+  grid-template-columns: minmax(0, max-content) minmax(0, max-content) minmax(0, max-content) 30px;
+  grid-template-areas: "mode role effort send";
   align-items: center;
   gap: 6px;
   margin-top: 6px;
@@ -723,22 +719,6 @@ body {
 
 .composer-row #effort {
   grid-area: effort;
-}
-
-.composer-row #settings-toggle {
-  width: 28px;
-  height: 28px;
-  padding: 0;
-  border: 1px solid transparent;
-  color: var(--vscode-descriptionForeground);
-  background: transparent;
-  grid-area: settings;
-}
-
-.composer-row #settings-toggle:hover {
-  color: var(--vscode-foreground);
-  background: var(--vscode-button-secondaryHoverBackground);
-  border-color: var(--vscode-panel-border);
 }
 
 .composer-row #send {
@@ -872,9 +852,9 @@ select:disabled {
   }
 
   .composer-row {
-    grid-template-columns: minmax(0, max-content) minmax(0, max-content) 28px 30px;
+    grid-template-columns: minmax(0, max-content) minmax(0, max-content) 30px;
     grid-template-areas:
-      "mode mode . ."
-      "role effort settings send";
+      "mode mode ."
+      "role effort send";
   }
 }

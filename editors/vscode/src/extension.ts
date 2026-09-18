@@ -33,6 +33,7 @@ const maxChildOutput = 1024 * 1024;
 const busyStates = new Set(["running", "waiting_approval", "waiting_question", "stopping"]);
 const executionSettings = new Set(["sandbox", "network", "approval"]);
 const defaultSettings = new Set(["defaultRole", "defaultMode", "defaultEffort"]);
+const binaryPathCache = new Map<string, string>();
 
 type SessionPick = vscode.QuickPickItem & { sessionId: string };
 type ReferenceSuggestion = { path: string; folder: boolean };
@@ -58,19 +59,27 @@ function currentWorkspace(): Workspace {
 function displayBinaryPath(binary: string): string {
 	const value = binary.trim() || "ghg";
 	if (isAbsolute(value)) return value;
+	const cwd = currentWorkspace()?.uri.fsPath || process.cwd();
+	const cacheKey = `${cwd}\0${value}`;
+	const cached = binaryPathCache.get(cacheKey);
+	if (cached !== undefined) return cached;
 	if (value.includes("/") || value.includes("\\")) {
-		return resolve(currentWorkspace()?.uri.fsPath || process.cwd(), value);
+		const resolved = resolve(cwd, value);
+		binaryPathCache.set(cacheKey, resolved);
+		return resolved;
 	}
+	let resolved = value;
 	try {
 		const resolver = process.platform === "win32" ? "where.exe" : "which";
-		const resolved = execFileSync(resolver, [value], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] })
+		const path = execFileSync(resolver, [value], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] })
 			.split(/\r?\n/, 1)[0]
 			?.trim();
-		if (resolved) return resolved;
+		if (path) resolved = path;
 	} catch {
 		// Keep the configured command when it is not available on PATH.
 	}
-	return value;
+	binaryPathCache.set(cacheKey, resolved);
+	return resolved;
 }
 
 function cleanReferences(value: unknown): string[] {
@@ -343,6 +352,7 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 	private commands: CommandSpec[] = [];
 	private pendingSteers: SteerRequest[] = [];
 	private steerCancelRequested = false;
+	private modelCache?: { key: string; models: Record<string, string>; capabilities: CatalogModel[] };
 
 	constructor(private readonly extension: vscode.ExtensionContext) {}
 
@@ -385,6 +395,11 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 	private async loadModels(): Promise<void> {
 		const workspace = currentWorkspace();
 		const binary = vscode.workspace.getConfiguration("ghg").get<string>("binaryPath", "ghg");
+		const key = `${workspace?.uri.fsPath || ""}\0${binary}`;
+		if (this.modelCache?.key === key) {
+			this.post({ type: "models", models: this.modelCache.models, capabilities: this.modelCache.capabilities });
+			return;
+		}
 		try {
 			const models = await listModels(binary, workspace?.uri.fsPath);
 			let capabilities: CatalogModel[] = [];
@@ -393,6 +408,7 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 			} catch {
 				// Model names remain useful when the optional catalog cache is unavailable.
 			}
+			this.modelCache = { key, models, capabilities };
 			this.post({ type: "models", models, capabilities });
 		} catch (error) {
 			this.post({ type: "notice", text: `model discovery unavailable: ${error instanceof Error ? error.message : String(error)}` });
@@ -409,7 +425,9 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 		} catch {
 			// Keep the refreshed role names even if catalog metadata is unavailable.
 		}
-		this.post({ type: "models", models: parseRoleModels(parsed), capabilities });
+		const models = parseRoleModels(parsed);
+		this.modelCache = { key: `${workspace?.uri.fsPath || ""}\0${binary}`, models, capabilities };
+		this.post({ type: "models", models, capabilities });
 		this.post({ type: "notice", text: "model catalogs refreshed" });
 	}
 
