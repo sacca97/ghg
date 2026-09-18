@@ -348,7 +348,9 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 	private bufferedEvents: Event[] = [];
 	private lastSnapshot?: Event;
 	private promptIDs = new Set<string>();
+	private pendingApprovals = new Set<string>();
 	private detachWaiters = new Map<string, { resolve: () => void; reject: (error: Error) => void }>();
+	private commandWaiters = new Map<string, { resolve: () => void; reject: (error: Error) => void }>();
 	private commands: CommandSpec[] = [];
 	private pendingSteers: SteerRequest[] = [];
 	private steerCancelRequested = false;
@@ -581,11 +583,23 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 					waiter.resolve();
 				}
 			}
+			if (event.type === "ack" && typeof event.request_id === "string") {
+				const waiter = this.commandWaiters.get(event.request_id);
+				if (waiter) {
+					this.commandWaiters.delete(event.request_id);
+					waiter.resolve();
+				}
+			}
 			if (event.type === "error" && typeof event.request_id === "string") {
 				const waiter = this.detachWaiters.get(event.request_id);
 				if (waiter) {
 					this.detachWaiters.delete(event.request_id);
 					waiter.reject(new Error(typeof event.error === "string" ? event.error : "ghg detach failed"));
+				}
+				const commandWaiter = this.commandWaiters.get(event.request_id);
+				if (commandWaiter) {
+					this.commandWaiters.delete(event.request_id);
+					commandWaiter.reject(new Error(typeof event.error === "string" ? event.error : "ghg command failed"));
 				}
 			}
 			if (event.type === "turn_end") {
@@ -622,6 +636,8 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 			}
 			for (const waiter of this.detachWaiters.values()) waiter.reject(new Error("ghg bridge closed before detaching"));
 			this.detachWaiters.clear();
+			for (const waiter of this.commandWaiters.values()) waiter.reject(new Error("ghg bridge closed before acknowledging the command"));
+			this.commandWaiters.clear();
 			if (this.bridge === child) {
 				this.bridge = undefined;
 				this.bridgeReady = undefined;
@@ -630,7 +646,7 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 				this.bridgeBinary = "";
 				this.lastSnapshot = undefined;
 			}
-			if (this.active) {
+			if (this.active && this.pendingApprovals.size === 0) {
 				this.setActive(false);
 				this.post({ type: "turn_end" });
 			}
@@ -642,7 +658,9 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 		const id = typeof approval.id === "string" ? approval.id : "";
 		const child = this.bridge;
 		if (!id || !child || this.promptIDs.has(id)) return;
+		const session = this.bridgeSession;
 		this.promptIDs.add(id);
+		this.pendingApprovals.add(id);
 		try {
 			const tool = String(approval.tool || "tool");
 			const command = String(approval.command || "Allow operation?");
@@ -651,22 +669,33 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 				["Allow once", "Allow always", "Deny", "Deny with instruction"],
 				{ placeHolder: `${tool}: ${command}${rule ? ` · always: ${rule}` : ""}` },
 			);
-			if (this.bridge !== child) return;
+			const currentBridge = () => this.bridge && this.bridgeSession === session ? this.bridge : undefined;
 			if (choice === "Deny with instruction") {
 				const redirect = await vscode.window.showInputBox({
 					prompt: "Tell ghg what to do instead",
 					ignoreFocusOut: true,
 					validateInput: (value) => value.length > 4096 ? "Instruction is limited to 4096 characters." : undefined,
 				});
-				await this.writeBridgeCommand(child, "approve", {
+				const target = currentBridge();
+				if (!target) {
+					this.post({ type: "notice", text: "approval remains pending; reconnecting to the worker" });
+					return;
+				}
+				await this.writeBridgeCommand(target, "approve", {
 					id, decision: "reject", redirect: redirect?.trim() || "approval instruction was dismissed",
 				});
 				return;
 			}
+			const target = currentBridge();
+			if (!target) {
+				this.post({ type: "notice", text: "approval remains pending; reconnecting to the worker" });
+				return;
+			}
 			const decision = choice === "Allow always" ? "allow_always" : choice === "Allow once" ? "allow_once" : "reject";
-			await this.writeBridgeCommand(child, "approve", { id, decision, redirect: choice ? undefined : "approval prompt was dismissed" });
+			await this.writeBridgeCommand(target, "approve", { id, decision, redirect: choice ? undefined : "approval prompt was dismissed" });
 		} finally {
 			this.promptIDs.delete(id);
+			this.pendingApprovals.delete(id);
 		}
 	}
 
@@ -805,10 +834,29 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 
 	private async bridgeCommand(name: string, payload: unknown = null, initialRole: Role = "fast", initialMode: "execute" | "plan" = "execute"): Promise<void> {
 		await this.ensureBridge(initialRole, initialMode);
-		if (!this.bridge?.stdin) {
+		const child = this.bridge;
+		if (!child?.stdin) {
 			throw new Error("ghg bridge is unavailable");
 		}
-		await this.writeBridgeCommand(this.bridge, name, payload);
+		if (name === "configure") {
+			await this.writeBridgeCommandAndWait(child, name, payload);
+			return;
+		}
+		await this.writeBridgeCommand(child, name, payload);
+	}
+
+	private async writeBridgeCommandAndWait(child: ChildProcess, name: string, payload: unknown): Promise<void> {
+		const requestID = `vscode-${++this.bridgeRequest}`;
+		const result = new Promise<void>((resolve, reject) => {
+			this.commandWaiters.set(requestID, { resolve, reject });
+		});
+		try {
+			await this.writeBridgeCommand(child, name, payload, requestID);
+			await result;
+		} catch (error) {
+			this.commandWaiters.delete(requestID);
+			throw error;
+		}
 	}
 
 	private stopBridge(): Promise<void> {

@@ -593,7 +593,7 @@ func (c *AnthropicClient) doStreamOnce(ctx context.Context, body []byte, session
 		return Message{}, Usage{}, err
 	}
 	c.setSessionHeader(req, sessionID)
-	resp, err := c.httpClientFor(requestTimeout).Do(req)
+	resp, err := c.httpClientForStream().Do(req)
 	if err != nil {
 		return Message{}, Usage{}, err
 	}
@@ -607,7 +607,7 @@ func (c *AnthropicClient) doStreamOnce(ctx context.Context, body []byte, session
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		return Message{}, Usage{}, anthropicHTTPError(resp)
 	}
-	return consumeAnthropicSSE(resp.Body, onText, onThink)
+	return consumeAnthropicSSE(ctx, resp.Body, c.streamIdleTimeout, onText, onThink)
 }
 
 // Complete performs a non-streaming Messages request for compaction and
@@ -854,7 +854,7 @@ type anthropicStreamBlock struct {
 	stopped   bool
 }
 
-func consumeAnthropicSSE(r io.Reader, onText, onThink func(string)) (Message, Usage, error) {
+func consumeAnthropicSSE(ctx context.Context, r io.Reader, idle time.Duration, onText, onThink func(string)) (Message, Usage, error) {
 	blocks := map[int]*anthropicStreamBlock{}
 	var inputUsage anthropicUsage
 	stopReason := ""
@@ -863,7 +863,7 @@ func consumeAnthropicSSE(r io.Reader, onText, onThink func(string)) (Message, Us
 	handle := func(data []byte) error {
 		if string(data) == "[DONE]" {
 			sawStop = true
-			return nil
+			return stopSSE
 		}
 		var event anthropicEvent
 		if err := json.Unmarshal(data, &event); err != nil {
@@ -965,7 +965,7 @@ func consumeAnthropicSSE(r io.Reader, onText, onThink func(string)) (Message, Us
 		return nil
 	}
 
-	if err := scanAnthropicSSE(r, handle); err != nil {
+	if err := scanAnthropicSSE(ctx, r, idle, handle); err != nil {
 		return Message{}, anthropicUsageValue(inputUsage), err
 	}
 	if !sawStop {
@@ -993,8 +993,8 @@ func consumeAnthropicSSE(r io.Reader, onText, onThink func(string)) (Message, Us
 	return msg, usage, nil
 }
 
-func scanAnthropicSSE(r io.Reader, handle func([]byte) error) error {
-	return scanSSE(r, maxAnthropicSSELine, func(_ string, data []byte) error {
+func scanAnthropicSSE(ctx context.Context, r io.Reader, idle time.Duration, handle func([]byte) error) error {
+	return scanSSE(ctx, r, idle, maxAnthropicSSELine, func(_ string, data []byte) error {
 		return handle(data)
 	}, func(line string) error {
 		return nonRetryable{fmt.Errorf("malformed anthropic SSE line %q", line)}

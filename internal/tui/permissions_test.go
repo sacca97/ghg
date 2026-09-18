@@ -1,8 +1,10 @@
 package tui
 
 import (
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/sacca97/ghg/internal/config"
 	"github.com/sacca97/ghg/internal/tools"
+	workerwire "github.com/sacca97/ghg/internal/worker"
 	"os"
 	"testing"
 )
@@ -24,6 +26,29 @@ func TestCommandRuleArity(t *testing.T) {
 		if got := tools.CommandRule(in); got != want {
 			t.Errorf("CommandRule(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+func TestPermissionDialogStaysOpenWhenWorkerDisconnects(t *testing.T) {
+	m := compactCmdModel()
+	m.permDialog = &permDialog{
+		req:      tools.GateRequest{Tool: "bash", Command: "git status", Rule: "git status"},
+		workerID: "approval-1",
+	}
+
+	m.permKey(tea.KeyMsg{Type: tea.KeyEnter})
+	if m.permDialog == nil {
+		t.Fatal("approval dialog was dismissed without a worker connection")
+	}
+}
+
+func TestStalePermissionDialogClearsAfterReattach(t *testing.T) {
+	m := compactCmdModel()
+	m.permDialog = &permDialog{workerID: "approval-1"}
+
+	m.applyWorkerSnapshot(workerwire.Snapshot{State: workerwire.StateIdle})
+	if m.permDialog != nil {
+		t.Fatal("stale approval dialog survived a reattach without a pending request")
 	}
 }
 

@@ -347,10 +347,18 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.flushThink()
 			m.thinkStart = time.Time{}
 		}
+		var reconnect tea.Cmd
+		if isCurrentClient && m.permDialog != nil && m.prog != nil && m.store != nil {
+			// Keep the approval modal open and reattach to the same live worker.
+			// The worker deliberately keeps a pending approval when a controller
+			// disconnects, so dropping the dialog here would strand the turn.
+			m.workerStartFailed = false
+			reconnect = m.startWorkerCmd()
+		}
 		if msg.err != nil && !wasDetached && !errors.Is(msg.err, context.Canceled) {
 			m.append(errStyle.Render("worker: " + msg.err.Error()))
 		}
-		return m, nil
+		return m, reconnect
 
 	case workerPermissionMsg:
 		m.permDialog = &permDialog{

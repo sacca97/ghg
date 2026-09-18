@@ -11,28 +11,35 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
 type transport struct {
-	BaseURL       string
-	APIKey        string
-	HTTP          *http.Client
-	Headers       map[string]string
-	AuthKind      string
-	AuthHeader    string
-	SessionHeader string
-	MaxRetries    int
-	OnRetry       func(RetryEvent)
+	BaseURL           string
+	APIKey            string
+	HTTP              *http.Client
+	Headers           map[string]string
+	AuthKind          string
+	AuthHeader        string
+	SessionHeader     string
+	MaxRetries        int
+	OnRetry           func(RetryEvent)
+	streamIdleTimeout time.Duration
 }
 
-const defaultModelRequestTimeout = 5 * time.Minute
+const (
+	defaultModelRequestTimeout    = 5 * time.Minute
+	defaultModelStreamIdleTimeout = 5 * time.Minute
+)
 
 func newTransport(baseURL, apiKey string) transport {
 	return transport{
-		BaseURL: strings.TrimRight(baseURL, "/"),
-		APIKey:  apiKey,
-		HTTP:    &http.Client{Timeout: defaultModelRequestTimeout},
+		BaseURL:           strings.TrimRight(baseURL, "/"),
+		APIKey:            apiKey,
+		HTTP:              &http.Client{Timeout: defaultModelRequestTimeout},
+		streamIdleTimeout: defaultModelStreamIdleTimeout,
 	}
 }
 
@@ -57,6 +64,19 @@ func (t transport) httpClientFor(timeout time.Duration) *http.Client {
 	}
 	clone := *client
 	clone.Timeout = timeout
+	return &clone
+}
+
+// httpClientForStream removes any total body timeout. Streaming calls use the
+// SSE idle timeout instead, so slow model reasoning is not mistaken for a
+// dead connection.
+func (t transport) httpClientForStream() *http.Client {
+	client := t.httpClient()
+	if client.Timeout == 0 {
+		return client
+	}
+	clone := *client
+	clone.Timeout = 0
 	return &clone
 }
 
@@ -307,7 +327,68 @@ func isAuthenticationError(body []byte) bool {
 	return false
 }
 
-func scanSSE(r io.Reader, maxLine int, handle func(string, []byte) error, malformed func(string) error) error {
+var stopSSE = errors.New("stop SSE")
+
+type streamIdleTimeoutError struct {
+	timeout time.Duration
+}
+
+func (e *streamIdleTimeoutError) Error() string {
+	return fmt.Sprintf("model stream idle timeout after %s", e.timeout)
+}
+
+func scanSSE(ctx context.Context, r io.Reader, idle time.Duration, maxLine int, handle func(string, []byte) error, malformed func(string) error) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var timedOut atomic.Bool
+	stopTimer := make(chan struct{})
+	activity := make(chan struct{}, 1)
+	var timerWG sync.WaitGroup
+	if idle > 0 {
+		if closer, ok := r.(io.Closer); ok {
+			timerWG.Go(func() {
+				timer := time.NewTimer(idle)
+				defer timer.Stop()
+				for {
+					select {
+					case <-timer.C:
+						timedOut.Store(true)
+						_ = closer.Close()
+						return
+					case <-activity:
+						if !timer.Stop() {
+							select {
+							case <-timer.C:
+							default:
+							}
+						}
+						timer.Reset(idle)
+					case <-ctx.Done():
+						_ = closer.Close()
+						return
+					case <-stopTimer:
+						return
+					}
+				}
+			})
+			defer func() {
+				close(stopTimer)
+				timerWG.Wait()
+			}()
+		}
+	}
+
+	signalActivity := func() {
+		select {
+		case <-activity:
+		default:
+		}
+		select {
+		case activity <- struct{}{}:
+		default:
+		}
+	}
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 64*1024), maxLine)
 	var data []string
@@ -324,9 +405,13 @@ func scanSSE(r io.Reader, maxLine int, handle func(string, []byte) error, malfor
 		return handle(name, []byte(payload))
 	}
 	for sc.Scan() {
+		signalActivity()
 		line := strings.TrimSuffix(sc.Text(), "\r")
 		if line == "" {
 			if err := dispatch(); err != nil {
+				if errors.Is(err, stopSSE) {
+					return nil
+				}
 				return err
 			}
 			continue
@@ -349,8 +434,20 @@ func scanSSE(r io.Reader, maxLine int, handle func(string, []byte) error, malfor
 			data = append(data, value)
 		}
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if timedOut.Load() {
+		return &streamIdleTimeoutError{timeout: idle}
+	}
 	if err := sc.Err(); err != nil {
 		return err
 	}
-	return dispatch()
+	if err := dispatch(); err != nil {
+		if errors.Is(err, stopSSE) {
+			return nil
+		}
+		return err
+	}
+	return nil
 }

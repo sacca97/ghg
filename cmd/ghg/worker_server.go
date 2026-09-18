@@ -460,9 +460,6 @@ func (w *workerProcessState) configure(request workerConfigureRequest) error {
 	if strings.TrimSpace(request.Approval) != "" {
 		return w.configureApproval(request.Approval)
 	}
-	if err := w.persistConfigure(request); err != nil {
-		return err
-	}
 	w.mu.Lock()
 	if w.activeCancel != nil || w.stopRequested || w.state == workerwire.StateStopping {
 		w.mu.Unlock()
@@ -496,6 +493,10 @@ func (w *workerProcessState) configure(request workerConfigureRequest) error {
 		Role: role, SystemPrompt: systemPrompt,
 	})
 	if err != nil {
+		w.mu.Unlock()
+		return err
+	}
+	if err := w.persistConfigureLocked(request); err != nil {
 		w.mu.Unlock()
 		return err
 	}
@@ -554,7 +555,7 @@ func (w *workerProcessState) configure(request workerConfigureRequest) error {
 // for a role's model or the dynamic-reasoning switch to be configured, but the
 // worker owns the config file and performs the write. It runs before the live
 // route changes, so a validation or save failure leaves the worker untouched.
-func (w *workerProcessState) persistConfigure(request workerConfigureRequest) error {
+func (w *workerProcessState) persistConfigureLocked(request workerConfigureRequest) error {
 	role := strings.TrimSpace(request.Role)
 	model := strings.TrimSpace(request.Model)
 	persistModel := request.PersistRoleModel && model != ""
@@ -565,10 +566,8 @@ func (w *workerProcessState) persistConfigure(request workerConfigureRequest) er
 	if persistModel && !config.IsRole(role) {
 		return fmt.Errorf("unknown role %q", role)
 	}
-	w.mu.Lock()
 	cfg := w.cfg
 	if cfg == nil {
-		w.mu.Unlock()
 		return errors.New("worker configuration is unavailable")
 	}
 	if persistModel {
@@ -581,7 +580,6 @@ func (w *workerProcessState) persistConfigure(request workerConfigureRequest) er
 		value := *request.DynamicReasoning
 		cfg.DynamicReasoning = &value
 	}
-	w.mu.Unlock()
 	if err := cfg.Save(); err != nil {
 		return fmt.Errorf("save worker configuration: %w", err)
 	}

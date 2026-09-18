@@ -7,6 +7,7 @@ import (
 	"github.com/sacca97/ghg/internal/config"
 	"github.com/sacca97/ghg/internal/models"
 	"github.com/sacca97/ghg/internal/tools"
+	workerwire "github.com/sacca97/ghg/internal/worker"
 )
 
 func TestConfigureWorkerCompactionFallsBackByRole(t *testing.T) {
@@ -138,6 +139,53 @@ func TestWorkerConfigurePersistsRoleModelAndDynamicReasoning(t *testing.T) {
 	}
 	if got := after.Roles[config.RoleFast]; got != marker {
 		t.Fatalf("failed persist changed the role route: %+v", got)
+	}
+}
+
+func TestWorkerConfigureBusyDoesNotPersistOrApplyRoute(t *testing.T) {
+	t.Setenv("GHG_HOME", t.TempDir())
+	cfg := &config.Config{
+		Providers: map[string]config.Provider{
+			"test": {BaseURL: "https://provider.example/v1", API: string(models.ProtocolOpenAICompletions), APIKey: "key"},
+		},
+		Models: map[string]config.Model{
+			"old-model": {Providers: []string{"test"}},
+			"new-model": {Providers: []string{"test"}},
+		},
+		Roles: map[string]config.RoleConfig{
+			config.RoleFast: {Model: "old-model", Provider: "test"},
+		},
+	}
+	if err := cfg.Save(); err != nil {
+		t.Fatal(err)
+	}
+	w := &workerProcessState{
+		cfg:          cfg,
+		ag:           agent.New(nil, "old-model", 100, "system"),
+		activeCancel: func() {},
+		state:        workerwire.StateRunning,
+		modelName:    "old-model",
+		provider:     "test",
+		role:         config.RoleFast,
+	}
+	err := w.configure(workerConfigureRequest{
+		Role: config.RoleFast, Model: "new-model", Provider: "test", PersistRoleModel: true,
+	})
+	if err == nil || err.Error() != "worker is busy or stopping" {
+		t.Fatalf("configure error = %v, want busy error", err)
+	}
+	if got := w.ag.Model; got != "old-model" {
+		t.Fatalf("live model = %q, want old-model", got)
+	}
+	if got := cfg.Roles[config.RoleFast].Model; got != "old-model" {
+		t.Fatalf("in-memory role model = %q, want old-model", got)
+	}
+	saved, err := config.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := saved.Roles[config.RoleFast].Model; got != "old-model" {
+		t.Fatalf("saved role model = %q, want old-model", got)
 	}
 }
 

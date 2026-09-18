@@ -3,7 +3,6 @@
 package models
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"encoding/base64"
@@ -12,9 +11,10 @@ import (
 	"net/http"
 	"slices"
 	"strconv"
-	"strings"
 	"time"
 )
+
+const maxOpenAIChatSSELine = 10 * 1024 * 1024
 
 // Message is one chat message. Content is a string; ToolCalls set on assistant
 // messages, ToolCallID on role "tool" results. A user message may also carry
@@ -278,7 +278,8 @@ type Request struct {
 	DynamicReasoning          bool                     `json:"-"`
 	ReasoningSelectionReason  string                   `json:"-"`
 	OnRequestDiagnostics      func(RequestDiagnostics) `json:"-"`
-	// RequestTimeout overrides the client's HTTP timeout for this call.
+	// RequestTimeout overrides the client's total HTTP timeout for non-streaming
+	// calls. Streaming calls use the idle timeout and caller context instead.
 	RequestTimeout time.Duration `json:"-"`
 }
 
@@ -601,7 +602,7 @@ func (c *Client) streamOnce(ctx context.Context, body []byte, sessionID string, 
 		return Message{}, Usage{}, err
 	}
 	c.setSessionHeader(hr, sessionID)
-	resp, err := c.httpClientFor(requestTimeout).Do(hr)
+	resp, err := c.httpClientForStream().Do(hr)
 	if err != nil {
 		return Message{}, Usage{}, err
 	}
@@ -614,26 +615,19 @@ func (c *Client) streamOnce(ctx context.Context, body []byte, sessionID string, 
 	var usage Usage      // from the terminal chunk (include_usage); zero if omitted
 	var calls []ToolCall // indexed by stream tool_call index
 	finish := ""
-	sc := bufio.NewScanner(resp.Body)
-	sc.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
-	for sc.Scan() {
-		line := sc.Text()
-		if !strings.HasPrefix(line, "data:") {
-			continue
-		}
-		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
-		if data == "[DONE]" {
-			break
+	if err := scanSSE(ctx, resp.Body, c.streamIdleTimeout, maxOpenAIChatSSELine, func(_ string, data []byte) error {
+		if string(data) == "[DONE]" {
+			return stopSSE
 		}
 		var ch chunk
-		if err := json.Unmarshal([]byte(data), &ch); err != nil {
-			continue
+		if err := json.Unmarshal(data, &ch); err != nil {
+			return nil
 		}
 		if ch.Error != nil {
 			if isTransientErrorMessage(ch.Error.Message) {
-				return Message{}, usage, fmt.Errorf("api error: %s", ch.Error.Message)
+				return fmt.Errorf("api error: %s", ch.Error.Message)
 			}
-			return Message{}, usage, nonRetryable{fmt.Errorf("api error: %s", ch.Error.Message)}
+			return nonRetryable{fmt.Errorf("api error: %s", ch.Error.Message)}
 		}
 		if ch.Usage != nil {
 			u := *ch.Usage // the terminal usage chunk carries empty choices
@@ -646,7 +640,7 @@ func (c *Client) streamOnce(ctx context.Context, body []byte, sessionID string, 
 			usage = u
 		}
 		if len(ch.Choices) == 0 {
-			continue
+			return nil
 		}
 		if fr := ch.Choices[0].FinishReason; fr != "" {
 			finish = fr
@@ -676,8 +670,8 @@ func (c *Client) streamOnce(ctx context.Context, body []byte, sessionID string, 
 			}
 			cur.Function.Arguments += tc.Function.Arguments
 		}
-	}
-	if err := sc.Err(); err != nil {
+		return nil
+	}, nil); err != nil {
 		return Message{}, usage, err
 	}
 	// Never execute tool calls from a max_tokens-truncated response: the

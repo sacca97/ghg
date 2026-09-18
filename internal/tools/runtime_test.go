@@ -261,6 +261,57 @@ func TestRuntimeHereDocFailsClosed(t *testing.T) {
 	}
 }
 
+func TestRuntimeOpaqueShellUsesApprovalPath(t *testing.T) {
+	runtime, workspace := testRuntime(t, ApprovalAutoReview)
+	var reviewed ApprovalRequest
+	runtime.Reviewer = func(_ context.Context, request ApprovalRequest) (ApprovalResult, error) {
+		reviewed = request
+		return ApprovalResult{Decision: ApprovalApproveOnce, Reason: "opaque command is allowed in the sandbox", Confidence: 0.95}, nil
+	}
+
+	granted, covered, err := runtime.authorizeCommand(context.Background(), "bash", `printf '%s' "$(printf ok)"`, workspace)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !covered || granted == nil {
+		t.Fatalf("covered=%v granted=%v, want an approved sandbox policy", covered, granted)
+	}
+	if reviewed.Classification != string(dispositionReview) || len(reviewed.Segments) != 0 {
+		t.Fatalf("opaque approval request = %+v", reviewed)
+	}
+	if !strings.Contains(reviewed.ReviewCommand, "$(printf ok)") {
+		t.Fatalf("opaque review command = %q, want interpretable shell syntax", reviewed.ReviewCommand)
+	}
+	if !strings.Contains(reviewed.Justification, "explicit approval") {
+		t.Fatalf("opaque approval justification = %q", reviewed.Justification)
+	}
+	if granted.Network() != sandbox.NetworkDeny {
+		t.Fatalf("opaque approval widened network to %q", granted.Network())
+	}
+}
+
+func TestRuntimeOpaqueShellFallsBackToHuman(t *testing.T) {
+	runtime, workspace := testRuntime(t, ApprovalAutoReview)
+	var humanCalls int
+	runtime.Reviewer = func(_ context.Context, _ ApprovalRequest) (ApprovalResult, error) {
+		return ApprovalResult{Decision: ApprovalEscalateToHuman, Reason: "the shell effect needs user confirmation", Confidence: 0.9}, nil
+	}
+	runtime.HumanGate = func(_ context.Context, request GateRequest) (GateDecision, string) {
+		humanCalls++
+		if !strings.Contains(request.Command, "$(printf ok)") {
+			t.Fatalf("human request command = %q, want interpretable shell syntax", request.Command)
+		}
+		return GateAllowOnce, ""
+	}
+
+	if _, covered, err := runtime.authorizeCommand(context.Background(), "bash", `printf '%s' "$(printf ok)"`, workspace); err != nil || !covered {
+		t.Fatalf("opaque human approval covered=%v err=%v", covered, err)
+	}
+	if humanCalls != 1 {
+		t.Fatalf("human calls = %d, want one", humanCalls)
+	}
+}
+
 func TestRuntimeCoalescesConcurrentReviewerDecisions(t *testing.T) {
 	runtime, workspace := testRuntime(t, ApprovalAutoReview)
 	started := make(chan struct{})

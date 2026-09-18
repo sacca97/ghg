@@ -141,6 +141,10 @@ func (m *model) permKey(msg tea.KeyMsg) bool {
 	}
 	answer := func(decision tools.GateDecision, redirect string) {
 		if d.workerID != "" {
+			if m.workerClient == nil {
+				m.append(errStyle.Render("approval is still pending: worker connection lost; reconnecting"))
+				return
+			}
 			decisionName := "reject"
 			switch decision {
 			case tools.GateAllowOnce:
@@ -153,6 +157,7 @@ func (m *model) permKey(msg tea.KeyMsg) bool {
 					ID: d.workerID, Decision: decisionName, Redirect: redirect,
 				}); err != nil {
 					m.append(errStyle.Render("approval failed: " + err.Error()))
+					return
 				}
 			}
 		}

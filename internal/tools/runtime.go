@@ -68,10 +68,13 @@ type CommandSegment struct {
 
 // ApprovalRequest is the redacted capability request sent to a human or the
 // optional tiny reviewer. It contains no conversation, file contents, or
-// child environment. Command and segment text are redacted before dispatch.
+// child environment. Command and segment text are redacted before dispatch;
+// ReviewCommand is a bounded, redacted preview used only when the parser could
+// not safely segment the shell syntax.
 type ApprovalRequest struct {
 	Tool                string           `json:"tool"`
 	Command             string           `json:"command"`
+	ReviewCommand       string           `json:"review_command,omitempty"`
 	Segments            []CommandSegment `json:"segments"`
 	CWD                 string           `json:"cwd"`
 	ReadRoots           []string         `json:"read_roots,omitempty"`
@@ -496,7 +499,27 @@ func (r *ToolRuntime) authorizeCommand(ctx context.Context, tool, command, cwd s
 	}
 	segments, parseErr := SegmentShell(command)
 	if parseErr != nil {
-		return r.denyApproval(ctx, ApprovalRequest{Tool: tool, Command: redactCommand(command, r.SecretNames), Classification: string(dispositionHardDeny), Fingerprint: operationFingerprint(tool, command, cwd)}, "opaque shell syntax cannot be safely segmented")
+		// Keep the parser fail-closed, but do not turn an unparseable command
+		// into an unconditional denial. The tiny reviewer or interactive gate
+		// can make the explicit approval decision; the command still receives
+		// only the existing sandbox because no roots or network capability can
+		// be safely inferred from opaque syntax.
+		reason := "opaque shell syntax cannot be safely segmented; explicit approval is required"
+		request := r.approvalRequest(tool, command, cwd, nil, dispositionReview, false, reason, nil, nil)
+		request.ReviewCommand = truncateApprovalText(redactFreeText(command, r.SecretNames), 2000)
+		decision, checked, err := r.reviewOrHuman(ctx, request, true)
+		if err != nil {
+			return r.Policy, checked, err
+		}
+		if decision != GateAllowOnce && decision != GateAllowAlways {
+			return r.Policy, true, errors.New("capability approval was denied")
+		}
+		granted, err := r.grantRequest(request)
+		if err != nil {
+			return r.Policy, true, err
+		}
+		r.audit(ExecutionAudit{Request: request, Disposition: string(dispositionReview), Granted: grantedCapability(request)})
+		return granted, true, nil
 	}
 	disposition, reason, network := classifyCommand(segments, r.Policy)
 	if r.Cautious && disposition == dispositionRoutine {
@@ -636,40 +659,50 @@ func (r *ToolRuntime) reviewOrHumanOnce(ctx context.Context, request ApprovalReq
 	}
 	if allowAutoReview && approvalMode == ApprovalAutoReview {
 		if r.Reviewer == nil {
-			return GateReject, true, errors.New("auto is enabled but no tiny reviewer is configured")
-		}
-		result, err := r.Reviewer(ctx, request)
-		if err == nil && result.Decision == ApprovalApproveOnce && result.Confidence >= 0.70 && strings.TrimSpace(result.Reason) != "" {
-			r.audit(ExecutionAudit{Request: request, Disposition: "reviewer", Reviewer: sanitizeApprovalResult(result, r.SecretNames)})
-			return GateAllowOnce, true, nil
-		}
-		r.audit(ExecutionAudit{Request: request, Disposition: "reviewer", Reviewer: sanitizeApprovalResult(result, r.SecretNames), Error: approvalError(result, err, r.SecretNames)})
-		if err == nil && result.Decision == ApprovalDeny {
-			reason := truncateApprovalText(strings.TrimSpace(redactFreeText(result.Reason, r.SecretNames)), 500)
-			if reason == "" {
-				reason = "no reason supplied"
+			// Interactive runs can still fall back to the normal prompt when
+			// auto-review was selected but its tiny reviewer is unavailable.
+			// Headless runs remain fail-closed below.
+		} else {
+			result, err := r.Reviewer(ctx, request)
+			if err == nil && result.Decision == ApprovalApproveOnce && result.Confidence >= 0.70 && strings.TrimSpace(result.Reason) != "" {
+				r.audit(ExecutionAudit{Request: request, Disposition: "reviewer", Reviewer: sanitizeApprovalResult(result, r.SecretNames)})
+				return GateAllowOnce, true, nil
 			}
-			return GateReject, true, fmt.Errorf("approval reviewer denied the capability: %s", reason)
-		}
-		// Malformed/failed/low-confidence output is a human fallback only in
-		// an interactive run. It is never converted into approval.
-		if r.Headless {
-			if err != nil {
-				return GateReject, true, errors.New("approval reviewer failed closed: " + redactFreeText(err.Error(), r.SecretNames))
+			r.audit(ExecutionAudit{Request: request, Disposition: "reviewer", Reviewer: sanitizeApprovalResult(result, r.SecretNames), Error: approvalError(result, err, r.SecretNames)})
+			if err == nil && result.Decision == ApprovalDeny {
+				reason := truncateApprovalText(strings.TrimSpace(redactFreeText(result.Reason, r.SecretNames)), 500)
+				if reason == "" {
+					reason = "no reason supplied"
+				}
+				return GateReject, true, fmt.Errorf("approval reviewer denied the capability: %s", reason)
 			}
-			return GateReject, true, errors.New("approval reviewer returned low confidence")
+			// Malformed/failed/low-confidence output is a human fallback only in
+			// an interactive run. It is never converted into approval.
+			if r.Headless {
+				if err != nil {
+					return GateReject, true, errors.New("approval reviewer failed closed: " + redactFreeText(err.Error(), r.SecretNames))
+				}
+				if result.Decision == ApprovalEscalateToHuman {
+					return GateReject, true, errors.New("approval reviewer requested human approval, but this run is headless")
+				}
+				return GateReject, true, errors.New("approval reviewer returned low confidence")
+			}
 		}
 	}
 	if r.Headless || r.HumanGate == nil {
 		return GateReject, true, errors.New("capability approval requires an interactive human reviewer")
 	}
-	rule := CommandRule(request.Command)
+	command := request.Command
+	if request.ReviewCommand != "" {
+		command = request.ReviewCommand
+	}
+	rule := CommandRule(command)
 	if request.Classification == string(dispositionHuman) {
 		// Human-only operations include protected metadata and external roots;
 		// never let their "always" choice collapse to a broad command prefix.
-		rule = normalizeShellText(request.Command)
+		rule = normalizeShellText(command)
 	}
-	decision, redirect := r.HumanGate(ctx, GateRequest{Tool: request.Tool, Command: request.Command, Rule: rule})
+	decision, redirect := r.HumanGate(ctx, GateRequest{Tool: request.Tool, Command: command, Rule: rule})
 	if decision == GateReject {
 		if redirect == "" {
 			redirect = "the user rejected this action"
@@ -708,6 +741,7 @@ func (r *ToolRuntime) audit(audit ExecutionAudit) {
 
 func (r *ToolRuntime) redactAudit(audit ExecutionAudit) ExecutionAudit {
 	audit.Request.Command = redactCommand(audit.Request.Command, r.SecretNames)
+	audit.Request.ReviewCommand = ""
 	audit.Request.Goal = redactFreeText(audit.Request.Goal, r.SecretNames)
 	audit.Request.Justification = redactFreeText(audit.Request.Justification, r.SecretNames)
 	if audit.Request.Segments != nil {

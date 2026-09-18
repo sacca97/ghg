@@ -119,6 +119,21 @@ func TestHTTPClientForOverridesTimeoutWithoutMutatingBase(t *testing.T) {
 	}
 }
 
+func TestHTTPClientForStreamDisablesTotalTimeout(t *testing.T) {
+	transport := newTransport("http://provider.test", "key")
+	transport.HTTP.Timeout = time.Second
+	client := transport.httpClientForStream()
+	if client == transport.HTTP {
+		t.Fatal("stream request should use a cloned client")
+	}
+	if client.Timeout != 0 {
+		t.Fatalf("stream timeout = %s, want disabled", client.Timeout)
+	}
+	if transport.HTTP.Timeout != time.Second {
+		t.Fatalf("base timeout = %s, want unchanged", transport.HTTP.Timeout)
+	}
+}
+
 func completeText(backend Backend, ctx context.Context, req Request) (string, Usage, error) {
 	msg, usage, err := backend.Complete(ctx, req)
 	return msg.TextContent(), usage, err

@@ -533,7 +533,7 @@ func (c *OpenAIResponsesClient) doStreamOnce(ctx context.Context, body []byte, s
 		return Message{}, Usage{}, err
 	}
 	c.setSessionHeader(req, sessionID)
-	resp, err := c.httpClientFor(requestTimeout).Do(req)
+	resp, err := c.httpClientForStream().Do(req)
 	if err != nil {
 		return Message{}, Usage{}, err
 	}
@@ -544,7 +544,7 @@ func (c *OpenAIResponsesClient) doStreamOnce(ctx context.Context, body []byte, s
 	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
 		return Message{}, Usage{}, openAIResponsesHTTPError(resp)
 	}
-	return consumeOpenAIResponsesSSE(resp.Body, onText, onThink)
+	return consumeOpenAIResponsesSSE(ctx, resp.Body, c.streamIdleTimeout, onText, onThink)
 }
 
 func (c *OpenAIResponsesClient) complete(ctx context.Context, req Request, sink EventSink) (Message, Usage, error) {
@@ -901,7 +901,7 @@ type openAIResponsesStreamCall struct {
 	Arguments string
 }
 
-func consumeOpenAIResponsesSSE(r io.Reader, onText, onThink func(string)) (Message, Usage, error) {
+func consumeOpenAIResponsesSSE(ctx context.Context, r io.Reader, idle time.Duration, onText, onThink func(string)) (Message, Usage, error) {
 	items := make(map[int]json.RawMessage)
 	calls := make(map[string]*openAIResponsesStreamCall)
 	var fallbackText strings.Builder
@@ -926,7 +926,7 @@ func consumeOpenAIResponsesSSE(r io.Reader, onText, onThink func(string)) (Messa
 	handle := func(eventName string, data []byte) error {
 		if string(data) == "[DONE]" {
 			sawTerminal = true
-			return nil
+			return stopSSE
 		}
 		var event openAIResponsesStreamEvent
 		if err := json.Unmarshal(data, &event); err != nil {
@@ -1068,7 +1068,7 @@ func consumeOpenAIResponsesSSE(r io.Reader, onText, onThink func(string)) (Messa
 		return nil
 	}
 
-	if err := scanSSE(r, maxOpenAIResponsesSSELine, handle, func(line string) error {
+	if err := scanSSE(ctx, r, idle, maxOpenAIResponsesSSELine, handle, func(line string) error {
 		return nonRetryable{fmt.Errorf("malformed openai responses SSE line %q", line)}
 	}); err != nil {
 		return Message{}, openAIResponsesUsageValue(&usage), err

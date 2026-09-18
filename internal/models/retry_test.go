@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -98,6 +99,82 @@ func (r *errorAfterBody) Read(p []byte) (int, error) {
 }
 
 func (r *errorAfterBody) Close() error { return nil }
+
+type delayedBody struct {
+	data  []byte
+	delay time.Duration
+	once  sync.Once
+}
+
+func (r *delayedBody) Read(p []byte) (int, error) {
+	r.once.Do(func() { time.Sleep(r.delay) })
+	if len(r.data) == 0 {
+		return 0, io.EOF
+	}
+	n := copy(p, r.data)
+	r.data = r.data[n:]
+	return n, nil
+}
+
+func (r *delayedBody) Close() error { return nil }
+
+type blockingBody struct {
+	closed chan struct{}
+	once   sync.Once
+}
+
+func (r *blockingBody) Read([]byte) (int, error) {
+	<-r.closed
+	return 0, io.ErrClosedPipe
+}
+
+func (r *blockingBody) Close() error {
+	r.once.Do(func() { close(r.closed) })
+	return nil
+}
+
+func TestStreamUsesIdleTimeoutInsteadOfTotalTimeout(t *testing.T) {
+	client := testChatClient(t, "http://provider.test", "k")
+	client.MaxRetries = 1
+	client.streamIdleTimeout = 100 * time.Millisecond
+	client.HTTP = &http.Client{
+		Timeout: 1 * time.Millisecond,
+		Transport: testRoundTripper(func(*http.Request) (*http.Response, error) {
+			resp := testHTTPResponse(http.StatusOK, "")
+			resp.Body = &delayedBody{
+				data:  []byte("data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n"),
+				delay: 10 * time.Millisecond,
+			}
+			resp.Header.Set("Content-Type", "text/event-stream")
+			return resp, nil
+		}),
+	}
+
+	msg, _, err := client.Stream(context.Background(), Request{Model: "m"}, EventSink{})
+	if err != nil {
+		t.Fatalf("stream failed despite activity inside idle timeout: %v", err)
+	}
+	if msg.Content != "ok" {
+		t.Fatalf("content = %q, want ok", msg.Content)
+	}
+}
+
+func TestStreamReportsIdleTimeout(t *testing.T) {
+	client := retryClient(t, testRoundTripper(func(*http.Request) (*http.Response, error) {
+		resp := testHTTPResponse(http.StatusOK, "")
+		resp.Body = &blockingBody{closed: make(chan struct{})}
+		resp.Header.Set("Content-Type", "text/event-stream")
+		return resp, nil
+	}))
+	client.MaxRetries = 1
+	client.streamIdleTimeout = 10 * time.Millisecond
+
+	_, _, err := client.Stream(context.Background(), Request{Model: "m"}, EventSink{})
+	var idleErr *streamIdleTimeoutError
+	if !errors.As(err, &idleErr) {
+		t.Fatalf("error = %v, want stream idle timeout", err)
+	}
+}
 
 const http2GoAwayError = `http2: server sent GOAWAY and closed the connection; LastStreamID=27, ErrCode=NO_ERROR, debug=""`
 const http2InternalStreamError = `stream error: stream ID 25; INTERNAL_ERROR; received from peer`

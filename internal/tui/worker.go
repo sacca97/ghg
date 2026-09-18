@@ -623,6 +623,11 @@ func (m *model) applyWorkerSnapshot(snapshot workerwire.Snapshot) {
 			req:      tools.GateRequest{Tool: snapshot.Pending.Tool, Command: snapshot.Pending.Command, Rule: snapshot.Pending.Rule},
 			workerID: snapshot.Pending.ID,
 		}
+	} else if snapshot.Pending == nil && m.permDialog != nil && m.permDialog.workerID != "" {
+		// A dead worker can be replaced during reconnect. Its in-memory
+		// approval flight no longer exists, so do not leave a stale modal open.
+		m.permDialog = nil
+		m.append(dimStyle.Render("approval request is no longer pending"))
 	}
 	if snapshot.PendingQuestion != nil && m.questionDialog == nil {
 		m.questionDialog = &questionDialog{request: *snapshot.PendingQuestion}
