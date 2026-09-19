@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -18,6 +19,7 @@ type Tool struct {
 	Def       models.Tool
 	Run       func(ctx context.Context, args json.RawMessage) (string, error)
 	RunResult func(ctx context.Context, args json.RawMessage) (ToolResult, error)
+	Available func(*ToolRuntime) (bool, string)
 }
 
 func resultTool(def models.Tool, run func(context.Context, json.RawMessage) (ToolResult, error)) Tool {
@@ -31,16 +33,14 @@ func resultTool(def models.Tool, run func(context.Context, json.RawMessage) (Too
 	}
 }
 
+func withAvailability(tool Tool, check func(*ToolRuntime) (bool, string)) Tool {
+	tool.Available = check
+	return tool
+}
+
 // All returns the built-in tool set.
 func All() []Tool {
 	return []Tool{bashTool(), readTool(), writeTool(), editTool(), grepTool(), globTool(), findFilesTool(), lspTool(), webFetchTool(), webSearchTool()}
-}
-
-// CapabilityReporter lets an optional runtime service report deterministic
-// preflight failures without making the tools package depend on its concrete
-// implementation.
-type CapabilityReporter interface {
-	CapabilityStatus() (bool, []string)
 }
 
 // FilterAvailable removes tools whose deterministic runtime prerequisites are
@@ -52,80 +52,18 @@ func FilterAvailable(ts []Tool, runtime *ToolRuntime) ([]Tool, []string) {
 		return ts, nil
 	}
 
-	needBash := false
-	needLSP := false
-	needRG := false
-	needWebFetch := false
-	needWebSearch := false
-	for _, tool := range ts {
-		switch tool.Def.Function.Name {
-		case "bash":
-			needBash = true
-		case "grep", "glob", "find_files":
-			needRG = true
-		case "lsp":
-			needLSP = true
-		case "web_fetch":
-			needWebFetch = true
-		case "web_search":
-			needWebSearch = true
-		}
-	}
-
-	missing := make(map[string]string)
+	out := make([]Tool, 0, len(ts))
 	var notices []string
-	if needBash && !bashAvailable() {
-		missing["bash"] = "bash unavailable: the selected shell is not on PATH"
-	}
-	_, rgOK := rgAvailable()
-	if needRG && !rgOK {
-		for _, name := range []string{"grep", "glob", "find_files"} {
-			missing[name] = "repository search unavailable: rg is not on PATH"
-		}
-		notices = append(notices, missing["grep"])
-	}
-	if needLSP {
-		lspAvailable := runtime.LanguageService != nil
-		lspNotices := []string(nil)
-		if reporter, ok := runtime.LanguageService.(CapabilityReporter); ok {
-			lspAvailable, lspNotices = reporter.CapabilityStatus()
-		}
-		if len(lspNotices) > 0 {
-			notices = append(notices, lspNotices...)
-		}
-		if !lspAvailable {
-			missing["lsp"] = "lsp unavailable: no configured language server is runnable"
-			if len(lspNotices) == 0 {
-				notices = append(notices, missing["lsp"])
-			}
-		}
-	}
-	if needWebFetch || needWebSearch {
-		networkAllowed := runtime.Policy != nil && runtime.Policy.NetworkAllowed()
-		if !networkAllowed {
-			mode := runtime.CurrentApprovalMode()
-			canRequestApproval := runtime.Policy != nil && mode != ApprovalNever && (runtime.HumanGate != nil || (mode == ApprovalAutoReview && runtime.Reviewer != nil))
-			if !canRequestApproval {
-				missing["web_fetch"] = "web access unavailable: network is denied and no approval path is configured"
-				missing["web_search"] = missing["web_fetch"]
-				notices = append(notices, missing["web_fetch"])
-			} else {
-				notices = append(notices, "web access will request approval when first used")
-			}
-		}
-		if needWebSearch {
-			if _, err := searchProviderStatus(); err != nil {
-				missing["web_search"] = "web search unavailable: " + err.Error()
-				notices = append(notices, missing["web_search"])
-			}
-		}
-	}
-	if len(missing) == 0 {
-		return ts, notices
-	}
-	out := make([]Tool, 0, len(ts)-len(missing))
 	for _, tool := range ts {
-		if _, unavailable := missing[tool.Def.Function.Name]; unavailable {
+		if tool.Available == nil {
+			out = append(out, tool)
+			continue
+		}
+		available, reason := tool.Available(runtime)
+		if !available {
+			if reason != "" && !slices.Contains(notices, reason) {
+				notices = append(notices, reason)
+			}
 			continue
 		}
 		out = append(out, tool)

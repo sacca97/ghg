@@ -32,6 +32,9 @@ func importFixture(t *testing.T, mcpImport string) (wd string) {
 		`{"mcpServers": {"node_repl": {"command": "/app/bin/node_repl"}, "paper": {"url": "http://127.0.0.1:29979/mcp"}}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	if err := config.Trust(wd); err != nil {
+		t.Fatal(err)
+	}
 	return wd
 }
 
@@ -72,7 +75,7 @@ func TestMCPImportDryRunWritesNothing(t *testing.T) {
 	chdir(t, wd)
 
 	var runErr error
-	printed := captureStdout(t, func() { runErr = mcpImportCLI([]string{"--dry-run"}) })
+	printed := captureStdout(t, func() { runErr = mcpImportCLI([]string{"--dry-run"}, false) })
 	if runErr != nil {
 		t.Fatal(runErr)
 	}
@@ -105,7 +108,7 @@ func TestMCPImportAppliesAndIsIdempotent(t *testing.T) {
 	wd := importFixture(t, `, "mcpImport": { "claude": { "exclude": ["node_repl"] } }`)
 	chdir(t, wd)
 
-	if err := mcpImportCLI(nil); err != nil {
+	if err := mcpImportCLI(nil, false); err != nil {
 		t.Fatal(err)
 	}
 	reloaded, err := config.Load()
@@ -120,7 +123,7 @@ func TestMCPImportAppliesAndIsIdempotent(t *testing.T) {
 	}
 	// Second run: nothing left to import, config unchanged.
 	var runErr error
-	printed := captureStdout(t, func() { runErr = mcpImportCLI(nil) })
+	printed := captureStdout(t, func() { runErr = mcpImportCLI(nil, false) })
 	if runErr != nil {
 		t.Fatal(runErr)
 	}

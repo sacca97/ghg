@@ -14,9 +14,21 @@ import (
 	"github.com/sacca97/ghg/internal/mcp"
 )
 
+func discoverProjectMCP(cfg *config.Config, trustProject bool) (mcp.Filtered, error) {
+	wd, err := os.Getwd()
+	if err != nil {
+		return mcp.Filtered{}, err
+	}
+	project, err := config.NewProjectContext(wd, trustProject || config.Trusted(wd))
+	if err != nil {
+		return mcp.Filtered{}, err
+	}
+	return mcp.LoadMergedFiltered(project, mcp.FromConfigMap(cfg.MCPServers), mcp.ImportPolicyFrom(cfg.MCPImport)), nil
+}
+
 // mcpCLI executes MCP subcommands (list, add, remove, serve, test, import).
 // Writes configuration updates atomically to ~/.ghg/config.json.
-func mcpCLI(args []string, version string) error {
+func mcpCLI(args []string, version string, trustProject bool) error {
 	if len(args) == 0 {
 		return fmt.Errorf("usage: ghg mcp <list|add|remove|import|serve|test>")
 	}
@@ -27,10 +39,10 @@ func mcpCLI(args []string, version string) error {
 		if len(args) < 2 {
 			return fmt.Errorf("usage: ghg mcp test <name>")
 		}
-		return mcpTestCLI(args[1])
+		return mcpTestCLI(args[1], trustProject)
 	}
 	if args[0] == "import" {
-		return mcpImportCLI(args[1:])
+		return mcpImportCLI(args[1:], trustProject)
 	}
 
 	cfg, err := config.Load()
@@ -40,8 +52,10 @@ func mcpCLI(args []string, version string) error {
 
 	switch args[0] {
 	case "list":
-		wd, _ := os.Getwd()
-		disc := mcp.LoadMergedFiltered(wd, mcp.FromConfigMap(cfg.MCPServers), mcp.ImportPolicyFrom(cfg.MCPImport))
+		disc, err := discoverProjectMCP(cfg, trustProject)
+		if err != nil {
+			return err
+		}
 		allNames := map[string]struct{}{}
 		for name := range disc.Merged {
 			allNames[name] = struct{}{}
@@ -107,8 +121,10 @@ func mcpCLI(args []string, version string) error {
 		name := args[1]
 		if _, ok := cfg.MCPServers[name]; !ok {
 			// Maybe it's imported (or blocked by the import policy).
-			wd, _ := os.Getwd()
-			disc := mcp.LoadMergedFiltered(wd, mcp.FromConfigMap(cfg.MCPServers), mcp.ImportPolicyFrom(cfg.MCPImport))
+			disc, err := discoverProjectMCP(cfg, trustProject)
+			if err != nil {
+				return err
+			}
 			if _, imported := disc.Merged[name]; imported {
 				return fmt.Errorf("%q comes from .mcp.json or ~/.codex/config.toml — edit that file to remove it", name)
 			}
@@ -130,13 +146,15 @@ func mcpCLI(args []string, version string) error {
 // mcpTestCLI is the doctor: connect to one configured server, report status,
 // timing, tool names, and the stderr tail on failure. Exits non-zero when the
 // server isn't usable, so CI can validate a .mcp.json before it ships.
-func mcpTestCLI(name string) error {
+func mcpTestCLI(name string, trustProject bool) error {
 	cfg, err := config.Load()
 	if err != nil {
 		return err
 	}
-	wd, _ := os.Getwd()
-	disc := mcp.LoadMergedFiltered(wd, mcp.FromConfigMap(cfg.MCPServers), mcp.ImportPolicyFrom(cfg.MCPImport))
+	disc, err := discoverProjectMCP(cfg, trustProject)
+	if err != nil {
+		return err
+	}
 	sc, ok := disc.Merged[name]
 	if !ok {
 		if _, blocked := disc.Blocked[name]; blocked {
@@ -180,7 +198,7 @@ func mcpTarget(c mcp.ServerConfig) string {
 // policy and not already in ghg's config (idempotent; existing ghg
 // entries are never touched). --dry-run prints the JSONC fragment instead of
 // writing.
-func mcpImportCLI(args []string) error {
+func mcpImportCLI(args []string, trustProject bool) error {
 	dryRun := false
 	for _, a := range args {
 		if a == "--dry-run" {
@@ -193,8 +211,10 @@ func mcpImportCLI(args []string) error {
 	if err != nil {
 		return err
 	}
-	wd, _ := os.Getwd()
-	disc := mcp.LoadMergedFiltered(wd, mcp.FromConfigMap(cfg.MCPServers), mcp.ImportPolicyFrom(cfg.MCPImport))
+	disc, err := discoverProjectMCP(cfg, trustProject)
+	if err != nil {
+		return err
+	}
 	add := map[string]config.MCPServer{}
 	for name, sc := range disc.Merged {
 		if _, owned := cfg.MCPServers[name]; owned {

@@ -22,20 +22,17 @@ var embeddedSystemPrompt string
 
 func systemPrompt() string {
 	wd, _ := os.Getwd()
-	return systemPromptForProject(config.Trusted(wd))
+	project, _ := config.NewProjectContext(wd, config.Trusted(wd))
+	return systemPromptForProject(project)
 }
 
-// systemPromptForProject builds the stable prompt prefix. Headless runs are
-// explicitly trusted automation, while the interactive caller starts with the
-// persisted trust state and tui.Run fills the first-run gap after its prompt.
-func systemPromptForProject(projectTrusted bool) string {
-	wd, _ := os.Getwd()
-	prompt := strings.TrimRight(embeddedSystemPrompt, "\n") + "\n\nCurrent working directory: " + wd
+func systemPromptForProject(project config.ProjectContext) string {
+	prompt := strings.TrimRight(embeddedSystemPrompt, "\n") + "\n\nCurrent working directory: " + project.Root
 	if extra := config.UserInstructions(); extra != "" {
 		prompt += "\n\nStanding instructions from the user (~/.ghg/AGENTS.md — treat as user rules):\n" + extra
 	}
-	if project := config.ProjectInstructions(wd, projectTrusted); project != "" {
-		prompt += "\n\n" + project
+	if instructions := config.ProjectInstructions(project.Root, project.Trusted); instructions != "" {
+		prompt += "\n\n" + instructions
 	}
 	// the skills block is appended fresh each turn by the TUI, so newly added
 	// skills are picked up without restarting
@@ -83,6 +80,7 @@ func main() {
 	sandboxFlag := flag.String("sandbox", "", "execution sandbox: read-only, workspace-write, or danger-full-access")
 	networkFlag := flag.String("network", "", "execution network: deny or host")
 	approvalFlag := flag.String("approval", "", "exceptional capability approval: ask, auto, or never")
+	trustProjectFlag := flag.Bool("trust-project", false, "allow project-local instructions, profiles, and MCP configuration")
 	flag.Usage = func() {
 		fmt.Fprintln(flag.CommandLine.Output(), "usage: ghg [flags] [prompt]")
 		flag.PrintDefaults()
@@ -94,9 +92,10 @@ commands:
   sessions  list saved sessions
   ps        list live workers
   attach    attach to a live worker or resume its session
-  stop      stop a live worker
-  outputs   collect unreferenced output payloads
-  mcp       manage MCP servers
+	  stop      stop a live worker
+	  outputs   collect unreferenced output payloads
+	  trace     inspect ordered session telemetry
+	  mcp       manage MCP servers
   auth      configure provider credentials
   export    export session results`)
 	}
@@ -126,12 +125,12 @@ commands:
 		args := flag.Args()[1:]
 		switch flag.Arg(0) {
 		case "run":
-			if err := runCLI(forwardRootArgs(args, "run", *modelFlag, *providerFlag, resumeID, *cautiousFlag, *sandboxFlag, *networkFlag, *approvalFlag)); err != nil {
+			if err := runCLI(forwardRootArgs(args, "run", *modelFlag, *providerFlag, resumeID, *cautiousFlag, *sandboxFlag, *networkFlag, *approvalFlag, *trustProjectFlag)); err != nil {
 				die(err)
 			}
 			return
 		case "bridge":
-			if err := bridgeCLI(forwardRootArgs(args, "bridge", *modelFlag, *providerFlag, resumeID, *cautiousFlag, *sandboxFlag, *networkFlag, *approvalFlag)); err != nil {
+			if err := bridgeCLI(forwardRootArgs(args, "bridge", *modelFlag, *providerFlag, resumeID, *cautiousFlag, *sandboxFlag, *networkFlag, *approvalFlag, *trustProjectFlag)); err != nil {
 				die(err)
 			}
 			return
@@ -165,8 +164,13 @@ commands:
 				die(err)
 			}
 			return
+		case "trace":
+			if err := traceCLI(args); err != nil {
+				die(err)
+			}
+			return
 		case "mcp":
-			if err := mcpCLI(args, version); err != nil {
+			if err := mcpCLI(args, version, *trustProjectFlag); err != nil {
 				die(err)
 			}
 			return
@@ -196,13 +200,21 @@ commands:
 	}
 
 	if *benchFlag {
-		profiles, err := loadProviderProfiles()
+		wd, err := os.Getwd()
+		if err != nil {
+			die(err)
+		}
+		project, err := config.NewProjectContext(wd, *trustProjectFlag)
+		if err != nil {
+			die(err)
+		}
+		profiles, err := loadProviderProfilesForProject(project)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, "ghg:", err)
 			os.Exit(1)
 		}
 		if *modelFlag == "" && *providerFlag == "" {
-			if _, _, _, err := agent.NewConfiguredForRole(cfg, profiles, config.RoleForMode(config.ModeActing), systemPrompt(), false); err != nil {
+			if _, _, _, err := agent.NewConfiguredForRole(cfg, profiles, config.RoleForMode(config.ModeActing), systemPromptForProject(project), false); err != nil {
 				fmt.Fprintln(os.Stderr, "ghg:", err)
 				os.Exit(1)
 			}
@@ -210,12 +222,21 @@ commands:
 		}
 		if _, _, _, err := agent.NewConfigured(agent.BuildOptions{
 			Config: cfg, Profiles: profiles, Model: *modelFlag, Provider: *providerFlag,
-			Role: config.RoleForMode(config.ModeActing), SystemPrompt: systemPrompt(),
+			Role: config.RoleForMode(config.ModeActing), SystemPrompt: systemPromptForProject(project),
 		}); err != nil {
 			fmt.Fprintln(os.Stderr, "ghg:", err)
 			os.Exit(1)
 		}
 		return
+	}
+	if *trustProjectFlag {
+		wd, err := os.Getwd()
+		if err != nil {
+			die(err)
+		}
+		if err := config.Trust(wd); err != nil {
+			die(err)
+		}
 	}
 	tui.Version = version // /report names the build in the bug-report bundle
 	_, err = tui.Run(cfg, *modelFlag, *providerFlag, systemPrompt(), resumeID, *cautiousFlag)
@@ -225,7 +246,7 @@ commands:
 	}
 }
 
-func forwardRootArgs(args []string, command, model, provider, resume string, cautious bool, sandbox, network, approval string) []string {
+func forwardRootArgs(args []string, command, model, provider, resume string, cautious bool, sandbox, network, approval string, trustProject bool) []string {
 	out := append([]string(nil), args...)
 	prepend := func(name, value string) {
 		if value != "" {
@@ -233,6 +254,9 @@ func forwardRootArgs(args []string, command, model, provider, resume string, cau
 		}
 	}
 	prepend("--approval", approval)
+	if trustProject {
+		out = append([]string{"--trust-project"}, out...)
+	}
 	prepend("--network", network)
 	prepend("--sandbox", sandbox)
 	if cautious {

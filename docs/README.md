@@ -7,15 +7,10 @@ Start with [architecture.md](architecture.md) for the moving parts.
 
 ## Install
 
-Prebuilt binaries (Linux/macOS, x64/arm64) from GitHub Releases — checksum-verified:
+Prebuilt binaries (Linux/macOS, x64/arm64) are available from the
+[GitHub Releases](https://github.com/sacca97/ghg/releases) page.
 
-```sh
-curl -fsSL https://raw.githubusercontent.com/sacca97/ghg/main/install.sh | sh
-```
-
-The script downloads the release asset for your platform, verifies it against the published `SHA256SUMS`, and drops `ghg` into the first writable directory on your `PATH`. Pin a version with `GHG_VERSION=v0.1.0`, force the install dir with `GHG_BIN_DIR`.
-
-From source instead (requires Go ≥ 1.27):
+From source instead (requires Go ≥ 1.26.5):
 
 ```sh
 go install github.com/sacca97/ghg/cmd/ghg@latest
@@ -40,7 +35,9 @@ ghg auth <profile> <key>
 Then `ghg` and you're in. First things to try: `/context-doctor` (audit
 what a fresh session injects, in tokens), `/goal <text>` (work until a structured
 goal update completes it),
-drop a `.mcp.json` in the repo (MCP servers just appear — `/mcp` to see them).
+drop a `.mcp.json` in a trusted repo (MCP servers just appear — `/mcp` to see
+them). Headless runs ignore project-local instructions, profiles, and MCP by
+default; pass `--trust-project` when that is intentional.
 
 ## Run
 
@@ -177,6 +174,9 @@ each server's tools automatically. CLI: `ghg mcp list|add|remove|import`
 stderr tail; non-zero exit — validate a `.mcp.json` in CI). `ghg mcp
 serve` runs ghg's own tools (read/bash/edit/write) as an MCP server for
 other harnesses.
+
+Inspect an ordered session trace with `ghg trace <session>` or use
+`ghg trace <session> --jsonl` for machine-readable events.
 
 Gate the claude/codex imports with the `"mcpImport"` block — useful when
 another app writes MCP entries into `~/.codex/config.toml` you don't want

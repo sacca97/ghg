@@ -21,7 +21,15 @@ func loadProviderProfiles() (models.Profiles, error) {
 	if err != nil {
 		return models.Profiles{}, fmt.Errorf("provider profiles: current directory: %w", err)
 	}
-	return models.Load(models.LoadOptions{ProjectTrusted: config.Trusted(wd)})
+	project, err := config.NewProjectContext(wd, config.Trusted(wd))
+	if err != nil {
+		return models.Profiles{}, fmt.Errorf("provider profiles: project context: %w", err)
+	}
+	return loadProviderProfilesForProject(project)
+}
+
+func loadProviderProfilesForProject(project config.ProjectContext) (models.Profiles, error) {
+	return models.Load(models.LoadOptions{ProjectDir: project.Root, ProjectTrusted: project.Trusted})
 }
 
 func defaultEffort(cfg *config.Config) string {

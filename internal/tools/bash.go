@@ -22,10 +22,17 @@ import (
 )
 
 func bashTool() Tool {
-	return resultTool(models.NewTool("bash",
+	return withAvailability(resultTool(models.NewTool("bash",
 		"Execute a bash command in the current working directory and return its combined stdout/stderr. Use for builds, tests, git, and operations the dedicated read/search/edit tools cannot express. Prefer grep, glob, find_files, and bounded read for exploration; simple recursive inspection commands may be redirected.",
 		`{"type":"object","properties":{"command":{"type":"string","description":"The bash command to execute"},"timeout":{"type":"number","description":"Timeout in seconds (default 120)"}},"required":["command"]}`),
-		runBashResult)
+		runBashResult), bashAvailability)
+}
+
+func bashAvailability(_ *ToolRuntime) (bool, string) {
+	if bashAvailable() {
+		return true, ""
+	}
+	return false, ""
 }
 
 func runBashResult(ctx context.Context, args json.RawMessage) (ToolResult, error) {

@@ -226,15 +226,19 @@ func setSource(src map[string]ServerConfig, path string) {
 	}
 }
 
-// LoadMergedFiltered discovers server configs like LoadMerged, then applies
-// the import policy: filtered-out claude entries land in Blocked as
+// LoadMergedFiltered discovers server configs, then applies the import policy:
+// filtered-out claude entries land in Blocked as
 // disabled+noted copies. ghgCfg entries always pass through.
-func LoadMergedFiltered(cwd string, ghgCfg map[string]ServerConfig, policy ImportPolicy) Filtered {
+func LoadMergedFiltered(project config.ProjectContext, ghgCfg map[string]ServerConfig, policy ImportPolicy) Filtered {
 	errs := map[string]error{}
-	claudePath := filepath.Join(cwd, ".mcp.json")
-	claude, err := LoadClaude(claudePath)
-	if err != nil && !os.IsNotExist(err) {
-		errs[".mcp.json"] = err
+	claudePath := filepath.Join(project.Root, ".mcp.json")
+	claude := map[string]ServerConfig{}
+	if project.Trusted {
+		var err error
+		claude, err = LoadClaude(claudePath)
+		if err != nil && !os.IsNotExist(err) {
+			errs[".mcp.json"] = err
+		}
 	}
 	setSource(claude, claudePath)
 	setSource(ghgCfg, ghgConfigPath())
@@ -273,17 +277,6 @@ func LoadMergedFiltered(cwd string, ghgCfg map[string]ServerConfig, policy Impor
 		Sources: sources,
 		Errs:    errs,
 	}
-}
-
-// LoadMerged discovers MCP server configs from all supported sources and
-// merges them: the project .mcp.json in cwd (claude-style), then ghg's
-// own config on top. cwd is the project directory; ghgCfg may
-// be nil. Discovery failures (unreadable/unparseable files) are reported in
-// errs, keyed by source path, and never abort the merge. No import policy is
-// applied — sources are imported wholesale.
-func LoadMerged(cwd string, ghgCfg map[string]ServerConfig) (map[string]ServerConfig, map[string]error) {
-	f := LoadMergedFiltered(cwd, ghgCfg, ImportPolicyFrom(nil))
-	return f.Merged, f.Errs
 }
 
 // ghgConfigPath is ghg's own config file location (~/.ghg/config.json) —

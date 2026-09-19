@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -17,8 +18,38 @@ type trustedFile struct {
 	Paths map[string]bool `json:"paths"`
 }
 
+// ProjectContext is the startup trust decision shared by project-aware
+// loaders. Trusted is deliberately explicit so headless callers fail closed.
+type ProjectContext struct {
+	Root    string
+	Trusted bool
+}
+
+func NewProjectContext(root string, trusted bool) (ProjectContext, error) {
+	root, err := canonicalProjectRoot(root)
+	if err != nil {
+		return ProjectContext{}, err
+	}
+	return ProjectContext{Root: root, Trusted: trusted}, nil
+}
+
+func canonicalProjectRoot(root string) (string, error) {
+	root, err := filepath.Abs(root)
+	if err != nil {
+		return "", err
+	}
+	if resolved, err := filepath.EvalSymlinks(root); err == nil {
+		root = resolved
+	}
+	return filepath.Clean(root), nil
+}
+
 // Trusted reports whether dir (absolute path) has been trusted.
 func Trusted(dir string) bool {
+	dir, err := canonicalProjectRoot(dir)
+	if err != nil {
+		return false
+	}
 	var t trustedFile
 	if err := ReadJSON("trusted.json", &t); err != nil {
 		return false
@@ -28,12 +59,16 @@ func Trusted(dir string) bool {
 
 // Trust records dir (absolute path) as trusted.
 func Trust(dir string) error {
+	canonical, err := canonicalProjectRoot(dir)
+	if err != nil {
+		return err
+	}
 	var t trustedFile
 	_ = ReadJSON("trusted.json", &t)
 	if t.Paths == nil {
 		t.Paths = map[string]bool{}
 	}
-	t.Paths[dir] = true
+	t.Paths[canonical] = true
 	if err := WriteJSON("trusted.json", t); err != nil {
 		return err
 	}

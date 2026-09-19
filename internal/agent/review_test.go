@@ -142,6 +142,14 @@ func TestReviewBudgetInventoryAndBaseline(t *testing.T) {
 			}
 		})
 	}
+	huge := ReviewInventory{Files: make([]string, maxReviewBudget+1)}
+	if got := reviewBudgetBaseline("review", huge); got != maxReviewBudget {
+		t.Fatalf("large inventory baseline = %d, want %d", got, maxReviewBudget)
+	}
+	preflight := reviewPreflightPrompt(&ReviewBudget{Inventory: ReviewInventory{Files: make([]string, maxReviewPreflightFiles+1)}})
+	if !strings.Contains(preflight, "additional files omitted from preflight") {
+		t.Fatal("large inventory preflight was not truncated")
+	}
 	inventory := reviewInventoryAt(workspace, "")
 	if inventory.ProductionFiles != 6 || inventory.TestFiles != 2 || inventory.ProductionLOC != 21 {
 		t.Fatalf("inventory = %+v", inventory)

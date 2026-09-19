@@ -72,6 +72,7 @@ type workerStartSpec struct {
 	sandbox   string
 	network   string
 	approval  string
+	trusted   bool
 }
 
 func (m *model) workerStartSpec(cautious bool) workerStartSpec {
@@ -88,6 +89,7 @@ func (m *model) workerStartSpec(cautious bool) workerStartSpec {
 		mode:      m.uiMode(),
 		cwd:       m.workingDirectory(),
 		cautious:  cautious,
+		trusted:   m.project.Trusted,
 	}
 	if m.cfg != nil && m.cfg.Execution != nil {
 		spec.sandbox = m.cfg.Execution.Sandbox
@@ -140,16 +142,17 @@ func startWorkerProcess(spec workerStartSpec) workerStartedMsg {
 		return workerStartedMsg{err: err}
 	}
 	workerEnv := map[string]string{
-		"GHG_INTERNAL_WORKER":        "1",
-		workerwire.WorkerSessionEnv:  spec.sessionID,
-		workerwire.WorkerBaseEnv:     dir,
-		workerwire.WorkerCWDEnv:      spec.cwd,
-		workerwire.WorkerModelEnv:    spec.modelName,
-		workerwire.WorkerProviderEnv: spec.provName,
-		workerwire.WorkerRoleEnv:     spec.role,
-		workerwire.WorkerEffortEnv:   spec.effort,
-		workerwire.WorkerModeEnv:     spec.mode,
-		workerwire.WorkerCautiousEnv: strconv.FormatBool(spec.cautious),
+		"GHG_INTERNAL_WORKER":            "1",
+		workerwire.WorkerSessionEnv:      spec.sessionID,
+		workerwire.WorkerBaseEnv:         dir,
+		workerwire.WorkerCWDEnv:          spec.cwd,
+		workerwire.WorkerModelEnv:        spec.modelName,
+		workerwire.WorkerProviderEnv:     spec.provName,
+		workerwire.WorkerRoleEnv:         spec.role,
+		workerwire.WorkerEffortEnv:       spec.effort,
+		workerwire.WorkerModeEnv:         spec.mode,
+		workerwire.WorkerCautiousEnv:     strconv.FormatBool(spec.cautious),
+		workerwire.WorkerTrustProjectEnv: strconv.FormatBool(spec.trusted),
 	}
 	if spec.sandbox != "" {
 		workerEnv[workerwire.WorkerSandboxEnv] = spec.sandbox

@@ -62,7 +62,25 @@ type NavigationResult struct {
 }
 
 func lspTool() Tool {
-	return resultTool(models.NewTool("lsp", "Use the language server for bounded definitions, references, document symbols, hover information, or exact-symbol references/context. Paths and positions are workspace-authorized; columns are one-based Unicode-rune columns.", `{"type":"object","properties":{"operation":{"type":"string","enum":["definition","references","document_symbol","hover","symbol_references","symbol_context"]},"path":{"type":"string"},"symbol":{"type":"string","description":"Exact symbol name; required for symbol_references and symbol_context"},"line":{"type":"integer","description":"One-based line; required for position-based operations"},"column":{"type":"integer","description":"One-based Unicode-rune column; required for position-based operations"},"include_declaration":{"type":"boolean","description":"References and symbol_references only"}},"required":["operation","path"]}`), runLSPResult)
+	return withAvailability(resultTool(models.NewTool("lsp", "Use the language server for bounded definitions, references, document symbols, hover information, or exact-symbol references/context. Paths and positions are workspace-authorized; columns are one-based Unicode-rune columns.", `{"type":"object","properties":{"operation":{"type":"string","enum":["definition","references","document_symbol","hover","symbol_references","symbol_context"]},"path":{"type":"string"},"symbol":{"type":"string","description":"Exact symbol name; required for symbol_references and symbol_context"},"line":{"type":"integer","description":"One-based line; required for position-based operations"},"column":{"type":"integer","description":"One-based Unicode-rune column; required for position-based operations"},"include_declaration":{"type":"boolean","description":"References and symbol_references only"}},"required":["operation","path"]}`), runLSPResult), lspAvailability)
+}
+
+func lspAvailability(runtime *ToolRuntime) (bool, string) {
+	if runtime == nil || runtime.LanguageService == nil {
+		return false, "lsp unavailable: no configured language server is runnable"
+	}
+	if reporter, ok := runtime.LanguageService.(interface {
+		CapabilityStatus() (bool, []string)
+	}); ok {
+		available, notices := reporter.CapabilityStatus()
+		if len(notices) > 0 {
+			return available, strings.Join(notices, "; ")
+		}
+		if !available {
+			return false, "lsp unavailable: no configured language server is runnable"
+		}
+	}
+	return true, ""
 }
 
 func runLSPResult(ctx context.Context, args json.RawMessage) (ToolResult, error) {

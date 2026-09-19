@@ -47,15 +47,17 @@ type readDecision struct {
 
 type readCoverageTracker struct {
 	coverage []readCoverage
+	byPath   map[string][]int
 }
 
 func newReadCoverageTracker() *readCoverageTracker {
-	return &readCoverageTracker{}
+	return &readCoverageTracker{byPath: make(map[string][]int)}
 }
 
 func (t *readCoverageTracker) clear() {
 	if t != nil {
 		t.coverage = nil
+		t.byPath = make(map[string][]int)
 	}
 }
 
@@ -225,7 +227,8 @@ func potentiallyMutatingReadGuardTool(name, args string) bool {
 func (t *readCoverageTracker) covered(request readRequest) (readCoverage, bool) {
 	var best readCoverage
 	found := false
-	for _, coverage := range t.coverage {
+	for _, index := range t.byPath[request.path] {
+		coverage := t.coverage[index]
 		if coverage.path != request.path || request.start < coverage.start || request.start > coverage.end {
 			continue
 		}
@@ -243,7 +246,8 @@ func (t *readCoverageTracker) covered(request readRequest) (readCoverage, bool) 
 func (t *readCoverageTracker) expandingPrefix(request readRequest) (readCoverage, bool) {
 	var best readCoverage
 	found := false
-	for _, coverage := range t.coverage {
+	for _, index := range t.byPath[request.path] {
+		coverage := t.coverage[index]
 		if coverage.path != request.path || request.start != coverage.start || request.end <= coverage.end || coverage.nextOffset == 0 {
 			continue
 		}
@@ -256,19 +260,31 @@ func (t *readCoverageTracker) expandingPrefix(request readRequest) (readCoverage
 }
 
 func (t *readCoverageTracker) discardStale(paths map[string]struct{}) {
-	kept := t.coverage[:0]
-	for _, coverage := range t.coverage {
-		if _, requested := paths[coverage.path]; !requested {
-			kept = append(kept, coverage)
+	stale := make(map[int]struct{})
+	for path := range paths {
+		indices := t.byPath[path]
+		if len(indices) == 0 {
 			continue
 		}
-		info, err := os.Stat(coverage.path)
-		if err != nil || info.Size() != coverage.size || !info.ModTime().Equal(coverage.modTime) {
+		info, err := os.Stat(path)
+		if err == nil {
+			for _, index := range indices {
+				coverage := t.coverage[index]
+				if info.Size() == coverage.size && info.ModTime().Equal(coverage.modTime) {
+					continue
+				}
+				stale[index] = struct{}{}
+			}
 			continue
 		}
-		kept = append(kept, coverage)
+		for _, index := range indices {
+			stale[index] = struct{}{}
+		}
 	}
-	t.coverage = kept
+	if len(stale) == 0 {
+		return
+	}
+	t.removeIndexes(stale)
 }
 
 func readCoverageFromResult(result tools.ToolResult) (readCoverage, bool) {
@@ -335,6 +351,9 @@ func readGuardResultSucceeded(result tools.ToolResult) bool {
 }
 
 func (t *readCoverageTracker) record(result tools.ToolResult) {
+	if t.byPath == nil {
+		t.rebuildIndex()
+	}
 	for _, coverage := range readCoveragesFromResult(result) {
 		info, err := os.Stat(coverage.path)
 		if err != nil {
@@ -342,10 +361,13 @@ func (t *readCoverageTracker) record(result tools.ToolResult) {
 		}
 		coverage.size = info.Size()
 		coverage.modTime = info.ModTime()
+		index := len(t.coverage)
 		t.coverage = append(t.coverage, coverage)
+		t.byPath[coverage.path] = append(t.byPath[coverage.path], index)
 	}
 	if len(t.coverage) > maxReadCoverageEntries {
 		t.coverage = t.coverage[len(t.coverage)-maxReadCoverageEntries:]
+		t.rebuildIndex()
 	}
 }
 
@@ -366,7 +388,9 @@ func (t *readCoverageTracker) apply(a *Agent, ev Events, calls []models.ToolCall
 		}
 		result := decisionResult(decision, results)
 		results[i] = result
+		a.msgsMu.Lock()
 		calls[i].ExitCode = result.ExitCode
+		a.msgsMu.Unlock()
 		if ev.OnToolStart != nil {
 			ev.OnToolStart(calls[i].ID, calls[i].Function.Name, calls[i].Function.Arguments)
 		}
@@ -492,11 +516,32 @@ func (t *readCoverageTracker) invalidatePath(path string) {
 	if key == "" {
 		return
 	}
+	indices := t.byPath[key]
+	if len(indices) == 0 {
+		return
+	}
+	stale := make(map[int]struct{}, len(indices))
+	for _, index := range indices {
+		stale[index] = struct{}{}
+	}
+	t.removeIndexes(stale)
+}
+
+func (t *readCoverageTracker) removeIndexes(remove map[int]struct{}) {
 	kept := t.coverage[:0]
-	for _, coverage := range t.coverage {
-		if coverage.path != key {
-			kept = append(kept, coverage)
+	for index, coverage := range t.coverage {
+		if _, ok := remove[index]; ok {
+			continue
 		}
+		kept = append(kept, coverage)
 	}
 	t.coverage = kept
+	t.rebuildIndex()
+}
+
+func (t *readCoverageTracker) rebuildIndex() {
+	t.byPath = make(map[string][]int)
+	for index, coverage := range t.coverage {
+		t.byPath[coverage.path] = append(t.byPath[coverage.path], index)
+	}
 }

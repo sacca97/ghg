@@ -195,6 +195,7 @@ type model struct {
 	statusModeW   int                       // visible width of the bottom mode control
 	shortCWD      string                    // cached abbreviated working directory
 	workingDir    string                    // full working directory; changed by /cd
+	project       config.ProjectContext     // startup workspace and trust decision
 	modelSlotW    int                       // cached max width across role models
 	catalogs      map[string]config.Catalog // provider model lists (capabilities)
 	profiles      models.Profiles           // embedded/user/trusted-project provider metadata

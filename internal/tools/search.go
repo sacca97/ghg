@@ -71,24 +71,31 @@ type findFilesArgs struct {
 }
 
 func grepTool() Tool {
-	return resultTool(models.NewTool("grep",
+	return withAvailability(resultTool(models.NewTool("grep",
 		"Search text files for a regular expression. Prefer this for text; use patterns for independent searches in one traversal. Results respect nested .gitignore files, skip binaries and symlinks, are grouped by file or pattern, and paginate with an opaque cursor. Never construct or infer a cursor; pass it only when this tool explicitly returned one and copy it exactly.",
 		`{"type":"object","properties":{"pattern":{"type":"string","description":"Regular expression to search for"},"patterns":{"type":"array","minItems":1,"items":{"type":"string"},"description":"Independent regular expressions; results are labeled by pattern and searched in one traversal"},"path":{"type":"string","description":"File or directory to search (default: current working directory)"},"include":{"type":"string","description":"Optional glob filter such as *.go"},"max_results":{"type":"integer","description":"Matches per page (default 25, maximum 250)"},"cursor":{"type":"string","description":"Opaque cursor returned by this same tool in an earlier result; copy it exactly and do not infer or construct one"},"case_sensitive":{"type":"boolean","description":"Whether the expression is case-sensitive (default true)"},"literal":{"type":"boolean","description":"Treat patterns as literal text instead of regular expressions"}},"anyOf":[{"required":["pattern"]},{"required":["patterns"]},{"required":["cursor"]}]}`),
-		runGrepResult)
+		runGrepResult), searchAvailability)
 }
 
 func globTool() Tool {
-	return resultTool(models.NewTool("glob",
+	return withAvailability(resultTool(models.NewTool("glob",
 		"Find regular files by deterministic slash-aware glob. Use ** for recursive paths. It respects nested .gitignore files, never follows symlinks, and paginates with an opaque cursor. Never construct or infer a cursor; pass it only when this tool explicitly returned one and copy it exactly.",
 		`{"type":"object","properties":{"pattern":{"type":"string","description":"Glob pattern relative to path, for example **/*.go"},"path":{"type":"string","description":"Directory or file to search (default: current working directory)"},"max_results":{"type":"integer","description":"Paths per page (default 25, maximum 250)"},"cursor":{"type":"string","description":"Opaque cursor returned by this same tool in an earlier result; copy it exactly and do not infer or construct one"}},"required":["pattern"]}`),
-		runGlobResult)
+		runGlobResult), searchAvailability)
 }
 
 func findFilesTool() Tool {
-	return resultTool(models.NewTool("find_files",
+	return withAvailability(resultTool(models.NewTool("find_files",
 		"Find files by fuzzy path or filename match. Every candidate is scored before the best results are selected; use glob for exact patterns. Results paginate with an opaque cursor. Never construct or infer a cursor; pass it only when this tool explicitly returned one and copy it exactly.",
 		`{"type":"object","properties":{"query":{"type":"string","description":"Filename or path text to match fuzzily"},"path":{"type":"string","description":"Directory to search (default: current working directory)"},"max_results":{"type":"integer","description":"Paths per page (default 25, maximum 250)"},"cursor":{"type":"string","description":"Opaque cursor returned by this same tool in an earlier result; copy it exactly and do not infer or construct one"}},"required":["query"]}`),
-		runFindFilesResult)
+		runFindFilesResult), searchAvailability)
+}
+
+func searchAvailability(_ *ToolRuntime) (bool, string) {
+	if _, ok := rgAvailable(); ok {
+		return true, ""
+	}
+	return false, "repository search unavailable: rg is not on PATH"
 }
 
 func runGrepResult(ctx context.Context, args json.RawMessage) (ToolResult, error) {

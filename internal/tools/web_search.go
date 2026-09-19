@@ -54,9 +54,19 @@ type searchBackend struct {
 }
 
 func webSearchTool() Tool {
-	return resultTool(models.NewTool("web_search",
+	return withAvailability(resultTool(models.NewTool("web_search",
 		"Search the public web with the configured SearXNG provider or Brave fallback. Returns up to ten results with source URLs; never fetches result pages automatically.",
-		`{"type":"object","properties":{"query":{"type":"string","description":"Web search query"},"count":{"type":"integer","description":"Number of results, default 5, maximum 10"}},"required":["query"],"additionalProperties":false}`), runWebSearch)
+		`{"type":"object","properties":{"query":{"type":"string","description":"Web search query"},"count":{"type":"integer","description":"Number of results, default 5, maximum 10"}},"required":["query"],"additionalProperties":false}`), runWebSearch), webSearchAvailability)
+}
+
+func webSearchAvailability(runtime *ToolRuntime) (bool, string) {
+	if available, reason := webAccessAvailability(runtime); !available {
+		return false, reason
+	}
+	if _, err := searchProviderStatus(); err != nil {
+		return false, "web search unavailable: " + err.Error()
+	}
+	return true, ""
 }
 
 func searchProviderStatus() (searchBackend, error) {

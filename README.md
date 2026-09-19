@@ -33,15 +33,38 @@ config you can read.
 
 ## Install
 
+### From Source (Makefile)
+
 ```sh
-curl -fsSL https://raw.githubusercontent.com/sacca97/ghg/main/install.sh | sh
+make install
 ```
 
-Checksum-verified prebuilt binaries (Linux/macOS, x64/arm64). Or from source
-(Go ≥ 1.27):
+Builds `ghg` with release flags and installs it to your PATH (resolving `$GHG_BIN_PATH`, `$BINDIR`, an existing `ghg` on PATH, `/usr/local/bin`, `/opt/homebrew/bin`, or `~/.local/bin/ghg`).
+
+To build locally without installing:
+
+```sh
+make build          # outputs ./ghg
+```
+
+### Via `go install`
 
 ```sh
 go install github.com/sacca97/ghg/cmd/ghg@latest
+```
+
+### VS Code Extension
+
+Build and install both `ghg` and the VS Code extension into `code` or `code-insiders`:
+
+```sh
+make install-vscode
+```
+
+Or build and package the `.vsix` bundle only:
+
+```sh
+make build-vscode   # outputs editors/vscode/ghg.vsix
 ```
 
 Then `ghg` and you're in. Any OpenAI-compatible endpoint works as a
@@ -65,8 +88,10 @@ ghg auth openrouter   # masked key prompt — or /auth openrouter in-session
                     provider catalog, no config needed
 ```
 
-Drop a `.mcp.json` in your repo and MCP servers just appear (`/mcp` to see
-them). ctrl+c once interrupts; twice quits.
+Drop a `.mcp.json` in a trusted repo and MCP servers just appear (`/mcp` to
+see them). Headless runs ignore project-local instructions, profiles, and MCP
+by default; pass `--trust-project` for intentional repository automation.
+ctrl+c once interrupts; twice quits.
 
 ## Docs
 

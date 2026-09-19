@@ -39,13 +39,17 @@ func runTUI(cfg *config.Config, modelName, provName, sysPrompt, resumeID string,
 	} else if !ok {
 		return "", fmt.Errorf("folder not trusted")
 	}
+	project, err := config.NewProjectContext(wd, true)
+	if err != nil {
+		return "", err
+	}
 	if !strings.Contains(sysPrompt, "<project_instructions>") {
-		if project := config.ProjectInstructions(wd, true); project != "" {
-			sysPrompt += "\n\n" + project
+		if instructions := config.ProjectInstructions(project.Root, project.Trusted); instructions != "" {
+			sysPrompt += "\n\n" + instructions
 		}
 	}
 
-	profiles, err := models.Load(models.LoadOptions{ProjectTrusted: true})
+	profiles, err := models.Load(models.LoadOptions{ProjectDir: project.Root, ProjectTrusted: project.Trusted})
 	if err != nil {
 		return "", err
 	}
@@ -77,6 +81,7 @@ func runTUI(cfg *config.Config, modelName, provName, sysPrompt, resumeID string,
 		catalogs: config.LoadCatalogs(), profiles: profiles, mouseOn: mouseOn, now: time.Now, showThinking: showThinking,
 		mode:       uiModeExecute,
 		cautious:   cautious,
+		project:    project,
 		shortCWD:   shortCWD(),
 		workingDir: cwd(),
 	}

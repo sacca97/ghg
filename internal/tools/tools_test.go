@@ -18,6 +18,23 @@ func run(t *testing.T, name, args string) string {
 	return Execute(context.Background(), All(), name, json.RawMessage(args))
 }
 
+func TestFilterAvailableUsesToolCheckers(t *testing.T) {
+	unavailable := Tool{
+		Def: models.NewTool("unavailable", "", `{}`),
+		Available: func(*ToolRuntime) (bool, string) {
+			return false, "unavailable tool is disabled"
+		},
+	}
+	unchanged := Tool{Def: models.NewTool("unchanged", "", `{}`)}
+	filtered, notices := FilterAvailable([]Tool{unavailable, unchanged}, &ToolRuntime{})
+	if len(filtered) != 1 || filtered[0].Def.Function.Name != "unchanged" {
+		t.Fatalf("filtered tools = %v", toolNames(filtered))
+	}
+	if len(notices) != 1 || notices[0] != "unavailable tool is disabled" {
+		t.Fatalf("notices = %v", notices)
+	}
+}
+
 func TestToolRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	f := filepath.Join(dir, "sub", "a.txt")

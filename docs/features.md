@@ -140,8 +140,9 @@ diagnostics. `internal/lsp/navigation_test.go` covers the navigation path.
 trusted project root. Missing, unreadable, oversized, or symlinked files are
 ignored; trusted instructions are inserted beside the user's `~/.ghg/AGENTS.md`
 block in the system prompt. Interactive startup adds the block after the folder
-trust prompt, so first-run acceptance applies immediately. Headless
-`ghg run` is explicitly trusted automation and receives the same block.
+trust prompt, so first-run acceptance applies immediately. Headless `ghg run`
+and `ghg bridge` fail closed by default; pass `--trust-project` when repository
+instructions and project profiles are intentionally trusted.
 Tests: `config/project_test.go` and `cmd/ghg/main_test.go`.
 
 Long-running non-interactive bash calls emit accumulated output snapshots every
@@ -711,9 +712,9 @@ Polish (the "never stuck, always know why" pass):
   with an actionable message (`/mcp <name> reconnect|enable`); a
   still-connecting server caps the wait at a 5s grace then returns "retry in
   a moment". No turn parks on a 30s startup timeout.
-- **Did-you-mean** — `tools.Suggester` (installed by `Agent.SetMCPTools`)
-  runs an early-exit Levenshtein over live tool names, so a stale/typo'd
-  `mcp__` call gets `did you mean mcp__docs__greet?` instead of a dead end.
+- **Did-you-mean** — live tool names are passed directly to the suggestion
+  helper, so a stale/typo'd `mcp__` call gets `did you mean
+  mcp__docs__greet?` instead of a dead end.
 - **First-settle notes** — each server's first settle lands one transcript
   line (`⚡ mcp: docs ready (4 tools)` / `✗ mcp: x failed: …`); later
   transitions stay quiet.

@@ -50,6 +50,7 @@ func bridgeCLI(args []string) error {
 	sandboxFlag := fs.String("sandbox", "", "execution sandbox override")
 	networkFlag := fs.String("network", "", "execution network override")
 	approvalFlag := fs.String("approval", "", "execution approval override")
+	trustProjectFlag := fs.Bool("trust-project", false, "allow project-local instructions, profiles, and MCP configuration")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -68,7 +69,15 @@ func bridgeCLI(args []string) error {
 	if err := validationCfg.ApplyExecutionOverrides(*sandboxFlag, *networkFlag, *approvalFlag); err != nil {
 		return err
 	}
-	profiles, err := loadProviderProfiles()
+	wd, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+	project, err := config.NewProjectContext(wd, *trustProjectFlag)
+	if err != nil {
+		return err
+	}
+	profiles, err := loadProviderProfilesForProject(project)
 	if err != nil {
 		return err
 	}
@@ -92,7 +101,7 @@ func bridgeCLI(args []string) error {
 		sessionID = session.NewSessionID()
 	}
 
-	sysPrompt := systemPrompt()
+	sysPrompt := systemPromptForProject(project)
 	if modelName == "" && providerName == "" {
 		_, modelName, providerName, err = agent.NewConfiguredForRole(cfg, profiles, *roleFlag, sysPrompt, false)
 		if err != nil {
@@ -128,20 +137,18 @@ func bridgeCLI(args []string) error {
 		if err = runtimeFile.WritePrompt(sysPrompt); err != nil {
 			return err
 		}
-		cwd, cwdErr := os.Getwd()
-		if cwdErr != nil {
-			return cwdErr
-		}
+		cwd := project.Root
 		env := map[string]string{
-			"GHG_INTERNAL_WORKER":        "1",
-			workerwire.WorkerSessionEnv:  sessionID,
-			workerwire.WorkerBaseEnv:     dir,
-			workerwire.WorkerCWDEnv:      cwd,
-			workerwire.WorkerModelEnv:    modelName,
-			workerwire.WorkerProviderEnv: providerName,
-			workerwire.WorkerRoleEnv:     *roleFlag,
-			workerwire.WorkerModeEnv:     *modeFlag,
-			workerwire.WorkerCautiousEnv: strconv.FormatBool(*cautiousFlag),
+			"GHG_INTERNAL_WORKER":            "1",
+			workerwire.WorkerSessionEnv:      sessionID,
+			workerwire.WorkerBaseEnv:         dir,
+			workerwire.WorkerCWDEnv:          cwd,
+			workerwire.WorkerModelEnv:        modelName,
+			workerwire.WorkerProviderEnv:     providerName,
+			workerwire.WorkerRoleEnv:         *roleFlag,
+			workerwire.WorkerModeEnv:         *modeFlag,
+			workerwire.WorkerCautiousEnv:     strconv.FormatBool(*cautiousFlag),
+			workerwire.WorkerTrustProjectEnv: strconv.FormatBool(project.Trusted),
 		}
 		if *sandboxFlag != "" {
 			env[workerwire.WorkerSandboxEnv] = *sandboxFlag

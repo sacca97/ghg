@@ -220,7 +220,7 @@ func (w *workerProcessState) compactRetry() (workerwire.HistoryResult, error) {
 		return workerwire.HistoryResult{}, err
 	}
 	messages = w.withSystemPrompt(messages)
-	w.ag.Messages = messages
+	w.ag.SetMessages(messages)
 	w.ag.RebuildTouched(w.ag.MessagesSnapshot())
 	w.mu.Lock()
 	w.saved = len(messages)
@@ -272,7 +272,7 @@ func (w *workerProcessState) rewind(request workerwire.RewindRequest) (workerwir
 	}
 	w.ag.ResetState()
 	messages := slices.Clone(request.Messages)
-	w.ag.Messages = messages
+	w.ag.SetMessages(messages)
 	w.ag.RebuildTouched(w.ag.MessagesSnapshot())
 	w.mu.Lock()
 	saved := min(w.saved, cut)

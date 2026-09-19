@@ -154,7 +154,15 @@ func newWorkerProcess(runtimeFile workerwire.Runtime) (*workerProcessState, erro
 	if err := cfg.ApplyExecutionOverrides(os.Getenv(workerwire.WorkerSandboxEnv), os.Getenv(workerwire.WorkerNetworkEnv), os.Getenv(workerwire.WorkerApprovalEnv)); err != nil {
 		return nil, err
 	}
-	profiles, err := loadProviderProfiles()
+	wd, err := os.Getwd()
+	if err != nil {
+		return nil, err
+	}
+	project, err := config.NewProjectContext(wd, workerProjectTrusted())
+	if err != nil {
+		return nil, err
+	}
+	profiles, err := loadProviderProfilesForProject(project)
 	if err != nil {
 		return nil, err
 	}
@@ -175,12 +183,7 @@ func newWorkerProcess(runtimeFile workerwire.Runtime) (*workerProcessState, erro
 		return nil, existsErr
 	}
 	if !exists {
-		cwd, cwdErr := os.Getwd()
-		if cwdErr != nil {
-			store.Close()
-			return nil, cwdErr
-		}
-		if err := store.CreateWithID(sessionID, cwd, modelName, providerName); err != nil {
+		if err := store.CreateWithID(sessionID, project.Root, modelName, providerName); err != nil {
 			store.Close()
 			return nil, err
 		}
@@ -224,7 +227,7 @@ func newWorkerProcess(runtimeFile workerwire.Runtime) (*workerProcessState, erro
 	}
 	sysPrompt, err := runtimeFile.ReadPrompt()
 	if err != nil {
-		sysPrompt = systemPromptForProject(true)
+		sysPrompt = systemPromptForProject(project)
 	}
 	ag, modelName, providerName, err := agent.NewConfigured(agent.BuildOptions{
 		Config: cfg, Profiles: profiles, Model: modelName, Provider: providerName,
@@ -240,7 +243,7 @@ func newWorkerProcess(runtimeFile workerwire.Runtime) (*workerProcessState, erro
 	if len(loaded) > 0 && loaded[0].Role == "system" {
 		loaded = loaded[1:]
 	}
-	ag.Messages = append(ag.Messages, loaded...)
+	ag.SetMessages(append([]models.Message{ag.Messages[0]}, loaded...))
 	ag.RebuildTouched(ag.MessagesSnapshot())
 	if len(progressEvents) > 0 {
 		var progress []agent.ReviewProgress
@@ -337,21 +340,24 @@ func newWorkerProcess(runtimeFile workerwire.Runtime) (*workerProcessState, erro
 	if cautious, _ := strconv.ParseBool(os.Getenv(workerwire.WorkerCautiousEnv)); cautious {
 		configuredRuntime.Cautious = true
 	}
-	if wd, wdErr := os.Getwd(); wdErr == nil {
-		disc := mcp.LoadMergedFiltered(wd, mcp.FromConfigMap(cfg.MCPServers), mcp.ImportPolicyFrom(cfg.MCPImport))
-		if len(disc.Merged) > 0 || len(disc.Blocked) > 0 || len(disc.Errs) > 0 {
-			w.mcp = mcp.NewManager(disc.Merged)
-			w.mcp.SetRuntime(configuredRuntime)
-			w.mcp.SetBlocked(disc.Blocked)
-			w.mcp.SetOnChange(func() {
-				ag.SetMCPTools(w.mcp.Tools())
-				w.publish(workerwire.EventMCP, w.mcpStatuses(), true)
-			})
-			w.mcp.Start(context.Background())
+	disc := mcp.LoadMergedFiltered(project, mcp.FromConfigMap(cfg.MCPServers), mcp.ImportPolicyFrom(cfg.MCPImport))
+	if len(disc.Merged) > 0 || len(disc.Blocked) > 0 || len(disc.Errs) > 0 {
+		w.mcp = mcp.NewManager(disc.Merged)
+		w.mcp.SetRuntime(configuredRuntime)
+		w.mcp.SetBlocked(disc.Blocked)
+		w.mcp.SetOnChange(func() {
 			ag.SetMCPTools(w.mcp.Tools())
-		}
+			w.publish(workerwire.EventMCP, w.mcpStatuses(), true)
+		})
+		w.mcp.Start(context.Background())
+		ag.SetMCPTools(w.mcp.Tools())
 	}
 	return w, nil
+}
+
+func workerProjectTrusted() bool {
+	trusted, _ := strconv.ParseBool(os.Getenv(workerwire.WorkerTrustProjectEnv))
+	return trusted
 }
 
 // configureWorkerCompaction keeps usable compaction routes in the configured

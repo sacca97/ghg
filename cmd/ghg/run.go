@@ -43,6 +43,7 @@ func runCLI(args []string) error {
 	sandboxFlag := fs.String("sandbox", "", "execution sandbox: read-only, workspace-write, or danger-full-access")
 	networkFlag := fs.String("network", "", "execution network: deny or host")
 	approvalFlag := fs.String("approval", "", "exceptional capability approval: ask, auto, or never")
+	trustProjectFlag := fs.Bool("trust-project", false, "allow project-local instructions, profiles, and MCP configuration")
 	cautiousFlag := fs.Bool("cautious", false, "ask before running commands / writing files")
 	quietFlag := fs.Bool("quiet", false, "suppress the stderr tool/session notes (clean stdout for -format json piping)")
 	noSessionFlag := fs.Bool("no-session", false, "run without persisting a session (one-off jobs don't clutter ghg sessions)")
@@ -85,15 +86,21 @@ func runCLI(args []string) error {
 	if err := cfg.ApplyExecutionOverrides(*sandboxFlag, *networkFlag, *approvalFlag); err != nil {
 		return err
 	}
-	profiles, err := loadProviderProfiles()
+	wd, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+	project, err := config.NewProjectContext(wd, *trustProjectFlag)
+	if err != nil {
+		return err
+	}
+	profiles, err := loadProviderProfilesForProject(project)
 	if err != nil {
 		return err
 	}
 	// System prompt: -system-file wins over -system (a file is the deliberate
 	// choice; a stray -system alongside it is almost certainly stale).
-	// Headless mode is explicitly trusted automation, so it receives the same
-	// project-local AGENTS.md block without an interactive trust prompt.
-	sys := systemPromptForProject(true)
+	sys := systemPromptForProject(project)
 	if *systemFlag != "" {
 		sys = *systemFlag
 	}
@@ -342,8 +349,9 @@ func runCLI(args []string) error {
 			if len(loaded) > 0 && loaded[0].Role == "system" {
 				loaded = loaded[1:]
 			}
-			ag.Messages = append(ag.Messages[:1], loaded...) // keep our system prompt, replay the rest
-			saved = len(ag.Messages)
+			messages := append([]models.Message{ag.Messages[0]}, loaded...)
+			ag.SetMessages(messages) // keep our system prompt, replay the rest
+			saved = len(messages)
 		} else {
 			cwd, cerr := os.Getwd()
 			if cerr != nil {

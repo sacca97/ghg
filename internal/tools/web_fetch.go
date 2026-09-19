@@ -35,9 +35,26 @@ type webFetchArgs struct {
 type webLookup func(context.Context, string) ([]net.IP, error)
 
 func webFetchTool() Tool {
-	return resultTool(models.NewTool("web_fetch",
+	return withAvailability(resultTool(models.NewTool("web_fetch",
 		"Fetch a public HTTP or HTTPS URL and return bounded readable text. No cookies, credentials, JavaScript, forms, or private-network addresses are allowed.",
-		`{"type":"object","properties":{"url":{"type":"string","description":"Public http:// or https:// URL"}},"required":["url"],"additionalProperties":false}`), runWebFetch)
+		`{"type":"object","properties":{"url":{"type":"string","description":"Public http:// or https:// URL"}},"required":["url"],"additionalProperties":false}`), runWebFetch), webAccessAvailability)
+}
+
+func webAccessAvailability(runtime *ToolRuntime) (bool, string) {
+	networkAllowed := runtime != nil && runtime.Policy != nil && runtime.Policy.NetworkAllowed()
+	if networkAllowed {
+		return true, ""
+	}
+	mode := ApprovalNever
+	if runtime != nil {
+		mode = runtime.CurrentApprovalMode()
+	}
+	canRequestApproval := runtime != nil && runtime.Policy != nil && mode != ApprovalNever &&
+		(runtime.HumanGate != nil || (mode == ApprovalAutoReview && runtime.Reviewer != nil))
+	if canRequestApproval {
+		return true, "web access will request approval when first used"
+	}
+	return false, "web access unavailable: network is denied and no approval path is configured"
 }
 
 func runWebFetch(ctx context.Context, args json.RawMessage) (ToolResult, error) {

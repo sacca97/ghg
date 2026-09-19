@@ -227,6 +227,7 @@ changed files, verification, blockers, and next action. Output only the checkpoi
 	}
 	a.msgsMu.Lock()
 	a.Messages = finalView
+	a.tokenEstimateValid = false
 	a.msgsMu.Unlock()
 	a.resetSeenOperations()
 	return summary, tailStart, nil
@@ -433,6 +434,7 @@ func (a *Agent) emergencyCutover(ctx context.Context, ev Events) (string, int, e
 	view = append(view, tail...)
 	a.msgsMu.Lock()
 	a.Messages = view
+	a.tokenEstimateValid = false
 	a.msgsMu.Unlock()
 	return summary, tailStart, nil
 }

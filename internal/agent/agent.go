@@ -147,7 +147,10 @@ type Agent struct {
 	// msgsMu guards Messages for concurrent READERS: the turn goroutine
 	// mutates Messages freely, but a test/UI reader taking msgsMu sees a
 	// consistent slice. Mutations hold it only for the append.
-	msgsMu sync.Mutex
+	msgsMu             sync.Mutex
+	tokenEstimate      int
+	tokenEstimateCount int
+	tokenEstimateValid bool
 
 	// stateMu guards the live observation/search registries and their durable
 	// adapters. A TUI command can clear or replace an agent while a background
@@ -258,6 +261,7 @@ func (a *Agent) AppendUser(content string) {
 	a.mu.Lock()
 	a.msgsMu.Lock()
 	a.Messages = append(a.Messages, models.Message{Role: "user", Content: content})
+	a.tokenEstimateValid = false
 	a.msgsMu.Unlock()
 	a.mu.Unlock()
 }
@@ -330,7 +334,15 @@ func (a *Agent) ActiveTokens() int {
 			return base + unreported
 		}
 	}
-	return EstimateTokens(a.Messages)
+	if !a.tokenEstimateValid || len(a.Messages) < a.tokenEstimateCount {
+		a.tokenEstimate = EstimateTokens(a.Messages)
+		a.tokenEstimateCount = len(a.Messages)
+		a.tokenEstimateValid = true
+	} else if len(a.Messages) > a.tokenEstimateCount {
+		a.tokenEstimate += EstimateTokens(a.Messages[a.tokenEstimateCount:])
+		a.tokenEstimateCount = len(a.Messages)
+	}
+	return a.tokenEstimate
 }
 
 func New(backend models.Backend, model string, maxTokens int, systemPrompt string) *Agent {
@@ -726,7 +738,13 @@ func toolDiagnosticName(call models.ToolCall) string {
 func (a *Agent) MessagesSnapshot() []models.Message {
 	a.msgsMu.Lock()
 	defer a.msgsMu.Unlock()
-	return append([]models.Message(nil), a.Messages...)
+	messages := append([]models.Message(nil), a.Messages...)
+	for i := range messages {
+		if len(messages[i].ToolCalls) > 0 {
+			messages[i].ToolCalls = append([]models.ToolCall(nil), messages[i].ToolCalls...)
+		}
+	}
+	return messages
 }
 
 // MessageCount returns the current conversation length without copying it.
@@ -750,6 +768,18 @@ func (a *Agent) SetSystemPrompt(prompt string) {
 		a.Messages[0].Role = "system"
 		a.Messages[0].Content = prompt
 	}
+	a.tokenEstimateValid = false
+	a.msgsMu.Unlock()
+}
+
+// SetMessages replaces the conversation between turns.
+func (a *Agent) SetMessages(messages []models.Message) {
+	if a == nil {
+		return
+	}
+	a.msgsMu.Lock()
+	a.Messages = append([]models.Message(nil), messages...)
+	a.tokenEstimateValid = false
 	a.msgsMu.Unlock()
 }
 
@@ -764,11 +794,12 @@ func (a *Agent) SetMCPTools(ts []tools.Tool) {
 
 // AllTools returns built-ins + the current MCP set.
 func (a *Agent) AllTools() []tools.Tool {
+	_, searchState, _, _ := a.stateSnapshot()
 	a.toolsMu.Lock()
 	defer a.toolsMu.Unlock()
 	all := append(append([]tools.Tool(nil), a.Tools...), a.mcpTools...)
 	if a.HistoryRecall && a.HistoryCatalog != nil && a.currentSessionID() != "" {
-		all = append(all, HistoryTools(a.HistoryCatalog, a.currentSessionID, a.searchState)...)
+		all = append(all, HistoryTools(a.HistoryCatalog, a.currentSessionID, searchState)...)
 	}
 	if a.SubagentsDisabled {
 		filtered := make([]tools.Tool, 0, len(all))
@@ -847,17 +878,21 @@ func (a *Agent) callStream(ctx context.Context, backend models.Backend, role, pr
 		copy := value
 		requestDiagnostics = &copy
 	}
-	a.emitPromptView(ev, call, req)
+	requestShape := requestShapeInfo{}
+	if ev.OnModelCallEnd != nil {
+		requestShape = requestShapeTelemetry(req)
+	}
+	a.emitPromptView(ev, call, req, requestShape)
 	if ev.OnModelCallStart != nil {
 		ev.OnModelCallStart(call)
 	}
 	if backend == nil {
 		err := errors.New("agent: nil backend")
-		a.emitCallEnd(ev, call, start, req, models.Message{}, models.Usage{}, err, requestDiagnostics, checkpointLevel)
+		a.emitCallEnd(ev, call, start, req, models.Message{}, models.Usage{}, err, requestDiagnostics, checkpointLevel, requestShape)
 		return models.Message{}, models.Usage{}, err
 	}
 	msg, usage, err := backend.Stream(ctx, req, sink)
-	a.emitCallEnd(ev, call, start, req, msg, usage, err, requestDiagnostics, checkpointLevel)
+	a.emitCallEnd(ev, call, start, req, msg, usage, err, requestDiagnostics, checkpointLevel, requestShape)
 	return msg, usage, err
 }
 
@@ -884,17 +919,21 @@ func (a *Agent) callCompletePurpose(ctx context.Context, backend models.Backend,
 		copy := value
 		requestDiagnostics = &copy
 	}
-	a.emitPromptView(ev, call, req)
+	requestShape := requestShapeInfo{}
+	if ev.OnModelCallEnd != nil {
+		requestShape = requestShapeTelemetry(req)
+	}
+	a.emitPromptView(ev, call, req, requestShape)
 	if ev.OnModelCallStart != nil {
 		ev.OnModelCallStart(call)
 	}
 	if backend == nil {
 		err := errors.New("agent: nil backend")
-		a.emitCallEnd(ev, call, start, req, models.Message{}, models.Usage{}, err, requestDiagnostics, 0)
+		a.emitCallEnd(ev, call, start, req, models.Message{}, models.Usage{}, err, requestDiagnostics, 0, requestShape)
 		return models.Message{}, models.Usage{}, err
 	}
 	msg, usage, err := backend.Complete(ctx, req)
-	a.emitCallEnd(ev, call, start, req, msg, usage, err, requestDiagnostics, 0)
+	a.emitCallEnd(ev, call, start, req, msg, usage, err, requestDiagnostics, 0, requestShape)
 	return msg, usage, err
 }
 
@@ -915,25 +954,28 @@ func (a *Agent) reasoningSelectorTelemetry(defs []models.Tool) (bool, []string) 
 	return false, nil
 }
 
-func (a *Agent) emitPromptView(ev Events, call ModelCallStart, req models.Request) {
+func (a *Agent) emitPromptView(ev Events, call ModelCallStart, req models.Request, shape requestShapeInfo) {
 	if ev.OnPromptView == nil {
 		return
 	}
-	data, _ := json.Marshal(req)
+	serializedBytes := shape.Bytes
+	if serializedBytes == 0 {
+		data, _ := json.Marshal(req)
+		serializedBytes = len(data)
+	}
 	ev.OnPromptView(PromptView{
 		ModelCallStart:  call,
 		MessageCount:    len(req.Messages),
 		EstimatedTokens: EstimateTokens(req.Messages),
-		SerializedBytes: len(data),
+		SerializedBytes: serializedBytes,
 		ContextLimit:    a.ContextLimit,
 	})
 }
 
-func (a *Agent) emitCallEnd(ev Events, call ModelCallStart, start time.Time, req models.Request, msg models.Message, usage models.Usage, err error, requestDiagnostics *models.RequestDiagnostics, checkpointLevel int) {
+func (a *Agent) emitCallEnd(ev Events, call ModelCallStart, start time.Time, req models.Request, msg models.Message, usage models.Usage, err error, requestDiagnostics *models.RequestDiagnostics, checkpointLevel int, requestShape requestShapeInfo) {
 	if ev.OnModelCallEnd == nil {
 		return
 	}
-	requestShape := requestShapeTelemetry(req)
 	end := ModelCallEnd{
 		ModelCallStart:           call,
 		LatencyMS:                time.Since(start).Milliseconds(),
@@ -1302,6 +1344,7 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 	} else {
 		a.Messages = append(a.Messages, msg)
 	}
+	a.tokenEstimateValid = false
 	a.msgsMu.Unlock()
 	reviewTarget := msg.Content
 
@@ -2216,8 +2259,10 @@ func (a *Agent) runToolResultsWithPolicy(ctx context.Context, calls []models.Too
 	}()
 	for oc := range outCh {
 		results[oc.i] = oc.result
+		a.msgsMu.Lock()
 		calls[oc.i].DurationMs = oc.ms
 		calls[oc.i].ExitCode = oc.result.ExitCode
+		a.msgsMu.Unlock()
 	}
 	if readGuard != nil {
 		readGuard.apply(a, ev, calls, results, decisions)

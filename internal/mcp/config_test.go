@@ -109,7 +109,8 @@ func TestLoadMergedDiscovery(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	merged, errs := LoadMerged(dir, map[string]ServerConfig{"mine": {Command: []string{"my-srv"}}})
+	filtered := LoadMergedFiltered(config.ProjectContext{Root: dir, Trusted: true}, map[string]ServerConfig{"mine": {Command: []string{"my-srv"}}}, ImportPolicyFrom(nil))
+	merged, errs := filtered.Merged, filtered.Errs
 	if len(errs) != 0 {
 		t.Fatalf("unexpected discovery errors: %v", errs)
 	}
@@ -123,7 +124,8 @@ func TestLoadMergedDiscovery(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, ".mcp.json"), []byte(`{broken`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	_, errs = LoadMerged(dir, nil)
+	filtered = LoadMergedFiltered(config.ProjectContext{Root: dir, Trusted: true}, nil, ImportPolicyFrom(nil))
+	errs = filtered.Errs
 	if _, ok := errs[".mcp.json"]; !ok {
 		t.Error("expected a parse error for .mcp.json")
 	}
@@ -144,7 +146,7 @@ func TestLoadMergedFilteredPolicy(t *testing.T) {
 		Enabled: true,
 		Exclude: map[string]bool{"ghost": true},
 	}}
-	f := LoadMergedFiltered(dir, nil, policy)
+	f := LoadMergedFiltered(config.ProjectContext{Root: dir, Trusted: true}, nil, policy)
 	if _, ok := f.Merged["paper"]; !ok {
 		t.Error("admitted server should merge")
 	}
@@ -163,7 +165,7 @@ func TestLoadMergedFilteredPolicy(t *testing.T) {
 	}
 
 	// Source off: everything from claude drops into Blocked.
-	f = LoadMergedFiltered(dir, nil, ImportPolicy{
+	f = LoadMergedFiltered(config.ProjectContext{Root: dir, Trusted: true}, nil, ImportPolicy{
 		Claude: ImportSourcePolicy{Enabled: false},
 	})
 	if len(f.Blocked) != 3 {
@@ -174,7 +176,7 @@ func TestLoadMergedFilteredPolicy(t *testing.T) {
 	}
 
 	// Only-allowlist, and exclude beating only when both are set.
-	f = LoadMergedFiltered(dir, nil, ImportPolicy{
+	f = LoadMergedFiltered(config.ProjectContext{Root: dir, Trusted: true}, nil, ImportPolicy{
 		Claude: ImportSourcePolicy{Enabled: true, Only: map[string]bool{"proj": true, "ghost": true},
 			Exclude: map[string]bool{"ghost": true}},
 	})
@@ -186,7 +188,7 @@ func TestLoadMergedFilteredPolicy(t *testing.T) {
 	}
 
 	// A ghg entry of the same name is never shadowed by a ghost row.
-	ghgOver := LoadMergedFiltered(dir, map[string]ServerConfig{"ghost": {Command: []string{"mine"}}}, policy)
+	ghgOver := LoadMergedFiltered(config.ProjectContext{Root: dir, Trusted: true}, map[string]ServerConfig{"ghost": {Command: []string{"mine"}}}, policy)
 	if ghgOver.Merged["ghost"].Command[0] != "mine" {
 		t.Error("ghg config must still win over a blocked import")
 	}
@@ -195,7 +197,7 @@ func TestLoadMergedFilteredPolicy(t *testing.T) {
 	}
 
 	// Zero policy == LoadMerged (import everything).
-	def := LoadMergedFiltered(dir, nil, ImportPolicyFrom(nil))
+	def := LoadMergedFiltered(config.ProjectContext{Root: dir, Trusted: true}, nil, ImportPolicyFrom(nil))
 	if len(def.Merged) != 3 || len(def.Blocked) != 0 {
 		t.Errorf("nil policy must import everything, got merged=%v blocked=%v", def.Merged, def.Blocked)
 	}
@@ -209,6 +211,18 @@ func TestLoadMergedFilteredPolicy(t *testing.T) {
 	}
 }
 
+func TestLoadMergedFilteredSkipsUntrustedProjectFile(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, ".mcp.json"), []byte(`{"mcpServers":{"project":{"command":"should-not-start"}}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	f := LoadMergedFiltered(config.ProjectContext{Root: dir}, nil, ImportPolicyFrom(nil))
+	if len(f.Merged) != 0 || len(f.Blocked) != 0 || len(f.Errs) != 0 {
+		t.Fatalf("untrusted project MCP config was loaded: %+v", f)
+	}
+}
+
 // TestManagerFromBlockedDiscovery pins the scenario end to end at the manager level:
 // a .mcp.json carrying an excluded server, gated by policy, produces a manager with
 // no excluded server in the live set and one visible blocked row.
@@ -219,7 +233,7 @@ func TestManagerFromBlockedDiscovery(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	f := LoadMergedFiltered(dir, nil, ImportPolicyFrom(&config.MCPImport{
+	f := LoadMergedFiltered(config.ProjectContext{Root: dir, Trusted: true}, nil, ImportPolicyFrom(&config.MCPImport{
 		Claude: &config.MCPImportSource{Exclude: []string{"node_repl"}},
 	}))
 	mgr := NewManager(f.Merged)
@@ -247,7 +261,7 @@ func TestManagerStatusSource(t *testing.T) {
 		`{"mcpServers": {"proj": {"command": "proj-srv"}}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	f := LoadMergedFiltered(dir, nil, ImportPolicyFrom(nil))
+	f := LoadMergedFiltered(config.ProjectContext{Root: dir, Trusted: true}, nil, ImportPolicyFrom(nil))
 	mgr := NewManager(f.Merged)
 	sts := mgr.Statuses()
 	if len(sts) != 1 || sts[0].Source != filepath.Join(dir, ".mcp.json") {

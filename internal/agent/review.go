@@ -43,9 +43,11 @@ type reviewContinuation struct {
 const (
 	defaultReviewBudget     = 4
 	minReviewBudget         = 5
+	maxReviewBudget         = 64
 	maxReviewInventoryFiles = 4096
 	maxReviewInventoryBytes = 32 << 20
 	maxReviewFocusFiles     = 5
+	maxReviewPreflightFiles = 128
 )
 
 // ReviewInventory is the bounded, deterministic scope summary used to size a
@@ -158,12 +160,15 @@ func (a *Agent) RestoreReviewContinuation(target string, progress []ReviewProgre
 	if budget.Baseline <= 0 {
 		budget.Baseline = defaultReviewBudget
 	}
+	budget.Baseline = clampReviewBudget(budget.Baseline)
 	if budget.Allocation <= 0 {
 		budget.Allocation = budget.Baseline
 	}
 	if budget.HardLimit <= 0 {
 		budget.HardLimit = 2 * max(budget.Baseline, minReviewBudget)
 	}
+	budget.HardLimit = min(max(budget.HardLimit, budget.Baseline), 2*maxReviewBudget)
+	budget.Allocation = min(max(budget.Allocation, 1), budget.HardLimit)
 	budget.TargetHash = targetHash
 	a.reviewContinuation = &reviewContinuation{
 		target:            target,
@@ -655,7 +660,7 @@ func clampReviewBudget(value int) int {
 	if value < minReviewBudget {
 		return minReviewBudget
 	}
-	return value
+	return min(value, maxReviewBudget)
 }
 
 func reviewExtensionAllocation(current, hardLimit, baseline int) int {
@@ -757,10 +762,14 @@ func reviewPreflightPrompt(budget *ReviewBudget) string {
 		}
 	}
 	b.WriteString("files:\n")
-	for _, file := range inventory.Files {
+	fileLimit := min(len(inventory.Files), maxReviewPreflightFiles)
+	for _, file := range inventory.Files[:fileLimit] {
 		b.WriteString("- ")
 		b.WriteString(file)
 		b.WriteByte('\n')
+	}
+	if fileLimit < len(inventory.Files) {
+		fmt.Fprintf(&b, "- ... (%d additional files omitted from preflight)\n", len(inventory.Files)-fileLimit)
 	}
 	b.WriteString("</review_preflight>")
 	return b.String()

@@ -20,13 +20,17 @@ import (
 )
 
 func TestForwardRootArgs(t *testing.T) {
-	run := forwardRootArgs([]string{"--format", "json", "prompt"}, "run", "model", "provider", "session", true, "workspace-write", "deny", "ask")
+	run := forwardRootArgs([]string{"--format", "json", "prompt"}, "run", "model", "provider", "session", true, "workspace-write", "deny", "ask", false)
 	if got, want := strings.Join(run, " "), "-m model -p provider --resume session --cautious --sandbox workspace-write --network deny --approval ask --format json prompt"; got != want {
 		t.Fatalf("run args = %q, want %q", got, want)
 	}
-	bridge := forwardRootArgs(nil, "bridge", "model", "provider", "session", false, "", "", "")
+	bridge := forwardRootArgs(nil, "bridge", "model", "provider", "session", false, "", "", "", false)
 	if got, want := strings.Join(bridge, " "), "-m model -p provider --session session"; got != want {
 		t.Fatalf("bridge args = %q, want %q", got, want)
+	}
+	trusted := forwardRootArgs(nil, "run", "", "", "", false, "", "", "", true)
+	if got, want := strings.Join(trusted, " "), "--trust-project"; got != want {
+		t.Fatalf("trusted run args = %q, want %q", got, want)
 	}
 }
 
@@ -77,14 +81,18 @@ func TestSystemPromptAppendsTrustedProjectInstructions(t *testing.T) {
 		t.Fatalf("trusted AGENTS.md should be in the system prompt:\n%s", p)
 	}
 	base := strings.Index(p, "You are an expert coding assistant")
-	cwd := strings.Index(p, "Current working directory: "+root)
+	projectCtx, err := config.NewProjectContext(root, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cwd := strings.Index(p, "Current working directory: "+projectCtx.Root)
 	me := strings.Index(p, "Standing instructions from the user")
-	project := strings.Index(p, "<project_instructions>")
-	if base < 0 || cwd < base || me < cwd || project < me {
-		t.Fatalf("prompt blocks out of order: base=%d cwd=%d me=%d project=%d", base, cwd, me, project)
+	projectPos := strings.Index(p, "<project_instructions>")
+	if base < 0 || cwd < base || me < cwd || projectPos < me {
+		t.Fatalf("prompt blocks out of order: base=%d cwd=%d me=%d project=%d", base, cwd, me, projectPos)
 	}
 
-	if got := systemPromptForProject(false); strings.Contains(got, "run task check") {
+	if got := systemPromptForProject(config.ProjectContext{Root: root}); strings.Contains(got, "run task check") {
 		t.Fatal("untrusted project instructions must not be added")
 	}
 }

@@ -16,18 +16,19 @@ const (
 )
 
 const (
-	WorkerSessionEnv  = "GHG_WORKER_SESSION"
-	WorkerBaseEnv     = "GHG_WORKER_BASE"
-	WorkerCWDEnv      = "GHG_WORKER_CWD"
-	WorkerModelEnv    = "GHG_WORKER_MODEL"
-	WorkerProviderEnv = "GHG_WORKER_PROVIDER"
-	WorkerRoleEnv     = "GHG_WORKER_ROLE"
-	WorkerEffortEnv   = "GHG_WORKER_EFFORT"
-	WorkerModeEnv     = "GHG_WORKER_MODE"
-	WorkerCautiousEnv = "GHG_WORKER_CAUTIOUS"
-	WorkerSandboxEnv  = "GHG_WORKER_SANDBOX"
-	WorkerNetworkEnv  = "GHG_WORKER_NETWORK"
-	WorkerApprovalEnv = "GHG_WORKER_APPROVAL"
+	WorkerSessionEnv      = "GHG_WORKER_SESSION"
+	WorkerBaseEnv         = "GHG_WORKER_BASE"
+	WorkerCWDEnv          = "GHG_WORKER_CWD"
+	WorkerModelEnv        = "GHG_WORKER_MODEL"
+	WorkerProviderEnv     = "GHG_WORKER_PROVIDER"
+	WorkerRoleEnv         = "GHG_WORKER_ROLE"
+	WorkerEffortEnv       = "GHG_WORKER_EFFORT"
+	WorkerModeEnv         = "GHG_WORKER_MODE"
+	WorkerCautiousEnv     = "GHG_WORKER_CAUTIOUS"
+	WorkerSandboxEnv      = "GHG_WORKER_SANDBOX"
+	WorkerNetworkEnv      = "GHG_WORKER_NETWORK"
+	WorkerApprovalEnv     = "GHG_WORKER_APPROVAL"
+	WorkerTrustProjectEnv = "GHG_WORKER_TRUST_PROJECT"
 )
 
 const (
