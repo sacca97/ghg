@@ -1593,6 +1593,10 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 			reasoningEffort, reasoningReason = nextEffort, "model_requested"
 		}
 		reasoningEffort, reasoningEnabled := a.reasoningRequest(reasoningEffort)
+		toolChoice := ""
+		if a.ReviewMode && reviewClosed {
+			toolChoice = "submit_review"
+		}
 		requestTimeout := time.Duration(0)
 		if finalizing || (reviewBudget != nil && reviewClosed) {
 			requestTimeout = finalizationRequestTimeout
@@ -1617,6 +1621,7 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 			Model:                     a.Model,
 			Messages:                  msgs,
 			Tools:                     reqDefs,
+			ToolChoice:                toolChoice,
 			ReasoningEffort:           reasoningEffort,
 			ReasoningEnabled:          reasoningEnabled,
 			ConfiguredReasoningEffort: baselineEffort,

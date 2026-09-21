@@ -80,15 +80,21 @@ func (c *OpenAIResponsesClient) endpoint(suffix string) (string, error) {
 // - Compaction, rewind, model/provider switching, system-prompt changes, retries, and resume must invalidate the chain.
 // Stateless full-history replay with a stable prompt prefix and session-scoped prompt_cache_key is the proven production approach.
 type openAIResponsesRequest struct {
-	Model           string                    `json:"model"`
-	Instructions    string                    `json:"instructions,omitempty"`
-	Input           []json.RawMessage         `json:"input,omitempty"`
-	Tools           []openAIResponsesTool     `json:"tools,omitempty"`
-	MaxOutputTokens int                       `json:"max_output_tokens,omitempty"`
-	Reasoning       *openAIResponsesReasoning `json:"reasoning,omitempty"`
-	Stream          bool                      `json:"stream,omitempty"`
-	Store           *bool                     `json:"store,omitempty"`
-	PromptCacheKey  string                    `json:"prompt_cache_key,omitempty"`
+	Model           string                     `json:"model"`
+	Instructions    string                     `json:"instructions,omitempty"`
+	Input           []json.RawMessage          `json:"input,omitempty"`
+	Tools           []openAIResponsesTool      `json:"tools,omitempty"`
+	ToolChoice      *openAIResponsesToolChoice `json:"tool_choice,omitempty"`
+	MaxOutputTokens int                        `json:"max_output_tokens,omitempty"`
+	Reasoning       *openAIResponsesReasoning  `json:"reasoning,omitempty"`
+	Stream          bool                       `json:"stream,omitempty"`
+	Store           *bool                      `json:"store,omitempty"`
+	PromptCacheKey  string                     `json:"prompt_cache_key,omitempty"`
+}
+
+type openAIResponsesToolChoice struct {
+	Type string `json:"type"`
+	Name string `json:"name"`
 }
 
 type openAIResponsesTool struct {
@@ -205,6 +211,9 @@ func newOpenAIResponsesRequest(req Request, stream bool, flavor ...responsesFlav
 	wire.Tools, err = openAIResponsesTools(req.Tools)
 	if err != nil {
 		return openAIResponsesRequest{}, err
+	}
+	if req.ToolChoice != "" {
+		wire.ToolChoice = &openAIResponsesToolChoice{Type: "function", Name: req.ToolChoice}
 	}
 	wire.Reasoning = openAIResponsesReasoningFor(req.ReasoningEffort)
 	if len(wire.Input) == 0 && wire.Instructions == "" {

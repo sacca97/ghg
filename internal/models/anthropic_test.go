@@ -149,6 +149,20 @@ func TestAnthropicRequestTranslation(t *testing.T) {
 	}
 }
 
+func TestAnthropicToolChoiceSerialized(t *testing.T) {
+	wire, err := newAnthropicRequest(Request{
+		Model:      "claude-test",
+		Messages:   []Message{{Role: "user", Content: "submit"}},
+		ToolChoice: "submit_review",
+	}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wire.ToolChoice == nil || wire.ToolChoice.Type != "tool" || wire.ToolChoice.Name != "submit_review" {
+		t.Fatalf("tool choice = %+v", wire.ToolChoice)
+	}
+}
+
 func TestAnthropicTransientSystemFollowsStableHistory(t *testing.T) {
 	wire, err := newAnthropicRequest(Request{
 		Model: "claude-test",

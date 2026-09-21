@@ -77,14 +77,20 @@ func (c *AnthropicClient) Complete(ctx context.Context, req Request) (Message, U
 }
 
 type anthropicRequest struct {
-	Model        string              `json:"model"`
-	MaxTokens    int                 `json:"max_tokens"`
-	System       []anthropicBlock    `json:"system,omitempty"`
-	Messages     []anthropicMessage  `json:"messages"`
-	Tools        []anthropicTool     `json:"tools,omitempty"`
-	Stream       bool                `json:"stream,omitempty"`
-	Thinking     *anthropicThinking  `json:"thinking,omitempty"`
-	OutputConfig *anthropicOutputCfg `json:"output_config,omitempty"`
+	Model        string               `json:"model"`
+	MaxTokens    int                  `json:"max_tokens"`
+	System       []anthropicBlock     `json:"system,omitempty"`
+	Messages     []anthropicMessage   `json:"messages"`
+	Tools        []anthropicTool      `json:"tools,omitempty"`
+	ToolChoice   *anthropicToolChoice `json:"tool_choice,omitempty"`
+	Stream       bool                 `json:"stream,omitempty"`
+	Thinking     *anthropicThinking   `json:"thinking,omitempty"`
+	OutputConfig *anthropicOutputCfg  `json:"output_config,omitempty"`
+}
+
+type anthropicToolChoice struct {
+	Type string `json:"type"`
+	Name string `json:"name"`
 }
 
 type anthropicMessage struct {
@@ -203,6 +209,9 @@ func newAnthropicRequest(req Request, stream bool) (anthropicRequest, error) {
 	wire.Tools, err = anthropicTools(req.Tools)
 	if err != nil {
 		return anthropicRequest{}, err
+	}
+	if req.ToolChoice != "" {
+		wire.ToolChoice = &anthropicToolChoice{Type: "tool", Name: req.ToolChoice}
 	}
 	wire.Thinking, wire.OutputConfig = anthropicReasoningRequest(req)
 	applyAnthropicCachePolicy(&wire, stableMessageIndex)

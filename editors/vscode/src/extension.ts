@@ -348,6 +348,8 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 	private bufferedEvents: Event[] = [];
 	private lastSnapshot?: Event;
 	private promptIDs = new Set<string>();
+	private queuedPromptIDs = new Set<string>();
+	private promptQueue: Promise<void> = Promise.resolve();
 	private pendingApprovals = new Set<string>();
 	private detachWaiters = new Map<string, { resolve: () => void; reject: (error: Error) => void }>();
 	private commandWaiters = new Map<string, { resolve: () => void; reject: (error: Error) => void }>();
@@ -472,10 +474,28 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 				await this.submitInput(request.prompt, request.role, request.mode === "plan" ? "plan" : "execute", {}, request.references);
 			}
 		} catch (error) {
+			this.clearPendingSteers();
 			this.post({ type: "error", error: error instanceof Error ? error.message : String(error) });
 			this.setActive(false);
 			this.post({ type: "turn_end" });
 		}
+	}
+
+	private clearPendingSteers(): void {
+		this.pendingSteers = [];
+		this.steerCancelRequested = false;
+	}
+
+	private enqueuePrompt(id: string, prompt: () => Promise<void>): Promise<void> {
+		if (id && (this.promptIDs.has(id) || this.queuedPromptIDs.has(id))) return Promise.resolve();
+		if (id) this.queuedPromptIDs.add(id);
+		const run = async () => {
+			if (id) this.queuedPromptIDs.delete(id);
+			await prompt();
+		};
+		const next = this.promptQueue.then(run, run);
+		this.promptQueue = next.catch(() => undefined);
+		return next;
 	}
 
 	private async pickModel(mode: "chat" | "plan", selectedRole?: Role): Promise<void> {
@@ -609,6 +629,7 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 				if (nextSteer) queueMicrotask(() => void this.submitSteered(nextSteer));
 			}
 			if (event.type === "error" && this.active) {
+				this.clearPendingSteers();
 				this.setActive(false);
 				this.post({ type: "turn_end" });
 			}
@@ -647,6 +668,7 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 				this.lastSnapshot = undefined;
 			}
 			if (this.active && this.pendingApprovals.size === 0) {
+				this.clearPendingSteers();
 				this.setActive(false);
 				this.post({ type: "turn_end" });
 			}
@@ -691,8 +713,9 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 				this.post({ type: "notice", text: "approval remains pending; reconnecting to the worker" });
 				return;
 			}
+			if (!choice) return;
 			const decision = choice === "Allow always" ? "allow_always" : choice === "Allow once" ? "allow_once" : "reject";
-			await this.writeBridgeCommand(target, "approve", { id, decision, redirect: choice ? undefined : "approval prompt was dismissed" });
+			await this.writeBridgeCommand(target, "approve", { id, decision });
 		} finally {
 			this.promptIDs.delete(id);
 			this.pendingApprovals.delete(id);
@@ -757,11 +780,11 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 	private async handleBridgeEvent(event: Event): Promise<void> {
 		if (event.type === "permission_request") {
 			const approval = event.approval as Record<string, unknown> | undefined;
-			if (approval) await this.showApproval(approval);
+			if (approval) await this.enqueuePrompt(typeof approval.id === "string" ? approval.id : "", () => this.showApproval(approval));
 			return;
 		}
 		if (event.type === "question_request") {
-			await this.showQuestion(event);
+			await this.enqueuePrompt(typeof event.id === "string" ? event.id : "", () => this.showQuestion(event));
 			return;
 		}
 		if (event.type === "snapshot") {
@@ -769,10 +792,12 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 			if (!snapshot) return;
 			this.setActive(typeof snapshot.state === "string" && busyStates.has(snapshot.state));
 			if (snapshot.pending_approval && typeof snapshot.pending_approval === "object") {
-				await this.showApproval(snapshot.pending_approval as Record<string, unknown>);
+				const approval = snapshot.pending_approval as Record<string, unknown>;
+				await this.enqueuePrompt(typeof approval.id === "string" ? approval.id : "", () => this.showApproval(approval));
 			}
 			if (snapshot.pending_question && typeof snapshot.pending_question === "object") {
-				await this.showQuestion(snapshot.pending_question as Record<string, unknown>);
+				const question = snapshot.pending_question as Record<string, unknown>;
+				await this.enqueuePrompt(typeof question.id === "string" ? question.id : "", () => this.showQuestion(question));
 			}
 		}
 		if (event.type === "state") {
@@ -1064,7 +1089,7 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 			if (!plan) throw new Error("no plan to execute — use /plan <goal> first");
 			this.setActive(true);
 			this.post({ type: "turn_start", mode: "chat" });
-			await this.submitInput(`Execute the following approved plan. Create and maintain a todowrite checklist while implementing it.\n\n${plan}`, "fast", "execute", {}, references);
+			await this.submitInput(`Execute the following approved plan. Create and maintain a todowrite checklist while implementing it.\n\n${plan}`, role, "execute", {}, references);
 			return;
 		}
 		case "/review":
@@ -1373,8 +1398,7 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 				try {
 					await this.bridgeCommand("cancel");
 				} catch (error) {
-					this.pendingSteers.pop();
-					this.steerCancelRequested = false;
+					this.clearPendingSteers();
 					this.post({ type: "error", error: error instanceof Error ? error.message : String(error) });
 				}
 			}

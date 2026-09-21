@@ -106,6 +106,20 @@ func TestOpenAIResponsesRequestTranslation(t *testing.T) {
 	}
 }
 
+func TestOpenAIResponsesToolChoiceSerialized(t *testing.T) {
+	wire, err := newOpenAIResponsesRequest(Request{
+		Model:      "gpt-test",
+		Messages:   []Message{{Role: "user", Content: "submit"}},
+		ToolChoice: "submit_review",
+	}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if wire.ToolChoice == nil || wire.ToolChoice.Type != "function" || wire.ToolChoice.Name != "submit_review" {
+		t.Fatalf("tool choice = %+v", wire.ToolChoice)
+	}
+}
+
 func TestOpenAIResponsesStreamAssemblesTextThinkingAndUsage(t *testing.T) {
 	client := responsesClientForTest(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/responses" || r.Header.Get("Authorization") != "Bearer responses-test-key" {

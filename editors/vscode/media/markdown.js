@@ -60,6 +60,7 @@ export function renderMarkdown(element, source) {
   let paragraph = [];
   let lists = [];
   let code;
+  let codeLines;
   let fence;
 
   const flushParagraph = () => {
@@ -82,9 +83,10 @@ export function renderMarkdown(element, source) {
     const opening = line.match(/^ {0,3}(`{3,}|~{3,})\s*([\w+-]*)\s*$/);
     if (fence) {
       if (opening && opening[1][0] === fence) {
+        code.textContent = codeLines.join("\n");
         fence = undefined;
       } else {
-        code.textContent += `${code.textContent ? "\n" : ""}${line}`;
+        codeLines.push(line);
       }
       continue;
     }
@@ -105,6 +107,7 @@ export function renderMarkdown(element, source) {
       header.append(label, copyButton("Copy code", () => codeElement.textContent || ""));
       codeBlock.append(header, pre);
       element.append(codeBlock);
+      codeLines = [];
       fence = opening[1][0];
       continue;
     }
@@ -203,5 +206,6 @@ export function renderMarkdown(element, source) {
     flushList();
     paragraph.push(line.trim());
   }
+  if (fence && code) code.textContent = codeLines.join("\n");
   flushText();
 }

@@ -437,6 +437,9 @@ func TestReviewFinalizationRetriesWithoutReopeningExploration(t *testing.T) {
 		if request.RequestTimeout != finalizationRequestTimeout {
 			t.Fatalf("finalization timeout = %s, want %s", request.RequestTimeout, finalizationRequestTimeout)
 		}
+		if request.ToolChoice != "submit_review" {
+			t.Fatalf("finalization tool choice = %q, want submit_review", request.ToolChoice)
+		}
 	}
 	if len(ag.Messages) != 22 {
 		t.Fatalf("messages after retry = %d, want 22", len(ag.Messages))
@@ -506,6 +509,9 @@ func TestRestoreReviewContinuationKeepsCheckpointState(t *testing.T) {
 	state := ag.reviewContinuation
 	if state.target != "review target" || state.budget.CurrentRound != 8 || state.budget.Allocation != 8 || !state.checkpointPending || state.closed {
 		t.Fatalf("restored review state = %+v", state)
+	}
+	if !state.budget.resumed || !strings.Contains(reviewPreflightPrompt(state.budget), "may be stale") {
+		t.Fatal("restored review did not mark its inventory as potentially stale")
 	}
 	if ag.RestoreReviewContinuation("completed", []ReviewProgress{{Phase: "completed", CurrentRound: 8, Allocation: 8, HardLimit: 38}}) {
 		t.Fatal("completed review should not be restored")

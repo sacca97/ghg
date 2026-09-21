@@ -300,9 +300,10 @@ function effortsForCurrentModel() {
 function normalizeEffortForModel(value, levels = effortsForCurrentModel()) {
   const current = typeof value === "string" ? value.trim().toLowerCase() : "";
   if (current === "off" || current === "none" || current === "default") return "";
+  if (current === "") return "";
   const match = levels.find((level) => level.toLowerCase() === current);
   if (match) return match;
-  return current === "" || levels.length === 1 ? "" : levels[1];
+  return levels.length === 1 ? "" : levels[1];
 }
 
 function setupOptionLists() {
@@ -608,6 +609,7 @@ function commandToken() {
 function requestCompletionsNow() {
   const command = commandToken();
   if (command) {
+    completionRequest += 1;
     completionToken = { ...command, kind: "command" };
     completionKind = "command";
     const query = command.query.toLowerCase();
@@ -619,6 +621,7 @@ function requestCompletionsNow() {
   }
   const token = referenceToken();
   if (!token) {
+    completionRequest += 1;
     hideCompletions();
     return;
   }
@@ -654,6 +657,7 @@ const callEffort = (raw) => {
 const handlers = {
   turn_start() {
     active = true;
+    turnConfiguredEffort = state.effort;
     planDeltaSeen = false;
     resetStreams();
     activity = "Thinking";
@@ -725,6 +729,11 @@ const handlers = {
 
   text(raw) {
     if (typeof raw.delta !== "string") return;
+    if (state.mode === "review") {
+      activity = "Thinking";
+      updateStatus();
+      return;
+    }
     appendDelta("text", raw.delta);
     activity = "Responding";
   },
@@ -957,6 +966,11 @@ const handlers = {
     pendingUser = false;
     const message = text(raw.error) || "ghg failed";
     const interrupted = /context canceled|interrupted/i.test(message);
+    if (typeof turnConfiguredEffort === "string") {
+      state.effort = turnConfiguredEffort;
+      turnConfiguredEffort = undefined;
+      syncControls();
+    }
     if (!interrupted) {
       append({ kind: "error", text: message }, true);
     }
@@ -977,6 +991,7 @@ const handlers = {
 
   new_session() {
     pendingUser = false;
+    state.proposedPlan = "";
     state.blocks = [];
     state.references = [];
     resetStreams();
@@ -987,6 +1002,7 @@ const handlers = {
   },
 
   resume_session() {
+    state.proposedPlan = "";
     append({ kind: "notice", text: "Session resumed." }, true);
   },
 

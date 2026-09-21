@@ -244,6 +244,13 @@ func TestOpenAIReasoningToggleSerialized(t *testing.T) {
 	}
 }
 
+func TestOpenAIToolChoiceSerialized(t *testing.T) {
+	wire := newOpenAIRequest(Request{Model: "m", ToolChoice: "submit_review"}, false)
+	if wire.ToolChoice == nil || wire.ToolChoice.Type != "function" || wire.ToolChoice.Function.Name != "submit_review" {
+		t.Fatalf("tool choice = %+v", wire.ToolChoice)
+	}
+}
+
 func TestComplete(t *testing.T) {
 	client := testChatClientWithHandler(t, "test-key", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("Authorization"); got != "Bearer test-key" {

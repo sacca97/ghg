@@ -266,6 +266,7 @@ type Request struct {
 	Model           string    `json:"model"`
 	Messages        []Message `json:"messages"`
 	Tools           []Tool    `json:"tools,omitempty"`
+	ToolChoice      string    `json:"-"`
 	MaxTokens       int       `json:"max_tokens,omitempty"`
 	ReasoningEffort string    `json:"reasoning_effort,omitempty"`
 	SessionID       string    `json:"session_id,omitempty"`
@@ -311,11 +312,12 @@ type RequestDiagnostics struct {
 // Stream controls transport behavior and therefore belongs to the adapter,
 // not to the request passed between the agent and a Backend.
 type openAIRequest struct {
-	Model           string    `json:"model"`
-	Messages        []Message `json:"messages"`
-	Tools           []Tool    `json:"tools,omitempty"`
-	MaxTokens       int       `json:"max_tokens,omitempty"`
-	ReasoningEffort string    `json:"reasoning_effort,omitempty"`
+	Model           string            `json:"model"`
+	Messages        []Message         `json:"messages"`
+	Tools           []Tool            `json:"tools,omitempty"`
+	ToolChoice      *openAIToolChoice `json:"tool_choice,omitempty"`
+	MaxTokens       int               `json:"max_tokens,omitempty"`
+	ReasoningEffort string            `json:"reasoning_effort,omitempty"`
 	Thinking        *struct {
 		Type string `json:"type"`
 	} `json:"thinking,omitempty"`
@@ -323,6 +325,13 @@ type openAIRequest struct {
 	StreamOptions *struct {
 		IncludeUsage bool `json:"include_usage"`
 	} `json:"stream_options,omitempty"`
+}
+
+type openAIToolChoice struct {
+	Type     string `json:"type"`
+	Function struct {
+		Name string `json:"name"`
+	} `json:"function"`
 }
 
 func newOpenAIRequest(req Request, stream bool) openAIRequest {
@@ -337,6 +346,11 @@ func newOpenAIRequest(req Request, stream bool) openAIRequest {
 		MaxTokens:       req.MaxTokens,
 		ReasoningEffort: req.ReasoningEffort,
 		Stream:          stream,
+	}
+	if req.ToolChoice != "" {
+		choice := &openAIToolChoice{Type: "function"}
+		choice.Function.Name = req.ToolChoice
+		wire.ToolChoice = choice
 	}
 	if req.ReasoningEnabled != nil {
 		typ := "disabled"

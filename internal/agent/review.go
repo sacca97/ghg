@@ -84,6 +84,7 @@ type ReviewBudget struct {
 	Focus          []string
 	Rationale      string
 	Inventory      ReviewInventory
+	resumed        bool
 	checkpointOpen bool
 }
 
@@ -170,6 +171,7 @@ func (a *Agent) RestoreReviewContinuation(target string, progress []ReviewProgre
 	budget.HardLimit = min(max(budget.HardLimit, budget.Baseline), 2*maxReviewBudget)
 	budget.Allocation = min(max(budget.Allocation, 1), budget.HardLimit)
 	budget.TargetHash = targetHash
+	budget.resumed = true
 	a.reviewContinuation = &reviewContinuation{
 		target:            target,
 		budget:            &budget,
@@ -737,7 +739,11 @@ func reviewPreflightPrompt(budget *ReviewBudget) string {
 	inventory := budget.Inventory
 	var b strings.Builder
 	b.WriteString("<review_preflight>\n")
-	b.WriteString("This deterministic inventory is authoritative for the review scope. Treat it as scope context; it does not prescribe an inspection workflow.\n")
+	if budget.resumed {
+		b.WriteString("This review was resumed. The inventory was captured before the interruption and may be stale; re-check paths before relying on it.\n")
+	} else {
+		b.WriteString("This deterministic inventory is authoritative for the review scope. Treat it as scope context; it does not prescribe an inspection workflow.\n")
+	}
 	b.WriteString("review policy: budget is an estimate; finish when semantic coverage is sufficient, not when every line is read.\n")
 	fmt.Fprintf(&b, "scope: %s\nproduction files: %d\ntest files: %d\nproduction LOC: %d\n", strings.Join(inventory.Scope, ", "), inventory.ProductionFiles, inventory.TestFiles, inventory.ProductionLOC)
 	if inventory.Partial {
