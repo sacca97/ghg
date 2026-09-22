@@ -8,6 +8,7 @@ import (
 	"github.com/sacca97/ghg/internal/skills"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -173,6 +174,21 @@ func TestAtMentionFuzzyCompletion(t *testing.T) {
 	_, cs = completions("fix @docs/r", nil, nil, nil, nil, nil)
 	if len(cs) != 1 || cs[0].Text != "@docs/roadmap.md" {
 		t.Fatalf("slash query: %v", texts(cs))
+	}
+}
+
+func TestMentionIndexedPartialPathAndDirectory(t *testing.T) {
+	paths := []string{"internal/agent/compact.go", "docs/guide/readme.md"}
+	cands := mentionCandidates(paths, "agent")
+	dirTexts := texts(cands)
+	if !slices.Contains(dirTexts, "internal/agent/") {
+		t.Fatalf("indexed directory completion: %v", dirTexts)
+	}
+
+	_, cands = completionsWithMention("fix @agent/comp", nil, nil, nil, nil, nil,
+		[]cand{{Text: "internal/agent/compact.go"}})
+	if !slices.Contains(texts(cands), "@internal/agent/compact.go") {
+		t.Fatalf("indexed partial path completion: %v", texts(cands))
 	}
 }
 

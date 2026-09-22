@@ -1,6 +1,7 @@
 package tui
 
 import (
+	tea "github.com/charmbracelet/bubbletea"
 	"github.com/sacca97/ghg/internal/search"
 	"os"
 	"path/filepath"
@@ -40,6 +41,13 @@ var exportKindCands = []cand{
 // completions splits val into an untouched head and candidates for its last
 // token. nil efforts uses the default /effort candidates.
 func completions(val string, models, providers, authProviders, skillCands, efforts []cand) (head string, cands []cand) {
+	return completionsWithMention(val, models, providers, authProviders, skillCands, efforts, nil)
+}
+
+// completionsWithMention is the production variant of completions. A nil
+// mention list keeps the old synchronous behavior for pure completion tests;
+// a non-nil list means the recursive search already ran off the UI loop.
+func completionsWithMention(val string, models, providers, authProviders, skillCands, efforts, mention []cand) (head string, cands []cand) {
 	if efforts == nil {
 		efforts = effortCands
 	}
@@ -73,15 +81,19 @@ func completions(val string, models, providers, authProviders, skillCands, effor
 	case strings.HasPrefix(token, "$"): // codex-style skill invocation
 		cands = filterPrefix(skillCands, token)
 	case strings.HasPrefix(token, "@"):
-		// @file mentions: path-like queries (with a separator, ~, or leading
-		// dot) complete like paths; bare words fuzzy-match the recursive
-		// index so "@roadmap" finds docs/roadmap.md without the full path.
+		// Literal paths stay instant; recursive matches arrive through the
+		// background index supplied by the model.
 		if q := token[1:]; isPathQuery(q) {
 			for _, c := range mentionPathMatches(q) {
 				cands = append(cands, cand{"@" + c.Text, c.Desc})
 			}
-		} else {
-			for _, f := range fuzzyFiles(q, menuRows) {
+		}
+		if mention != nil {
+			for _, c := range mention {
+				cands = append(cands, cand{"@" + c.Text, c.Desc})
+			}
+		} else if !isPathQuery(token[1:]) {
+			for _, f := range fuzzyFiles(token[1:], menuRows) {
 				cands = append(cands, cand{"@" + f, ""})
 			}
 		}
@@ -89,8 +101,18 @@ func completions(val string, models, providers, authProviders, skillCands, effor
 	default:
 		cands = pathMatches(token)
 	}
-	sort.Slice(cands, func(a, b int) bool { return cands[a].Text < cands[b].Text })
-	return head, cands
+	// A recursive result can overlap a literal directory lookup. Keep the
+	// dropdown stable instead of showing the same path twice.
+	seen := make(map[string]bool, len(cands))
+	unique := cands[:0]
+	for _, c := range cands {
+		if !seen[c.Text] {
+			seen[c.Text] = true
+			unique = append(unique, c)
+		}
+	}
+	sort.Slice(unique, func(a, b int) bool { return unique[a].Text < unique[b].Text })
+	return head, unique
 }
 
 func filterPrefix(all []cand, prefix string) []cand {
@@ -191,6 +213,91 @@ func fuzzyFiles(query string, limit int) []string {
 		return nil
 	}
 	return search.FuzzyFiles(root, query, limit)
+}
+
+// mentionCandidates turns recursive file hits into file and useful parent
+// directory completions. Empty directories remain available through literal
+// path completion, which avoids a second recursive walker.
+func mentionCandidates(paths []string, query string) []cand {
+	seen := make(map[string]bool, len(paths)*2)
+	out := make([]cand, 0, len(paths)*2)
+	add := func(path string, folder bool) {
+		if path == "" || seen[path] {
+			return
+		}
+		seen[path] = true
+		desc := ""
+		if folder {
+			desc = "dir"
+		}
+		out = append(out, cand{path, desc})
+	}
+	for _, path := range paths {
+		add(path, false)
+		parts := strings.Split(path, "/")
+		for i := 1; i < len(parts); i++ {
+			dir := strings.Join(parts[:i], "/") + "/"
+			if matchTier(strings.TrimSuffix(dir, "/"), query) >= 0 {
+				add(dir, true)
+			}
+		}
+	}
+	return out
+}
+
+func mentionQuery(value string) (string, bool) {
+	token := value[strings.LastIndexByte(value, ' ')+1:]
+	if !strings.HasPrefix(token, "@") {
+		return "", false
+	}
+	return token[1:], true
+}
+
+type mentionSearchMsg struct {
+	root       string
+	query      string
+	generation uint64
+	candidates []cand
+}
+
+// mentionSearchCmd runs the existing cached walk in a Bubble Tea command so
+// the first scan cannot block typing or rendering.
+func (m *model) mentionSearchCmd() tea.Cmd {
+	query, ok := mentionQuery(m.input.Value())
+	if !ok {
+		return nil
+	}
+	root := m.workingDirectory()
+	if filepath.IsAbs(query) || query == "~" || strings.HasPrefix(query, "~/") {
+		return nil
+	}
+	if m.mentionSearchPending {
+		return nil
+	}
+	if m.mentionSearchRoot == root && m.mentionSearchQuery == query && m.mentionSearchResults != nil {
+		return nil
+	}
+	m.mentionSearchPending = true
+	m.mentionSearchRoot = root
+	m.mentionSearchQuery = query
+	m.mentionSearchResults = []cand{}
+	generation := m.mentionSearchGeneration
+	return func() tea.Msg {
+		paths := search.FuzzyFiles(root, query, menuRows)
+		return mentionSearchMsg{
+			root: root, query: query, generation: generation,
+			candidates: mentionCandidates(paths, query),
+		}
+	}
+}
+
+func (m *model) invalidateMentionSearch(root string) {
+	search.InvalidateFileIndex(root)
+	m.mentionSearchGeneration++
+	m.mentionSearchPending = false
+	m.mentionSearchRoot = ""
+	m.mentionSearchQuery = ""
+	m.mentionSearchResults = nil
 }
 
 // matchTier grades how well q matches file f (both compared lowercase):

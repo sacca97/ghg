@@ -142,14 +142,19 @@ type model struct {
 	current string // in-flight partial assistant line
 	inMsg   bool   // "● " prefix already printed for this assistant segment
 
-	showThinking bool      // ctrl+o: render reasoning timer
-	thinkStart   time.Time // timestamp when reasoning began for current segment
-	thinkEffort  string    // effective effort for the current model call
-	menu         *menu
-	picker       *picker
-	settings     *settings // ctrl+p settings
-	cancel       context.CancelFunc
-	prog         *tea.Program
+	showThinking            bool      // ctrl+o: render reasoning timer
+	thinkStart              time.Time // timestamp when reasoning began for current segment
+	thinkEffort             string    // effective effort for the current model call
+	menu                    *menu
+	mentionSearchRoot       string
+	mentionSearchQuery      string
+	mentionSearchResults    []cand
+	mentionSearchPending    bool
+	mentionSearchGeneration uint64
+	picker                  *picker
+	settings                *settings // ctrl+p settings
+	cancel                  context.CancelFunc
+	prog                    *tea.Program
 
 	store        *session.Store
 	sessionID    string
@@ -397,7 +402,16 @@ func (m *model) refreshMenu() {
 }
 
 func (m *model) completionCandidates(input string) (string, []cand) {
-	return completions(input, m.modelCands(), m.providerCands(), m.authProviderCands(), m.skillCands(), effortCandsFor(m.effortsFor()))
+	var mention []cand
+	if query, ok := mentionQuery(input); ok {
+		// A non-nil empty slice deliberately means "search is in progress";
+		// completions must not fall back to a synchronous recursive walk.
+		mention = []cand{}
+		if m.mentionSearchRoot == m.workingDirectory() && m.mentionSearchQuery == query && m.mentionSearchResults != nil {
+			mention = m.mentionSearchResults
+		}
+	}
+	return completionsWithMention(input, m.modelCands(), m.providerCands(), m.authProviderCands(), m.skillCands(), effortCandsFor(m.effortsFor()), mention)
 }
 
 // previewCand inserts the highlighted candidate as a tab-cycle preview (no

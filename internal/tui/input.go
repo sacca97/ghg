@@ -211,7 +211,7 @@ func (m *model) key(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.input.SetValue(v)
 		m.input.CursorEnd()
 		m.refreshMenu()
-		return m, cmd
+		return m, tea.Batch(cmd, m.mentionSearchCmd())
 	}
 	// an open task detail view owns the keyboard until esc backs out of it
 	if m.taskVP != nil {
@@ -468,7 +468,7 @@ func (m *model) key(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		var cmd tea.Cmd
 		m.input, cmd = m.input.Update(msg)
 		m.refreshMenu()
-		return m, cmd
+		return m, tea.Batch(cmd, m.mentionSearchCmd())
 
 	case tea.KeyEnter:
 		if m.namePrompt != nil { // inline prompt (fork naming, /rename) commits
@@ -491,7 +491,7 @@ func (m *model) key(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			// insert it now (directories stay open for deeper completion)
 			if m.menu.cyc {
 				m.acceptPreview()
-				return m, nil
+				return m, m.mentionSearchCmd()
 			}
 			// Bare commands that act without further args run immediately.
 			if m.menu.head == "" && registryFind(c.Text) != nil {
@@ -500,7 +500,7 @@ func (m *model) key(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				return m.command(c.Text)
 			}
 			if m.accept() {
-				return m, nil // completed something; next enter submits
+				return m, m.mentionSearchCmd() // completed something; next enter submits
 			}
 			// selection was already fully typed — fall through to submit
 		}
@@ -586,7 +586,7 @@ func (m *model) key(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	var cmd tea.Cmd
 	m.input, cmd = m.input.Update(msg)
 	m.refreshMenu()
-	return m, cmd
+	return m, tea.Batch(cmd, m.mentionSearchCmd())
 }
 
 // shiftEnterRe matches the common shift+enter encodings bubbletea doesn't map

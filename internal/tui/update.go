@@ -251,6 +251,24 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.input.SetWidth(msg.Width - 2)
 		return m, nil
 
+	case mentionSearchMsg:
+		if msg.generation != m.mentionSearchGeneration {
+			return m, nil
+		}
+		m.mentionSearchPending = false
+		query, ok := mentionQuery(m.input.Value())
+		if !ok || query != msg.query || m.workingDirectory() != msg.root {
+			m.mentionSearchRoot = ""
+			m.mentionSearchQuery = ""
+			m.mentionSearchResults = nil
+			return m, m.mentionSearchCmd()
+		}
+		m.mentionSearchRoot = msg.root
+		m.mentionSearchQuery = msg.query
+		m.mentionSearchResults = msg.candidates
+		m.refreshMenu()
+		return m, nil
+
 	case recentSessionsMsg:
 		return m, m.applyRecentSessions(msg)
 
@@ -626,7 +644,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.input.InsertString("@" + msg.path + " ")
 			m.refreshMenu()
 		}
-		return m, nil
+		return m, m.mentionSearchCmd()
 
 	}
 

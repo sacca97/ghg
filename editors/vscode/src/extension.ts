@@ -156,9 +156,6 @@ async function referenceSuggestions(workspace: vscode.WorkspaceFolder, query: st
 	if (normalized === undefined) {
 		return [];
 	}
-	if (normalized.includes("/")) {
-		return directoryReferenceSuggestions(workspace, normalized);
-	}
 	const pattern = normalized ? `**/*${literalGlob(normalized)}*` : "**/*";
 	const files = await vscode.workspace.findFiles(
 		new vscode.RelativePattern(workspace, pattern),
@@ -167,13 +164,25 @@ async function referenceSuggestions(workspace: vscode.WorkspaceFolder, query: st
 	);
 	const prefix = normalized.toLowerCase();
 	const candidates = new Map<string, boolean>();
+	// Keep direct directory completion for empty folders; recursive findFiles
+	// below only sees files. Deep partial paths are handled by the same search.
+	if (normalized.includes("/")) {
+		try {
+			for (const item of await directoryReferenceSuggestions(workspace, normalized)) {
+				candidates.set(item.path, item.folder);
+			}
+		} catch {
+			// The recursive workspace search still handles partial/nonexistent parents.
+		}
+	}
 	for (const uri of files) {
 		const path = vscode.workspace.asRelativePath(uri, false).replace(/\\/g, "/");
 		const lowerPath = path.toLowerCase();
 		const basename = path.slice(path.lastIndexOf("/") + 1).toLowerCase();
-		// normalized never contains "/" at this point (slash queries return early
-		// above), so a match has to come from the basename.
-		if (!lowerPath.startsWith(prefix) && !basename.startsWith(prefix)) {
+		const matches = prefix.includes("/")
+			? lowerPath.includes(prefix)
+			: lowerPath.startsWith(prefix) || basename.startsWith(prefix);
+		if (!matches) {
 			continue;
 		}
 		if (!lowerPath.startsWith(prefix)) {

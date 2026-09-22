@@ -15,7 +15,6 @@ import (
 	"github.com/sacca97/ghg/internal/agent"
 	"github.com/sacca97/ghg/internal/config"
 	"github.com/sacca97/ghg/internal/models"
-	"github.com/sacca97/ghg/internal/search"
 	"github.com/sacca97/ghg/internal/session"
 	"github.com/sacca97/ghg/internal/tools"
 	workerwire "github.com/sacca97/ghg/internal/worker"
@@ -500,6 +499,7 @@ func (m *model) handleWorkerFrame(frame workerwire.Frame) (tea.Model, tea.Cmd) {
 					m.append(errStyle.Render("/cd: controller: " + err.Error()))
 				} else {
 					m.workingDir, m.shortCWD = result.CWD, shortCWD()
+					m.invalidateMentionSearch(result.CWD)
 					m.append(dimStyle.Render("→ " + result.CWD))
 				}
 			}
@@ -682,7 +682,7 @@ func (m *model) workerEvent(event workerwire.EventEnvelope) tea.Cmd {
 		}
 		return nil
 	case workerwire.EventTask:
-		search.InvalidateFileIndex(m.workingDirectory())
+		m.invalidateMentionSearch(m.workingDirectory())
 		if value, ok := decodeEvent[workerwire.TaskState](event.Data); ok {
 			if m.workerTasks == nil {
 				m.workerTasks = make(map[string]workerwire.TaskState)
@@ -709,7 +709,7 @@ func (m *model) workerEvent(event workerwire.EventEnvelope) tea.Cmd {
 			return m.applyWorkerMsg(planDeltaMsg(value))
 		}
 	case workerwire.EventShellDone:
-		search.InvalidateFileIndex(m.workingDirectory())
+		m.invalidateMentionSearch(m.workingDirectory())
 		if value, ok := decodeEvent[workerwire.ShellResult](event.Data); ok {
 			return m.applyWorkerMsg(shellDoneMsg{cmd: value.Command, out: value.Output})
 		}
@@ -831,7 +831,7 @@ func (m *model) workerEvent(event workerwire.EventEnvelope) tea.Cmd {
 			}
 		}
 	case workerwire.EventTurnDone:
-		search.InvalidateFileIndex(m.workingDirectory())
+		m.invalidateMentionSearch(m.workingDirectory())
 		if value, ok := decodeEvent[workerwire.TurnResult](event.Data); ok {
 			var err error
 			if !value.Interrupted {
