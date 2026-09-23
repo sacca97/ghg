@@ -29,7 +29,10 @@ func loadProviderProfiles() (models.Profiles, error) {
 }
 
 func loadProviderProfilesForProject(project config.ProjectContext) (models.Profiles, error) {
-	return models.Load(models.LoadOptions{ProjectDir: project.Root, ProjectTrusted: project.Trusted})
+	return models.Load(models.LoadOptions{
+		ProjectDir:     filepath.Join(project.Root, ".ghg", "providers"),
+		ProjectTrusted: project.Trusted,
+	})
 }
 
 func defaultEffort(cfg *config.Config) string {

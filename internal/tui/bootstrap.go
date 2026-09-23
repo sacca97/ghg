@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -49,7 +50,10 @@ func runTUI(cfg *config.Config, modelName, provName, sysPrompt, resumeID string,
 		}
 	}
 
-	profiles, err := models.Load(models.LoadOptions{ProjectDir: project.Root, ProjectTrusted: project.Trusted})
+	profiles, err := models.Load(models.LoadOptions{
+		ProjectDir:     filepath.Join(project.Root, ".ghg", "providers"),
+		ProjectTrusted: project.Trusted,
+	})
 	if err != nil {
 		return "", err
 	}

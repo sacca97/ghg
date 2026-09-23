@@ -55,6 +55,28 @@ func TestModelsCLIJSON(t *testing.T) {
 	}
 }
 
+func TestLoadProviderProfilesIgnoresProjectRootYAML(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, ".golangci.yml"), []byte("version: \"2\"\nrun:\n  timeout: 5m\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	project := filepath.Join(root, ".ghg", "providers")
+	if err := os.MkdirAll(project, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(project, "local.yaml"), []byte("schema: 1\nid: local\ndisplay_name: local\nprotocol: openai-chat-completions\nbase_url: https://example.test/v1\nauth:\n  kind: none\ncatalog:\n  kind: none\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	profiles, err := loadProviderProfilesForProject(config.ProjectContext{Root: root, Trusted: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := profiles.Lookup("local"); !ok {
+		t.Fatal("trusted project profile was not loaded")
+	}
+}
+
 func TestSessionsCLI(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("GHG_HOME", dir)
