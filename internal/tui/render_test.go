@@ -961,12 +961,15 @@ func TestReviewProgressRendersScopeAndLease(t *testing.T) {
 	}})
 	view := ansi.Strip(m.View())
 	for _, want := range []string{
-		"◎ review scope", "scope: internal/tui", "◎ review scope resolved", "scope: internal/tui, internal/worker", "20 production · 10 tests · 8.4k LOC · 5 large files", "budget: 16 exploration rounds · hard limit: 38",
+		"◎ review scope", "scope: internal/tui", "20 production · 10 tests · 8.4k LOC · 5 large files", "budget: 16 exploration rounds · hard limit: 38",
 		"◎ review budget extended · 16 → 20 · hard limit 38", "reason: trace fork/rewind history replacement",
 	} {
 		if !strings.Contains(view, want) {
 			t.Fatalf("view missing %q:\n%s", want, view)
 		}
+	}
+	if strings.Count(view, "◎ review scope") != 1 {
+		t.Fatalf("review scope was rendered more than once: %s", view)
 	}
 	if strings.Count(view, "◎ review budget extended") != 1 {
 		t.Fatalf("duplicate extension notice:\n%s", view)
@@ -1112,19 +1115,56 @@ func TestDockAndStatusHitboxesMatchRenderedRows(t *testing.T) {
 	}
 }
 
-func TestDockClickOpensClickedTask(t *testing.T) {
+func TestDockMouseTargetsOnlyRenderedTaskRows(t *testing.T) {
 	m := statusModel()
 	now := time.Now()
-	m.workerTasks = map[string]workerwire.TaskState{
-		"older": {ID: "older", Description: "old", Status: "running", StartedAt: now.Add(-time.Minute)},
-		"newer": {ID: "newer", Description: "new", Status: "running", StartedAt: now},
+	m.workerTasks = make(map[string]workerwire.TaskState, 8)
+	for i := 0; i < 8; i++ {
+		id := fmt.Sprintf("task-%d", i)
+		m.workerTasks[id] = workerwire.TaskState{ID: id, Description: id, Status: "running", StartedAt: now.Add(-time.Duration(i) * time.Minute)}
 	}
+	m.tasksFocus = true
+	m.taskSel = 6
 	tm, _ := m.Update(mkWinSize(100, 30))
 	m = tm.(*model)
-	m.taskSel = 1
-	_, _ = m.Update(tea.MouseMsg{Action: tea.MouseActionPress, Button: tea.MouseButtonLeft, X: 1, Y: m.dockTop()})
-	if m.taskVP == nil || m.taskVP.id != "newer" {
-		t.Fatalf("dock click opened %+v, want newer", m.taskVP)
+	_, _ = m.Update(tea.MouseMsg{Action: tea.MouseActionPress, Button: tea.MouseButtonLeft, X: 1, Y: m.dockTop() + 1})
+	if m.taskVP == nil || m.taskVP.id != "task-4" {
+		t.Fatalf("scrolled dock click opened %+v, want task-4", m.taskVP)
+	}
+
+	// A wheel over the input area is outside the rendered task rows, even
+	// when the full task list is taller than the dock.
+	m.taskVP = nil
+	m.tasksFocus = false
+	m.layout()
+	moreY := m.dockTop() + m.dockRows - 1
+	_, _ = m.Update(tea.MouseMsg{Action: tea.MouseActionPress, Button: tea.MouseButtonLeft, X: 1, Y: moreY})
+	if m.taskVP != nil {
+		t.Fatalf("+N more row opened a hidden task: %s", m.taskVP.id)
+	}
+	y := m.dockTop() + m.dockRows
+	_, _ = m.Update(tea.MouseMsg{Action: tea.MouseActionPress, Button: tea.MouseButtonWheelUp, X: 1, Y: y})
+	if m.tasksFocus {
+		t.Fatal("wheel over input was captured by the tasks dock")
+	}
+}
+
+func TestTaskDetailUpdatesWhenTaskSettles(t *testing.T) {
+	m := statusModel()
+	m.workerTasks = map[string]workerwire.TaskState{
+		"task": {ID: "task", Description: "work", Prompt: "do it", Status: "running"},
+	}
+	tm, _ := m.Update(mkWinSize(80, 24))
+	m = tm.(*model)
+	m.openTask("task")
+	if !strings.Contains(ansi.Strip(m.taskVP.vp.View()), "running…") {
+		t.Fatal("open task view should show that the task is running")
+	}
+	m.workerTasks["task"] = workerwire.TaskState{ID: "task", Description: "work", Prompt: "do it", Status: "done", Report: "finished"}
+	_, _ = m.Update(taskUpdateMsg{})
+	body := ansi.Strip(m.taskVP.vp.View())
+	if !strings.Contains(body, "finished") || strings.Contains(body, "running…") {
+		t.Fatalf("task detail body did not refresh after completion: %q", body)
 	}
 }
 

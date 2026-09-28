@@ -617,6 +617,7 @@ func (m *model) applyWorkerSnapshot(snapshot workerwire.Snapshot) {
 		m.workerTasks[task.ID] = task
 		m.workerLiveWork = m.workerLiveWork || task.Status == "running"
 	}
+	m.refreshTaskText()
 	m.busy = workerStateBusy(snapshot.State)
 	if m.busy && m.cancel == nil {
 		// A resumed worker has no local submitTurn closure, but it is still

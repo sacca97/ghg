@@ -19,6 +19,7 @@ import (
 	"github.com/sacca97/ghg/internal/models"
 	"github.com/sacca97/ghg/internal/schedule"
 	"github.com/sacca97/ghg/internal/session"
+	"github.com/sacca97/ghg/internal/textutil"
 	workerwire "github.com/sacca97/ghg/internal/worker"
 )
 
@@ -83,9 +84,7 @@ func (m *model) compactLog() {
 	b.WriteString(dimStyle.Render("compactions — raw history preserved; /compact retry undoes the latest:"))
 	for _, c := range events {
 		summary := strings.Join(strings.Fields(c.Summary), " ")
-		if len(summary) > 80 {
-			summary = summary[:80] + "…"
-		}
+		summary = textutil.UTF8Truncate(summary, 80, "…")
 		b.WriteString("\n  ")
 		b.WriteString(dimStyle.Render("#" + strconv.Itoa(c.Seq) + " folded through message " + strconv.Itoa(c.Cutoff) + ": "))
 		b.WriteString(summary)

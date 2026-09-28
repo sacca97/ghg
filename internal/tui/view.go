@@ -14,6 +14,7 @@ import (
 	"github.com/sacca97/ghg/internal/agent"
 	"github.com/sacca97/ghg/internal/config"
 	"github.com/sacca97/ghg/internal/models"
+	"github.com/sacca97/ghg/internal/textutil"
 
 	"github.com/charmbracelet/x/ansi"
 )
@@ -627,10 +628,7 @@ func (m *model) tasksView() string {
 		b.WriteString("\n")
 		b.WriteString(toolStyle.Render(line))
 		if t.Status != agent.TaskRunning {
-			report := t.Report
-			if len(report) > 200 {
-				report = report[:200] + "…"
-			}
+			report := textutil.UTF8Truncate(t.Report, 200, "…")
 			b.WriteString("\n")
 			b.WriteString(dimStyle.Render("      " + strings.ReplaceAll(report, "\n", " ")))
 		}

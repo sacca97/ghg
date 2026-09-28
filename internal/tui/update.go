@@ -163,25 +163,23 @@ func (m *model) handleMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 	if m.picker == nil {
 		// dock rows sit just above the input box: click selects/opens,
 		// wheel scrolls the selection through the strip
-		if top, n := m.dockTop(), len(m.dockTasks()); n > 0 && msg.Y >= top && msg.Y < top+n {
+		tasks := m.dockTasks()
+		lo, hi := m.dockTaskWindow(len(tasks))
+		if top, rows := m.dockTop(), hi-lo; rows > 0 && msg.Y >= top && msg.Y < top+rows {
 			if msg.Button == tea.MouseButtonWheelUp || msg.Button == tea.MouseButtonWheelDown {
 				m.tasksFocus = true
 				if msg.Button == tea.MouseButtonWheelUp {
 					m.taskSel = max(m.taskSel-1, 0)
 				} else {
-					m.taskSel = min(m.taskSel+1, n-1)
+					m.taskSel = min(m.taskSel+1, len(tasks)-1)
 				}
 				return m, nil
 			}
 			if msg.Action == tea.MouseActionPress && msg.Button == tea.MouseButtonLeft {
-				sel := msg.Y - top
+				sel := lo + msg.Y - top
 				m.tasksFocus = true
-				m.taskSel = min(sel, n-1)
-				// re-fetch: the list can change between the hitbox check
-				// above and this open (settled tasks age out)
-				if tasks := m.dockTasks(); len(tasks) > 0 {
-					m.openTask(tasks[min(m.taskSel, len(tasks)-1)].ID)
-				}
+				m.taskSel = sel
+				m.openTask(tasks[sel].ID)
 				return m, nil
 			}
 		}
@@ -599,9 +597,6 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.reviewScopeShown = true
 			m.append(dimStyle.Render(renderReviewScope(progress)))
 		}
-		if progress.Phase == "assessment" && progress.Inventory != nil && len(progress.Inventory.Scope) > 0 {
-			m.append(dimStyle.Render("◎ review scope resolved\n  scope: " + strings.Join(progress.Inventory.Scope, ", ")))
-		}
 		if progress.Phase == "extension" && progress.ToAllocation > progress.FromAllocation && progress.ToAllocation != m.reviewLastExtensionTo {
 			m.reviewLastExtensionTo = progress.ToAllocation
 			m.append(dimStyle.Render(renderReviewExtension(progress)))
@@ -626,6 +621,7 @@ func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case taskUpdateMsg:
+		m.refreshTaskText()
 		return m, nil
 
 	case mcpStatusMsg:

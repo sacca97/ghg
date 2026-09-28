@@ -62,6 +62,24 @@ func (m *model) clampTaskSel() {
 	m.taskSel = min(max(m.taskSel, 0), n-1)
 }
 
+func (m *model) dockTaskWindow(count int) (lo, hi int) {
+	if count == 0 {
+		return 0, 0
+	}
+	budget := tasksDockHeight
+	if m.tasksFocus {
+		budget-- // focused hint row
+	}
+	if count > budget {
+		budget-- // reserve the +N more row
+	}
+	sel := min(max(m.taskSel, 0), count-1)
+	if m.tasksFocus && sel >= budget {
+		lo = sel - budget + 1
+	}
+	return lo, min(lo+budget, count)
+}
+
 // tasksDock renders the persistent strip: one row per task with a live
 // status icon, plus a hint row when the dock is focused.
 func (m *model) tasksDock() string {
@@ -76,15 +94,7 @@ func (m *model) tasksDock() string {
 		rows = append(rows, dimStyle.Render(" ⚙ subagents — ↑/↓ select · enter open · esc back"))
 	}
 
-	budget := tasksDockHeight - len(rows)
-	if len(tasks) > budget { // reserve a row for the "+N more" counter
-		budget--
-	}
-	lo := 0
-	if m.tasksFocus && sel >= budget {
-		lo = sel - budget + 1 // keep the selection visible
-	}
-	hi := min(lo+budget, len(tasks))
+	lo, hi := m.dockTaskWindow(len(tasks))
 
 	for i := lo; i < hi; i++ {
 		t := tasks[i]
@@ -125,15 +135,26 @@ func (m *model) openTask(id string) {
 	if !ok {
 		return
 	}
-	tv := &taskView{id: id}
-	tv.text = fmt.Sprintf("%s %s  %s\n\n%s %s\n", toolStyle.Render("⚙"), t.ID, t.Description, youStyle.Render("prompt:"), t.Prompt)
-	if t.Status == string(agent.TaskRunning) {
-		tv.text += fmt.Sprintf("\n%s\n", dimStyle.Render("  running…"))
-	} else {
-		tv.text += fmt.Sprintf("\n%s %s\n", toolStyle.Render(t.Status+":"), t.Report)
-	}
+	tv := &taskView{id: id, text: taskViewText(t.ID, t.Description, t.Prompt, t.Status, t.Report)}
 	m.taskVP = tv
 	m.refreshTaskVP()
+}
+
+func taskViewText(id, description, prompt, status, report string) string {
+	text := fmt.Sprintf("%s %s  %s\n\n%s %s\n", toolStyle.Render("⚙"), id, description, youStyle.Render("prompt:"), prompt)
+	if status == string(agent.TaskRunning) {
+		return text + fmt.Sprintf("\n%s\n", dimStyle.Render("  running…"))
+	}
+	return text + fmt.Sprintf("\n%s %s\n", toolStyle.Render(status+":"), report)
+}
+
+func (m *model) refreshTaskText() {
+	if m.taskVP == nil {
+		return
+	}
+	if task, ok := m.workerTasks[m.taskVP.id]; ok {
+		m.taskVP.text = taskViewText(task.ID, task.Description, task.Prompt, task.Status, task.Report)
+	}
 }
 
 // refreshTaskVP resizes the open task pane to the free screen area and reloads

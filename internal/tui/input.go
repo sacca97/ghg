@@ -222,13 +222,12 @@ func (m *model) key(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	// Paste collapse (opt-in via config collapsePaste): a multi-line bracketed
 	// paste lands as a [Pasted ~N lines] placeholder in the input instead of
 	// spraying the textarea; the real text is held in pasteBuf and swapped in
-	// at submit. Off by default — a paste you can't see is a paste you can't
-	// trust.
-	if msg.Paste && m.cfg != nil && m.cfg.CollapsePaste != nil && *m.cfg.CollapsePaste {
+	// at submit. Only one paste is collapsed at a time; later pastes stay
+	// visible so their contents cannot overwrite the held text. Off by default.
+	if msg.Paste && m.pasteBuf == "" && m.cfg != nil && m.cfg.CollapsePaste != nil && *m.cfg.CollapsePaste {
 		if n := strings.Count(string(msg.Runes), "\n"); n >= 2 {
 			m.pasteBuf = string(msg.Runes)
-			m.input.SetValue(m.input.Value() + fmt.Sprintf("[Pasted ~%d lines]", n+1))
-			m.input.CursorEnd()
+			m.input.InsertString(fmt.Sprintf("[Pasted ~%d lines]", n+1))
 			m.growInput()
 			return m, nil
 		}

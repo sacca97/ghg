@@ -403,21 +403,21 @@ func TestPasteCollapseOptIn(t *testing.T) {
 	on := true
 	m2 := compactCmdModel()
 	m2.cfg.CollapsePaste = &on
+	m2.input.SetValue("before after")
+	m2.input.SetCursor(len("before "))
 	m2.Update(paste)
-	if !strings.Contains(m2.input.Value(), "[Pasted ~3 lines]") {
-		t.Fatalf("collapsed input should show the placeholder, got %q", m2.input.Value())
+	if got := m2.input.Value(); got != "before [Pasted ~3 lines]after" {
+		t.Fatalf("collapse should insert the placeholder at the caret, got %q", got)
 	}
 	if m2.pasteBuf == "" {
 		t.Fatal("the real paste text should be held")
 	}
-	// submit swaps it back
-	m2.input.SetValue(m2.input.Value()) // settle
-	m2.permDialog = nil
-	// drive the submit path's swap directly (the placeholder → real text)
-	text := strings.TrimSpace(m2.input.Value())
-	text = strings.Replace(text, "[Pasted ~3 lines]", strings.TrimSpace(m2.pasteBuf), 1)
-	if !strings.Contains(text, "line1\nline2\nline3") {
-		t.Fatalf("submit should restore the real text, got %q", text)
+	// Further pastes stay verbatim rather than overwriting the one retained
+	// collapsed paste.
+	m2.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("second\npaste\ntext"), Paste: true})
+	text := restoreCollapsedPaste(m2.input.Value(), m2.pasteBuf)
+	if !strings.Contains(text, "line1\nline2\nline3") || !strings.Contains(text, "second\npaste\ntext") {
+		t.Fatalf("submit should preserve both pastes, got %q", text)
 	}
 }
 
