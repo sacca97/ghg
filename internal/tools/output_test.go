@@ -44,11 +44,11 @@ func TestOutputToolsListReadAndScope(t *testing.T) {
 		Store:     func() *session.OutputStore { return outputs },
 		Messages:  func() []models.Message { return currentMessages },
 	})
-	list := tools.ExecuteResult(context.Background(), toolSet, "artifact_list", json.RawMessage(`{"tool":"bash"}`))
+	list := tools.ExecuteResult(context.Background(), toolSet, "output_list", json.RawMessage(`{"tool":"bash"}`))
 	if !strings.Contains(list.Preview, ref.ID) || !strings.Contains(list.Preview, "call=call-1") {
 		t.Fatalf("output_list = %q", list.Preview)
 	}
-	read := tools.ExecuteResult(context.Background(), toolSet, "artifact_read", json.RawMessage(`{"id":"`+ref.ID+`"}`))
+	read := tools.ExecuteResult(context.Background(), toolSet, "output_read", json.RawMessage(`{"id":"`+ref.ID+`"}`))
 	if !strings.Contains(read.Preview, "line two") || read.Output == nil || read.Output.ID != ref.ID {
 		t.Fatalf("output_read = %+v", read)
 	}
@@ -59,7 +59,7 @@ func TestOutputToolsListReadAndScope(t *testing.T) {
 	}
 	sessionID = other
 	currentMessages = nil
-	read = tools.ExecuteResult(context.Background(), toolSet, "artifact_read", json.RawMessage(`{"id":"`+ref.ID+`"}`))
+	read = tools.ExecuteResult(context.Background(), toolSet, "output_read", json.RawMessage(`{"id":"`+ref.ID+`"}`))
 	if !strings.Contains(read.Preview, "not available in the current session") {
 		t.Fatalf("cross-session output read = %q", read.Preview)
 	}
@@ -67,7 +67,7 @@ func TestOutputToolsListReadAndScope(t *testing.T) {
 
 func TestOutputToolsRejectPathsAndUnboundedReads(t *testing.T) {
 	toolSet := tools.OutputTools(tools.OutputToolConfig{})
-	if got := tools.ExecuteResult(context.Background(), toolSet, "artifact_read", json.RawMessage(`{"id":"../../secret"}`)); !strings.Contains(got.Preview, "no output store") {
+	if got := tools.ExecuteResult(context.Background(), toolSet, "output_read", json.RawMessage(`{"id":"../../secret"}`)); !strings.Contains(got.Preview, "no output store") {
 		t.Fatalf("path input without catalog = %q", got.Preview)
 	}
 }

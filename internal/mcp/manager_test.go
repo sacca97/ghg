@@ -120,7 +120,7 @@ func TestManagerConnectAndCall(t *testing.T) {
 	if len(ts) != 4 {
 		t.Fatalf("expected 4 tools, got %d: %v", len(ts), toolNames(ts))
 	}
-	out := tools.Execute(context.Background(), ts, "mcp__docs__greet", json.RawMessage(`{"name":"ghg"}`))
+	out := tools.ExecuteResult(context.Background(), ts, "mcp__docs__greet", json.RawMessage(`{"name":"ghg"}`)).Preview
 	if out != "hi ghg" {
 		t.Errorf("greet = %q", out)
 	}
@@ -135,7 +135,7 @@ func TestManagerToolFailuresAreToolOutput(t *testing.T) {
 	m := newTestManager(t, map[string]ServerConfig{"docs": testCfg("docs")})
 	m.Start(context.Background())
 	waitReady(t, m)
-	out := tools.Execute(context.Background(), m.Tools(), "mcp__docs__fail", nil)
+	out := tools.ExecuteResult(context.Background(), m.Tools(), "mcp__docs__fail", nil).Preview
 	if !strings.HasPrefix(out, "Error: ") || !strings.Contains(out, "boom") {
 		t.Errorf("fail = %q", out)
 	}
@@ -146,11 +146,11 @@ func TestManagerStructuredAndMedia(t *testing.T) {
 	m.Start(context.Background())
 	waitReady(t, m)
 	ts := m.Tools()
-	out := tools.Execute(context.Background(), ts, "mcp__docs__structured", nil)
+	out := tools.ExecuteResult(context.Background(), ts, "mcp__docs__structured", nil).Preview
 	if !strings.Contains(out, `"answer": 42`) {
 		t.Errorf("structured = %q", out)
 	}
-	out = tools.Execute(context.Background(), ts, "mcp__docs__media", nil)
+	out = tools.ExecuteResult(context.Background(), ts, "mcp__docs__media", nil).Preview
 	if !strings.Contains(out, "here you go") || !strings.Contains(out, "[image content omitted: image/png, 3 bytes]") {
 		t.Errorf("media = %q", out)
 	}
@@ -188,7 +188,7 @@ func TestManagerFailedServerDegradesToErrorString(t *testing.T) {
 			return s.call(ctx, "anything", args)
 		},
 	}
-	execOut := tools.Execute(context.Background(), []tools.Tool{staleTool}, "mcp__ghost__anything", nil)
+	execOut := tools.ExecuteResult(context.Background(), []tools.Tool{staleTool}, "mcp__ghost__anything", nil).Preview
 	if !strings.HasPrefix(execOut, "Error: ") || !strings.Contains(execOut, "unavailable") {
 		t.Errorf("execute stale tool = %q", execOut)
 	}
@@ -224,7 +224,7 @@ func TestManagerReconnect(t *testing.T) {
 	if st := m.Statuses(); st[0].Status != StatusReady {
 		t.Fatalf("after reconnect: %+v", st[0])
 	}
-	out := tools.Execute(context.Background(), m.Tools(), "mcp__docs__greet", json.RawMessage(`{"name":"back"}`))
+	out := tools.ExecuteResult(context.Background(), m.Tools(), "mcp__docs__greet", json.RawMessage(`{"name":"back"}`)).Preview
 	if out != "hi back" {
 		t.Errorf("greet after reconnect = %q", out)
 	}
@@ -247,7 +247,7 @@ func TestManagerParallelCallsRaceClean(t *testing.T) {
 			if i%2 == 1 {
 				name = "mcp__b__greet"
 			}
-			out := tools.Execute(context.Background(), ts, name, json.RawMessage(`{"name":"x"}`))
+			out := tools.ExecuteResult(context.Background(), ts, name, json.RawMessage(`{"name":"x"}`)).Preview
 			if out == "hi x" {
 				calls.Add(1)
 			}
@@ -363,7 +363,7 @@ func TestManagerAutoReconnect(t *testing.T) {
 	if !recovered {
 		t.Fatalf("auto-reconnect did not recover: %+v", m.Statuses()[0])
 	}
-	out := tools.Execute(context.Background(), m.Tools(), "mcp__docs__greet", json.RawMessage(`{"name":"auto"}`))
+	out := tools.ExecuteResult(context.Background(), m.Tools(), "mcp__docs__greet", json.RawMessage(`{"name":"auto"}`)).Preview
 	if out != "hi auto" {
 		t.Errorf("call after auto-reconnect = %q", out)
 	}

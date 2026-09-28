@@ -7,6 +7,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/charmbracelet/bubbles/cursor"
 	"github.com/charmbracelet/bubbles/key"
 	"github.com/charmbracelet/bubbles/textarea"
 	tea "github.com/charmbracelet/bubbletea"
@@ -96,6 +97,7 @@ func newInput() textarea.Model {
 	ti.BlurredStyle.Placeholder = dimStyle
 	ti.FocusedStyle.Prompt = botStyle
 	ti.BlurredStyle.Prompt = dimStyle
+	ti.Cursor.SetMode(cursor.CursorStatic)
 	ti.Focus()
 	return ti
 }

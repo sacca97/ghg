@@ -26,22 +26,6 @@ import (
 	workerwire "github.com/sacca97/ghg/internal/worker"
 )
 
-// Wire payload shapes live in internal/worker (workerwire); these aliases
-// keep the historical local names readable.
-type (
-	workerInput             = workerwire.Input
-	workerTurnResult        = workerwire.TurnResult
-	workerCompactResult     = workerwire.CompactResult
-	workerTaskState         = workerwire.TaskState
-	workerApproval          = workerwire.Approval
-	workerApprovalAnswer    = workerwire.ApprovalAnswer
-	workerConfigureRequest  = workerwire.ConfigureRequest
-	workerSnapshot          = workerwire.Snapshot
-	workerPermissionRequest = workerwire.PermissionRequest
-	workerQuestionRequest   = workerwire.QuestionRequest
-	workerQuestionAnswer    = workerwire.QuestionAnswer
-)
-
 type workerProcessState struct {
 	mu              sync.Mutex
 	cfg             *config.Config
@@ -174,23 +158,35 @@ func newWorkerProcess(runtimeFile workerwire.Runtime) (*workerProcessState, erro
 	if err != nil {
 		return nil, err
 	}
+	resourcesTransferred := false
+	var lspMgr *lsp.Manager
+	var runtimeCleanup func()
+	defer func() {
+		if resourcesTransferred {
+			return
+		}
+		if lspMgr != nil {
+			lspMgr.Close()
+		}
+		if runtimeCleanup != nil {
+			runtimeCleanup()
+		}
+		_ = store.Close()
+	}()
 	sessionID := runtimeFile.SessionID
 	modelName := os.Getenv(workerwire.WorkerModelEnv)
 	providerName := os.Getenv(workerwire.WorkerProviderEnv)
 	exists, existsErr := store.Exists(sessionID)
 	if existsErr != nil {
-		store.Close()
 		return nil, existsErr
 	}
 	if !exists {
 		if err := store.CreateWithID(sessionID, project.Root, modelName, providerName); err != nil {
-			store.Close()
 			return nil, err
 		}
 	}
 	meta, msgs, err := store.Load(sessionID)
 	if err != nil {
-		store.Close()
 		return nil, err
 	}
 	if modelName == "" {
@@ -234,7 +230,6 @@ func newWorkerProcess(runtimeFile workerwire.Runtime) (*workerProcessState, erro
 		Role: role, SystemPrompt: sysPrompt,
 	})
 	if err != nil {
-		store.Close()
 		return nil, err
 	}
 	ag.PlanMode = (mode == "plan")
@@ -265,16 +260,12 @@ func newWorkerProcess(runtimeFile workerwire.Runtime) (*workerProcessState, erro
 
 	configuredRuntime, lspMgr, runtimeCleanup, err := newConfiguredRuntime(cfg, false)
 	if err != nil {
-		store.Close()
 		return nil, err
 	}
 	var outputStore *session.OutputStore
 	if maxBytes, enabled := outputStoreLimit(cfg); enabled {
 		outputStore, err = openOutputStore(dir, maxBytes)
 		if err != nil {
-			lspMgr.Close()
-			runtimeCleanup()
-			store.Close()
 			return nil, err
 		}
 	}
@@ -288,9 +279,6 @@ func newWorkerProcess(runtimeFile workerwire.Runtime) (*workerProcessState, erro
 		perms: tools.LoadPermRules(),
 	}
 	if err := bindAgentSubsystems(context.Background(), ag, configuredRuntime, outputStore, store, sessionID, cfg); err != nil {
-		lspMgr.Close()
-		runtimeCleanup()
-		store.Close()
 		return nil, err
 	}
 	ag.LoadTodosJSON(store.Todos(sessionID))
@@ -352,6 +340,7 @@ func newWorkerProcess(runtimeFile workerwire.Runtime) (*workerProcessState, erro
 		w.mcp.Start(context.Background())
 		ag.SetMCPTools(w.mcp.Tools())
 	}
+	resourcesTransferred = true
 	return w, nil
 }
 
@@ -369,7 +358,7 @@ func configureWorkerCompaction(ag *agent.Agent, cfg *config.Config, profiles mod
 	ag.CompactCandidates = nil
 
 	for _, role := range []string{config.RoleTiny, config.RoleFast, config.RoleDefault, config.RoleSmart} {
-		if !compactionRoleConfigured(cfg, role) {
+		if _, ok := cfg.Roles[role]; !ok {
 			continue
 		}
 		target, err := cfg.ResolveRole(role)
@@ -384,17 +373,6 @@ func configureWorkerCompaction(ag *agent.Agent, cfg *config.Config, profiles mod
 			ag.CompactCandidates = append(ag.CompactCandidates, candidate)
 		}
 	}
-}
-
-func compactionRoleConfigured(cfg *config.Config, role string) bool {
-	if role == config.RoleDefault {
-		if _, ok := cfg.Roles[role]; ok {
-			return true
-		}
-		return strings.TrimSpace(cfg.DefaultModel) != ""
-	}
-	_, ok := cfg.Roles[role]
-	return ok
 }
 func (w *workerProcessState) transition(mutate func() (newState workerwire.State, newDetached bool, detail string, ok bool)) bool {
 	w.stateWriteMu.Lock()
@@ -503,7 +481,7 @@ func (w *workerProcessState) fireDueSchedule(now time.Time) {
 		return
 	}
 	prompt := fmt.Sprintf("⏰ Scheduled task #%d fired (%s). Work on it now:\n\n%s", task.ID, task.Schedule, task.Prompt)
-	if !w.startTurn(workerInput{Input: prompt}) {
+	if !w.startTurn(workerwire.Input{Input: prompt}) {
 		return
 	}
 	if err := w.store.MarkFired(w.sessionID, task.ID, task.Slot); err != nil {
@@ -549,8 +527,8 @@ func (w *workerProcessState) closeResources() {
 	}
 }
 
-func workerTask(task agent.BackgroundTask) workerTaskState {
-	return workerTaskState{ID: task.ID, Description: task.Description, Prompt: task.Prompt, Status: string(task.Status), Report: task.Report, StartedAt: task.StartedAt, EndedAt: task.EndedAt, Restored: task.Restored}
+func workerTask(task agent.BackgroundTask) workerwire.TaskState {
+	return workerwire.TaskState{ID: task.ID, Description: task.Description, Prompt: task.Prompt, Status: string(task.Status), Report: task.Report, StartedAt: task.StartedAt, EndedAt: task.EndedAt, Restored: task.Restored}
 }
 
 func sessionTask(task agent.BackgroundTask) session.Task {

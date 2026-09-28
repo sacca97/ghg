@@ -31,8 +31,8 @@ func TestCompletions(t *testing.T) {
 		t.Fatalf("command completion: %q %v", head, texts(cs))
 	}
 	// export kinds
-	head, cs = completions("/export-result ", models, provs, provs, nil, nil)
-	if head != "/export-result " || len(cs) != 4 || cs[0].Text != "chat" || cs[1].Text != "last" || cs[2].Text != "plan" || cs[3].Text != "review" {
+	head, cs = completions("/export ", models, provs, provs, nil, nil)
+	if head != "/export " || len(cs) != 4 || cs[0].Text != "chat" || cs[1].Text != "last" || cs[2].Text != "plan" || cs[3].Text != "review" {
 		t.Fatalf("export completion: %q %v", head, texts(cs))
 	}
 	// every slash command in the switch must be completable — the "I can't

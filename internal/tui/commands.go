@@ -100,7 +100,6 @@ func slashRegistry() []registryEntry {
 // registryFind returns the entry for a slash command name (nil for "!cmd"
 // and unknown names).
 func registryFind(name string) *registryEntry {
-	name = workerwire.CommandName(name)
 	for i := range registry {
 		if registry[i].Name == name {
 			return &registry[i]
@@ -162,9 +161,9 @@ func busyCmd(text string) bool {
 	if len(fields) == 0 {
 		return false
 	}
-	name := workerwire.CommandName(fields[0])
+	name := fields[0]
 	if name == "/goal" { // status and clear are settings; resume/<text> submit turns
-		return len(fields) == 1 || fields[1] == "clear" || fields[1] == "rounds"
+		return len(fields) == 1 || fields[1] == "clear"
 	}
 	return registryImmediate(name)
 }
@@ -184,7 +183,7 @@ func (m *model) command(text string) (tea.Model, tea.Cmd) {
 	if len(fields) == 0 {
 		return m, nil
 	}
-	command := workerwire.CommandName(fields[0])
+	command := fields[0]
 	switch command {
 	case "/quit":
 		return m, tea.Quit
@@ -272,25 +271,7 @@ func (m *model) command(text string) (tea.Model, tea.Cmd) {
 			if !m.requireAgent() {
 				return m, nil
 			}
-			if m.workerClient == nil && !m.ensureWorker() {
-				m.append(errStyle.Render("compact failed: worker unavailable: " + m.workerStartError))
-				return m, nil
-			}
-			requestID := workerRequestID("compact")
-			m.busy = true
-			m.turnStart = m.nowFn()
-			m.append(dimStyle.Render("◎ compacting…"))
-			m.cancel = func() {
-				if m.workerClient != nil {
-					_ = m.workerClient.Send(workerwire.CommandCancel, requestID+"-cancel", nil)
-				}
-			}
-			if err := m.workerClient.Send(workerwire.CommandCompact, requestID, nil); err != nil {
-				m.busy = false
-				m.cancel = nil
-				m.append(errStyle.Render("compact failed: " + err.Error()))
-			}
-			return m, m.spin.Tick
+			return m.startWorkerOperation("compact failed", "compact", workerwire.CommandCompact, "◎ compacting…", nil)
 		}
 		if len(fields) > 1 {
 			switch fields[1] {
@@ -387,25 +368,11 @@ func (m *model) command(text string) (tea.Model, tea.Cmd) {
 			}
 			window = n
 		}
-		if m.workerClient == nil && !m.ensureWorker() {
-			m.append(errStyle.Render("goal-from-context: worker unavailable: " + m.workerStartError))
-			return m, nil
-		}
-		m.busy = true
-		m.turnStart = m.nowFn()
-		m.append(dimStyle.Render(fmt.Sprintf("◎ formulating goal from the last %d messages…", window)))
-		requestID := workerRequestID("goal-from-context")
-		m.cancel = func() {
-			if m.workerClient != nil {
-				_ = m.workerClient.Send(workerwire.CommandCancel, requestID+"-cancel", nil)
-			}
-		}
-		if err := m.workerClient.Send(workerwire.CommandGoalFromContext, requestID, workerwire.GoalFromContextRequest{Window: window}); err != nil {
-			m.busy = false
-			m.cancel = nil
-			m.append(errStyle.Render("goal-from-context failed: " + err.Error()))
-		}
-		return m, m.spin.Tick
+		return m.startWorkerOperation(
+			"goal-from-context failed", "goal-from-context", workerwire.CommandGoalFromContext,
+			fmt.Sprintf("◎ formulating goal from the last %d messages…", window),
+			workerwire.GoalFromContextRequest{Window: window},
+		)
 	case "/plan":
 		return m.planCommand(text)
 	case "/execute":
@@ -413,9 +380,6 @@ func (m *model) command(text string) (tea.Model, tea.Cmd) {
 	case "/review":
 		return m.reviewCommand(text)
 	case "/export":
-		if fields[0] == "/export-chat" || fields[0] == "/export-log" {
-			text = "/export chat " + strings.TrimSpace(strings.TrimPrefix(text, fields[0]))
-		}
 		return m.exportResultCommand(text)
 	case "/goal":
 		switch {
@@ -435,8 +399,6 @@ func (m *model) command(text string) (tea.Model, tea.Cmd) {
 		case fields[1] == "clear":
 			m.setGoal("")
 			m.append(dimStyle.Render("(goal cleared)"))
-		case fields[1] == "rounds":
-			m.append(dimStyle.Render("goal runs are unbounded; /goal rounds is no longer used"))
 		case fields[1] == "resume":
 			if !m.requireAgent() {
 				break

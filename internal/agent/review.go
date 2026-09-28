@@ -136,9 +136,7 @@ func (a *Agent) RestoreReviewContinuation(target string, progress []ReviewProgre
 		if value.Allocation > 0 {
 			budget.Allocation = value.Allocation
 		}
-		if value.CurrentRound >= 0 {
-			budget.CurrentRound = value.CurrentRound
-		}
+		budget.CurrentRound = value.CurrentRound
 		if value.HardLimit > 0 {
 			budget.HardLimit = value.HardLimit
 		}

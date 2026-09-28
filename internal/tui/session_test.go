@@ -61,13 +61,13 @@ func TestExportResultCommand(t *testing.T) {
 	m.sessionID = sessionID
 	m.messages = []models.Message{{Role: "system", Content: "system prompt"}}
 	emptyChat := filepath.Join(tempDir, "empty-chat.md")
-	m.exportResultCommand("/export-result chat " + emptyChat)
+	m.exportResultCommand("/export chat " + emptyChat)
 	if _, err := os.Stat(emptyChat); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("empty chat export created %s", emptyChat)
 	}
 
 	// 1. When no results exist, it should report a friendly message
-	m.exportResultCommand("/export-result")
+	m.exportResultCommand("/export")
 	var foundNoResults bool
 	for _, b := range m.blocks {
 		if strings.Contains(b.text, "no completed workflow result") {
@@ -118,7 +118,7 @@ func TestExportResultCommand(t *testing.T) {
 
 	// 3. Export latest review to a specified file
 	outFile := filepath.Join(tempDir, "my-review.md")
-	m.exportResultCommand("/export-result review " + outFile)
+	m.exportResultCommand("/export review " + outFile)
 
 	data, err := os.ReadFile(outFile)
 	if err != nil {
@@ -130,7 +130,7 @@ func TestExportResultCommand(t *testing.T) {
 
 	// 4. Overwrite without force must show already exists error
 	m.blocks = nil
-	m.exportResultCommand("/export-result review " + outFile)
+	m.exportResultCommand("/export review " + outFile)
 	var foundExistsErr bool
 	for _, b := range m.blocks {
 		if strings.Contains(b.text, "already exists") {
@@ -144,7 +144,7 @@ func TestExportResultCommand(t *testing.T) {
 
 	// 5. Overwrite with --force must succeed
 	m.blocks = nil
-	m.exportResultCommand("/export-result review " + outFile + " --force")
+	m.exportResultCommand("/export review " + outFile + " --force")
 	var foundSuccess bool
 	for _, b := range m.blocks {
 		if strings.Contains(b.text, "exported review") {
@@ -159,7 +159,7 @@ func TestExportResultCommand(t *testing.T) {
 	// 6. Export last message
 	m.appendAssistant("This is the last assistant response summarizing the work.")
 	lastMsgOut := filepath.Join(tempDir, "last-message.md")
-	m.exportResultCommand("/export-result last " + lastMsgOut)
+	m.exportResultCommand("/export last " + lastMsgOut)
 
 	msgData, err := os.ReadFile(lastMsgOut)
 	if err != nil {
@@ -171,7 +171,7 @@ func TestExportResultCommand(t *testing.T) {
 
 	// 7. Export chat log
 	chatOut := filepath.Join(tempDir, "chat-log.md")
-	m.exportResultCommand("/export-result chat " + chatOut)
+	m.exportResultCommand("/export chat " + chatOut)
 	chatData, err := os.ReadFile(chatOut)
 	if err != nil {
 		t.Fatalf("failed to read exported chat log: %v", err)
@@ -203,7 +203,7 @@ func TestExportProposedPlan(t *testing.T) {
 	m.proposedPlanMD = "# Plan: Migrate database\n\n1. step 1: backup\n2. step 2: apply migrations\n"
 
 	outFile := filepath.Join(tempDir, "plan-export.md")
-	m.exportResultCommand("/export-result plan " + outFile)
+	m.exportResultCommand("/export plan " + outFile)
 
 	data, err := os.ReadFile(outFile)
 	if err != nil {

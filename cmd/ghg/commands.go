@@ -120,7 +120,13 @@ func configuredCatalogModels(cfg *config.Config) []catalogModelChoice {
 		seen[key] = struct{}{}
 		choice := catalogModelChoice{Model: model, Provider: provider}
 		if info := catalogs[provider].Find(model); info != nil {
-			choice.ReasoningEfforts = info.SupportedEfforts()
+			// Unknown capability metadata must stay unknown on the wire. An
+			// unconditional SupportedEfforts() adds only "off", which makes the
+			// extension hide its normal effort choices even though the worker
+			// falls back to the configured default levels.
+			if info.ReasoningKnown || info.ReasoningToggle || len(info.ReasoningEfforts) > 0 {
+				choice.ReasoningEfforts = info.SupportedEfforts()
+			}
 		}
 		choices = append(choices, choice)
 	}
@@ -267,5 +273,3 @@ func outputsCLI(args []string) error {
 	fmt.Printf("removed %d unreferenced output payload(s)\n", removed)
 	return nil
 }
-
-func artifactsCLI(args []string) error { return outputsCLI(args) }

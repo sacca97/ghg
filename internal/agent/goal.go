@@ -150,7 +150,7 @@ func GoalTool(record GoalRecord) tools.Tool {
 			if err := update.Validate(record.ID); err != nil {
 				return tools.ToolResult{}, err
 			}
-			result := tools.TextResult(goalUpdateMessage(update), "")
+			result := tools.NewTextResult(goalUpdateMessage(update), 0)
 			result.Source = GoalToolName
 			result.Metadata = map[string]string{
 				"goal_id":  record.ID,

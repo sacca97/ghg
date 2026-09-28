@@ -28,7 +28,7 @@ import (
 func runCLI(args []string) error {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	format := fs.String("format", "text", "output format: text (stream the reply) or json (newline-delimited event stream)")
-	modelFlag := fs.String("m", "", "model name from ~/.ghg/config.json (default: defaultModel)")
+	modelFlag := fs.String("m", "", "model name from ~/.ghg/config.json (default role)")
 	providerFlag := fs.String("p", "", "provider to route the model through (default: model's first provider)")
 	roleFlag := fs.String("role", "", "model role: default, smart, fast, or tiny (default: fast when -m/-p are omitted)")
 	planFlag := fs.Bool("plan", false, "plan the prompt with smart, then execute the plan with fast")

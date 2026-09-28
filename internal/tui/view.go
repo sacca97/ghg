@@ -554,7 +554,7 @@ func (m *model) contextLimitFor(provName, apiID string) int {
 	modelName := m.modelName
 	if m.cfg != nil {
 		if mdl, ok := m.cfg.Models[modelName]; ok {
-			if n := mdl.ContextWindow(); n > 0 {
+			if n := mdl.Context; n > 0 {
 				return n
 			}
 		}

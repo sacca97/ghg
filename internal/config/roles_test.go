@@ -7,17 +7,13 @@ import (
 
 func roleTestConfig() *Config {
 	return &Config{
-		DefaultModel:    "legacy-model",
-		DefaultProvider: "legacy-provider",
 		Providers: map[string]Provider{
-			"legacy-provider": {BaseURL: "https://legacy.example"},
-			"smart-provider":  {BaseURL: "https://smart.example"},
-			"fast-provider":   {BaseURL: "https://fast.example"},
+			"smart-provider": {BaseURL: "https://smart.example"},
+			"fast-provider":  {BaseURL: "https://fast.example"},
 		},
 		Models: map[string]Model{
-			"legacy-model": {Providers: []string{"legacy-provider"}},
-			"smart-model":  {Providers: []string{"smart-provider"}},
-			"fast-model":   {Providers: []string{"fast-provider"}},
+			"smart-model": {Providers: []string{"smart-provider"}},
+			"fast-model":  {Providers: []string{"fast-provider"}},
 		},
 	}
 }
@@ -45,7 +41,7 @@ func TestResolveRoleUsesConfiguredEntry(t *testing.T) {
 	}
 }
 
-func TestResolveRoleFallsBackToConfiguredDefaultThenLegacy(t *testing.T) {
+func TestResolveRoleFallsBackToConfiguredDefault(t *testing.T) {
 	c := roleTestConfig()
 	c.Roles = map[string]RoleConfig{
 		RoleDefault: {Model: "smart-model", Provider: "smart-provider"},
@@ -65,8 +61,8 @@ func TestResolveRoleFallsBackToConfiguredDefaultThenLegacy(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Model != "legacy-model" || got.Provider != "legacy-provider" {
-		t.Fatalf("legacy fallback = %+v", got)
+	if got.Model != "" || got.Provider != "" {
+		t.Fatalf("unconfigured default should remain empty: %+v", got)
 	}
 }
 

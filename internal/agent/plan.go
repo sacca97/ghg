@@ -94,7 +94,7 @@ func askUserTool(ask func(context.Context, QuestionRequest) (QuestionResult, err
 			if err != nil {
 				return tools.ToolResult{}, err
 			}
-			return tools.TextResult(string(data), string(data)), nil
+			return tools.NewTextResult(string(data), 0), nil
 		},
 	}
 }
@@ -487,11 +487,11 @@ func (p *planStreamParser) close() {
 // longestPrefixSuffix returns the length of the longest suffix of s that equals
 // a prefix of tag. It is bounded by len(s).
 func longestPrefixSuffix(s, tag string) int {
-	max := len(tag) - 1
-	if len(s) < max {
-		max = len(s)
+	keep := len(tag) - 1
+	if len(s) < keep {
+		keep = len(s)
 	}
-	for n := max; n > 0; n-- {
+	for n := keep; n > 0; n-- {
 		if strings.HasSuffix(s, tag[:n]) {
 			return n
 		}

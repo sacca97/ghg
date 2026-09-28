@@ -107,7 +107,6 @@ lines it returned; only lines outside that record require a narrower reread.
 primary mutation shape. It authorizes only ranges from the same session and
 path, uses same-position matching first and unique exact-byte relocation after
 shifts, and rejects stale, ambiguous, intersecting, or unobserved ranges.
-`mode: "exact"` is an explicit temporary compatibility mode.
 
 Observations and search snapshots mirror into `sessions.db`; live registries
 are shared by subagents and survive model switches. Multi-file edits preflight
@@ -235,8 +234,7 @@ execution has a structured result path. Every result keeps a model-sized
 state, exit code, and source metadata. Bash, file reads, native search, MCP,
 and output reads mark returned bytes as untrusted; the agent wraps those
 bytes in one `<untrusted_tool_output>` block before sending them to a
-provider. Direct legacy `tools.Execute` callers still receive the old plain
-preview.
+provider.
 
 Retained evidence is capped at 10 MiB per result by default. Overflow keeps a
 deterministic head/tail, hashes the retained bytes with SHA-256, and appends a
@@ -255,9 +253,6 @@ payloads, so forks can share immutable content safely. Compaction preserves
 the raw message log, keeps atomic tool-call groups, carries a metadata-only
 output manifest for cited/recent references, and shrinks an oversized recent
 result without dropping its recovery id.
-
-The legacy `artifact_list`/`artifact_read` tool names and `ghg artifacts gc`
-command remain accepted aliases.
 
 ### Background subagents
 
@@ -320,7 +315,7 @@ dedicated local worker process communicating over a per-session Unix domain sock
 #### Shared command layer
 
 `internal/worker/commands.go` — one declarative catalogue describes every
-user-facing command: canonical name, aliases, usage hint, and owner (`worker`,
+user-facing command: canonical name, usage hint, and owner (`worker`,
 `client`, or `supervisor`). Execution stays in each adapter's ordinary switch
 statement; only the metadata is shared, so help and completion cannot drift
 between clients.
@@ -337,8 +332,7 @@ between clients.
 
 The bridge sends the catalogue with its `bridge_ready` event, so the VS Code
 extension renders the same hints the TUI does without a second command list;
-the bridge itself only checks `workerwire.KnownCommand` and forwards, with no
-alias translation.
+the bridge checks `workerwire.KnownCommand` and forwards canonical names.
 
 Tests: `internal/worker/commands_test.go`,
 `TestWorkerConfigurePersistsRoleModelAndDynamicReasoning`,
@@ -352,8 +346,7 @@ Tests: `internal/worker/server_test.go` and `internal/worker/state_test.go`.
 providers; the provider's `GET /models` is the source of truth for
 capabilities. Two distinct limits, both honored:
 
-- **Context window (input)** — `Model.Context` (legacy `maxTokens` still
-  parses via `ContextWindow()`), overridden by the provider's
+- **Context window (input)** — `Model.Context`, overridden by the provider's
   `context_length`, or filled from the matching models.dev `limit.context`
   record when neither is configured. Compared with the latest successful
   request's reported prompt-plus-completion usage to drive proactive
@@ -390,7 +383,7 @@ smaller than a provider client: `Stream` accepts a request-local `EventSink`
 and returns the assembled assistant `Message` plus usage; `Complete` returns a
 message plus usage for one-shot work such as compaction. The protocol adapters
 implement `Backend` directly, while `NewBackend` selects the compiled adapter from the provider protocol
-(`openai-completions` remains a compatible legacy spelling). Retry callbacks
+(`openai-chat-completions`). Retry callbacks
 supplied by a turn stay in the request-local sink, so foreground and background
 subagents can share a backend without mutating a client hook. `CatalogBackend`
 is an optional capability: a configured local endpoint can work without
@@ -414,10 +407,10 @@ Tests: `models/profile_test.go`, `models/backend_test.go`, `models/responses_tes
 
 `internal/config/roles.go` and the existing TUI/CLI builders provide four model
 roles: `default`, `smart`, `fast`, and `tiny`. A role resolves to its configured
-model/provider, then the configured `default` role, then legacy
-`defaultModel/defaultProvider`; an explicitly configured invalid route is an
-error. Acting sessions default to `fast`, planning sessions to `smart`, while
-compaction and foreground/background `task` calls use `tiny`. The TUI bottom
+model/provider, then the configured `default` role; an explicitly configured
+invalid route is an error. Acting sessions default to `fast`, planning sessions
+to `smart`, while compaction and foreground/background `task` calls use `tiny`.
+The TUI bottom
 status bar exposes clickable `execute`/`plan` modes (`plan` maps to `smart`) and
 a role-first model settings flow (`default`, `plan`, `fast`, `tiny` → one-line
 `models/model` routes). Routes from providers without a configured

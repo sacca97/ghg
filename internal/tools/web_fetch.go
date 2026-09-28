@@ -201,7 +201,7 @@ func fetchWeb(ctx context.Context, rawURL string, client *http.Client, lookup we
 	}
 	raw := fmt.Sprintf("Requested URL: %s\nFinal URL: %s\nHTTP status: %s\nContent-Type: %s\nPage title: %s\n\n%s",
 		u.String(), finalURL, resp.Status, mediaType, title, content)
-	result := MarkUntrusted(TextResult(raw, ""), "web_fetch")
+	result := MarkUntrusted(NewTextResult(raw, 0), "web_fetch")
 	result.Metadata["requested_url"] = u.String()
 	result.Metadata["final_url"] = finalURL
 	result.Metadata["content_type"] = mediaType

@@ -20,7 +20,7 @@ import (
 	"github.com/sacca97/ghg/internal/tools"
 )
 
-func TestReadCoverageSuppressesRedundantRanges(t *testing.T) {
+func TestReadCoverage(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "source.go")
 	var content strings.Builder
 	for i := 1; i <= 500; i++ {
@@ -30,122 +30,170 @@ func TestReadCoverageSuppressesRedundantRanges(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ag := New(nil, "model", 100, "system")
-	guard := newReadCoverageTracker()
-	var telemetryMu sync.Mutex
-	var telemetry []ToolTelemetry
-	events := Events{OnToolTelemetry: func(value ToolTelemetry) {
-		telemetryMu.Lock()
-		telemetry = append(telemetry, value)
-		telemetryMu.Unlock()
-	}}
-	run := func(calls ...models.ToolCall) []tools.ToolResult {
-		return ag.runToolResultsWithPolicy(context.Background(), calls, events, ag.AllTools(), nil, "", guard)
-	}
-	readCall := func(id, args string) models.ToolCall {
-		return models.ToolCall{ID: id, Type: "function", Function: struct {
-			Name      string `json:"name"`
-			Arguments string `json:"arguments"`
-		}{Name: "read", Arguments: args}}
-	}
-
-	first := run(readCall("read-1", fmt.Sprintf(`{"path":%q,"offset":1,"limit":120}`, path)))[0]
-	if first.ExitCode != 0 || !strings.Contains(first.Preview, "1\tline 1") {
-		t.Fatalf("initial read failed: %+v", first)
-	}
-	repeat := run(readCall("read-2", fmt.Sprintf(`{"path":%q,"offset":1,"limit":120}`, path)))[0]
-	if repeat.ExitCode != 0 || repeat.Metadata["duplicate_suppressed"] != "true" || repeat.Metadata["observation_id"] != first.Metadata["observation_id"] {
-		t.Fatalf("repeat read was not compactly suppressed: %+v", repeat)
-	}
-	if strings.Contains(repeat.Preview, "line 1") || len(repeat.Preview) >= len(first.Preview) {
-		t.Fatalf("repeat read returned too much content: %q", repeat.Preview)
-	}
-
-	expanded := run(readCall("read-3", fmt.Sprintf(`{"path":%q,"offset":1,"limit":260}`, path)))[0]
-	if expanded.ExitCode != 0 || expanded.Metadata["duplicate_suppressed"] != "true" ||
-		!strings.Contains(expanded.Preview, "offset=121") || !strings.Contains(expanded.Preview, "limit=140") {
-		t.Fatalf("prefix expansion guidance = %+v", expanded)
-	}
-	next := run(readCall("read-4", fmt.Sprintf(`{"path":%q,"offset":121,"limit":140}`, path)))[0]
-	if next.ExitCode != 0 || next.Metadata["duplicate_suppressed"] == "true" || !strings.Contains(next.Preview, "121\tline 121") {
-		t.Fatalf("pagination read was not executed: %+v", next)
-	}
-	eof := run(readCall("read-eof", fmt.Sprintf(`{"path":%q,"offset":401,"limit":200}`, path)))[0]
-	eofRepeat := run(readCall("read-eof-repeat", fmt.Sprintf(`{"path":%q,"offset":401,"limit":200}`, path)))[0]
-	if eof.ExitCode != 0 || eof.Metadata["observation_next_offset"] != "0" {
-		t.Fatalf("EOF read metadata = %+v", eof)
-	}
-	if eofRepeat.ExitCode != 0 || !strings.Contains(eofRepeat.Preview, "already reaches EOF") || strings.Contains(eofRepeat.Preview, "offset 501") {
-		t.Fatalf("EOF repeat guidance = %+v", eofRepeat)
-	}
-
-	batch := run(
-		readCall("batch-90", fmt.Sprintf(`{"path":%q,"offset":301,"limit":90}`, path)),
-		readCall("batch-130", fmt.Sprintf(`{"path":%q,"offset":301,"limit":130}`, path)),
-		readCall("batch-100", fmt.Sprintf(`{"path":%q,"offset":301,"limit":100}`, path)),
-	)
-	if len(batch) != 3 || batch[0].Metadata["duplicate_suppressed"] != "true" ||
-		batch[2].Metadata["duplicate_suppressed"] != "true" || batch[1].Metadata["duplicate_suppressed"] == "true" ||
-		!strings.Contains(batch[1].Preview, "301\tline 301") {
-		t.Fatalf("same-offset batch results = %+v", batch)
-	}
-	batched := run(readCall("read-batch", fmt.Sprintf(`{"ranges":[{"path":%q,"offset":261,"limit":20},{"path":%q,"offset":281,"limit":20}]}`, path, path)))[0]
-	batchedRepeat := run(readCall("read-batch-repeat", fmt.Sprintf(`{"ranges":[{"path":%q,"offset":261,"limit":20},{"path":%q,"offset":281,"limit":20}]}`, path, path)))[0]
-	if batched.ExitCode != 0 || batched.Metadata["observation_count"] != "2" || batchedRepeat.Metadata["duplicate_suppressed"] != "true" {
-		t.Fatalf("batched read coverage = first=%+v repeat=%+v", batched, batchedRepeat)
-	}
-
-	missing := fmt.Sprintf(`{"path":%q,"offset":1,"limit":1}`, filepath.Join(filepath.Dir(path), "missing.go"))
-	failed := run(readCall("read-failed-1", missing))[0]
-	retried := run(readCall("read-failed-2", missing))[0]
-	if failed.ExitCode == 0 || retried.ExitCode == 0 || retried.Metadata["duplicate_suppressed"] == "true" {
-		t.Fatalf("failed reads must remain retryable: first=%+v retry=%+v", failed, retried)
-	}
-
-	bashArgs := `{"command":"printf bash"}`
-	bashResults := run(models.ToolCall{ID: "bash-1", Type: "function", Function: struct {
-		Name      string `json:"name"`
-		Arguments string `json:"arguments"`
-	}{Name: "bash", Arguments: bashArgs}}, models.ToolCall{ID: "bash-2", Type: "function", Function: struct {
-		Name      string `json:"name"`
-		Arguments string `json:"arguments"`
-	}{Name: "bash", Arguments: bashArgs}})
-	for _, result := range bashResults {
-		if result.Metadata["duplicate_suppressed"] == "true" {
-			t.Fatalf("bash call was suppressed: %+v", result)
+	t.Run("exact repeat and continuation", func(t *testing.T) {
+		h := newAgentHarness(t)
+		first := h.read(path, 1, 120)
+		if first.ExitCode != 0 || !strings.Contains(first.Preview, "1\tline 1") {
+			t.Fatalf("initial read failed: %+v", first)
 		}
-	}
-	failedBashArgs, err := json.Marshal(map[string]string{
-		"command": fmt.Sprintf("printf 'changed\\n' > %q; exit 1", path),
+		repeat := h.read(path, 1, 120)
+		if repeat.ExitCode != 0 || repeat.Metadata["duplicate_suppressed"] != "true" || repeat.Metadata["observation_id"] != first.Metadata["observation_id"] {
+			t.Fatalf("repeat read was not compactly suppressed: %+v", repeat)
+		}
+		if strings.Contains(repeat.Preview, "line 1") || len(repeat.Preview) >= len(first.Preview) {
+			t.Fatalf("repeat read returned too much content: %q", repeat.Preview)
+		}
+		if got := h.duplicateCallID.Load(); got == nil || *got != "test-2" {
+			t.Fatalf("suppressed read telemetry call ID = %v, want test-2", got)
+		}
+
+		expanded := h.read(path, 1, 260)
+		if expanded.ExitCode != 0 || expanded.Metadata["duplicate_suppressed"] != "true" ||
+			!strings.Contains(expanded.Preview, "offset=121") || !strings.Contains(expanded.Preview, "limit=140") {
+			t.Fatalf("prefix expansion guidance = %+v", expanded)
+		}
+		next := h.read(path, 121, 140)
+		if next.ExitCode != 0 || next.Metadata["duplicate_suppressed"] == "true" || !strings.Contains(next.Preview, "121\tline 121") {
+			t.Fatalf("pagination read was not executed: %+v", next)
+		}
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	failedBash := run(models.ToolCall{ID: "bash-failed", Type: "function", Function: struct {
-		Name      string `json:"name"`
-		Arguments string `json:"arguments"`
-	}{Name: "bash", Arguments: string(failedBashArgs)}})[0]
-	if failedBash.ExitCode == 0 {
-		t.Fatalf("expected modifying bash call to fail: %+v", failedBash)
-	}
-	afterFailedBash := run(readCall("read-after-failed-bash", fmt.Sprintf(`{"path":%q,"offset":1,"limit":120}`, path)))[0]
-	if afterFailedBash.ExitCode != 0 || afterFailedBash.Metadata["duplicate_suppressed"] == "true" || !strings.Contains(afterFailedBash.Preview, "changed") {
-		t.Fatalf("read after failed bash was not refreshed: %+v", afterFailedBash)
-	}
-	telemetryMu.Lock()
-	defer telemetryMu.Unlock()
-	foundDuplicateTelemetry := false
-	for _, value := range telemetry {
-		if value.ID == "read-2" {
-			foundDuplicateTelemetry = true
-			if !value.Duplicate {
-				t.Fatalf("suppressed read telemetry = %+v", value)
+
+	t.Run("repeated EOF", func(t *testing.T) {
+		h := newAgentHarness(t)
+		eof := h.read(path, 401, 200)
+		eofRepeat := h.read(path, 401, 200)
+		if eof.ExitCode != 0 || eof.Metadata["observation_next_offset"] != "0" {
+			t.Fatalf("EOF read metadata = %+v", eof)
+		}
+		if eofRepeat.ExitCode != 0 || !strings.Contains(eofRepeat.Preview, "already reaches EOF") || strings.Contains(eofRepeat.Preview, "offset 501") {
+			t.Fatalf("EOF repeat guidance = %+v", eofRepeat)
+		}
+	})
+
+	t.Run("overlapping batch", func(t *testing.T) {
+		h := newAgentHarness(t)
+		batch := h.calls(
+			h.toolCall("read", map[string]any{"path": path, "offset": 301, "limit": 90}),
+			h.toolCall("read", map[string]any{"path": path, "offset": 301, "limit": 130}),
+			h.toolCall("read", map[string]any{"path": path, "offset": 301, "limit": 100}),
+		)
+		if len(batch) != 3 || batch[0].Metadata["duplicate_suppressed"] != "true" ||
+			batch[2].Metadata["duplicate_suppressed"] != "true" || batch[1].Metadata["duplicate_suppressed"] == "true" ||
+			!strings.Contains(batch[1].Preview, "301\tline 301") {
+			t.Fatalf("same-offset batch results = %+v", batch)
+		}
+
+		ranges := []map[string]any{
+			{"path": path, "offset": 261, "limit": 20},
+			{"path": path, "offset": 281, "limit": 20},
+		}
+		batched := h.call("read", map[string]any{"ranges": ranges})
+		batchedRepeat := h.call("read", map[string]any{"ranges": ranges})
+		if batched.ExitCode != 0 || batched.Metadata["observation_count"] != "2" || batchedRepeat.Metadata["duplicate_suppressed"] != "true" {
+			t.Fatalf("batched read coverage = first=%+v repeat=%+v", batched, batchedRepeat)
+		}
+	})
+
+	t.Run("equal-extent batch aliases", func(t *testing.T) {
+		h := newAgentHarness(t)
+		batch := h.calls(
+			h.toolCall("read", map[string]any{"path": path, "offset": 1, "limit": readCoverageDefaultLimit}),
+			h.toolCall("read", map[string]any{"path": path}),
+		)
+		if len(batch) != 2 || batch[0].Metadata["duplicate_suppressed"] == "true" || batch[1].Metadata["duplicate_suppressed"] != "true" {
+			t.Fatalf("equal-extent read results = %+v", batch)
+		}
+	})
+
+	t.Run("state-only tool preserves read coverage", func(t *testing.T) {
+		h := newAgentHarness(t)
+		first := h.read(path, 1, 120)
+		batch := h.calls(
+			h.toolCall("read", map[string]any{"path": path, "offset": 1, "limit": 120}),
+			h.toolCall("todowrite", map[string]any{"todos": []any{}}),
+		)
+		if first.ExitCode != 0 || len(batch) != 2 || batch[0].Metadata["duplicate_suppressed"] != "true" || batch[1].ExitCode != 0 {
+			t.Fatalf("read plus todowrite results = first:%+v batch:%+v", first, batch)
+		}
+		if repeated := h.read(path, 1, 120); repeated.Metadata["duplicate_suppressed"] != "true" {
+			t.Fatalf("state-only tool cleared read coverage: %+v", repeated)
+		}
+	})
+
+	t.Run("failed operations remain retryable", func(t *testing.T) {
+		h := newAgentHarness(t)
+		missing := filepath.Join(filepath.Dir(path), "missing.go")
+		failed := h.read(missing, 1, 1)
+		retried := h.read(missing, 1, 1)
+		if failed.ExitCode == 0 || retried.ExitCode == 0 || retried.Metadata["duplicate_suppressed"] == "true" {
+			t.Fatalf("failed reads must remain retryable: first=%+v retry=%+v", failed, retried)
+		}
+
+		bashResults := h.calls(
+			h.toolCall("bash", map[string]string{"command": "printf bash"}),
+			h.toolCall("bash", map[string]string{"command": "printf bash"}),
+		)
+		for _, result := range bashResults {
+			if result.Metadata["duplicate_suppressed"] == "true" {
+				t.Fatalf("bash call was suppressed: %+v", result)
 			}
 		}
+		failedBash := h.call("bash", map[string]string{
+			"command": fmt.Sprintf("printf 'changed\\n' > %q; exit 1", path),
+		})
+		if failedBash.ExitCode == 0 {
+			t.Fatalf("expected modifying bash call to fail: %+v", failedBash)
+		}
+		afterFailedBash := h.read(path, 1, 120)
+		if afterFailedBash.ExitCode != 0 || afterFailedBash.Metadata["duplicate_suppressed"] == "true" || !strings.Contains(afterFailedBash.Preview, "changed") {
+			t.Fatalf("read after failed bash was not refreshed: %+v", afterFailedBash)
+		}
+	})
+}
+
+type agentHarness struct {
+	t               *testing.T
+	ag              *Agent
+	coverage        *readCoverageTracker
+	events          Events
+	duplicateCallID atomic.Pointer[string]
+	nextCall        int
+}
+
+func newAgentHarness(t *testing.T) *agentHarness {
+	t.Helper()
+	h := &agentHarness{t: t, ag: New(nil, "model", 100, "system"), coverage: newReadCoverageTracker()}
+	h.events.OnToolTelemetry = func(value ToolTelemetry) {
+		if value.Duplicate {
+			callID := value.ID
+			h.duplicateCallID.Store(&callID)
+		}
 	}
-	if !foundDuplicateTelemetry {
-		t.Fatal("suppressed read did not emit telemetry")
+	return h
+}
+
+func (h *agentHarness) toolCall(name string, args any) models.ToolCall {
+	h.t.Helper()
+	encoded, err := json.Marshal(args)
+	if err != nil {
+		h.t.Fatal(err)
 	}
+	h.nextCall++
+	return agentToolCall(fmt.Sprintf("test-%d", h.nextCall), name, string(encoded))
+}
+
+func (h *agentHarness) calls(calls ...models.ToolCall) []tools.ToolResult {
+	h.t.Helper()
+	return h.ag.runToolResultsWithPolicy(context.Background(), calls, h.events, h.ag.AllTools(), nil, "", h.coverage)
+}
+
+func (h *agentHarness) call(name string, args any) tools.ToolResult {
+	h.t.Helper()
+	return h.calls(h.toolCall(name, args))[0]
+}
+
+func (h *agentHarness) read(path string, offset, limit int) tools.ToolResult {
+	return h.call("read", map[string]any{"path": path, "offset": offset, "limit": limit})
 }
 
 func TestReadCoverageTrackerCapsHistory(t *testing.T) {
@@ -351,7 +399,9 @@ func TestToolTelemetryReportsPreviewRetentionAndRedirect(t *testing.T) {
 		{
 			Def: models.NewTool("probe", "probe", `{"type":"object"}`),
 			RunResult: func(context.Context, json.RawMessage) (tools.ToolResult, error) {
-				return tools.MarkUntrusted(tools.TextResultWithSize(strings.Repeat("x", 100), "preview", 100, true, 0), "probe"), nil
+				result := tools.NewTextResult(strings.Repeat("x", 100), 0)
+				result.Preview = "preview"
+				return tools.MarkUntrusted(result, "probe"), nil
 			},
 		},
 	}
@@ -387,30 +437,20 @@ func TestReadCoverageInvalidatesAfterEdit(t *testing.T) {
 	if err := os.WriteFile(path, []byte("before\nsecond\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	ag := New(nil, "model", 100, "system")
-	guard := newReadCoverageTracker()
-	run := func(call models.ToolCall) tools.ToolResult {
-		return ag.runToolResultsWithPolicy(context.Background(), []models.ToolCall{call}, Events{}, ag.AllTools(), nil, "", guard)[0]
-	}
-	readCall := func(id string) models.ToolCall {
-		return models.ToolCall{ID: id, Type: "function", Function: struct {
-			Name      string `json:"name"`
-			Arguments string `json:"arguments"`
-		}{Name: "read", Arguments: fmt.Sprintf(`{"path":%q,"offset":1,"limit":1}`, path)}}
-	}
-	first := run(readCall("read-before"))
+	h := newAgentHarness(t)
+	first := h.read(path, 1, 1)
 	if first.ExitCode != 0 || first.Metadata["observation_id"] == "" {
 		t.Fatalf("initial read failed: %+v", first)
 	}
 	if err := os.WriteFile(path, []byte("external\nsecond\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	refreshed := run(readCall("read-external"))
+	refreshed := h.read(path, 1, 1)
 	if refreshed.ExitCode != 0 || refreshed.Metadata["duplicate_suppressed"] == "true" || !strings.Contains(refreshed.Preview, "external") {
 		t.Fatalf("read after external change was not refreshed: %+v", refreshed)
 	}
 	first = refreshed
-	editArgs, err := json.Marshal(map[string]any{
+	edited := h.call("edit", map[string]any{
 		"mode": "observed",
 		"edits": []map[string]any{{
 			"observation": first.Metadata["observation_id"],
@@ -421,17 +461,10 @@ func TestReadCoverageInvalidatesAfterEdit(t *testing.T) {
 			"content":     "updated\n",
 		}},
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	edited := run(models.ToolCall{ID: "edit-1", Type: "function", Function: struct {
-		Name      string `json:"name"`
-		Arguments string `json:"arguments"`
-	}{Name: "edit", Arguments: string(editArgs)}})
 	if edited.ExitCode != 0 {
 		t.Fatalf("edit failed: %+v", edited)
 	}
-	second := run(readCall("read-after"))
+	second := h.read(path, 1, 1)
 	if second.ExitCode != 0 || second.Metadata["duplicate_suppressed"] == "true" || !strings.Contains(second.Preview, "updated") {
 		t.Fatalf("read after edit was not refreshed: %+v", second)
 	}
@@ -1360,9 +1393,20 @@ func TestTaskToolSpawnsSubagent(t *testing.T) {
 			if len(req.Messages) != 2 || req.Messages[1].Content != "find the answer" {
 				t.Errorf("subagent context wrong: %+v", req.Messages)
 			}
+			available := map[string]bool{
+				"task": false, "todowrite": false, "remember": false, "forget": false, "mcp__test__lookup": false,
+			}
 			for _, tl := range req.Tools {
-				if tl.Function.Name == "task" {
-					t.Error("subagent must not have the task tool")
+				if _, ok := available[tl.Function.Name]; ok {
+					available[tl.Function.Name] = true
+				}
+			}
+			if available["task"] {
+				t.Error("subagent must not have the task tool")
+			}
+			for _, name := range []string{"todowrite", "remember", "forget", "mcp__test__lookup"} {
+				if !available[name] {
+					t.Errorf("subagent is missing inherited tool %q", name)
 				}
 			}
 			if sink.OnText != nil {
@@ -1381,6 +1425,7 @@ func TestTaskToolSpawnsSubagent(t *testing.T) {
 		}
 	}}
 	ag := New(backend, "m", 100, "sys")
+	ag.SetMCPTools([]tools.Tool{{Def: models.NewTool("mcp__test__lookup", "test", `{}`)}})
 	final, err := ag.Turn(context.Background(), "go", Events{})
 	if err != nil || final != "done" {
 		t.Fatalf("%q %v", final, err)
@@ -1438,7 +1483,7 @@ func TestTaskUsesTinyRoleFactoryForForegroundAndBackground(t *testing.T) {
 
 func TestTaskToolBadArgs(t *testing.T) {
 	ag := New(&mockAgentBackend{}, "m", 100, "sys")
-	out := tools.Execute(context.Background(), ag.Tools, "task", json.RawMessage(`{bad`))
+	out := tools.ExecuteResult(context.Background(), ag.Tools, "task", json.RawMessage(`{bad`)).Preview
 	if !strings.HasPrefix(out, "Error") {
 		t.Fatalf("expected error, got %q", out)
 	}
@@ -1560,6 +1605,17 @@ func TestEstimateTokens(t *testing.T) {
 	}
 	if got := EstimateTokens(msgs); got != 104+37 {
 		t.Fatalf("got %d, want %d", got, 104+37)
+	}
+	imageMessage := models.Message{
+		Role:    "user",
+		Content: "inspect image",
+		Parts: []models.ContentPart{
+			{Type: "text", Text: "inspect image"},
+			models.ImagePart("png", []byte{1}),
+		},
+	}
+	if got, want := EstimateTokens([]models.Message{imageMessage}), 4+(len(imageMessage.Content)+3)/4+1200; got != want {
+		t.Fatalf("text and image parts = %d tokens, want %d", got, want)
 	}
 }
 
@@ -1850,6 +1906,9 @@ func TestCompactionBuildsFortyThousandTokenWorkingSet(t *testing.T) {
 	}
 	if got := EstimateTokens(ag.Messages); got > compactionContextTarget {
 		t.Fatalf("post-compaction working set = %d, exceeds %d", got, compactionContextTarget)
+	}
+	if got := ag.ActiveTokens(); got > compactionContextTarget {
+		t.Fatalf("post-compaction active tokens = %d, exceeds %d", got, compactionContextTarget)
 	}
 }
 
@@ -2606,7 +2665,7 @@ func TestSecondMalformedToolCallTerminatesTurn(t *testing.T) {
 	}
 }
 
-func TestOversizedValidToolBatchIsRetriedWithoutMutation(t *testing.T) {
+func TestOversizedValidToolBatchIsSanitizedForRetry(t *testing.T) {
 	args := fmt.Sprintf(`{"data":%q}`, strings.Repeat("x", 200*1024))
 	calls := make([]models.ToolCall, 3)
 	for i := range calls {
@@ -2638,12 +2697,17 @@ func TestOversizedValidToolBatchIsRetriedWithoutMutation(t *testing.T) {
 	if executed != 0 {
 		t.Fatalf("oversized valid calls must not execute, got %d executions", executed)
 	}
+	if calls[0].Function.Arguments != args {
+		t.Fatal("sanitizing retained history mutated the backend response")
+	}
 	var retained bool
 	for _, msg := range ag.Messages {
 		if msg.Role == "assistant" && len(msg.ToolCalls) == len(calls) {
 			retained = true
-			if msg.ToolCalls[0].Function.Arguments != args {
-				t.Fatal("valid oversized arguments were mutated")
+			for _, call := range msg.ToolCalls {
+				if call.Function.Arguments != "{}" {
+					t.Fatalf("oversized arguments retained in active history: %d bytes", len(call.Function.Arguments))
+				}
 			}
 		}
 		if msg.Role == "tool" && !strings.Contains(msg.Content, "aggregate argument size") {
@@ -2653,6 +2717,20 @@ func TestOversizedValidToolBatchIsRetriedWithoutMutation(t *testing.T) {
 	if !retained {
 		t.Fatal("oversized assistant tool call was not retained for retry")
 	}
+	if len(backend.requests) != 2 {
+		t.Fatalf("model requests = %d, want initial call and one retry", len(backend.requests))
+	}
+	for _, msg := range backend.requests[1].Messages {
+		if msg.Role == "assistant" && len(msg.ToolCalls) == len(calls) {
+			for _, call := range msg.ToolCalls {
+				if call.Function.Arguments != "{}" {
+					t.Fatalf("retry resent %d oversized argument bytes", len(call.Function.Arguments))
+				}
+			}
+			return
+		}
+	}
+	t.Fatal("retry request omitted sanitized oversized tool-call batch")
 }
 
 func TestToolFailureClassificationUsesExitCode(t *testing.T) {
@@ -2679,6 +2757,41 @@ func TestDuplicateToolDiagnosticUsesResponseOrder(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "duplicate tool calls: read repeated 2 times") {
 		t.Fatalf("duplicate diagnostic was not response-ordered: %v", err)
+	}
+}
+
+func TestDuplicateToolCallsGetOneCorrectiveRetry(t *testing.T) {
+	backend := &mockAgentBackend{responses: []models.Message{
+		{Role: "assistant", ToolCalls: []models.ToolCall{
+			agentToolCall("call-1", "test_tool", `{"value":1}`),
+			agentToolCall("call-2", "test_tool", `{"value":1}`),
+		}},
+		{Role: "assistant", Content: "recovered"},
+	}}
+	var executed int
+	ag := New(backend, "model", 100, "system")
+	ag.Tools = []tools.Tool{{
+		Def: models.NewTool("test_tool", "test", `{}`),
+		Run: func(context.Context, json.RawMessage) (string, error) {
+			executed++
+			return "unexpected", nil
+		},
+	}}
+	got, err := ag.Turn(context.Background(), "go", Events{})
+	if err != nil || got != "recovered" {
+		t.Fatalf("turn result = %q, %v", got, err)
+	}
+	if executed != 0 || len(backend.requests) != 2 {
+		t.Fatalf("executed=%d requests=%d, want no execution and one corrective retry", executed, len(backend.requests))
+	}
+	var errorsReturned int
+	for _, msg := range ag.Messages {
+		if msg.Role == "tool" && strings.Contains(msg.Content, "duplicate tool calls") {
+			errorsReturned++
+		}
+	}
+	if errorsReturned != 2 {
+		t.Fatalf("duplicate call correction results = %d, want one per distinct call id", errorsReturned)
 	}
 }
 
@@ -2760,7 +2873,7 @@ func TestLargeToolResultGetsAnOutputReference(t *testing.T) {
 		Def: models.NewTool("large", "large result", `{"type":"object","properties":{}}`),
 		RunResult: func(context.Context, json.RawMessage) (tools.ToolResult, error) {
 			raw := strings.Repeat("x", 60_000)
-			return tools.MarkUntrusted(tools.TextResult(raw, tools.Truncate(raw)), "test"), nil
+			return tools.MarkUntrusted(tools.NewTextResult(raw, 0), "test"), nil
 		},
 	}}
 	calls := []models.ToolCall{{ID: "large-1", Function: struct {
@@ -2792,7 +2905,7 @@ func TestDisabledOutputsExplainUnrecoverableOutput(t *testing.T) {
 		Def: models.NewTool("large", "large result", `{"type":"object","properties":{}}`),
 		RunResult: func(context.Context, json.RawMessage) (tools.ToolResult, error) {
 			raw := strings.Repeat("x", 60_000)
-			return tools.TextResult(raw, tools.Truncate(raw)), nil
+			return tools.NewTextResult(raw, 0), nil
 		},
 	}}
 	calls := []models.ToolCall{{ID: "large-1", Function: struct {
@@ -2813,7 +2926,7 @@ func TestSubagentGuidanceMatchesBoundedExplorationTools(t *testing.T) {
 	}
 	parent := New(nil, "model", 100, "system")
 	description := taskTool(parent).Def.Function.Description
-	for _, fragment := range []string{"currently available tools", "bounded repository navigation", "observed edit ranges"} {
+	for _, fragment := range []string{"workspace, session, and configured MCP tools", "bounded repository navigation", "observed edit ranges"} {
 		if !strings.Contains(description, fragment) {
 			t.Errorf("task description lacks %q: %s", fragment, description)
 		}

@@ -63,7 +63,7 @@ func resolveDisplayRoute(cfg *config.Config, profiles models.Profiles, modelName
 		route.ContextLimit = cat.ContextLength(route.APIID)
 	}
 	if route.ContextLimit <= 0 {
-		route.ContextLimit = resolved.Model.ContextWindow()
+		route.ContextLimit = resolved.Model.Context
 	}
 	if route.ContextLimit <= 0 {
 		route.ContextLimit = config.LoadModelsDev().ContextLength(route.APIID, resolved.Provider.Profile, route.ProviderName)

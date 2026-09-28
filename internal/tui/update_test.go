@@ -537,7 +537,7 @@ func TestQueueSelResetsOnSteer(t *testing.T) {
 func TestBusyCmdAllowList(t *testing.T) {
 	runs := []string{
 		"/help", "/effort", "/effort high",
-		"/tasks", "/tasks abc123", "/goal", "/goal clear", "/goal rounds 5",
+		"/tasks", "/tasks abc123", "/goal", "/goal clear",
 		"/approval", "/approval auto", "/cd", "/cd /tmp", "/pwd", "/ask what is this?", "/notify", "/notify on", "/rename", "/continue",
 		"/compact", "/clear",
 	}

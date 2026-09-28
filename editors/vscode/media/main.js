@@ -53,8 +53,8 @@ const slashCommands = [
   ["/approval", "switch approval mode (ask|auto|never)"],
   ["/notify", "Telegram completion notifications (config|on|off)"],
   ["/continue", "continue an interrupted turn"],
-  ["/pwd", "print working directory"], ["/detach", "detach worker"], ["/quit", "exit"], ["/exit", "exit"], ["/q", "exit"], ["/rename", "rename session"],
-  ["/resume", "resume a session"], ["/review", "review a target"], ["/commands", "show commands"],
+  ["/pwd", "print working directory"], ["/detach", "detach worker"], ["/quit", "exit"], ["/rename", "rename session"],
+  ["/resume", "resume a session"], ["/review", "review a target"],
 ].map(([name, hint]) => ({ name, hint }));
 
 // --- persisted state -------------------------------------------------------

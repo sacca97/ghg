@@ -57,7 +57,7 @@ func TestGrepTool(t *testing.T) {
 		}
 	}
 
-	out = Execute(context.Background(), All(), "grep", json.RawMessage(fmt.Sprintf(`{"pattern":"NEEDLE","path":%q,"case_sensitive":false,"literal":true}`, dir)))
+	out = ExecuteResult(context.Background(), All(), "grep", json.RawMessage(fmt.Sprintf(`{"pattern":"NEEDLE","path":%q,"case_sensitive":false,"literal":true}`, dir))).Preview
 	if !strings.Contains(out, match+":\n  2:needle one") {
 		t.Fatalf("case-insensitive literal search missed match: %q", out)
 	}
@@ -181,7 +181,7 @@ func TestSearchLimitsCancellationAndInvalidArguments(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	out = Execute(ctx, All(), "glob", json.RawMessage(fmt.Sprintf(`{"pattern":"**/*","path":%q}`, dir)))
+	out = ExecuteResult(ctx, All(), "glob", json.RawMessage(fmt.Sprintf(`{"pattern":"**/*","path":%q}`, dir))).Preview
 	if !strings.Contains(out, "context canceled") {
 		t.Fatalf("expected cancellation error, got %q", out)
 	}

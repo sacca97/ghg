@@ -120,15 +120,24 @@ function promptWithReferences(prompt: string, paths: string[]): string {
 
 function commandMayRunDuringTurn(prompt: string): boolean {
 	const name = prompt.trim().split(/\s+/, 1)[0];
-	return ["/approval", "/commands", "/detach", "/export", "/export-result", "/export-chat", "/export-log", "/help", "/notify", "/search-providers", "/pwd", "/rename", "/q", "/quit", "/exit"].includes(name);
+	return ["/approval", "/detach", "/export", "/help", "/notify", "/search-providers", "/pwd", "/rename", "/quit"].includes(name);
 }
 
 function literalGlob(value: string): string {
 	return value.replace(/[\\{}()[\]*?]/g, (character) => `\\${character}`);
 }
 
+function caseInsensitiveGlob(value: string): string {
+	return [...value].map((character) => {
+		const lower = character.toLowerCase();
+		const upper = character.toUpperCase();
+		if (lower !== upper && lower.length === 1 && upper.length === 1) return `[${lower}${upper}]`;
+		return literalGlob(character);
+	}).join("");
+}
+
 function excludedReferencePath(path: string): boolean {
-	return path.split("/").some((segment) => segment === ".git" || segment === ".ghg" || segment === "node_modules");
+	return path.split("/").some((segment) => [".git", ".ghg", "node_modules"].includes(segment.toLowerCase()));
 }
 
 async function directoryReferenceSuggestions(workspace: vscode.WorkspaceFolder, query: string): Promise<ReferenceSuggestion[]> {
@@ -136,13 +145,23 @@ async function directoryReferenceSuggestions(workspace: vscode.WorkspaceFolder, 
 	if (slash < 0) return [];
 	const parent = query.slice(0, slash);
 	if (excludedReferencePath(parent)) return [];
-	const parentURI = parent ? vscode.Uri.joinPath(workspace.uri, ...parent.split("/")) : workspace.uri;
+	let parentURI = workspace.uri;
+	const actualParts: string[] = [];
+	for (const part of parent.split("/").filter(Boolean)) {
+		const entries = await vscode.workspace.fs.readDirectory(parentURI);
+		const directories = entries.filter(([, type]) => (type & vscode.FileType.Directory) !== 0);
+		const match = directories.find(([name]) => name === part) ??
+			directories.find(([name]) => name.toLowerCase() === part.toLowerCase());
+		if (!match) return [];
+		actualParts.push(match[0]);
+		parentURI = vscode.Uri.joinPath(parentURI, match[0]);
+	}
 	const entries = await vscode.workspace.fs.readDirectory(parentURI);
 	return entries
 		.map(([name, type]) => {
 			const folder = (type & vscode.FileType.Directory) !== 0;
 			return {
-				path: `${parent ? `${parent}/` : ""}${name}${folder ? "/" : ""}`,
+				path: `${actualParts.length ? `${actualParts.join("/")}/` : ""}${name}${folder ? "/" : ""}`,
 				folder,
 			};
 		})
@@ -156,7 +175,7 @@ async function referenceSuggestions(workspace: vscode.WorkspaceFolder, query: st
 	if (normalized === undefined) {
 		return [];
 	}
-	const pattern = normalized ? `**/*${literalGlob(normalized)}*` : "**/*";
+	const pattern = normalized ? `**/*${caseInsensitiveGlob(normalized)}*` : "**/*";
 	const files = await vscode.workspace.findFiles(
 		new vscode.RelativePattern(workspace, pattern),
 		"{**/.git/**,**/.ghg/**,**/node_modules/**}",
@@ -329,7 +348,6 @@ type WebviewMessage = { type?: unknown; [key: string]: unknown };
 // without a second hand-maintained command list.
 type CommandSpec = {
 	name: string;
-	aliases?: string[];
 	hint: string;
 	owner: string;
 };
@@ -1107,11 +1125,8 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 			this.post({ type: "turn_start", mode: "chat" });
 			await this.submitInput(args, role, "execute", { review: true }, references);
 			return;
-		case "/export":
-		case "/export-result":
-		case "/export-chat":
-		case "/export-log": {
-			let kind = name === "/export-chat" || name === "/export-log" ? "chat" : "";
+		case "/export": {
+			let kind = "";
 			let destination = "";
 			let format = "";
 			let force = false;
@@ -1245,11 +1260,8 @@ class GHGViewProvider implements vscode.WebviewViewProvider {
 		case "/resume":
 			return this.resumeSession(args || undefined);
 		case "/quit":
-		case "/exit":
-		case "/q":
 			void this.stopBridge();
 			return;
-		case "/commands":
 		case "/help": {
 			const supported = new Set(extensionCommands);
 			const entries = this.commands.filter((entry) => supported.has(entry.name));

@@ -147,7 +147,7 @@ func TestNewBackend(t *testing.T) {
 		wantErr  bool
 	}{
 		{name: "canonical openai protocol", protocol: ProtocolOpenAIChatCompletions, baseURL: "http://example.test"},
-		{name: "legacy openai protocol", protocol: ProtocolOpenAICompletions, baseURL: "http://example.test"},
+		{name: "removed openai protocol alias", protocol: Protocol("openai-completions"), baseURL: "http://example.test", wantErr: true},
 		{name: "empty protocol uses current adapter", baseURL: "http://example.test"},
 		{name: "empty base url", protocol: ProtocolOpenAIChatCompletions, wantErr: true},
 		{name: "unknown protocol", protocol: Protocol("made-up"), baseURL: "http://example.test", wantErr: true},

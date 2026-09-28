@@ -76,7 +76,7 @@ func completionsWithMention(val string, models, providers, authProviders, skillC
 			{"on", "enable Telegram for this session"},
 			{"off", "disable Telegram for this session"},
 		}, token)
-	case len(fields) == 1 && (fields[0] == "/export" || fields[0] == "/export-result"):
+	case len(fields) == 1 && fields[0] == "/export":
 		cands = filterPrefix(exportKindCands, token)
 	case strings.HasPrefix(token, "$"): // codex-style skill invocation
 		cands = filterPrefix(skillCands, token)
@@ -189,16 +189,82 @@ func pathMatches(prefix string) []cand {
 			p = home + p[1:]
 		}
 	}
-	matches, _ := filepath.Glob(p + "*")
+	dir, partial := filepath.Split(p)
+	if dir == "" {
+		dir = "."
+	}
+	resolvedDir, ok := resolveCaseInsensitivePath(dir)
+	if !ok {
+		return nil
+	}
+	entries, err := os.ReadDir(resolvedDir)
+	if err != nil {
+		return nil
+	}
 	var out []cand
-	for _, m := range matches {
-		if fi, err := os.Stat(m); err == nil && fi.IsDir() {
-			out = append(out, cand{m + "/", "dir"})
+	for _, entry := range entries {
+		if !strings.HasPrefix(strings.ToLower(entry.Name()), strings.ToLower(partial)) {
+			continue
+		}
+		match := filepath.Join(resolvedDir, entry.Name())
+		if !filepath.IsAbs(prefix) && !strings.HasPrefix(prefix, "~") {
+			if cwd, err := os.Getwd(); err == nil {
+				if relative, err := filepath.Rel(cwd, match); err == nil {
+					match = relative
+					if strings.HasPrefix(prefix, "."+string(os.PathSeparator)) {
+						match = "." + string(os.PathSeparator) + match
+					}
+				}
+			}
+		}
+		if entry.IsDir() {
+			out = append(out, cand{match + "/", "dir"})
 		} else {
-			out = append(out, cand{m, ""})
+			out = append(out, cand{match, ""})
 		}
 	}
 	return out
+}
+
+// resolveCaseInsensitivePath resolves existing path components using the
+// filesystem's actual spelling. This keeps @mentions and path completion
+// usable when the user does not remember capitalization.
+func resolveCaseInsensitivePath(path string) (string, bool) {
+	abs, err := filepath.Abs(filepath.Clean(path))
+	if err != nil {
+		return "", false
+	}
+	volume := filepath.VolumeName(abs)
+	root := volume + string(os.PathSeparator)
+	remaining := strings.TrimPrefix(abs, root)
+	current := root
+	for _, part := range strings.Split(remaining, string(os.PathSeparator)) {
+		if part == "" {
+			continue
+		}
+		entries, err := os.ReadDir(current)
+		if err != nil {
+			return "", false
+		}
+		found := ""
+		for _, entry := range entries {
+			if !strings.EqualFold(entry.Name(), part) {
+				continue
+			}
+			if found != "" {
+				return "", false // ambiguous on a case-sensitive filesystem
+			}
+			found = entry.Name()
+		}
+		if found == "" {
+			return "", false
+		}
+		current = filepath.Join(current, found)
+	}
+	if _, err := os.Stat(current); err != nil {
+		return "", false
+	}
+	return current, true
 }
 
 // fuzzyFiles returns up to limit files from the index matching query, best
@@ -358,6 +424,9 @@ func resolveMentionPath(p string) (string, bool) {
 	}
 	if _, err := os.Stat(abs); err == nil {
 		return abs, true
+	}
+	if resolved, ok := resolveCaseInsensitivePath(abs); ok {
+		return resolved, true
 	}
 	// Not a literal path: try a unique fuzzy match against the index, but
 	// only for bare words (no separators) so partial paths stay untouched.

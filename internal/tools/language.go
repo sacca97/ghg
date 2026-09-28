@@ -133,7 +133,7 @@ func runLSPResult(ctx context.Context, args json.RawMessage) (ToolResult, error)
 		return ToolResult{}, err
 	}
 	raw := renderNavigation(result)
-	return MarkUntrusted(textResult(raw, Truncate(raw), 0), "lsp"), nil
+	return MarkUntrusted(NewTextResult(raw, 0), "lsp"), nil
 }
 
 const maxSymbolCandidates = 20
@@ -158,11 +158,11 @@ func runSymbolLSPResult(ctx context.Context, service LanguageService, operation,
 		if symbols.Omitted > 0 {
 			raw += fmt.Sprintf(" (%d other symbols omitted)", symbols.Omitted)
 		}
-		return MarkUntrusted(textResult(raw, Truncate(raw), 0), "lsp"), nil
+		return MarkUntrusted(NewTextResult(raw, 0), "lsp"), nil
 	}
 	if len(exact) > 1 {
 		raw := renderAmbiguousSymbols(strings.TrimSpace(name), exact)
-		return MarkUntrusted(textResult(raw, Truncate(raw), 0), "lsp"), nil
+		return MarkUntrusted(NewTextResult(raw, 0), "lsp"), nil
 	}
 	symbol := exact[0]
 	if operation == "symbol_context" {
@@ -191,7 +191,7 @@ func runSymbolLSPResult(ctx context.Context, service LanguageService, operation,
 		return ToolResult{}, err
 	}
 	raw := renderNavigation(references)
-	return MarkUntrusted(textResult(raw, Truncate(raw), 0), "lsp"), nil
+	return MarkUntrusted(NewTextResult(raw, 0), "lsp"), nil
 }
 
 func renderAmbiguousSymbols(name string, symbols []LSPSymbol) string {

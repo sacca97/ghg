@@ -438,7 +438,7 @@ func TestConfigDirectoryIsNotReadableByToolsOrChildren(t *testing.T) {
 	}
 	sentinelConfig := filepath.Join(ghgHome, "config.json")
 	configJSON := `{
-		"defaultModel": "custom-model",
+		"version": 2,
 		"providers": {
 			"custom": {
 				"name": "custom",

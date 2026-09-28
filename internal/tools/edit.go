@@ -18,12 +18,8 @@ import (
 )
 
 type editRequest struct {
-	Mode       string          `json:"mode"`
-	Path       string          `json:"path"`
-	OldString  string          `json:"old_string"`
-	NewString  string          `json:"new_string"`
-	ReplaceAll bool            `json:"replace_all"`
-	Edits      []editOperation `json:"edits"`
+	Mode  string          `json:"mode"`
+	Edits []editOperation `json:"edits"`
 }
 
 type editOperation struct {
@@ -38,8 +34,8 @@ type editOperation struct {
 
 func editTool() Tool {
 	return resultTool(models.NewTool("edit",
-		"Apply one or more observed line-range edits atomically. Each primary edit references a read observation; use mode=exact only for temporary unique old_string compatibility.",
-		`{"type":"object","properties":{"mode":{"type":"string","enum":["observed","exact"],"description":"observed is the primary range-authorized mode; exact is compatibility mode"},"edits":{"type":"array","description":"Observed operations to apply atomically across one or more files","items":{"type":"object","properties":{"observation":{"type":"string"},"path":{"type":"string"},"start_line":{"type":"integer"},"end_line":{"type":"integer"},"operation":{"type":"string","enum":["replace","delete","insert_before","insert_after"],"description":"Defaults to replace"},"content":{"type":"string","description":"Replacement or insertion text; replace requires non-empty content"}},"required":["observation","path","start_line","end_line"]}},"path":{"type":"string","description":"Compatibility-mode file path"},"old_string":{"type":"string","description":"Compatibility-mode exact text"},"new_string":{"type":"string","description":"Compatibility-mode replacement"},"replace_all":{"type":"boolean","description":"Compatibility-mode replace every occurrence"}},"required":["mode"]}`),
+		"Apply one or more observed line-range edits atomically. Each edit must reference a read observation.",
+		`{"type":"object","properties":{"mode":{"type":"string","enum":["observed"],"description":"Range-authorized edits based on read observations"},"edits":{"type":"array","description":"Observed operations to apply atomically across one or more files","items":{"type":"object","properties":{"observation":{"type":"string"},"path":{"type":"string"},"start_line":{"type":"integer"},"end_line":{"type":"integer"},"operation":{"type":"string","enum":["replace","delete","insert_before","insert_after"],"description":"Defaults to replace"},"content":{"type":"string","description":"Replacement or insertion text; replace requires non-empty content"}},"required":["observation","path","start_line","end_line"]}}},"required":["mode","edits"]}`),
 		runEdit)
 }
 
@@ -49,12 +45,10 @@ func runEdit(ctx context.Context, args json.RawMessage) (ToolResult, error) {
 		return ToolResult{}, err
 	}
 	switch strings.ToLower(strings.TrimSpace(request.Mode)) {
-	case "exact":
-		return runExactEdit(ctx, request)
 	case "observed":
 		return runObservedEdit(ctx, request)
 	case "":
-		return ToolResult{}, errors.New("edit mode is required: use mode=observed with edits, or mode=exact for compatibility")
+		return ToolResult{}, errors.New("edit mode is required: use mode=observed with edits")
 	default:
 		return ToolResult{}, fmt.Errorf("unsupported edit mode %q", request.Mode)
 	}
@@ -127,48 +121,6 @@ func lspDiagnostics(ctx context.Context, path string) string {
 		return ""
 	}
 	return runtime.LanguageService.WaitDiagnostics(ctx, path)
-}
-
-func runExactEdit(ctx context.Context, request editRequest) (ToolResult, error) {
-	if request.Path == "" || request.OldString == "" {
-		return ToolResult{}, errors.New("exact edit requires path and a non-empty old_string")
-	}
-	canonical, err := authorizedObservationPath(ctx, request.Path, sandbox.AccessWrite, false)
-	if err != nil {
-		return ToolResult{}, err
-	}
-	if deny := checkGate(ctx, "edit", canonical); deny != "" {
-		return ToolResult{}, errors.New(deny)
-	}
-	original, err := os.ReadFile(canonical)
-	if err != nil {
-		return ToolResult{}, err
-	}
-	info, err := os.Stat(canonical)
-	if err != nil {
-		return ToolResult{}, err
-	}
-	n := bytes.Count(original, []byte(request.OldString))
-	if n == 0 {
-		return ToolResult{}, fmt.Errorf("old_string not found in %s", canonical)
-	}
-	if n > 1 && !request.ReplaceAll {
-		return ToolResult{}, fmt.Errorf("old_string appears %d times in %s; make it unique or set replace_all", n, canonical)
-	}
-	updated := bytes.ReplaceAll(original, []byte(request.OldString), []byte(request.NewString))
-	if err := publishEditFiles(ctx, []editPublication{{path: canonical, original: original, updated: updated, mode: info.Mode()}}); err != nil {
-		return ToolResult{}, err
-	}
-	final, readErr := os.ReadFile(canonical)
-	if readErr != nil {
-		return ToolResult{}, fmt.Errorf("read back %s: %w", canonical, readErr)
-	}
-	out := fmt.Sprintf("Replaced %d occurrence(s) in %s", n, canonical)
-	if d := editDiff(string(original), string(final)); d != "" {
-		out += "\n```diff\n" + d + "\n```"
-	}
-	out += lspDiagnostics(ctx, canonical)
-	return textResult(out, Truncate(out), 0), nil
 }
 
 type observedEdit struct {
@@ -380,7 +332,9 @@ func runObservedEdit(ctx context.Context, request editRequest) (ToolResult, erro
 	}
 	preview := strings.TrimSuffix(out.String(), "\n")
 	retainedStr := strings.TrimSuffix(retained.String(), "\n")
-	return textResult(retainedStr, Truncate(preview), 0), nil
+	result := NewTextResult(retainedStr, 0)
+	result.Preview = Truncate(preview)
+	return result, nil
 }
 
 // publishEditFiles stages every replacement before renaming any of them, then
@@ -766,5 +720,5 @@ func runWriteResult(ctx context.Context, args json.RawMessage) (ToolResult, erro
 	if _, statErr := os.Stat(path); statErr == nil {
 		raw += lspDiagnostics(ctx, path)
 	}
-	return textResult(raw, raw, 0), nil
+	return NewTextResult(raw, 0), nil
 }

@@ -146,7 +146,14 @@ func bashToolResult(segments []CommandSegment, res bashResult, sandboxPolicy *sa
 	if exit != "" || res.TimedOut {
 		exitCode = 1
 	}
-	ret := MarkUntrusted(capturedResult(full, TruncateTailWithLimit(full, bashPreviewLimitSegments(segments)), originalBytes, complete, exitCode), "bash")
+	ret := NewTextResult(full, exitCode)
+	ret.OriginalBytes = originalBytes
+	ret.Complete = complete && originalBytes == int64(len(ret.Retained))
+	ret.Preview = TruncateTailWithLimit(full, bashPreviewLimitSegments(segments))
+	if ret.Preview == "" {
+		ret.Preview = "(no output)"
+	}
+	ret = MarkUntrusted(ret, "bash")
 	if sandboxPolicy != nil && (res.Exit != "" || res.TimedOut) && isSandboxNetworkDenied(full) {
 		if ret.Metadata == nil {
 			ret.Metadata = make(map[string]string)
@@ -524,11 +531,12 @@ func runPipedBash(ctx context.Context, cmd *exec.Cmd, opts bashOptions) bashResu
 	}
 
 	mu.Lock()
+	captured := out.Result(exitCode(waitErr))
 	result := bashResult{
-		Output:        out.String(),
-		OriginalBytes: out.OriginalBytes(),
-		Complete:      out.Complete(),
-		ExitCode:      exitCode(waitErr),
+		Output:        captured.Retained,
+		OriginalBytes: captured.OriginalBytes,
+		Complete:      captured.Complete,
+		ExitCode:      captured.ExitCode,
 		Started:       true,
 	}
 	mu.Unlock()

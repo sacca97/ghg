@@ -24,7 +24,7 @@ func (w *workerProcessState) startCompact() bool {
 	return w.startOperation("compaction", func(ctx context.Context) { w.runCompact(ctx) })
 }
 
-func (w *workerProcessState) startTurn(input workerInput) bool {
+func (w *workerProcessState) startTurn(input workerwire.Input) bool {
 	return w.startOperation("turn", func(ctx context.Context) { w.runTurn(ctx, input) })
 }
 
@@ -193,7 +193,7 @@ func (w *workerProcessState) runCompact(ctx context.Context) {
 	}
 	w.persist()
 	interrupted := errors.Is(err, context.Canceled) || ctx.Err() != nil
-	result := workerCompactResult{Usage: w.ag.Usage(), Messages: boundedWorkerMessages(w.ag.MessagesSnapshot()), Interrupted: interrupted}
+	result := workerwire.CompactResult{Usage: w.ag.Usage(), Messages: boundedWorkerMessages(w.ag.MessagesSnapshot()), Interrupted: interrupted}
 	if err != nil && !interrupted {
 		result.Error = err.Error()
 	}
@@ -318,7 +318,7 @@ func (w *workerProcessState) historyResult() workerwire.HistoryResult {
 	}
 }
 
-func (w *workerProcessState) runTurn(ctx context.Context, input workerInput) {
+func (w *workerProcessState) runTurn(ctx context.Context, input workerwire.Input) {
 	turnAt := len(w.ag.MessagesSnapshot())
 	snap := input.Snap
 	if snap == "" {
@@ -513,7 +513,7 @@ func (w *workerProcessState) runTurn(ctx context.Context, input workerInput) {
 			}
 		}
 	}
-	result := workerTurnResult{
+	result := workerwire.TurnResult{
 		SessionID: w.sessionID, Final: final, Usage: w.ag.Usage(),
 		ContextTokens: w.ag.ContextTokens(), ContextLimit: contextLimit,
 		Model: modelID, ModelName: modelName, Provider: provider,

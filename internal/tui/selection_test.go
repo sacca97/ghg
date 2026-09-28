@@ -12,8 +12,8 @@ import (
 
 func pickerCfg() *config.Config {
 	return &config.Config{
-		DefaultModel: "kimi-k3-fast",
-		Providers:    map[string]config.Provider{"inference": {BaseURL: "https://catalog.example/v1", APIKey: "test-key"}},
+		Roles:     map[string]config.RoleConfig{config.RoleDefault: {Model: "kimi-k3-fast"}},
+		Providers: map[string]config.Provider{"inference": {BaseURL: "https://catalog.example/v1", APIKey: "test-key"}},
 		Models: map[string]config.Model{
 			"kimi-k3-fast": {Providers: []string{"inference"}},
 		},

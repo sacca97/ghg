@@ -72,7 +72,7 @@ func (t *readCoverageTracker) prepare(calls []models.ToolCall, unavailable map[s
 
 	hasRead, hasMutation := false, false
 	for i, call := range calls {
-		if potentiallyMutatingReadGuardTool(call.Function.Name, call.Function.Arguments) {
+		if potentiallyMutatingReadGuardTool(call.Function.Name) {
 			hasMutation = true
 		}
 		requests, ok := normalizeReadRequests(call.Function.Name, call.Function.Arguments)
@@ -140,7 +140,8 @@ func (t *readCoverageTracker) prepare(calls []models.ToolCall, unavailable map[s
 				decisions[j].suppressed {
 				continue
 			}
-			if decisions[j].request.end > decisions[root].request.end {
+			if decisions[j].request.end > decisions[root].request.end ||
+				(decisions[j].request.end == decisions[root].request.end && j < root) {
 				root = j
 			}
 		}
@@ -214,9 +215,10 @@ func normalizeReadRange(path string, offset, limit int) (readRequest, bool) {
 	return readRequest{path: canonical, start: start, end: start + limit - 1}, true
 }
 
-func potentiallyMutatingReadGuardTool(name, args string) bool {
+func potentiallyMutatingReadGuardTool(name string) bool {
 	switch name {
-	case "read", "grep", "glob", "find_files", "lsp", "output_list", "output_read", "artifact_list", "artifact_read", "history_search", "history_read", "submit_review":
+	case "read", "grep", "glob", "find_files", "lsp", "output_list", "output_read", "history_search", "history_read",
+		"submit_review", "request_review_extension", "ask_user", GoalToolName, nextReasoningEffortToolName, "todowrite":
 		return false
 	default:
 		// Unknown and MCP tools are opaque to the agent and may mutate files.
@@ -424,7 +426,7 @@ func (t *readCoverageTracker) apply(a *Agent, ev Events, calls []models.ToolCall
 		if call.Function.Name == "read" {
 			hasRead = true
 		}
-		if potentiallyMutatingReadGuardTool(call.Function.Name, call.Function.Arguments) {
+		if potentiallyMutatingReadGuardTool(call.Function.Name) {
 			hasMutation = true
 		}
 	}
@@ -454,7 +456,7 @@ func (t *readCoverageTracker) apply(a *Agent, ev Events, calls []models.ToolCall
 				t.invalidatePath(path)
 			}
 		default:
-			if potentiallyMutatingReadGuardTool(call.Function.Name, call.Function.Arguments) {
+			if potentiallyMutatingReadGuardTool(call.Function.Name) {
 				t.clear()
 			}
 		}
@@ -498,7 +500,7 @@ func redundantReadResult(coverage readCoverage) tools.ToolResult {
 }
 
 func readGuidanceResult(text string, coverage readCoverage) tools.ToolResult {
-	result := tools.TextResult(text, text)
+	result := tools.NewTextResult(text, 0)
 	result.Source = "read"
 	result.Metadata = map[string]string{"duplicate_suppressed": "true"}
 	if coverage.observation != "" {

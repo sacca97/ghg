@@ -180,7 +180,7 @@ func searchBraveWithClient(ctx context.Context, in webSearchArgs, key, endpoint 
 	if out.Len() == 0 {
 		out.WriteString("(no results)")
 	}
-	result := MarkUntrusted(TextResult(out.String(), ""), "web_search:brave")
+	result := MarkUntrusted(NewTextResult(out.String(), 0), "web_search:brave")
 	result.Metadata["provider"] = "brave"
 	return result, nil
 }
@@ -253,7 +253,7 @@ func searchSearxngWithClient(ctx context.Context, in webSearchArgs, backend sear
 	if out.Len() == 0 {
 		out.WriteString("(no results)")
 	}
-	result := MarkUntrusted(TextResult(out.String(), ""), "web_search:searxng")
+	result := MarkUntrusted(NewTextResult(out.String(), 0), "web_search:searxng")
 	result.Metadata["provider"] = "searxng"
 	result.Metadata["provider_name"] = backend.Name
 	return result, nil

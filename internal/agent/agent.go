@@ -47,6 +47,8 @@ const (
 	finalizationRequestTimeout      = 10 * time.Minute
 )
 
+var errDuplicateToolCalls = errors.New("model returned duplicate tool calls")
+
 // HistoryCatalog is the durable session boundary for bounded history recall.
 type HistoryCatalog interface {
 	SearchHistory(context.Context, string, string, string, *int, int) ([]session.HistoryHit, error)
@@ -432,9 +434,15 @@ func (a *Agent) newSubagent(ctx context.Context, role string) (*Agent, error) {
 	if sub.ContextLimit == 0 {
 		sub.ContextLimit = a.ContextLimit
 	}
-	// The task tool is deliberately non-recursive: replace any factory-built
-	// default tool set with the ordinary built-ins, then restore output tools.
+	// Rebuild agent-bound tools for the subagent; delegation and parent-turn
+	// controls are intentionally excluded, while ordinary workspace/session
+	// tools and the parent's current MCP tools are retained.
 	sub.Tools = tools.All()
+	sub.Tools = append(sub.Tools, todoTool(sub))
+	sub.Tools = append(sub.Tools, memory.Tools(sub.currentSessionID)...)
+	a.toolsMu.Lock()
+	sub.mcpTools = append([]tools.Tool(nil), a.mcpTools...)
+	a.toolsMu.Unlock()
 	sub.Runtime = a.Runtime.Child()
 	sub.files = a.files
 	sub.Outputs = a.Outputs
@@ -687,7 +695,7 @@ func (a *Agent) validateToolBatch(calls []models.ToolCall) error {
 	}
 
 	if firstDuplicateTool != "" {
-		return fmt.Errorf("model returned duplicate tool calls: %s repeated %d times", firstDuplicateTool, duplicateCounts[firstDuplicateTool]+1)
+		return fmt.Errorf("%w: %s repeated %d times", errDuplicateToolCalls, firstDuplicateTool, duplicateCounts[firstDuplicateTool]+1)
 	}
 	return nil
 }
@@ -1088,7 +1096,7 @@ func requestHash(data []byte) string {
 func isRepositoryNavigationTool(name string) bool {
 	switch name {
 	case "read", "grep", "glob", "find_files", "lsp",
-		"output_list", "output_read", "artifact_list", "artifact_read", "history_search", "history_read", "web_fetch", "web_search":
+		"output_list", "output_read", "history_search", "history_read", "web_fetch", "web_search":
 		return true
 	default:
 		return false
@@ -1098,7 +1106,7 @@ func isRepositoryNavigationTool(name string) bool {
 func explorationBatch(calls []models.ToolCall) (hasNavigation, hasMutation bool) {
 	for _, call := range calls {
 		hasNavigation = hasNavigation || isRepositoryNavigationTool(call.Function.Name)
-		hasMutation = hasMutation || potentiallyMutatingReadGuardTool(call.Function.Name, call.Function.Arguments)
+		hasMutation = hasMutation || potentiallyMutatingReadGuardTool(call.Function.Name)
 	}
 	return hasNavigation, hasMutation
 }
@@ -1437,7 +1445,7 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 	turnDefs := tools.Defs(turnTools)
 
 	turnErrors := make(map[string]int)
-	malformedRoundsInTurn := 0
+	toolBatchRetriesInTurn := 0
 	rounds := 0
 	explorationRounds := 0
 	explorationReminder := ""
@@ -1647,20 +1655,8 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 		if err != nil {
 			if errors.Is(err, context.Canceled) || ctx.Err() != nil {
 				if msg.Content != "" || len(msg.ToolCalls) > 0 {
-					msg.Usage = &usage
-					msg.Model = a.Model + " @ " + a.Provider
 					msg.StopReason = "interrupted"
-					a.msgsMu.Lock()
-					a.Messages = append(a.Messages, msg)
-					for _, tc := range msg.ToolCalls {
-						a.Messages = append(a.Messages, models.Message{
-							Role:       "tool",
-							Content:    "Error: tool call interrupted — the turn was canceled by user before execution completed",
-							ToolCallID: tc.ID,
-							Name:       tc.Function.Name,
-						})
-					}
-					a.msgsMu.Unlock()
+					a.appendTurnErrorResponse(msg, usage, "Error: tool call interrupted — the turn was canceled by user before execution completed")
 				}
 			}
 			if reviewClosed && ctx.Err() == nil {
@@ -1764,17 +1760,7 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 			}
 		}
 		if reviewCheckpointError != "" {
-			msg.Usage = &usage
-			msg.Model = a.Model + " @ " + a.Provider
-			a.msgsMu.Lock()
-			a.Messages = append(a.Messages, msg)
-			for _, tc := range msg.ToolCalls {
-				a.Messages = append(a.Messages, models.Message{
-					Role: "tool", Content: "Error: " + reviewCheckpointError,
-					ToolCallID: tc.ID, Name: tc.Function.Name,
-				})
-			}
-			a.msgsMu.Unlock()
+			a.appendTurnErrorResponse(msg, usage, "Error: "+reviewCheckpointError)
 			continue
 		}
 		evidenceBatch := reviewFinalEvidenceBatch
@@ -1824,14 +1810,19 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 					} else {
 						reviewFinalEvidenceRetryUsed = true
 					}
-				} else if malformedRoundsInTurn > 0 {
+				} else if toolBatchRetriesInTurn > 0 {
 					if batchTooLarge {
 						return "", errors.New("model tool batch remained oversized")
 					}
 					return "", errors.New("model tool channel remained malformed")
 				}
-				malformedRoundsInTurn++
-				if !batchTooLarge {
+				toolBatchRetriesInTurn++
+				if batchTooLarge {
+					msg.ToolCalls = append([]models.ToolCall(nil), msg.ToolCalls...)
+					for i := range msg.ToolCalls {
+						msg.ToolCalls[i].Function.Arguments = "{}"
+					}
+				} else {
 					malformedSet := make(map[int]bool, len(malformedIndices))
 					for _, idx := range malformedIndices {
 						malformedSet[idx] = true
@@ -1845,48 +1836,29 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 						}
 					}
 				}
-				msg.Usage = &usage
-				msg.Model = a.Model + " @ " + a.Provider
-				a.msgsMu.Lock()
-				a.Messages = append(a.Messages, msg)
 				errorMessage := malformedToolCallError
 				if batchTooLarge {
 					errorMessage = oversizedToolBatchError
 				}
-				for _, tc := range msg.ToolCalls {
-					a.Messages = append(a.Messages, models.Message{
-						Role:       "tool",
-						Content:    errorMessage,
-						ToolCallID: tc.ID,
-						Name:       tc.Function.Name,
-					})
-				}
-				a.msgsMu.Unlock()
+				a.appendTurnErrorResponse(msg, usage, errorMessage)
 				continue
 			}
 
 			if err := a.validateToolBatch(msg.ToolCalls); err != nil {
 				if !evidenceBatch {
-					return "", err
+					if !errors.Is(err, errDuplicateToolCalls) || toolBatchRetriesInTurn > 0 {
+						return "", err
+					}
+					toolBatchRetriesInTurn++
+					a.appendTurnErrorResponse(msg, usage, "Error: "+err.Error()+". Remove duplicate calls and reissue only the distinct operations.")
+					continue
 				}
 				if reviewFinalEvidenceRetryUsed {
 					closeReviewExploration()
 				} else {
 					reviewFinalEvidenceRetryUsed = true
 				}
-				msg.Usage = &usage
-				msg.Model = a.Model + " @ " + a.Provider
-				a.msgsMu.Lock()
-				a.Messages = append(a.Messages, msg)
-				for _, tc := range msg.ToolCalls {
-					a.Messages = append(a.Messages, models.Message{
-						Role:       "tool",
-						Content:    "Error: final evidence batch was rejected before execution: " + err.Error(),
-						ToolCallID: tc.ID,
-						Name:       tc.Function.Name,
-					})
-				}
-				a.msgsMu.Unlock()
+				a.appendTurnErrorResponse(msg, usage, "Error: final evidence batch was rejected before execution: "+err.Error())
 				continue
 			}
 		}
@@ -2030,6 +2002,19 @@ func (a *Agent) turn(ctx context.Context, input string, parts []models.ContentPa
 			}
 			return msg.Content, nil
 		}
+	}
+}
+
+func (a *Agent) appendTurnErrorResponse(msg models.Message, usage models.Usage, toolError string) {
+	msg.Usage = &usage
+	msg.Model = a.Model + " @ " + a.Provider
+	a.msgsMu.Lock()
+	defer a.msgsMu.Unlock()
+	a.Messages = append(a.Messages, msg)
+	for _, call := range msg.ToolCalls {
+		a.Messages = append(a.Messages, models.Message{
+			Role: "tool", Content: toolError, ToolCallID: call.ID, Name: call.Function.Name,
+		})
 	}
 }
 

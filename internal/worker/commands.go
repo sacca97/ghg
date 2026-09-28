@@ -15,15 +15,14 @@ const (
 )
 
 // CommandSpec is the declarative catalogue entry for one user-facing command:
-// its canonical name, accepted aliases, one-line hint, and owning layer.
+// its canonical name, one-line hint, and owning layer.
 // Execution stays in each adapter's ordinary switch statement; only the
 // metadata is shared so help, completion, and availability cannot drift
 // between the TUI, the VS Code extension, and the worker.
 type CommandSpec struct {
-	Name    string
-	Aliases []string
-	Hint    string
-	Owner   CommandOwner
+	Name  string
+	Hint  string
+	Owner CommandOwner
 }
 
 // commandCatalogue is the single source of truth for user-facing commands.
@@ -43,20 +42,20 @@ var commandCatalogue = []CommandSpec{
 	{Name: "/dynamic-reasoning", Hint: "— toggle model per-call reasoning effort selection (default on)", Owner: OwnerWorker},
 	{Name: "/effort", Hint: "[level] — reasoning effort: off·low·medium·high (bare opens selector)", Owner: OwnerWorker},
 	{Name: "/execute", Hint: "[plan] — execute the latest proposal or supplied plan with the fast model", Owner: OwnerWorker},
-	{Name: "/export", Aliases: []string{"/export-result", "/export-chat", "/export-log"}, Hint: "[chat|logs|plan|review|last] [path] [--format json|markdown] [--force] — export chat log or structured result to a file", Owner: OwnerClient},
+	{Name: "/export", Hint: "[chat|logs|plan|review|last] [path] [--format json|markdown] [--force] — export chat log or structured result to a file", Owner: OwnerClient},
 	{Name: "/fork", Hint: "[name] — copy the conversation into a new session (pick a point in the rewind picker with f)", Owner: OwnerWorker},
 	{Name: "/goal", Hint: "<text> — keep working until the goal is met (unbounded; resume | clear)", Owner: OwnerWorker},
 	{Name: "/goal-from-context", Hint: "[n] — formulate a goal from the last n messages (default 8) and work until it's met", Owner: OwnerWorker},
-	{Name: "/help", Aliases: []string{"/commands"}, Hint: "— show all commands and keybindings", Owner: OwnerClient},
+	{Name: "/help", Hint: "— show all commands and keybindings", Owner: OwnerClient},
 	{Name: "/lsp", Hint: "— show language server status", Owner: OwnerWorker},
 	{Name: "/mcp", Hint: "[name] [reconnect|enable|disable] — MCP servers: status, reconnect, toggle", Owner: OwnerWorker},
-	{Name: "/me", Aliases: []string{"/agents"}, Hint: "— edit your standing instructions (~/.ghg/AGENTS.md) in $EDITOR", Owner: OwnerClient},
+	{Name: "/me", Hint: "— edit your standing instructions (~/.ghg/AGENTS.md) in $EDITOR", Owner: OwnerClient},
 	{Name: "/memory", Hint: "[n] [session] — saved memories: list what's injected each turn, mark entry n done", Owner: OwnerClient},
 	{Name: "/model", Hint: "<name> [provider] — switch model (any provider-catalog model works; refresh pulls new announcements)", Owner: OwnerWorker},
 	{Name: "/notify", Hint: "[config|on|off] — configure or toggle Telegram completion notifications", Owner: OwnerWorker},
 	{Name: "/plan", Hint: "[goal] — enter read-only Plan mode or explore a goal with the smart model (run it with /execute)", Owner: OwnerWorker},
 	{Name: "/pwd", Hint: "— print working directory", Owner: OwnerClient},
-	{Name: "/quit", Aliases: []string{"/exit", "/q"}, Hint: "— exit", Owner: OwnerClient},
+	{Name: "/quit", Hint: "— exit", Owner: OwnerClient},
 	{Name: "/rename", Hint: "[title] — retitle this session", Owner: OwnerWorker},
 	{Name: "/report", Hint: "— bug-report bundle: prefilled GitHub-issue link + copy-pastable environment snippet (terminal, versions)", Owner: OwnerClient},
 	{Name: "/resume", Hint: "[id] — resume a previous session", Owner: OwnerSupervisor},
@@ -71,27 +70,12 @@ func Commands() []CommandSpec {
 	return commandCatalogue
 }
 
-// FindCommand resolves a canonical name or one of its aliases to its catalogue
-// entry, or nil for an unknown command.
+// FindCommand resolves a canonical command name, or nil for an unknown command.
 func FindCommand(name string) *CommandSpec {
 	for i := range commandCatalogue {
 		if commandCatalogue[i].Name == name {
 			return &commandCatalogue[i]
 		}
-		for _, alias := range commandCatalogue[i].Aliases {
-			if alias == name {
-				return &commandCatalogue[i]
-			}
-		}
 	}
 	return nil
-}
-
-// CommandName resolves a command or alias to its canonical catalogue name,
-// returning the input unchanged when it is unknown.
-func CommandName(name string) string {
-	if spec := FindCommand(name); spec != nil {
-		return spec.Name
-	}
-	return name
 }

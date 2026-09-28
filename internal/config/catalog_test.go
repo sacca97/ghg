@@ -24,7 +24,7 @@ func cfgWithProviders(names ...string) *Config {
 		Models:    map[string]Model{},
 	}
 	for _, n := range names {
-		c.Providers[n] = Provider{BaseURL: "https://" + n, API: "openai-completions"}
+		c.Providers[n] = Provider{BaseURL: "https://" + n, API: "openai-chat-completions"}
 	}
 	return c
 }
@@ -108,7 +108,7 @@ func TestResolveCatalogFallbackOwnerWinsOverDefaultProvider(t *testing.T) {
 		ContextLength: 128000,
 	})
 	cfg := cfgWithProviders("provider-a", "provider-b")
-	cfg.DefaultProvider = "provider-a"
+	cfg.Roles = map[string]RoleConfig{RoleDefault: {Provider: "provider-a"}}
 
 	route, err := cfg.Resolve("b-only-model", "")
 	if err != nil {

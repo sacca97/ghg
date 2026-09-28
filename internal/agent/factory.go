@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/sacca97/ghg/internal/auth"
 	"github.com/sacca97/ghg/internal/config"
@@ -24,15 +25,16 @@ func NewConfigured(opts BuildOptions) (*Agent, string, string, error) {
 		return nil, "", "", fmt.Errorf("agent configuration is nil")
 	}
 	cfg := opts.Config
+	defaultRoute := cfg.Roles[config.RoleDefault]
+	if opts.AllowMissingCredentials && opts.Model == "" && strings.TrimSpace(defaultRoute.Model) == "" {
+		provider := opts.Provider
+		if provider == "" {
+			provider = defaultRoute.Provider
+		}
+		return nil, "", provider, nil
+	}
 	route, err := cfg.Resolve(opts.Model, opts.Provider)
 	if err != nil {
-		if opts.AllowMissingCredentials && opts.Model == "" && cfg.DefaultModel == "" {
-			provider := opts.Provider
-			if provider == "" {
-				provider = cfg.DefaultProvider
-			}
-			return nil, "", provider, nil
-		}
 		return nil, "", "", err
 	}
 
@@ -73,7 +75,7 @@ func NewConfigured(opts BuildOptions) (*Agent, string, string, error) {
 
 	catalogs := config.LoadCatalogs()
 	cat, hasCatalog := catalogs[providerName]
-	contextLimit := route.Model.ContextWindow()
+	contextLimit := route.Model.Context
 	if hasCatalog {
 		if n := cat.ContextLength(route.APIID); n > 0 {
 			contextLimit = n
@@ -130,9 +132,6 @@ func NewConfiguredForRole(cfg *config.Config, profiles models.Profiles, role, sy
 	}
 	target, err := cfg.ResolveRole(role)
 	if err != nil {
-		if allowMissingCredentials && len(cfg.Providers) == 0 && len(cfg.Models) == 0 && len(cfg.Roles) == 0 {
-			return nil, cfg.DefaultModel, cfg.DefaultProvider, nil
-		}
 		return nil, "", "", err
 	}
 	ag, modelName, providerName, err := NewConfigured(BuildOptions{

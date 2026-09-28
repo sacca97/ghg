@@ -227,11 +227,13 @@ func runObservedReadBatch(ctx context.Context, ranges []readRangeArgs) (ToolResu
 		output.WriteString(text)
 	}
 	raw := output.String()
-	preview := raw
+	preview := Truncate(raw)
 	if len(raw) > maxOutput && len(summaries) > 0 {
 		preview = TruncateWithSuffix(raw, strings.Join(summaries, ""))
 	}
-	result := TextResultWithSize(raw, preview, int64(len(raw)), complete, 0)
+	result := NewTextResult(raw, 0)
+	result.Preview = preview
+	result.Complete = result.Complete && complete
 	if selected == 0 {
 		result.ExitCode = 1
 	}
@@ -368,7 +370,7 @@ func prepareObservedContent(ctx context.Context, canonical, display string, r io
 		Content:     content.String(),
 		Complete:    !limitedByBytes,
 	}
-	result := TextResultWithSize(raw, raw, int64(len(raw)), true, 0)
+	result := NewTextResult(raw, 0)
 	result.Metadata = map[string]string{
 		"observation_id":          id,
 		"observation_path":        canonical,

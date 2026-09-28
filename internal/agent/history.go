@@ -301,7 +301,7 @@ func renderHistorySearch(snapshot search.Snapshot, cursor historyCursor, limit i
 	if hasMore {
 		fmt.Fprintf(&b, "\nnext_cursor=%s", historyCursorString(historyCursor{kind: cursor.kind, id: cursor.id, offset: next}))
 	}
-	return tools.MarkUntrusted(tools.TextResult(b.String(), b.String()), "history_search"), hasMore
+	return tools.MarkUntrusted(tools.NewTextResult(b.String(), 0), "history_search"), hasMore
 }
 
 func historyReadItemFromMessage(item HistoryMessage) historyReadItem {
@@ -356,7 +356,7 @@ func renderHistoryRead(snapshot search.Snapshot, cursor historyCursor) (tools.To
 	if hasMore {
 		fmt.Fprintf(&b, "\nnext_cursor=%s", historyCursorString(historyCursor{kind: cursor.kind, id: cursor.id, offset: next}))
 	}
-	return tools.MarkUntrusted(tools.TextResult(b.String(), b.String()), "history_read"), hasMore
+	return tools.MarkUntrusted(tools.NewTextResult(b.String(), 0), "history_read"), hasMore
 }
 
 func formatHistoryReadItem(item historyReadItem) string {

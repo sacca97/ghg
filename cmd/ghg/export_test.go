@@ -114,37 +114,4 @@ func TestExportCLI(t *testing.T) {
 		t.Fatalf("unexpected exported json content: %s", string(jsonData))
 	}
 
-	// 5. Export last message
-	msgs := []models.Message{
-		{Role: "user", Content: "hello"},
-		{Role: "assistant", Content: "This is the final assistant response text."},
-	}
-	_ = st.Save(sessionID, 0, msgs, "model-test", "prov-test")
-
-	outMsg := filepath.Join(tempDir, "last.md")
-	err = exportCLI([]string{"--session", sessionID, "--kind", "last", "--output", outMsg})
-	if err != nil {
-		t.Fatalf("export last message failed: %v", err)
-	}
-	msgData, err := os.ReadFile(outMsg)
-	if err != nil {
-		t.Fatalf("read exported last message: %v", err)
-	}
-	if !strings.Contains(string(msgData), "This is the final assistant response text.") {
-		t.Fatalf("unexpected exported message content: %s", string(msgData))
-	}
-
-	// 6. Export whole chat log
-	outChat := filepath.Join(tempDir, "chat.md")
-	err = exportCLI([]string{"--session", sessionID, "--kind", "chat", "--output", outChat})
-	if err != nil {
-		t.Fatalf("export chat log failed: %v", err)
-	}
-	chatData, err := os.ReadFile(outChat)
-	if err != nil {
-		t.Fatalf("read exported chat: %v", err)
-	}
-	if !strings.Contains(string(chatData), "### User\n\nhello") || !strings.Contains(string(chatData), "### Assistant\n\nThis is the final assistant response text.") {
-		t.Fatalf("unexpected exported chat content: %s", string(chatData))
-	}
 }

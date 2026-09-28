@@ -13,9 +13,8 @@ import (
 func TestConfigureWorkerCompactionFallsBackByRole(t *testing.T) {
 	newConfig := func() *config.Config {
 		return &config.Config{
-			DefaultModel: "default-model",
 			Providers: map[string]config.Provider{
-				"test": {BaseURL: "https://provider.example/v1", API: string(models.ProtocolOpenAICompletions), APIKey: "key"},
+				"test": {BaseURL: "https://provider.example/v1", API: string(models.ProtocolOpenAIChatCompletions), APIKey: "key"},
 			},
 			Models: map[string]config.Model{
 				"tiny-model":    {Providers: []string{"test"}, MaxOut: 1500},
@@ -48,7 +47,6 @@ func TestConfigureWorkerCompactionFallsBackByRole(t *testing.T) {
 			delete(cfg.Roles, config.RoleSmart)
 		}, want: "default-model", wantMax: 1700},
 		{name: "smart last", configure: func(cfg *config.Config) {
-			cfg.DefaultModel = ""
 			delete(cfg.Roles, config.RoleTiny)
 			delete(cfg.Roles, config.RoleFast)
 			delete(cfg.Roles, config.RoleDefault)
@@ -96,9 +94,8 @@ func TestWorkerEffortForModelDoesNotEscalateBaseline(t *testing.T) {
 func TestWorkerConfigurePersistsRoleModelAndDynamicReasoning(t *testing.T) {
 	t.Setenv("GHG_HOME", t.TempDir())
 	cfg := &config.Config{
-		DefaultModel: "fast-model",
 		Providers: map[string]config.Provider{
-			"test": {BaseURL: "https://provider.example/v1", API: string(models.ProtocolOpenAICompletions), APIKey: "key"},
+			"test": {BaseURL: "https://provider.example/v1", API: string(models.ProtocolOpenAIChatCompletions), APIKey: "key"},
 		},
 		Models: map[string]config.Model{
 			"fast-model": {Providers: []string{"test"}, MaxOut: 1600},
@@ -109,7 +106,7 @@ func TestWorkerConfigurePersistsRoleModelAndDynamicReasoning(t *testing.T) {
 	}
 	w := &workerProcessState{cfg: cfg, profiles: models.Profiles{}, ag: agent.New(nil, "fast-model", 100, "system")}
 	dynamicReasoning := false
-	if err := w.configure(workerConfigureRequest{
+	if err := w.configure(workerwire.ConfigureRequest{
 		Role: config.RoleFast, Model: "fast-model", Provider: "test",
 		DynamicReasoning: &dynamicReasoning, PersistDynamicReasoning: true,
 		PersistRoleModel: true, Mode: "execute",
@@ -130,7 +127,7 @@ func TestWorkerConfigurePersistsRoleModelAndDynamicReasoning(t *testing.T) {
 
 	// An unknown role must be refused before anything is written.
 	marker := config.RoleConfig{Model: "fast-model", Provider: "test"}
-	if err := w.configure(workerConfigureRequest{Model: "fast-model", Provider: "test", PersistRoleModel: true}); err == nil {
+	if err := w.configure(workerwire.ConfigureRequest{Model: "fast-model", Provider: "test", PersistRoleModel: true}); err == nil {
 		t.Fatal("persisting without a role should fail")
 	}
 	after, err := config.Load()
@@ -146,7 +143,7 @@ func TestWorkerConfigureBusyDoesNotPersistOrApplyRoute(t *testing.T) {
 	t.Setenv("GHG_HOME", t.TempDir())
 	cfg := &config.Config{
 		Providers: map[string]config.Provider{
-			"test": {BaseURL: "https://provider.example/v1", API: string(models.ProtocolOpenAICompletions), APIKey: "key"},
+			"test": {BaseURL: "https://provider.example/v1", API: string(models.ProtocolOpenAIChatCompletions), APIKey: "key"},
 		},
 		Models: map[string]config.Model{
 			"old-model": {Providers: []string{"test"}},
@@ -168,7 +165,7 @@ func TestWorkerConfigureBusyDoesNotPersistOrApplyRoute(t *testing.T) {
 		provider:     "test",
 		role:         config.RoleFast,
 	}
-	err := w.configure(workerConfigureRequest{
+	err := w.configure(workerwire.ConfigureRequest{
 		Role: config.RoleFast, Model: "new-model", Provider: "test", PersistRoleModel: true,
 	})
 	if err == nil || err.Error() != "worker is busy or stopping" {
@@ -197,7 +194,7 @@ func TestWorkerApprovalModeChangesLive(t *testing.T) {
 		t.Fatal(err)
 	}
 	w := &workerProcessState{cfg: cfg, runtime: runtime}
-	if err := w.configure(workerConfigureRequest{Approval: "auto"}); err != nil {
+	if err := w.configure(workerwire.ConfigureRequest{Approval: "auto"}); err != nil {
 		t.Fatal(err)
 	}
 	if got := runtime.CurrentApprovalMode(); got != tools.ApprovalAutoReview {
@@ -206,7 +203,7 @@ func TestWorkerApprovalModeChangesLive(t *testing.T) {
 	if cfg.Execution == nil || cfg.Execution.Approval != string(tools.ApprovalAutoReview) {
 		t.Fatalf("saved approval mode = %+v", cfg.Execution)
 	}
-	if err := w.configure(workerConfigureRequest{Approval: "invalid"}); err == nil {
+	if err := w.configure(workerwire.ConfigureRequest{Approval: "invalid"}); err == nil {
 		t.Fatal("invalid approval mode should fail")
 	}
 }

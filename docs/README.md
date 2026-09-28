@@ -64,13 +64,13 @@ looks like this:
 
 ```json
 {
-  "defaultModel": "example-model",
+  "version": 2,
   "providers": {
     "example": {
       "name": "Example provider",
       "profile": "generic-openai",
       "baseUrl": "https://api.example.com/v1",
-      "api": "openai-completions",
+      "api": "openai-chat-completions",
       "apiKeyEnv": "EXAMPLE_API_KEY"
     }
   },
@@ -86,10 +86,12 @@ looks like this:
 }
 ```
 
-The optional `roles` block accepts only `default`, `smart`, `fast`, and `tiny`.
+The `roles` block accepts only `default`, `smart`, `fast`, and `tiny`.
 Acting sessions use `fast`, planning uses `smart`, and compaction plus
-delegated tasks use `tiny`; omitted roles fall back to `defaultModel` and
-`defaultProvider`.
+delegated tasks use `tiny`; omitted roles fall back to the configured `default`
+role. On first load, older files migrate to version 2: legacy default fields
+become the default role, `maxTokens` becomes `context`, and the old OpenAI
+protocol spelling is rewritten. The migrated file is backed up.
 
 Completion notifications are opt-in per session. Run `/notify config` inside
 ghg to enter the Telegram bot token and chat ID; ghg sends a test message
@@ -101,8 +103,7 @@ request's provider-reported `PromptTokens + CompletionTokens` drives proactive
 compaction against it. The provider's `/models` `context_length` overrides it
 when advertised; otherwise ghg uses matching models.dev metadata when available.
 `maxOut` (optional) caps **output** tokens; 0 uses the
-provider's `max_completion_tokens`, else `context`. The old `maxTokens` field
-still parses (it always meant the context window) but is superseded by `context`.
+provider's `max_completion_tokens`, else `context`.
 
 **Catalog models need no config entry.** ghg caches each provider's
 `GET /models` (24h TTL in `~/.ghg/models.json`), and any advertised model is

@@ -42,8 +42,7 @@ func CompactThreshold(c *Config) float64 {
 
 // Config is the root of ~/.ghg/config.json (JSONC: comments allowed).
 type Config struct {
-	DefaultModel     string                    `json:"defaultModel"`
-	DefaultProvider  string                    `json:"defaultProvider,omitempty"`  // override the model's first provider
+	Version          int                       `json:"version"`
 	DefaultEffort    string                    `json:"defaultEffort,omitempty"`    // reasoning effort for new sessions: "", "low", "medium", "high"
 	DynamicReasoning *bool                     `json:"dynamicReasoning,omitempty"` // nil/on lets the model select an advertised effort for one call
 	CompactPct       int                       `json:"compactPct,omitempty"`       // compact at this % of the context window; 0 = DefaultCompactPct
@@ -260,7 +259,7 @@ func path() (string, error) {
 // without logging secrets.
 func (c *Config) fingerprint() string {
 	return fmt.Sprintf("providers=%d models=%d default=%q",
-		len(c.Providers), len(c.Models), c.DefaultModel)
+		len(c.Providers), len(c.Models), c.Roles[RoleDefault].Model)
 }
 
 // Load reads ~/.ghg/config.json, writing a default config on first run. The
@@ -279,8 +278,8 @@ func Load() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
-	var cfg Config
-	if err := parseJSONC(data, &cfg); err != nil {
+	cfg, err := decodeConfig(data)
+	if err != nil {
 		logf("config.load", "PARSE FAILURE %s: %v (%d bytes)", p, err, len(data))
 		return nil, fmt.Errorf("parse %s: %w", p, err)
 	}
@@ -304,8 +303,8 @@ func Load() (*Config, error) {
 	if len(cfg.Providers) == 0 && len(cfg.Models) == 0 {
 		logf("config.load", "CLOBBERED/EMPTY config detected (%d bytes on disk), attempting recovery", len(data))
 		if bak, err := os.ReadFile(p + ".bak"); err == nil {
-			var restored Config
-			if parseJSONC(bak, &restored) == nil && (len(restored.Providers) > 0 || len(restored.Models) > 0) {
+			restored, decodeErr := decodeConfig(bak)
+			if decodeErr == nil && (len(restored.Providers) > 0 || len(restored.Models) > 0) {
 				logf("config.load", "restored from .bak (%s)", restored.fingerprint())
 				if len(restored.MCPServers) == 0 && len(cfg.MCPServers) > 0 {
 					restored.MCPServers = cfg.MCPServers // keep the user's servers
@@ -313,7 +312,7 @@ func Load() (*Config, error) {
 				if restored.MCPImport == nil {
 					restored.MCPImport = cfg.MCPImport // keep import gating too
 				}
-				return &restored, restored.Save()
+				return restored, restored.Save()
 			}
 		}
 		def := Default()
@@ -323,7 +322,7 @@ func Load() (*Config, error) {
 		return def, def.Save()
 	}
 	logf("config.load", "ok (%s)", cfg.fingerprint())
-	return &cfg, nil
+	return cfg, nil
 }
 
 // Save writes the config back to ~/.ghg/config.json. The write is atomic
@@ -332,6 +331,12 @@ func Load() (*Config, error) {
 // with providers/models) with a structurally empty one — that path has only
 // ever been reached by a bug, never intentionally.
 func (c *Config) Save() error {
+	if c.Version == 0 {
+		c.Version = ConfigVersion
+	}
+	if c.Version != ConfigVersion {
+		return fmt.Errorf("unsupported config version %d (want %d)", c.Version, ConfigVersion)
+	}
 	if err := c.ValidateRoles(); err != nil {
 		return err
 	}
@@ -390,10 +395,12 @@ func marshalConfig(c *Config) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := rejectLegacyProtocols(c); err != nil {
+		return nil, err
+	}
 	header := "// ghg configuration — JSONC: comments and trailing commas are allowed.\n" +
 		"// providers: declare each API endpoint once; optional profile selects non-secret YAML metadata.\n" +
-		"// models: route each model to one or\n" +
-		"// more providers (first is the default). defaultModel/defaultProvider pick the route.\n" +
+		"// models: route each model to one or more providers (first is the default).\n" +
 		"// mcp: ghg's own MCP servers; mcpImport: gate claude/codex imports, e.g.\n" +
 		"//   \"mcpImport\": { \"codex\": { \"enabled\": true, \"exclude\": [\"node_repl\"] } }\n"
 	out := append([]byte(header), body...)
@@ -403,12 +410,13 @@ func marshalConfig(c *Config) ([]byte, error) {
 // Default returns the first-run config, wired for the built-in default service.
 func Default() *Config {
 	return &Config{
+		Version: ConfigVersion,
 		Providers: map[string]Provider{
 			"inference": {
 				Name:      "Inference",
 				Profile:   "inference",
 				BaseURL:   "https://api.inference.net/v1",
-				API:       "openai-completions",
+				API:       "openai-chat-completions",
 				APIKeyEnv: "INFERENCE_API_KEY",
 			},
 		},

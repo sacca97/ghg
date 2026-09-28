@@ -84,44 +84,18 @@ type ToolResult struct {
 	Metadata map[string]string
 }
 
-// textResult retains bounded evidence and applies the caller's model preview.
-// The raw string is already bounded by callers that read external streams;
-// retainText applies the common hard ceiling for file/MCP/tool strings.
-func textResult(raw, preview string, exitCode int) ToolResult {
-	retained, complete := retainText(raw)
-	if preview == "" && raw != "" {
-		preview = Truncate(raw)
+// NewTextResult builds a result from already-materialized text.
+func NewTextResult(text string, exitCode int) ToolResult {
+	retained, complete := retainText(text)
+	preview := Truncate(text)
+	if preview == "" {
+		preview = "(no output)"
 	}
 	return ToolResult{
 		Preview:       preview,
 		Retained:      retained,
-		OriginalBytes: int64(len(raw)),
+		OriginalBytes: int64(len(text)),
 		Complete:      complete,
-		ExitCode:      exitCode,
-	}
-}
-
-// TextResult builds a structured result for an integration tool whose raw
-// output is already available as a string. preview is the text sent to the
-// model; an empty preview for non-empty raw output uses the standard head cap.
-func TextResult(raw, preview string) ToolResult {
-	return textResult(raw, preview, 0)
-}
-
-// capturedResult adapts a stream capture that already retained a bounded
-// representation while preserving the producer's original byte count.
-func capturedResult(retained, preview string, original int64, complete bool, exitCode int) ToolResult {
-	if original <= 0 {
-		original = int64(len(retained))
-	}
-	if preview == "" && retained != "" {
-		preview = TruncateTail(retained)
-	}
-	return ToolResult{
-		Preview:       preview,
-		Retained:      retained,
-		OriginalBytes: original,
-		Complete:      complete && original == int64(len(retained)),
 		ExitCode:      exitCode,
 	}
 }
@@ -272,31 +246,18 @@ func (c *OutputCapture) OriginalBytes() int64 { return c.total }
 // Complete reports whether every written byte is retained.
 func (c *OutputCapture) Complete() bool { return !c.truncated }
 
-// TextCapture remains an alias for integration callers that use the older
-// name.
-type TextCapture = OutputCapture
-
-// NewTextCapture creates a bounded capture for integration output.
-func NewTextCapture(limit int64) *TextCapture { return NewOutputCapture(limit) }
-
-// CapturedTextResult converts a bounded capture into a structured result.
-func CapturedTextResult(c *TextCapture, preview string, exitCode int) ToolResult {
-	if c == nil {
-		return ToolResult{}
-	}
-	return capturedResult(c.String(), preview, c.OriginalBytes(), c.Complete(), exitCode)
-}
-
-// TextResultWithSize builds a result from an already-bounded representation
-// while preserving the producer's original byte count.
-func TextResultWithSize(retained, preview string, original int64, complete bool, exitCode int) ToolResult {
-	return capturedResult(retained, preview, original, complete, exitCode)
+// Result converts captured output into a bounded tool result.
+func (c *OutputCapture) Result(exitCode int) ToolResult {
+	result := NewTextResult(c.String(), exitCode)
+	result.OriginalBytes = c.total
+	result.Complete = c.Complete() && c.total == int64(len(result.Retained))
+	return result
 }
 
 // MarkUntrusted records that result's bytes came from an external or
 // user-controlled source. The marker is metadata rather than a change to
-// Preview so legacy Execute callers and the TUI can keep their existing text;
-// the agent applies ModelText when it builds the provider-facing message.
+// Preview so the TUI can keep the user-facing text; the agent applies
+// ModelText when it builds the provider-facing message.
 func MarkUntrusted(result ToolResult, source string) ToolResult {
 	if strings.TrimSpace(source) == "" {
 		source = result.Source
@@ -345,29 +306,12 @@ func ModelText(result ToolResult) string {
 		strconv.Quote(source), body, reference)
 }
 
-func normalizeResult(result ToolResult) ToolResult {
-	if result.OriginalBytes <= 0 {
-		result.OriginalBytes = int64(len(result.Retained))
-	}
-	if result.Retained == "" && result.Preview != "" && result.Preview != "(no output)" {
-		result.Retained, result.Complete = retainText(result.Preview)
-		if result.OriginalBytes < int64(len(result.Retained)) {
-			result.OriginalBytes = int64(len(result.Retained))
-		}
-	}
-	if result.Preview == "" {
-		result.Preview = "(no output)"
-	}
-	result.Preview = Truncate(result.Preview)
-	return result
-}
-
 func errorToolResult(err error) ToolResult {
 	if err == nil {
 		err = errors.New("tool failed")
 	}
 	message := "Error: " + err.Error()
-	result := textResult(message, message, 1)
+	result := NewTextResult(message, 1)
 	result.Complete = true
 	return result
 }

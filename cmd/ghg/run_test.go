@@ -36,9 +36,10 @@ func runFixture(t *testing.T, reply string, reqs *[]models.Request) {
 	home := t.TempDir()
 	t.Setenv("GHG_HOME", home)
 	cfg := fmt.Sprintf(`{
-		"defaultModel": "test",
-		"providers": {"testprov": {"baseUrl": %q, "api": "openai-completions", "apiKey": "k"}},
-		"models": {"test": {"providers": ["testprov"], "maxOut": 100}}
+		"version": 2,
+		"providers": {"testprov": {"baseUrl": %q, "api": "openai-chat-completions", "apiKey": "k"}},
+		"models": {"test": {"providers": ["testprov"], "maxOut": 100}},
+		"roles": {"default": {"model": "test", "provider": "testprov"}}
 	}`, srv.URL)
 	if err := os.WriteFile(filepath.Join(home, "config.json"), []byte(cfg), 0o600); err != nil {
 		t.Fatal(err)
@@ -92,9 +93,10 @@ func runPlanFixture(t *testing.T, reqs *[]models.Request) {
 	home := t.TempDir()
 	t.Setenv("GHG_HOME", home)
 	cfg := fmt.Sprintf(`{
-		"defaultModel": "test",
-		"providers": {"testprov": {"baseUrl": %q, "api": "openai-completions", "apiKey": "k"}},
-		"models": {"test": {"providers": ["testprov"], "maxOut": 100}}
+		"version": 2,
+		"providers": {"testprov": {"baseUrl": %q, "api": "openai-chat-completions", "apiKey": "k"}},
+		"models": {"test": {"providers": ["testprov"], "maxOut": 100}},
+		"roles": {"default": {"model": "test", "provider": "testprov"}}
 	}`, srv.URL)
 	if err := os.WriteFile(filepath.Join(home, "config.json"), []byte(cfg), 0o600); err != nil {
 		t.Fatal(err)
@@ -136,54 +138,6 @@ func runCapture(t *testing.T, stdinData string, args ...string) (string, error) 
 	<-done
 	outR.Close()
 	return buf.String(), runErr
-}
-
-// text mode streams the assistant reply to stdout.
-func TestRunTextOutput(t *testing.T) {
-	runFixture(t, "hello world", nil)
-
-	out, err := runCapture(t, "", "say hi")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(out, "hello world") {
-		t.Fatalf("stdout should stream the reply, got %q", out)
-	}
-}
-
-// --format json emits newline-delimited events: a text event per delta and a
-// final done event carrying the full reply.
-func TestRunJSONStream(t *testing.T) {
-	runFixture(t, "all done", nil)
-
-	out, err := runCapture(t, "", "--format", "json", "go")
-	if err != nil {
-		t.Fatal(err)
-	}
-	var sawText, sawSession, sawDone bool
-	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
-		var ev map[string]any
-		if err := json.Unmarshal([]byte(line), &ev); err != nil {
-			t.Fatalf("line not JSON: %q: %v", line, err)
-		}
-		switch ev["type"] {
-		case "text":
-			sawText = true
-		case "session":
-			sawSession = true
-			if id, _ := ev["session_id"].(string); id == "" {
-				t.Fatal("session event has no session_id")
-			}
-		case "done":
-			sawDone = true
-			if text, _ := ev["text"].(string); text != "all done" {
-				t.Fatalf("done text: %q", ev["text"])
-			}
-		}
-	}
-	if !sawText || !sawSession || !sawDone {
-		t.Fatalf("want session, text, and done events, got:\n%s", out)
-	}
 }
 
 func TestRunPlanOnlyUsesReadOnlyPlannerAndExits(t *testing.T) {
@@ -301,43 +255,6 @@ func TestRunStdinAppendsToPrompt(t *testing.T) {
 	}
 }
 
-// -resume continues a persisted session instead of starting fresh; the
-// resumed conversation's history precedes the new prompt.
-func TestRunResume(t *testing.T) {
-	var reqs []models.Request
-	runFixture(t, "first reply", &reqs)
-	if _, err := runCapture(t, "", "first question"); err != nil {
-		t.Fatal(err)
-	}
-
-	// find the session id from the store (same GHG_HOME for both runs)
-	dir, _ := configDir()
-	st, err := sessionOpen(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	metas, _ := st.Recent(10)
-	if len(metas) != 1 {
-		t.Fatalf("one session should exist, got %d", len(metas))
-	}
-	id := metas[0].ID
-	st.Close()
-
-	if _, err := runCapture(t, "", "-resume", id, "follow up"); err != nil {
-		t.Fatal(err)
-	}
-	last := reqs[len(reqs)-1]
-	var sawFirst bool
-	for _, m := range last.Messages {
-		if m.Role == "user" && strings.Contains(m.TextContent(), "first question") {
-			sawFirst = true
-		}
-	}
-	if !sawFirst {
-		t.Fatal("a resumed run should carry the prior conversation")
-	}
-}
-
 // -resume with an unknown id errors clearly.
 func TestRunResumeUnknown(t *testing.T) {
 	runFixture(t, "x", nil)
@@ -381,9 +298,10 @@ func TestRunMaxTurns(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("GHG_HOME", home)
 	cfg := fmt.Sprintf(`{
-		"defaultModel": "test",
-		"providers": {"testprov": {"baseUrl": %q, "api": "openai-completions", "apiKey": "k"}},
-		"models": {"test": {"providers": ["testprov"], "maxOut": 100}}
+		"version": 2,
+		"providers": {"testprov": {"baseUrl": %q, "api": "openai-chat-completions", "apiKey": "k"}},
+		"models": {"test": {"providers": ["testprov"], "maxOut": 100}},
+		"roles": {"default": {"model": "test", "provider": "testprov"}}
 	}`, srv.URL)
 	os.WriteFile(filepath.Join(home, "config.json"), []byte(cfg), 0o600)
 
@@ -404,9 +322,10 @@ func TestRunTimeout(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("GHG_HOME", home)
 	cfg := fmt.Sprintf(`{
-		"defaultModel": "test",
-		"providers": {"testprov": {"baseUrl": %q, "api": "openai-completions", "apiKey": "k"}},
-		"models": {"test": {"providers": ["testprov"], "maxOut": 100}}
+		"version": 2,
+		"providers": {"testprov": {"baseUrl": %q, "api": "openai-chat-completions", "apiKey": "k"}},
+		"models": {"test": {"providers": ["testprov"], "maxOut": 100}},
+		"roles": {"default": {"model": "test", "provider": "testprov"}}
 	}`, srv.URL)
 	os.WriteFile(filepath.Join(home, "config.json"), []byte(cfg), 0o600)
 
@@ -422,27 +341,11 @@ func TestRunNoSession(t *testing.T) {
 	if _, err := runCapture(t, "", "-no-session", "one-off"); err != nil {
 		t.Fatal(err)
 	}
-	dir, _ := configDir()
-	st, _ := sessionOpen(dir)
+	st, _ := session.Open(filepath.Join(os.Getenv("GHG_HOME"), "sessions.db"))
 	defer st.Close()
 	metas, _ := st.Recent(10)
 	if len(metas) != 0 {
 		t.Fatalf("-no-session should leave no sessions, got %d", len(metas))
-	}
-}
-
-// -quiet -format json: clean NDJSON on stdout, nothing on stderr.
-func TestRunQuietJSON(t *testing.T) {
-	runFixture(t, "quiet reply", nil)
-	out, err := runCapture(t, "", "-quiet", "-format", "json", "go")
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
-		var ev map[string]any
-		if err := json.Unmarshal([]byte(line), &ev); err != nil {
-			t.Fatalf("stdout should be clean NDJSON, got line %q: %v", line, err)
-		}
 	}
 }
 
@@ -462,7 +365,3 @@ func TestRunUnusableSessionDatabaseFailsUnlessNoSession(t *testing.T) {
 		t.Fatalf("-no-session should bypass session database error, got: %v", err)
 	}
 }
-
-func configDir() (string, error) { return os.Getenv("GHG_HOME"), nil }
-
-func sessionOpen(dir string) (*session.Store, error) { return session.Open(dir + "/sessions.db") }

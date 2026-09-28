@@ -54,7 +54,7 @@ The optional JSONC `roles` block accepts only `default`, `smart`, `fast`, and
 
 Acting sessions use `fast` by default and planning sessions use `smart`.
 Compaction and delegated `task` calls use `tiny`. An absent role falls back to
-`default`, then `defaultModel/defaultProvider`; a configured but invalid role
+`default`; a configured but invalid role
 is an error. `ghg run --role smart` selects a role for a headless run, while
 `-m`/`-p` remain explicit route overrides.
 
@@ -178,9 +178,9 @@ Three numbers with distinct meanings:
 | provider `context_length` | advertised limit | overrides `context` when present |
 | models.dev `reasoning_options` | model-specific effort/toggle controls | `/effort`, the clickable effort indicator, and request lowering |
 
-The old `maxTokens` field still parses (it always meant the context window)
-but is superseded by `context`. When config or the provider catalog omits the
-limit, or when the catalog omits reasoning controls, ghg uses the matching
+Older config files migrate `maxTokens` to `context` on first load. When config
+or the provider catalog omits the limit, or when the catalog omits reasoning
+controls, ghg uses the matching
 `limit.context` and `reasoning_options` from the daily models.dev cache at
 `~/.ghg/models-dev.json`. The cache is fetched lazily for listed models only.
 The upstream endpoint is an all-provider snapshot, but ghg retains only the

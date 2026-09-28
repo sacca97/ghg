@@ -19,7 +19,7 @@ import (
 
 type workerApprovalFlight struct {
 	done     chan struct{}
-	request  workerApproval
+	request  workerwire.Approval
 	decision tools.GateDecision
 	redirect string
 	once     sync.Once
@@ -27,8 +27,8 @@ type workerApprovalFlight struct {
 
 type workerQuestionFlight struct {
 	done    chan struct{}
-	request workerQuestionRequest
-	answers []workerQuestionAnswer
+	request workerwire.QuestionRequest
+	answers []workerwire.QuestionAnswer
 	err     error
 	once    sync.Once
 }
@@ -51,9 +51,9 @@ func (w *workerProcessState) Snapshot(context.Context) (any, error) {
 	w.mu.Unlock()
 	live := w.liveSnapshot()
 	if ag == nil {
-		return workerSnapshot{SessionID: w.sessionID, State: state, Detached: detached, Mode: mode, Approval: approval}, nil
+		return workerwire.Snapshot{SessionID: w.sessionID, State: state, Detached: detached, Mode: mode, Approval: approval}, nil
 	}
-	return workerSnapshot{
+	return workerwire.Snapshot{
 		SessionID: w.sessionID, State: state, Detached: detached,
 		Model: modelID, ModelName: modelName, Provider: providerName,
 		Role: role, Protocol: protocol, Effort: effort, Approval: approval, Mode: mode,
@@ -132,7 +132,7 @@ func marshalResult(label string, value any) (workerwire.CommandResult, error) {
 }
 
 func (w *workerProcessState) commandInput(command workerwire.Command) (workerwire.CommandResult, error) {
-	var input workerInput
+	var input workerwire.Input
 	if err := json.Unmarshal(command.Payload, &input); err != nil || strings.TrimSpace(input.Input) == "" {
 		return workerwire.CommandResult{}, errors.New("worker input is invalid")
 	}
@@ -156,7 +156,7 @@ func (w *workerProcessState) commandCancel() (workerwire.CommandResult, error) {
 }
 
 func (w *workerProcessState) commandApprove(command workerwire.Command) (workerwire.CommandResult, error) {
-	var answer workerApprovalAnswer
+	var answer workerwire.ApprovalAnswer
 	if err := json.Unmarshal(command.Payload, &answer); err != nil {
 		return workerwire.CommandResult{}, errors.New("approval answer is invalid")
 	}
@@ -178,7 +178,7 @@ func (w *workerProcessState) commandAnswerQuestion(command workerwire.Command) (
 }
 
 func (w *workerProcessState) commandConfigure(command workerwire.Command) (workerwire.CommandResult, error) {
-	var request workerConfigureRequest
+	var request workerwire.ConfigureRequest
 	if err := json.Unmarshal(command.Payload, &request); err != nil {
 		return workerwire.CommandResult{}, errors.New("worker configuration is invalid")
 	}
@@ -456,7 +456,7 @@ func canonicalDir(path string) (string, error) {
 // configure changes the live approval setting or the idle worker's route. Keeping the existing Agent
 // preserves its task registry, observations, history, and session resources;
 // the replacement agent is used only as a route builder.
-func (w *workerProcessState) configure(request workerConfigureRequest) error {
+func (w *workerProcessState) configure(request workerwire.ConfigureRequest) error {
 	if strings.TrimSpace(request.Approval) != "" {
 		return w.configureApproval(request.Approval)
 	}
@@ -542,7 +542,7 @@ func (w *workerProcessState) configure(request workerConfigureRequest) error {
 			_ = w.store.SetEffort(w.sessionID, effort)
 		}
 	}
-	w.publish(workerwire.EventRoute, workerConfigureRequest{
+	w.publish(workerwire.EventRoute, workerwire.ConfigureRequest{
 		Model: modelID, ModelName: resolvedModel, Provider: resolvedProvider,
 		Role: role, Protocol: protocol, Effort: effort, UpdateEffort: true,
 		Mode: mode,
@@ -555,7 +555,7 @@ func (w *workerProcessState) configure(request workerConfigureRequest) error {
 // for a role's model or the dynamic-reasoning switch to be configured, but the
 // worker owns the config file and performs the write. It runs before the live
 // route changes, so a validation or save failure leaves the worker untouched.
-func (w *workerProcessState) persistConfigureLocked(request workerConfigureRequest) error {
+func (w *workerProcessState) persistConfigureLocked(request workerwire.ConfigureRequest) error {
 	role := strings.TrimSpace(request.Role)
 	model := strings.TrimSpace(request.Model)
 	persistModel := request.PersistRoleModel && model != ""
@@ -608,7 +608,7 @@ func (w *workerProcessState) configureApproval(value string) error {
 	if err := cfg.Save(); err != nil {
 		return fmt.Errorf("save approval mode: %w", err)
 	}
-	w.publish(workerwire.EventRoute, workerConfigureRequest{Approval: string(mode)}, true)
+	w.publish(workerwire.EventRoute, workerwire.ConfigureRequest{Approval: string(mode)}, true)
 	return nil
 }
 
@@ -644,14 +644,14 @@ func (w *workerProcessState) humanGate(ctx context.Context, req tools.GateReques
 		return tools.GateAllowOnce, ""
 	}
 	id := fmt.Sprintf("approval-%d", w.approvalSeq.Add(1))
-	pending := &workerApproval{ID: id, Tool: req.Tool, Command: req.Command, Rule: req.Rule}
+	pending := &workerwire.Approval{ID: id, Tool: req.Tool, Command: req.Command, Rule: req.Rule}
 	flight := &workerApprovalFlight{done: make(chan struct{}), request: *pending}
 
 	w.transition(func() (workerwire.State, bool, string, bool) {
 		w.pending[id] = flight
 		return workerwire.StateWaitingApproval, w.detached, "approval requested", true
 	})
-	w.publish(workerwire.EventPermissionRequest, workerPermissionRequest{Approval: *pending}, true)
+	w.publish(workerwire.EventPermissionRequest, workerwire.PermissionRequest{Approval: *pending}, true)
 	select {
 	case <-flight.done:
 	case <-ctx.Done():
@@ -685,7 +685,7 @@ func (w *workerProcessState) questionGate(ctx context.Context, request agent.Que
 		questions[i] = workerwire.Question{ID: question.ID, Question: question.Question, Options: options}
 	}
 	id := fmt.Sprintf("question-%d", w.questionSeq.Add(1))
-	flight := &workerQuestionFlight{done: make(chan struct{}), request: workerQuestionRequest{ID: id, Questions: questions}}
+	flight := &workerQuestionFlight{done: make(chan struct{}), request: workerwire.QuestionRequest{ID: id, Questions: questions}}
 	w.mu.Lock()
 	if w.pendingQuestion != nil {
 		w.mu.Unlock()
@@ -752,7 +752,7 @@ func (w *workerProcessState) answerQuestion(answer workerwire.QuestionAnswerRequ
 	return true
 }
 
-func (w *workerProcessState) answerApproval(answer workerApprovalAnswer) bool {
+func (w *workerProcessState) answerApproval(answer workerwire.ApprovalAnswer) bool {
 	w.mu.Lock()
 	flight := w.pending[answer.ID]
 	w.mu.Unlock()
@@ -811,7 +811,7 @@ func (w *workerProcessState) rejectQuestion(reason string) {
 	}
 }
 
-func (w *workerProcessState) pendingState() *workerApproval {
+func (w *workerProcessState) pendingState() *workerwire.Approval {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	for _, request := range w.pending {
@@ -820,7 +820,7 @@ func (w *workerProcessState) pendingState() *workerApproval {
 	return nil
 }
 
-func (w *workerProcessState) pendingQuestionState() *workerQuestionRequest {
+func (w *workerProcessState) pendingQuestionState() *workerwire.QuestionRequest {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.pendingQuestion == nil {
@@ -878,12 +878,12 @@ func appendWorkerTail(current, value string) string {
 	return current
 }
 
-func (w *workerProcessState) taskStates() []workerTaskState {
+func (w *workerProcessState) taskStates() []workerwire.TaskState {
 	if w.ag == nil {
 		return nil
 	}
 	tasks := w.ag.Tasks().List()
-	out := make([]workerTaskState, 0, len(tasks))
+	out := make([]workerwire.TaskState, 0, len(tasks))
 	for _, task := range tasks {
 		out = append(out, workerTask(task))
 	}

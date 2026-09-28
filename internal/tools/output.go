@@ -61,7 +61,7 @@ func runOutputList(ctx context.Context, cfg OutputToolConfig, args json.RawMessa
 	if err != nil {
 		return ToolResult{}, err
 	}
-	return TextResult(formatOutputList(items), ""), nil
+	return NewTextResult(formatOutputList(items), 0), nil
 }
 
 func parseOutputTime(name, value string) (time.Time, error) {
@@ -148,13 +148,11 @@ func runOutputRead(ctx context.Context, cfg OutputToolConfig, args json.RawMessa
 		out += "\n" + string(data)
 	}
 	preview := Truncate(out)
-	return MarkUntrusted(ToolResult{
-		Preview:       preview,
-		Retained:      out,
-		OriginalBytes: int64(len(out)),
-		Complete:      len(out) == len(preview),
-		Output:        &meta.OutputRef,
-	}, "output_read"), nil
+	result := NewTextResult(out, 0)
+	result.Preview = preview
+	result.Complete = len(out) == len(preview)
+	result.Output = &meta.OutputRef
+	return MarkUntrusted(result, "output_read"), nil
 }
 
 func currentSessionID(sessionID func() string) string {

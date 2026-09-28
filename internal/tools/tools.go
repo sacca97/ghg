@@ -80,18 +80,9 @@ func Defs(ts []Tool) []models.Tool {
 	return defs
 }
 
-// Execute runs the named tool. Errors are returned as strings so they can be
-// fed back to the model rather than aborting the loop.
-func Execute(ctx context.Context, ts []Tool, name string, args json.RawMessage) string {
-	return ExecuteResult(ctx, ts, name, args).Preview
-}
-
 // ExecuteResult runs the named tool and returns its structured result. The
-// string Execute wrapper above remains the compatibility surface for MCP and
-// existing callers; agent turns use this form so retained evidence is still
-// available after the model preview is bounded.
+// Tool execution returns retained evidence as well as its bounded model preview.
 func ExecuteResult(ctx context.Context, ts []Tool, name string, args json.RawMessage) ToolResult {
-	name = canonicalToolName(name)
 	args = normalizeIntegerArgs(name, args)
 	for _, t := range ts {
 		if t.Def.Function.Name == name {
@@ -103,7 +94,7 @@ func ExecuteResult(ctx context.Context, ts []Tool, name string, args json.RawMes
 				var out string
 				out, err = t.Run(ctx, args)
 				if err == nil {
-					result = textResult(out, out, 0)
+					result = NewTextResult(out, 0)
 				}
 			} else {
 				err = errors.New("tool has no implementation")
@@ -113,7 +104,6 @@ func ExecuteResult(ctx context.Context, ts []Tool, name string, args json.RawMes
 				result.Source = name
 				return result
 			}
-			result = normalizeResult(result)
 			if result.Source == "" {
 				result.Source = name
 			}
@@ -218,23 +208,6 @@ func quotedInteger(raw json.RawMessage) (json.RawMessage, bool) {
 		return nil, false
 	}
 	return json.RawMessage(strconv.Itoa(number)), true
-}
-
-func canonicalToolName(name string) string {
-	switch name {
-	case "artifact_read":
-		return "output_read"
-	case "artifact_list":
-		return "output_list"
-	case "read_file":
-		return "read"
-	case "search", "search_text":
-		return "grep"
-	case "find", "find_file":
-		return "find_files"
-	default:
-		return name
-	}
 }
 
 func SuggestTool(name string, candidates []string) []string {

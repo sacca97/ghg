@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -36,13 +37,13 @@ func (s *stubLSP) Navigate(_ context.Context, request NavigationRequest) (Naviga
 
 func TestWriteEditAppendLSPDiagnostics(t *testing.T) {
 	stub := &stubLSP{block: "\n\n<diagnostics file=\"x.go\">\nERROR [1:1] boom\n</diagnostics>"}
-	ctx := WithRuntime(context.Background(), &ToolRuntime{LanguageService: stub})
+	ctx := WithObservationStore(WithRuntime(context.Background(), &ToolRuntime{LanguageService: stub}), "lsp-edit", observation.NewRegistry())
 
 	dir := t.TempDir()
 	p := filepath.Join(dir, "x.go")
 
 	args, _ := json.Marshal(map[string]any{"path": p, "content": "package main\n"})
-	out := Execute(ctx, All(), "write", args)
+	out := ExecuteResult(ctx, All(), "write", args).Preview
 	if !strings.Contains(out, "<diagnostics") || !strings.Contains(out, "ERROR [1:1] boom") {
 		t.Fatalf("write output missing diagnostics: %q", out)
 	}
@@ -50,8 +51,11 @@ func TestWriteEditAppendLSPDiagnostics(t *testing.T) {
 		t.Fatalf("hook calls: %v", stub.calls)
 	}
 
-	args, _ = json.Marshal(map[string]any{"mode": "exact", "path": p, "old_string": "main", "new_string": "main2"})
-	out = Execute(ctx, All(), "edit", args)
+	read := ExecuteResult(ctx, All(), "read", json.RawMessage(fmt.Sprintf(`{"path":%q}`, p)))
+	args, _ = json.Marshal(map[string]any{"mode": "observed", "edits": []any{map[string]any{
+		"observation": read.Metadata["observation_id"], "path": p, "start_line": 1, "end_line": 1, "content": "package main2",
+	}}})
+	out = ExecuteResult(ctx, All(), "edit", args).Preview
 	if !strings.Contains(out, "<diagnostics") {
 		t.Fatalf("edit output missing diagnostics: %q", out)
 	}
@@ -64,7 +68,7 @@ func TestLSPNilUnchangedOutput(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "x.go")
 	args, _ := json.Marshal(map[string]any{"path": p, "content": "hi"})
-	out := Execute(context.Background(), All(), "write", args)
+	out := ExecuteResult(context.Background(), All(), "write", args).Preview
 	if strings.Contains(out, "<diagnostics") {
 		t.Fatalf("nil hook must not alter output: %q", out)
 	}
@@ -75,7 +79,7 @@ func TestLSPFailureNeverFailsTool(t *testing.T) {
 	dir := t.TempDir()
 	p := filepath.Join(dir, "x.go")
 	args, _ := json.Marshal(map[string]any{"path": p, "content": "hi"})
-	out := Execute(ctx, All(), "write", args)
+	out := ExecuteResult(ctx, All(), "write", args).Preview
 	if !strings.HasPrefix(out, "Wrote") {
 		t.Fatalf("tool result should be the success message, got %q", out)
 	}

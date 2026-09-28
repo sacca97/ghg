@@ -99,7 +99,7 @@ ported. This fork does not merge from upstream — see `UPSTREAM.md`.
 - [x] Plan runaway guard & per-turn tool freezing — tools and definitions are frozen once at turn start; Plan mode tracks weighted expenditure and enforces a 128 model-call ceiling, forcing plan synthesis when reserve is crossed; sparse `FanIn` eliminates unused JSON marshaling; code review failures trigger a cheap 2-round `submit_review`-only correction workflow
 - [x] Streamed partial tool output — per-call context callback, 100ms accumulated snapshots, tool-id events, and a last-three-lines TUI tail that collapses on completion
 - [ ] Spill truncated bash output to a temp file and mention the path (pi bash tool) — **superseded** by the output store — do not port
-- [x] Recoverable tool-result outputs — structured bounded results, deterministic head/tail retention up to 10 MiB, SHA-256 content-addressed payloads, session-scoped `output_list`/`output_read` (with legacy aliases), fork/rewind-safe metadata, explicit opt-out, no-session cleanup, untrusted-output delimiters, and `ghg outputs gc`
+- [x] Recoverable tool-result outputs — structured bounded results, deterministic head/tail retention up to 10 MiB, SHA-256 content-addressed payloads, session-scoped `output_list`/`output_read`, fork/rewind-safe metadata, explicit opt-out, no-session cleanup, untrusted-output delimiters, and `ghg outputs gc`
 - [x] Inject `GHG_SESSION_ID` / `GHG_MODEL` env into bash children (pi injects `PI_*`) — stamped on child env (`internal/tools/runtime_config.go`);
 - [x] Trusted project instructions from `AGENTS.md` — bounded, symlink-rejecting load after the folder trust gate, injected beside `~/.ghg/AGENTS.md`
 - [x] Skills: scan `.agents/skills/*/SKILL.md` (project) and `~/.ghg/skills/` (user), inject name+description into the system prompt as an `<available_skills>` block; the model reads a SKILL.md with its own read tool when relevant (pi's approach — no skill tool needed, `packages/coding-agent/src/core/skills.ts`)
@@ -115,9 +115,9 @@ ported. This fork does not merge from upstream — see `UPSTREAM.md`.
 - [x] Provider-neutral backend boundary with compiled OpenAI-compatible Chat Completions, OpenAI Responses, and Anthropic adapters plus optional model catalog capability
 - [x] Declarative YAML provider profiles with embedded/user/trusted-project precedence, strict validation, and anonymous legacy compatibility
 - [x] Profile-driven `/auth` and `ghg auth` for every loaded provider, with masked TUI input, validation-before-save, catalog seeding/probes, YAML-only custom profiles, a single-profile ordered route table for multi-protocol providers, and a degraded cold start that promotes the acting `fast` role when available (otherwise the first catalog model) in place
-- [x] `anthropic-messages` API style alongside `openai-completions` (pi: `packages/ai/src/api/`) — native Messages adapter with tools, vision, thinking, cache usage, retries, and model discovery
+- [x] `anthropic-messages` API style alongside `openai-chat-completions` (pi: `packages/ai/src/api/`) — native Messages adapter with tools, vision, thinking, cache usage, retries, and model discovery
 - [x] `openai-responses` API style — native `/responses` adapter with flattened function tools, streamed text/reasoning/tool-call events, preserved output-item history, usage, retries, probing, and model discovery
-- [x] Model roles: JSONC `roles` accepts only `default`, `smart`, `fast`, and `tiny`; acting defaults to `fast`, planning defaults to `smart`, compaction and delegated tasks select `tiny`, and each role resolves through the profile factory with default/legacy fallback. The TUI exposes cycling bottom-bar `execute`/`plan` mode and model controls plus a role-first, API-key-filtered model selector (`plan` maps to `smart`)
+- [x] Model roles: JSONC `roles` accepts only `default`, `smart`, `fast`, and `tiny`; acting defaults to `fast`, planning defaults to `smart`, compaction and delegated tasks select `tiny`, and each role resolves through the profile factory with configured-default fallback. The TUI exposes cycling bottom-bar `execute`/`plan` mode and model controls plus a role-first, API-key-filtered model selector (`plan` maps to `smart`)
 - [x] Context-window metadata fallback: when a provider catalog omits `context_length`, lazily fetch the matching `limit.context` from the daily models.dev provider/model snapshot; only listed model IDs are retained locally, and profile aliases cover gateways whose runtime ID differs from its public metadata ID
 - [x] `"$VAR"` / `"!cmd"` resolution for apiKey/header values in config (pi models.json value resolution) — shipped with secrets-by-reference (internal/config/secret.go), resolved at point of use
 - [x] Reasoning effort: `/effort` (bare opens the selector), tab-completes, and the clickable `(effort)` control use the selected model's models.dev/provider-advertised options, including `max`, toggle-only `off`/`on`, and explicit off-only models; graded values and adapter-supported toggle state are sent per request, inherited by subagents, and survive model switches
@@ -167,7 +167,7 @@ ported. This fork does not merge from upstream — see `UPSTREAM.md`.
 
 - [x] Non-interactive one-shot mode: `ghg run "prompt"` — reads piped stdin too, `--format json` emits the raw event stream for scripting (opencode `cli/cmd/run.ts`)
 - [x] `ghg sessions` list subcommand
-- [x] `ghg outputs gc` — age/size cleanup of unreferenced retained tool-result payloads; referenced payloads are never removed (with `artifacts` as a legacy alias)
+- [x] `ghg outputs gc` — age/size cleanup of unreferenced retained tool-result payloads; referenced payloads are never removed
 - [x] Env markers in child processes (`GHG=1`, `GHG_SESSION_ID`) so scripts can detect they run under the agent (opencode sets `AGENT=1`, `OPENCODE_PID`)
 
 ## Autonomy & durability

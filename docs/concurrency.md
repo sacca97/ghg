@@ -164,7 +164,7 @@ running row. No callback means no ticker or extra goroutine.
 
 Each tool-call worker owns its bounded capture and finishes writing the
 retained bytes before it invokes `OnToolEnd` or publishes the result back to
-the turn. `TextCapture` and the bash runner keep a fixed head/tail buffer while
+the turn. `OutputCapture` and the bash runner keep a fixed head/tail buffer while
 counting every byte, so a noisy process cannot grow memory with its output.
 The injected output store is content-addressed and has no mutable package
 global; concurrent calls may deduplicate the same immutable payload safely.

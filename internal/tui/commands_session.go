@@ -280,14 +280,7 @@ type exportOptions struct {
 }
 
 func parseExportOptions(text string) exportOptions {
-	trimmed := text
-	for _, pfx := range []string{"/export-result", "/export"} {
-		if strings.HasPrefix(trimmed, pfx) {
-			trimmed = strings.TrimPrefix(trimmed, pfx)
-			break
-		}
-	}
-	args := strings.Fields(strings.TrimSpace(trimmed))
+	args := strings.Fields(strings.TrimSpace(strings.TrimPrefix(text, "/export")))
 	var opts exportOptions
 
 	for i := 0; i < len(args); i++ {
@@ -421,7 +414,7 @@ func (m *model) exportRecord(kind string) (session.WorkflowResultRecord, bool, e
 	return rec, ok, nil
 }
 
-// exportResultCommand handles `/export` and `/export-result` with `[chat|plan|review|last|message] [dest] [--format json|markdown] [--force]`.
+// exportResultCommand handles `/export` with `[chat|plan|review|last|message] [dest] [--format json|markdown] [--force]`.
 func (m *model) exportResultCommand(text string) (tea.Model, tea.Cmd) {
 	opts := parseExportOptions(text)
 	rec, ok, err := m.exportRecord(opts.kind)

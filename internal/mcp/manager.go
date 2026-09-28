@@ -387,7 +387,7 @@ func (s *server) bridge(d *sdkmcp.Tool) tools.Tool {
 
 // call runs one tool call against the session, serialized per server and
 // bounded by the configured tool timeout. Errors become error strings for
-// the model via tools.Execute — never loop-aborting (opencode throws and
+// the model via tools.ExecuteResult — never loop-aborting (opencode throws and
 // converts to an output-error tool part; ghg's "Error: …" convention is
 // the same shape).
 // connectGrace caps how long a tool call waits for a still-connecting server
@@ -462,7 +462,7 @@ func (s *server) callResult(ctx context.Context, tool string, args json.RawMessa
 }
 
 func mcpToolResult(res *sdkmcp.CallToolResult) tools.ToolResult {
-	capture := tools.NewTextCapture(0)
+	capture := tools.NewOutputCapture(0)
 	for _, c := range res.Content {
 		switch c := c.(type) {
 		case *sdkmcp.TextContent:
@@ -496,17 +496,18 @@ func mcpToolResult(res *sdkmcp.CallToolResult) tools.ToolResult {
 		capture.WriteString("(no output)")
 	}
 	if res.IsError {
-		wrapped := tools.NewTextCapture(0)
-		wrapped.WriteString("Error: ")
-		wrapped.WriteString(capture.String())
+		const prefix = "Error: "
+		result := tools.NewTextResult(prefix+capture.String(), 1)
 		original := capture.OriginalBytes() + int64(len("Error: "))
-		return tools.MarkUntrusted(tools.TextResultWithSize(wrapped.String(), tools.Truncate(wrapped.String()), original, capture.Complete() && original == int64(len(wrapped.String())), 1), "mcp")
+		result.OriginalBytes = original
+		result.Complete = capture.Complete() && original == int64(len(result.Retained))
+		return tools.MarkUntrusted(result, "mcp")
 	}
-	return tools.MarkUntrusted(tools.CapturedTextResult(capture, tools.Truncate(capture.String()), 0), "mcp")
+	return tools.MarkUntrusted(capture.Result(0), "mcp")
 }
 
 type textCaptureWriter struct {
-	capture *tools.TextCapture
+	capture *tools.OutputCapture
 }
 
 func (w textCaptureWriter) Write(p []byte) (int, error) {

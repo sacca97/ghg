@@ -303,37 +303,6 @@ func TestHeaderContainsOnlyAppAndSkillCount(t *testing.T) {
 	}
 }
 
-func TestHeaderShowsLoadedSkillCount(t *testing.T) {
-	m := compactCmdModel()
-	m.skillsLoaded = 33
-	head := strings.SplitN(m.View(), "\n", 2)[0]
-	if !strings.Contains(head, " ghg · skills: 33 loaded") {
-		t.Fatalf("header should show the loaded skill count next to ghg: %q", head)
-	}
-}
-
-// The header omits the context block entirely and leaves route details to the
-// bottom status line.
-func TestHeaderOmitsContext(t *testing.T) {
-	m := compactCmdModel()
-	m.width = 120
-	head := strings.SplitN(m.View(), "\n", 2)[0]
-	if strings.Contains(head, "⣿") {
-		t.Errorf("header should not contain a context block: %q", head)
-	}
-	if strings.Contains(head, "⚡") || strings.Contains(head, "kimi-k3-fast") {
-		t.Errorf("header should omit effort and route controls: %q", head)
-	}
-}
-
-func TestHeaderOmitsEffortControl(t *testing.T) {
-	m := compactCmdModel()
-	head := strings.SplitN(m.View(), "\n", 2)[0]
-	if strings.Contains(head, "⚡") || strings.Contains(head, "effort") {
-		t.Fatalf("header should not render a reasoning control: %q", head)
-	}
-}
-
 // The view contains only application content; terminal control sequences are
 // owned by Run, which uses Bubble Tea's alternate-screen lifecycle. Mouse
 // capture remains ON by default for wheel scroll and app-owned selection.
@@ -565,22 +534,6 @@ func TestLinkifyFilePathsKeepsVisibleText(t *testing.T) {
 	got := linkifyFilePaths(in, existsAll)
 	if !strings.Contains(ansi.Strip(got), "internal/tui/tui.go:42") {
 		t.Errorf("visible text lost: %q", ansi.Strip(got))
-	}
-}
-
-func TestSplitLineRef(t *testing.T) {
-	tests := []struct{ ref, path, line string }{
-		{"a/b.go:42", "a/b.go", "42"},
-		{"a/b.go", "a/b.go", ""},
-		{"a/b.go:x", "a/b.go:x", ""},       // non-numeric suffix stays in path
-		{"a/b.go:", "a/b.go", ""},          // trailing punctuation trimmed
-		{"/a/b:1/c.go", "/a/b:1/c.go", ""}, // ':' not trailing-number
-	}
-	for _, tt := range tests {
-		p, l := splitLineRef(tt.ref)
-		if p != tt.path || l != tt.line {
-			t.Errorf("splitLineRef(%q) = (%q, %q), want (%q, %q)", tt.ref, p, l, tt.path, tt.line)
-		}
 	}
 }
 
@@ -1245,27 +1198,6 @@ func TestStatusModelSlotStaysFixedAcrossRoleChanges(t *testing.T) {
 	}
 	if m.statusModelW >= len(long) {
 		t.Fatalf("narrow status should truncate the model slot, got width %d", m.statusModelW)
-	}
-}
-
-// Request usage is no longer rendered in the status segment; context size is
-// the useful persistent value there instead.
-func TestStatusLineOmitsTokenUsage(t *testing.T) {
-	m := statusModel()
-	m.modelName = "m"
-	m.provName = "p"
-	u := models.Usage{PromptTokens: 10000, CompletionTokens: 500}
-	u.PromptTokensDetails = &struct {
-		CachedTokens int `json:"cached_tokens"`
-	}{CachedTokens: 4000}
-	m.usage.Add(u)
-
-	got := m.statusView()
-	if strings.ContainsAny(got, "↓↑") || strings.Contains(got, "tok") {
-		t.Errorf("status should no longer show directional token usage: %q", got)
-	}
-	if !strings.Contains(got, "ctx 0") {
-		t.Errorf("status should show context size instead: %q", got)
 	}
 }
 

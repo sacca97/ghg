@@ -298,11 +298,7 @@ func (m *model) currentUsage() models.Usage {
 }
 
 func (m *model) Init() tea.Cmd {
-	workerCmd := m.startWorkerCmd()
-	if workerCmd == nil {
-		return textarea.Blink
-	}
-	return tea.Batch(textarea.Blink, workerCmd)
+	return m.startWorkerCmd()
 }
 
 func cwd() string {
@@ -328,7 +324,10 @@ func (m *model) switchModel(name, prov string) {
 		m.append(errStyle.Render(err.Error()))
 		return
 	}
-	m.cfg.DefaultModel, m.cfg.DefaultProvider = m.modelName, m.provName
+	if m.cfg.Roles == nil {
+		m.cfg.Roles = make(map[string]config.RoleConfig)
+	}
+	m.cfg.Roles[config.RoleDefault] = config.RoleConfig{Model: m.modelName, Provider: m.provName}
 	_ = m.saveConfig()
 }
 

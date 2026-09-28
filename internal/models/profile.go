@@ -404,9 +404,7 @@ func validateProfile(profile *Profile) error {
 		return fmt.Errorf("profile %q display_name is invalid", profile.ID)
 	}
 
-	// YAML profiles use canonical protocol names. The legacy
-	// openai-completions spelling is accepted only while normalizing the old
-	// JSONC provider instance in Resolve.
+	// Profile and provider protocol values use the canonical adapter names.
 	profile.Protocol = normalizeProtocol(profile.Protocol)
 	switch profile.Protocol {
 	case ProtocolOpenAIChatCompletions, ProtocolAnthropicMessages, ProtocolOpenAIResponses:
@@ -568,11 +566,7 @@ func validateRoutes(profile *Profile) error {
 }
 
 func normalizeProtocol(protocol Protocol) Protocol {
-	protocol = Protocol(strings.ToLower(strings.TrimSpace(string(protocol))))
-	if protocol == ProtocolOpenAICompletions {
-		return ProtocolOpenAIChatCompletions
-	}
-	return protocol
+	return Protocol(strings.ToLower(strings.TrimSpace(string(protocol))))
 }
 
 func normalizeBaseURL(raw string) (string, error) {

@@ -43,6 +43,9 @@ jobs:
       - name: go test (portable set)
         run: go test -race $(go list ./... | grep -v /internal/tui)
 
+      - name: CLI end-to-end run and resume
+        run: go test -tags=integration ./cmd/ghg -run '^TestCLIRunPersistsAndResumes$' -count=1
+
       - name: go mod tidy is a no-op
         run: |
           go mod tidy

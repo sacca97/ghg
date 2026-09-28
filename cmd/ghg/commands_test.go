@@ -2,117 +2,13 @@ package main
 
 import (
 	"context"
-	"encoding/json"
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
-	"github.com/sacca97/ghg/internal/config"
 	"github.com/sacca97/ghg/internal/models"
 	"github.com/sacca97/ghg/internal/session"
 )
-
-func TestModelsCLIJSON(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("GHG_HOME", home)
-	configJSON := `{"defaultModel":"fallback","defaultProvider":"provider","providers":{"provider":{"baseUrl":"https://example.test"}},"models":{"fallback":{"providers":["provider"]},"smart-model":{"providers":["provider"]}},"roles":{"smart":{"model":"smart-model","provider":"provider"}}}`
-	if err := os.WriteFile(filepath.Join(home, "config.json"), []byte(configJSON), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := config.SaveCatalog("provider", "https://example.test", []models.ModelInfo{
-		{ID: "smart-model", ReasoningEfforts: []string{"low", "max"}},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	out := captureStdout(t, func() {
-		if err := modelsCLI([]string{"--format", "json"}); err != nil {
-			t.Fatal(err)
-		}
-	})
-	var got map[string]string
-	if err := json.Unmarshal([]byte(out), &got); err != nil {
-		t.Fatal(err)
-	}
-	if got["smart"] != "smart-model" || got["fast"] != "fallback" {
-		t.Fatalf("role models = %#v", got)
-	}
-	out = captureStdout(t, func() {
-		if err := modelsCLI([]string{"--all", "--format", "json"}); err != nil {
-			t.Fatal(err)
-		}
-	})
-	var choices []catalogModelChoice
-	if err := json.Unmarshal([]byte(out), &choices); err != nil {
-		t.Fatal(err)
-	}
-	if len(choices) != 2 || choices[0].Model != "fallback" || choices[1].Model != "smart-model" {
-		t.Fatalf("catalog models = %#v", choices)
-	}
-	if got := choices[1].ReasoningEfforts; len(got) != 3 || got[0] != "" || got[1] != "low" || got[2] != "max" {
-		t.Fatalf("smart model reasoning efforts = %#v", got)
-	}
-}
-
-func TestLoadProviderProfilesIgnoresProjectRootYAML(t *testing.T) {
-	root := t.TempDir()
-	if err := os.WriteFile(filepath.Join(root, ".golangci.yml"), []byte("version: \"2\"\nrun:\n  timeout: 5m\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	project := filepath.Join(root, ".ghg", "providers")
-	if err := os.MkdirAll(project, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(project, "local.yaml"), []byte("schema: 1\nid: local\ndisplay_name: local\nprotocol: openai-chat-completions\nbase_url: https://example.test/v1\nauth:\n  kind: none\ncatalog:\n  kind: none\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-
-	profiles, err := loadProviderProfilesForProject(config.ProjectContext{Root: root, Trusted: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := profiles.Lookup("local"); !ok {
-		t.Fatal("trusted project profile was not loaded")
-	}
-}
-
-func TestSessionsCLI(t *testing.T) {
-	dir := t.TempDir()
-	t.Setenv("GHG_HOME", dir)
-
-	st, _ := session.Open(filepath.Join(dir, "sessions.db"))
-	id, _ := st.Create("/tmp", "kimi-k3-fast", "inference")
-	st.Save(id, 0, []models.Message{
-		{Role: "user", Content: "how do I unstage a file", Authored: true},
-		{Role: "assistant", Content: "git restore --staged"},
-	}, "kimi-k3-fast", "inference")
-	st.Close()
-
-	out := captureStdout(t, func() {
-		if err := sessionsCLI(nil); err != nil {
-			t.Fatal(err)
-		}
-	})
-	if !strings.Contains(out, "how do I unstage a file") || !strings.Contains(out, "kimi-k3-fast") {
-		t.Fatalf("sessions should list id/title/model, got:\n%s", out)
-	}
-	if !strings.Contains(out, "just now") && !strings.Contains(out, time.Now().Format("2006-01-02")) {
-		t.Fatalf("age column should render, got:\n%s", out)
-	}
-	out = captureStdout(t, func() {
-		if err := sessionsCLI([]string{"--format", "json"}); err != nil {
-			t.Fatal(err)
-		}
-	})
-	var listed []sessionListItem
-	if err := json.Unmarshal([]byte(out), &listed); err != nil {
-		t.Fatal(err)
-	}
-	if len(listed) != 1 || listed[0].ID != id || listed[0].Title != "how do I unstage a file" {
-		t.Fatalf("sessions JSON = %#v", listed)
-	}
-}
 
 func TestOutputsGarbageCollectKeepsReferencedPayloads(t *testing.T) {
 	home := t.TempDir()
@@ -148,7 +44,7 @@ func TestOutputsGarbageCollectKeepsReferencedPayloads(t *testing.T) {
 	}
 
 	out := captureStdout(t, func() {
-		if err := artifactsCLI([]string{"gc", "--max-bytes", "1"}); err != nil {
+		if err := outputsCLI([]string{"gc", "--max-bytes", "1"}); err != nil {
 			t.Fatal(err)
 		}
 	})

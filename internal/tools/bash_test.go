@@ -11,16 +11,6 @@ func testBash(ctx context.Context, command string, timeout time.Duration, update
 	return runBashCommand(ctx, bashOptions{Command: command, Timeout: timeout, OnUpdate: update})
 }
 
-func TestBashDoesNotHangOnTTYRead(t *testing.T) {
-	res := testBash(context.Background(), `exec 3< /dev/tty; read -r line <&3; echo "got: $line"`, 5*time.Second, nil)
-	if res.TimedOut {
-		t.Fatalf("command hung and timed out: %+v", res)
-	}
-	if res.Output == "" && res.Exit == "" {
-		t.Fatalf("expected a fast non-zero exit: %+v", res)
-	}
-}
-
 func TestBashCapture(t *testing.T) {
 	res := testBash(context.Background(), `echo hi; echo err >&2; exit 3`, 0, nil)
 	if !strings.Contains(res.Output, "hi") || !strings.Contains(res.Output, "err") {

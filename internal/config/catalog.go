@@ -437,17 +437,6 @@ func (c *Config) CatalogWantedModels(cats map[string]Catalog) map[string]struct{
 			wanted[id] = struct{}{}
 		}
 	}
-	for _, name := range []string{c.DefaultModel} {
-		id := strings.TrimSpace(name)
-		if id == "" {
-			continue
-		}
-		if model, ok := c.Models[id]; ok && strings.TrimSpace(model.ID) != "" {
-			wanted[strings.TrimSpace(model.ID)] = struct{}{}
-		} else {
-			wanted[id] = struct{}{}
-		}
-	}
 	return wanted
 }
 

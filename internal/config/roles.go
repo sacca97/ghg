@@ -34,23 +34,11 @@ type Model struct {
 	// MaxOut caps OUTPUT tokens (the max_tokens request param). 0 uses the
 	// provider default when no output limit is advertised.
 	MaxOut int `json:"maxOut,omitempty"`
-	// MaxTokens is the legacy field name for Context (it was misnamed: it held
-	// the context window, not an output cap). Read on load for back-compat.
-	MaxTokens int `json:"maxTokens,omitempty"`
 	// Vision reports whether the model accepts image inputs. When false (the
 	// default), @image tags are NOT inlined as base64 vision parts — the model
 	// gets a pointer note instead, so a text-only model isn't sent a request it
 	// would reject. A provider-advertised input_modalities entry overrides this.
 	Vision bool `json:"vision,omitempty"`
-}
-
-// ContextWindow returns the model's context (input) size, honoring the legacy
-// maxTokens field for configs written before the rename.
-func (m Model) ContextWindow() int {
-	if m.Context > 0 {
-		return m.Context
-	}
-	return m.MaxTokens
 }
 
 // ResolvedRoute contains the canonical provider and model resolution result.
@@ -65,8 +53,9 @@ type ResolvedRoute struct {
 // Resolve picks the provider and API model id for a model name.
 // provider may be "" to use the config default routing.
 func (c *Config) Resolve(model, provider string) (ResolvedRoute, error) {
+	defaultRoute := c.Roles[RoleDefault]
 	if model == "" {
-		model = c.DefaultModel
+		model = strings.TrimSpace(defaultRoute.Model)
 	}
 	m, ok := c.Models[model]
 	if !ok {
@@ -79,7 +68,7 @@ func (c *Config) Resolve(model, provider string) (ResolvedRoute, error) {
 		}
 	}
 	if provider == "" {
-		provider = c.DefaultProvider
+		provider = strings.TrimSpace(defaultRoute.Provider)
 	}
 	if provider == "" && len(m.Providers) > 0 {
 		provider = m.Providers[0]
@@ -144,9 +133,9 @@ func RoleForMode(mode string) string {
 	return RoleFast
 }
 
-// ResolveRole applies role -> configured entry -> configured default role ->
-// legacy defaultModel/defaultProvider. A configured entry is authoritative:
-// an invalid route is returned as an error instead of silently falling back.
+// ResolveRole applies role -> configured entry -> configured default role. A
+// configured entry is authoritative: an invalid route is returned as an error
+// instead of silently falling back.
 func (c *Config) ResolveRole(role string) (ResolvedRole, error) {
 	role = strings.TrimSpace(role)
 	if role == "" {
@@ -159,10 +148,16 @@ func (c *Config) ResolveRole(role string) (ResolvedRole, error) {
 	target, configured := c.Roles[role]
 	if !configured && role != RoleDefault {
 		target, configured = c.Roles[RoleDefault]
+		if configured && strings.TrimSpace(target.Model) == "" {
+			return ResolvedRole{Role: role, Provider: strings.TrimSpace(target.Provider)}, nil
+		}
 	}
 	if configured {
 		model := strings.TrimSpace(target.Model)
 		if model == "" {
+			if role == RoleDefault {
+				return ResolvedRole{Role: role, Provider: strings.TrimSpace(target.Provider)}, nil
+			}
 			return ResolvedRole{}, fmt.Errorf("role %q has no model", role)
 		}
 		provider := strings.TrimSpace(target.Provider)
@@ -173,19 +168,8 @@ func (c *Config) ResolveRole(role string) (ResolvedRole, error) {
 		return ResolvedRole{Role: role, Model: route.ModelName, Provider: route.ProviderName}, nil
 	}
 
-	// An empty legacy target is allowed through here so the interactive cold
-	// start can render and offer /auth. Strict callers still get the existing
-	// Config.Resolve error when they try to build an agent.
-	model := strings.TrimSpace(c.DefaultModel)
-	provider := strings.TrimSpace(c.DefaultProvider)
-	if model == "" {
-		return ResolvedRole{Role: role}, nil
-	}
-	route, err := c.Resolve(model, provider)
-	if err != nil {
-		return ResolvedRole{}, err
-	}
-	return ResolvedRole{Role: role, Model: route.ModelName, Provider: route.ProviderName}, nil
+	// No default route is normal on first run; model selection populates it.
+	return ResolvedRole{Role: role}, nil
 }
 
 // ValidateRoles rejects stale or misspelled role keys before they can be

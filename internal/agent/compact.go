@@ -82,7 +82,13 @@ func (a *Agent) maybeCompact(ctx context.Context, ev Events) error {
 func EstimateTokens(msgs []models.Message) int {
 	total := 0
 	for _, m := range msgs {
-		total += 4 + (len(m.TextContent())+3)/4 + 1200*len(m.Parts) // ~tokens for an image
+		images := 0
+		for _, part := range m.Parts {
+			if part.Type == "image_url" {
+				images++
+			}
+		}
+		total += 4 + (len(m.TextContent())+3)/4 + 1200*images // ~tokens per image
 		for _, tc := range m.ToolCalls {
 			total += 8 + (len(tc.Function.Name)+len(tc.Function.Arguments)+3)/4
 		}
@@ -381,7 +387,16 @@ func compactionView(sysPrompt models.Message, summary string, tail, all []models
 	if manifest != "" {
 		view = append(view, models.Message{Role: "system", Content: manifest})
 	}
-	return append(view, tail...)
+	return appendCompactionTail(view, tail)
+}
+
+func appendCompactionTail(view, tail []models.Message) []models.Message {
+	start := len(view)
+	view = append(view, tail...)
+	for i := start; i < len(view); i++ {
+		view[i].Usage = nil // provider usage describes the pre-compaction prompt
+	}
+	return view
 }
 
 func compactionSummaryTruncated(msg models.Message) bool {
@@ -431,7 +446,7 @@ func (a *Agent) emergencyCutover(ctx context.Context, ev Events) (string, int, e
 	if manifest != "" {
 		view = append(view, models.Message{Role: "system", Content: manifest})
 	}
-	view = append(view, tail...)
+	view = appendCompactionTail(view, tail)
 	a.msgsMu.Lock()
 	a.Messages = view
 	a.tokenEstimateValid = false

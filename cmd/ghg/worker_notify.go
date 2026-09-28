@@ -80,7 +80,7 @@ func (w *workerProcessState) enableTelegram(ctx context.Context, cfg *config.Con
 
 // notifyCompletion deliberately runs after the normal worker completion was
 // published. Delivery is best effort and never changes the turn result.
-func (w *workerProcessState) notifyCompletion(result workerTurnResult) {
+func (w *workerProcessState) notifyCompletion(result workerwire.TurnResult) {
 	if result.Error != "" || result.GoalContinue || strings.TrimSpace(result.Final) == "" || w.store == nil {
 		return
 	}

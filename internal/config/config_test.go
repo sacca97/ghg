@@ -14,15 +14,15 @@ func TestLoadSaveDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.DefaultModel != "" || len(cfg.Models) != 0 || cfg.Providers["inference"].BaseURL == "" || cfg.Providers["inference"].Profile != "inference" {
+	if cfg.Version != ConfigVersion || cfg.Roles[RoleDefault].Model != "" || len(cfg.Models) != 0 || cfg.Providers["inference"].BaseURL == "" || cfg.Providers["inference"].Profile != "inference" {
 		t.Fatalf("defaults: %+v", cfg)
 	}
-	cfg.DefaultModel = "glm-5.2-fast"
+	cfg.Roles = map[string]RoleConfig{RoleDefault: {Model: "glm-5.2-fast"}}
 	if err := cfg.Save(); err != nil {
 		t.Fatal(err)
 	}
 	cfg2, err := Load()
-	if err != nil || cfg2.DefaultModel != "glm-5.2-fast" {
+	if err != nil || cfg2.Roles[RoleDefault].Model != "glm-5.2-fast" {
 		t.Fatalf("reload: %+v %v", cfg2, err)
 	}
 }
@@ -59,6 +59,38 @@ func TestLoadRejectsBadJSON(t *testing.T) {
 	}
 }
 
+func TestLoadRejectsNoncurrentConfigVersion(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		input string
+		want  string
+	}{
+		{name: "missing", input: `{"providers":null,"models":null}`, want: "unsupported config version 0"},
+		{name: "old", input: `{"version":1}`, want: "unsupported config version 1"},
+		{name: "future", input: `{"version":3}`, want: "newer than supported"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			dir := filepath.Join(home, ".ghg")
+			if err := os.MkdirAll(dir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(dir, "config.json")
+			input := []byte(tc.input)
+			if err := os.WriteFile(path, input, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Load(); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("config should be rejected with %q: %v", tc.want, err)
+			}
+			if got, err := os.ReadFile(path); err != nil || string(got) != string(input) {
+				t.Fatalf("unsupported config was rewritten: %v\n%s", err, got)
+			}
+		})
+	}
+}
+
 func TestProviderKey(t *testing.T) {
 	t.Setenv("HOME", t.TempDir()) // no ~/.inf fallback available
 	t.Setenv("GHG_TEST_KEY", "from-env")
@@ -76,10 +108,10 @@ func TestProviderKey(t *testing.T) {
 
 func TestResolveRouting(t *testing.T) {
 	cfg := &Config{
-		DefaultModel: "m1",
+		Roles: map[string]RoleConfig{RoleDefault: {Model: "m1"}},
 		Providers: map[string]Provider{
-			"a": {BaseURL: "https://a", API: "openai-completions"},
-			"b": {BaseURL: "https://b", API: "openai-completions"},
+			"a": {BaseURL: "https://a", API: "openai-chat-completions"},
+			"b": {BaseURL: "https://b", API: "openai-chat-completions"},
 		},
 		Models: map[string]Model{
 			"m1": {Providers: []string{"a", "b"}, ID: "vendor/m1"},
@@ -158,28 +190,33 @@ func TestLoadJSONCCommentsAndTrailingCommas(t *testing.T) {
 	t.Setenv("HOME", home)
 	os.MkdirAll(filepath.Join(home, ".ghg"), 0o700)
 	src := `{
-  // default route
-  "defaultModel": "m1",
-  "defaultProvider": "a", /* block comment */
+  "version": 2, // current schema
+  "roles": {"default": {"model": "m1", "provider": "a"},}, /* block comment */
   "providers": {
-    "a": { "baseUrl": "https://a", "api": "openai-completions", }, // trailing comma
+    "a": { "baseUrl": "https://a", "api": "openai-chat-completions", }, // trailing comma
   },
   "models": {
-    "m1": { "providers": ["a",], "api": "anthropic-messages", "maxTokens": 1024, },
+    "m1": { "providers": ["a",], "api": "anthropic-messages", "context": 1024, },
+    "m2": { "providers": ["a"], "api": "openai-chat-completions", "context": 4096 },
   },
 }
 
 `
-	os.WriteFile(filepath.Join(home, ".ghg", "config.json"), []byte(src), 0o600)
+	if err := os.WriteFile(filepath.Join(home, ".ghg", "config.json"), []byte(src), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	cfg, err := Load()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.DefaultModel != "m1" || cfg.DefaultProvider != "a" {
-		t.Fatalf("defaults: %+v", cfg)
+	if cfg.Version != ConfigVersion || cfg.Roles[RoleDefault] != (RoleConfig{Model: "m1", Provider: "a"}) {
+		t.Fatalf("default role: %+v", cfg.Roles[RoleDefault])
 	}
-	if cfg.Models["m1"].Providers[0] != "a" || cfg.Models["m1"].API != "anthropic-messages" || cfg.Models["m1"].MaxTokens != 1024 {
+	if cfg.Models["m1"].Providers[0] != "a" || cfg.Models["m1"].API != "anthropic-messages" || cfg.Models["m1"].Context != 1024 {
 		t.Fatalf("model: %+v", cfg.Models["m1"])
+	}
+	if cfg.Providers["a"].API != "openai-chat-completions" || cfg.Models["m2"].API != "openai-chat-completions" || cfg.Models["m2"].Context != 4096 {
+		t.Fatalf("model protocol/context: %+v", cfg.Models["m2"])
 	}
 }
 
@@ -191,8 +228,8 @@ func TestMCPImportRoundTrip(t *testing.T) {
 	t.Setenv("HOME", home)
 	os.MkdirAll(filepath.Join(home, ".ghg"), 0o700)
 	src := `{
-  "defaultModel": "m1",
-  "providers": { "a": { "baseUrl": "https://a", "api": "openai-completions" } },
+	  "version": 2,
+	  "providers": { "a": { "baseUrl": "https://a", "api": "openai-chat-completions" } },
   "models": { "m1": { "providers": ["a"] } },
   "mcpImport": {
     "claude": { "enabled": false },
@@ -223,8 +260,8 @@ func TestMCPImportRoundTrip(t *testing.T) {
 	}
 	// Absent block stays nil — zero-breakage default.
 	if err := os.WriteFile(filepath.Join(home, ".ghg", "config.json"), []byte(`{
-  "defaultModel": "m1",
-  "providers": { "a": { "baseUrl": "https://a", "api": "openai-completions" } },
+	  "version": 2,
+	  "providers": { "a": { "baseUrl": "https://a", "api": "openai-chat-completions" } },
   "models": { "m1": { "providers": ["a"] } }
 }`), 0o600); err != nil {
 		t.Fatal(err)
@@ -246,7 +283,7 @@ func TestLoadPreservesMCPImportOnClobber(t *testing.T) {
 	dir := filepath.Join(home, ".ghg")
 	os.MkdirAll(dir, 0o700)
 	os.WriteFile(filepath.Join(dir, "config.json"), []byte(
-		`{"providers":null,"models":null,"mcpImport":{"codex":{"enabled":false}}}`), 0o600)
+		`{"version":2,"providers":null,"models":null,"mcpImport":{"codex":{"enabled":false}}}`), 0o600)
 	cfg, err := Load()
 	if err != nil {
 		t.Fatal(err)
@@ -263,15 +300,15 @@ func TestLoadRecoversFromClobberedConfig(t *testing.T) {
 	os.MkdirAll(dir, 0o700)
 	p := filepath.Join(dir, "config.json")
 	// a previously-clobbered config: parses fine but has no providers/models
-	os.WriteFile(p, []byte(`{"defaultModel":"","providers":null,"models":null}`), 0o600)
+	os.WriteFile(p, []byte(`{"version":2,"providers":null,"models":null}`), 0o600)
 	// a healthy backup from before the wipe
-	os.WriteFile(p+".bak", []byte(`{"defaultModel":"m1","providers":{"a":{"baseUrl":"https://a","api":"openai-completions"}},"models":{"m1":{"providers":["a"]}}}`), 0o600)
+	os.WriteFile(p+".bak", []byte(`{"version":2,"providers":{"a":{"baseUrl":"https://a","api":"openai-chat-completions"}},"models":{"m1":{"providers":["a"]}},"roles":{"default":{"model":"m1"}}}`), 0o600)
 
 	cfg, err := Load()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.DefaultModel != "m1" || len(cfg.Providers) != 1 {
+	if cfg.Roles[RoleDefault].Model != "m1" || len(cfg.Providers) != 1 {
 		t.Fatalf("expected restore from .bak, got %+v", cfg)
 	}
 }
@@ -281,12 +318,12 @@ func TestLoadRegeneratesDefaultsWhenEmptyAndNoBackup(t *testing.T) {
 	t.Setenv("HOME", home)
 	dir := filepath.Join(home, ".ghg")
 	os.MkdirAll(dir, 0o700)
-	os.WriteFile(filepath.Join(dir, "config.json"), []byte(`{"providers":null,"models":null}`), 0o600)
+	os.WriteFile(filepath.Join(dir, "config.json"), []byte(`{"version":2,"providers":null,"models":null}`), 0o600)
 	cfg, err := Load()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.DefaultModel != "" || len(cfg.Models) != 0 || len(cfg.Providers) == 0 {
+	if cfg.Roles[RoleDefault].Model != "" || len(cfg.Models) != 0 || len(cfg.Providers) == 0 {
 		t.Fatalf("expected regenerated defaults, got %+v", cfg)
 	}
 }
@@ -297,7 +334,7 @@ func TestSaveRefusesToClobberHealthyConfig(t *testing.T) {
 	dir := filepath.Join(home, ".ghg")
 	os.MkdirAll(dir, 0o700)
 	p := filepath.Join(dir, "config.json")
-	healthy := `{"defaultModel":"m1","providers":{"a":{"baseUrl":"https://a","api":"openai-completions"}},"models":{"m1":{"providers":["a"]}}}`
+	healthy := `{"version":2,"providers":{"a":{"baseUrl":"https://a","api":"openai-chat-completions"}},"models":{"m1":{"providers":["a"]}},"roles":{"default":{"model":"m1"}}}`
 	os.WriteFile(p, []byte(healthy), 0o600)
 
 	if err := (&Config{}).Save(); err == nil {
@@ -319,7 +356,7 @@ func TestSaveWritesBackupAndIsAtomic(t *testing.T) {
 	p, _ := path()
 	first, _ := os.ReadFile(p)
 
-	cfg.DefaultModel = "glm-5.2-fast"
+	cfg.Roles = map[string]RoleConfig{RoleDefault: {Model: "glm-5.2-fast"}}
 	if err := cfg.Save(); err != nil {
 		t.Fatal(err)
 	}
@@ -396,23 +433,6 @@ func TestLogEventNeverFails(t *testing.T) {
 	LogEvent("config.load", "should not panic or error")
 }
 
-// ContextWindow prefers the new `context` field but falls back to the legacy
-// `maxTokens` for configs written before the rename.
-func TestContextWindowBackCompat(t *testing.T) {
-	if got := (Model{Context: 200000}).ContextWindow(); got != 200000 {
-		t.Fatalf("context field: %d", got)
-	}
-	if got := (Model{MaxTokens: 131072}).ContextWindow(); got != 131072 {
-		t.Fatalf("legacy maxTokens: %d", got)
-	}
-	if got := (Model{Context: 200000, MaxTokens: 131072}).ContextWindow(); got != 200000 {
-		t.Fatalf("context should win over legacy: %d", got)
-	}
-	if got := (Model{}).ContextWindow(); got != 0 {
-		t.Fatalf("empty: %d", got)
-	}
-}
-
 // The catalog reports the provider's output cap (max_completion_tokens)
 // separately from the input window (context_length).
 func TestCatalogMaxCompletionTokens(t *testing.T) {
@@ -434,35 +454,6 @@ func TestCatalogMaxCompletionTokens(t *testing.T) {
 	}
 }
 
-// A config mixing old maxTokens with new context/maxOut parses both.
-func TestLoadMixedTokenFields(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	os.MkdirAll(filepath.Join(home, ".ghg"), 0o700)
-	src := `{
-  "defaultModel": "m1",
-  "providers": { "a": { "baseUrl": "https://a", "api": "openai-completions" } },
-  "models": {
-    "m1": { "providers": ["a"], "maxTokens": 131072 },
-    "m2": { "providers": ["a"], "context": 200000, "maxOut": 64000 }
-  }
-}
-
-`
-	os.WriteFile(filepath.Join(home, ".ghg", "config.json"), []byte(src), 0o600)
-	cfg, err := Load()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := cfg.Models["m1"].ContextWindow(); got != 131072 {
-		t.Fatalf("m1 legacy context: %d", got)
-	}
-	m2 := cfg.Models["m2"]
-	if m2.ContextWindow() != 200000 || m2.MaxOut != 64000 {
-		t.Fatalf("m2: %+v", m2)
-	}
-}
-
 func TestOutputConfigRoundTrip(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -471,8 +462,8 @@ func TestOutputConfigRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(`{
-  "defaultModel": "m1",
-  "providers": { "a": { "baseUrl": "https://a", "api": "openai-completions" } },
+	  "version": 2,
+	  "providers": { "a": { "baseUrl": "https://a", "api": "openai-chat-completions" } },
   "models": { "m1": { "providers": ["a"] } },
   "outputs": { "enabled": false, "maxBytes": 4096 }
 }`), 0o600); err != nil {
@@ -512,8 +503,8 @@ func TestSubagentsConfigRoundTripAndDisable(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(`{
-  "defaultModel": "m1",
-  "providers": { "a": { "baseUrl": "https://a", "api": "openai-completions" } },
+	  "version": 2,
+	  "providers": { "a": { "baseUrl": "https://a", "api": "openai-chat-completions" } },
   "models": { "m1": { "providers": ["a"] } },
   "subagents": false
 }`), 0o600); err != nil {

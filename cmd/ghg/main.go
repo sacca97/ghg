@@ -70,7 +70,7 @@ func main() {
 		}
 		return
 	}
-	modelFlag := flag.String("m", "", "model name from ~/.ghg/config.json (default: defaultModel)")
+	modelFlag := flag.String("m", "", "model name from ~/.ghg/config.json (default role)")
 	providerFlag := flag.String("p", "", "provider to route the model through (default: model's first provider)")
 	versionFlag := flag.Bool("version", false, "print version")
 	resumeFlag := flag.String("resume", "", "resume a previous session by id (or unique prefix)")
@@ -159,7 +159,7 @@ commands:
 				die(err)
 			}
 			return
-		case "outputs", "artifacts":
+		case "outputs":
 			if err := outputsCLI(args); err != nil {
 				die(err)
 			}

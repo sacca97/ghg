@@ -286,20 +286,14 @@ func TestProfileURLValidation(t *testing.T) {
 	}
 }
 
-func TestResolveAnonymousLegacyProvider(t *testing.T) {
-	resolved, err := (Profiles{}).Resolve(Instance{
+func TestResolveRejectsLegacyProtocol(t *testing.T) {
+	_, err := (Profiles{}).Resolve(Instance{
 		Name:     "legacy",
 		BaseURL:  "https://legacy.example/v1/",
 		Protocol: "openai-completions",
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if resolved.Protocol != ProtocolOpenAIChatCompletions || resolved.BaseURL != "https://legacy.example/v1" {
-		t.Fatalf("legacy provider was not normalized: %+v", resolved)
-	}
-	if resolved.Profile.ID != "anonymous" || resolved.Auth.Kind != AuthBearer || resolved.RequiresAPIKey() == false {
-		t.Fatalf("anonymous profile: %+v", resolved)
+	if err == nil || !strings.Contains(err.Error(), `unknown protocol "openai-completions"`) {
+		t.Fatalf("legacy protocol should be rejected, got %v", err)
 	}
 }
 

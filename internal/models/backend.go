@@ -58,7 +58,6 @@ type Protocol string
 
 const (
 	ProtocolOpenAIChatCompletions Protocol = "openai-chat-completions"
-	ProtocolOpenAICompletions     Protocol = "openai-completions"
 	ProtocolAnthropicMessages     Protocol = "anthropic-messages"
 	ProtocolOpenAIResponses       Protocol = "openai-responses"
 )
@@ -73,8 +72,7 @@ type BackendOptions struct {
 	Authorizer       RequestAuthorizer
 }
 
-// NewBackend selects the adapter for a resolved profile. The legacy
-// openai-completions spelling is normalized before selection.
+// NewBackend selects the adapter for a resolved profile.
 func NewBackend(resolved Resolved, opts BackendOptions) (Backend, error) {
 	protocol := normalizeProtocol(resolved.Protocol)
 	if opts.ProtocolOverride != "" {

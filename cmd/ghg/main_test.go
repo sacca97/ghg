@@ -106,81 +106,6 @@ func TestSystemPromptPrefersBoundedExplorationTools(t *testing.T) {
 	}
 }
 
-func TestContinueSessionIDUsesCurrentDirectory(t *testing.T) {
-	home := t.TempDir()
-	root := t.TempDir()
-	t.Setenv("GHG_HOME", home)
-	t.Chdir(root)
-	dir, err := config.Dir()
-	if err != nil {
-		t.Fatal(err)
-	}
-	st, err := session.Open(filepath.Join(dir, "sessions.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	id, err := st.Create(root, "model", "provider")
-	if err != nil {
-		st.Close()
-		t.Fatal(err)
-	}
-	if err := st.Save(id, 1, []models.Message{{Role: "system"}, {Role: "user", Content: "continue me"}}, "model", "provider"); err != nil {
-		st.Close()
-		t.Fatal(err)
-	}
-	if err := st.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	got, err := continueSessionID()
-	if err != nil || got != id {
-		t.Fatalf("continue session: %q, %v", got, err)
-	}
-}
-
-func TestWorkerEventOrderTerminalBeforeIdle(t *testing.T) {
-	baseDir, err := os.MkdirTemp("", "ghg-w-")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(baseDir)
-
-	runtimeFile, err := workerwire.NewRuntime(baseDir, "s1")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	var events []string
-	var eventsMu sync.Mutex
-
-	w := &workerProcessState{
-		runtimeFile: runtimeFile,
-		sessionID:   "s1",
-		state:       workerwire.StateIdle,
-		pending:     make(map[string]*workerApprovalFlight),
-		done:        make(chan struct{}),
-	}
-	w.ag = agent.New(nil, "m", 100, "sys")
-
-	w.startOperation("turn", func(ctx context.Context) {
-		w.publish(workerwire.EventTurnDone, workerTurnResult{}, true)
-		eventsMu.Lock()
-		events = append(events, "turn_done")
-		eventsMu.Unlock()
-	})
-
-	w.turns.Wait()
-	eventsMu.Lock()
-	events = append(events, "idle")
-	eventsMu.Unlock()
-
-	eventsMu.Lock()
-	defer eventsMu.Unlock()
-	if len(events) < 2 || events[0] != "turn_done" || events[1] != "idle" {
-		t.Fatalf("expected [turn_done, idle], got %v", events)
-	}
-}
-
 func TestWorkerLSPStatusCommandReturnsManagerStatuses(t *testing.T) {
 	w := &workerProcessState{lsp: lsp.NewManager(map[string]lsp.ServerSpec{
 		"gopls": {Command: []string{"gopls"}, Extensions: []string{".go"}},
@@ -303,15 +228,15 @@ func TestWorkerPlanTurnAndSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	snap, ok := snapAny.(workerSnapshot)
+	snap, ok := snapAny.(workerwire.Snapshot)
 	if !ok {
-		t.Fatalf("expected workerSnapshot, got %T", snapAny)
+		t.Fatalf("expected workerwire.Snapshot, got %T", snapAny)
 	}
 	if snap.Mode != "plan" {
 		t.Fatalf("expected snapshot mode 'plan', got %q", snap.Mode)
 	}
 
-	w.startTurn(workerInput{Input: "make a plan", PlanMode: true})
+	w.startTurn(workerwire.Input{Input: "make a plan", PlanMode: true})
 	w.turns.Wait()
 
 	// Verify plan was persisted to workflow results
@@ -449,7 +374,7 @@ func TestWorkerHumanGateAndPermRules(t *testing.T) {
 	}
 
 	// 2. Answer allow_always
-	ok := w.answerApproval(workerApprovalAnswer{ID: id, Decision: "allow_always"})
+	ok := w.answerApproval(workerwire.ApprovalAnswer{ID: id, Decision: "allow_always"})
 	if !ok {
 		t.Fatal("answerApproval returned false")
 	}

@@ -19,9 +19,10 @@ func importFixture(t *testing.T, mcpImport string) (wd string) {
 	t.Setenv("GHG_HOME", ghgHome)
 	wd = t.TempDir()
 	cfgSrc := `{
-  "defaultModel": "m1",
-  "providers": { "a": { "baseUrl": "https://a", "api": "openai-completions" } },
-  "models": { "m1": { "providers": ["a"] } }
+	  "version": 2,
+	  "providers": { "a": { "baseUrl": "https://a", "api": "openai-chat-completions" } },
+	  "models": { "m1": { "providers": ["a"] } },
+	  "roles": { "default": { "model": "m1" } }
   ` + mcpImport + `
 }`
 	if err := os.WriteFile(filepath.Join(ghgHome, "config.json"), []byte(cfgSrc), 0o600); err != nil {

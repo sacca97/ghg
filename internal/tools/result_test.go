@@ -2,7 +2,6 @@ package tools
 
 import (
 	"context"
-	"encoding/json"
 	"strings"
 	"testing"
 
@@ -41,26 +40,18 @@ func TestModelTextDelimitsUntrustedBytesAndKeepsOutputHintOutside(t *testing.T) 
 	}
 }
 
-func TestNormalizeResultCapsExplicitPreviewWithoutDroppingRetained(t *testing.T) {
-	retained := strings.Repeat("retained", maxOutput)
-	preview := strings.Repeat("preview", maxOutput)
-	tool := Tool{
-		Def: models.NewTool("preview", "", `{"type":"object"}`),
-		RunResult: func(context.Context, json.RawMessage) (ToolResult, error) {
-			return ToolResult{
-				Preview:       preview,
-				Retained:      retained,
-				OriginalBytes: int64(len(retained)),
-				Complete:      true,
-			}, nil
-		},
+func TestResultConstructors(t *testing.T) {
+	text := strings.Repeat("x", maxOutput+1)
+	result := NewTextResult(text, 3)
+	if len(result.Preview) > maxOutput || result.Retained != text || result.OriginalBytes != int64(len(text)) || !result.Complete || result.ExitCode != 3 {
+		t.Fatalf("materialized result = %+v", result)
 	}
-	result := ExecuteResult(context.Background(), []Tool{tool}, "preview", nil)
-	if len(result.Preview) > maxOutput || !strings.Contains(result.Preview, "truncated") {
-		t.Fatalf("explicit preview was not bounded: len=%d", len(result.Preview))
-	}
-	if result.Retained != retained {
-		t.Fatal("normalizing a preview must preserve retained evidence")
+
+	capture := NewOutputCapture(4)
+	_, _ = capture.WriteString("abcdefgh")
+	result = capture.Result(1)
+	if result.Retained != "abgh" || result.OriginalBytes != 8 || result.Complete || result.ExitCode != 1 {
+		t.Fatalf("captured result = %+v", result)
 	}
 }
 

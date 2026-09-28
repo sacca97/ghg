@@ -227,8 +227,10 @@ func (m *model) applyAuthResult(res authResultMsg) {
 		return
 	}
 	if roleName == "" {
-		m.cfg.DefaultModel = modelName
-		m.cfg.DefaultProvider = res.name
+		if m.cfg.Roles == nil {
+			m.cfg.Roles = make(map[string]config.RoleConfig)
+		}
+		m.cfg.Roles[config.RoleDefault] = config.RoleConfig{Model: modelName, Provider: res.name}
 		if err := m.cfg.Save(); err != nil {
 			m.append(errStyle.Render("config save failed: " + err.Error()))
 			return
@@ -279,7 +281,7 @@ func (m *model) authRoute(provider string, infos []models.ModelInfo, catalogSeed
 		modelName = firstCatalogModel(infos)
 	}
 	if modelName == "" {
-		modelName = m.cfg.DefaultModel
+		modelName = m.cfg.Roles[config.RoleDefault].Model
 	}
 	return modelName, ""
 }

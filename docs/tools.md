@@ -117,8 +117,7 @@ bounded `limit` (64 KiB by default, 1 MiB maximum). The session catalog checks
 ownership before the payload store reads the derived content-addressed path;
 paths and cross-session ids are rejected. A payload retained as head/tail is
 reported as incomplete, so the model cannot mistake missing middle bytes for
-evidence. The legacy `artifact_list` and `artifact_read` names remain accepted
-as aliases.
+evidence.
 
 ## bash
 

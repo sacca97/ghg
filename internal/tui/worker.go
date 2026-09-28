@@ -395,6 +395,28 @@ func (m *model) sendWorkerCommand(label, requestPrefix, name string, payload any
 	return requestID
 }
 
+func (m *model) startWorkerOperation(label, requestPrefix, name, status string, payload any) (tea.Model, tea.Cmd) {
+	if m.workerClient == nil && !m.ensureWorker() {
+		m.append(errStyle.Render(label + ": worker unavailable: " + m.workerStartError))
+		return m, nil
+	}
+	requestID := workerRequestID(requestPrefix)
+	m.busy = true
+	m.turnStart = m.nowFn()
+	m.append(dimStyle.Render(status))
+	m.cancel = func() {
+		if m.workerClient != nil {
+			_ = m.workerClient.Send(workerwire.CommandCancel, requestID+"-cancel", nil)
+		}
+	}
+	if err := m.workerClient.Send(name, requestID, payload); err != nil {
+		m.busy = false
+		m.cancel = nil
+		m.append(errStyle.Render(label + ": " + err.Error()))
+	}
+	return m, m.spin.Tick
+}
+
 func (m *model) submitWorkerTurn(text string, authored bool, prepared string, parts []models.ContentPart, at int, snap string, goalCtx *agent.GoalRecord, ask, continuation bool) (tea.Model, tea.Cmd) {
 	if m.workerClient == nil {
 		return m, nil

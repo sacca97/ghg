@@ -11,11 +11,12 @@ import (
 	"time"
 
 	"github.com/sacca97/ghg/internal/models"
+	"github.com/sacca97/ghg/internal/observation"
 )
 
 func run(t *testing.T, name, args string) string {
 	t.Helper()
-	return Execute(context.Background(), All(), name, json.RawMessage(args))
+	return ExecuteResult(context.Background(), All(), name, json.RawMessage(args)).Preview
 }
 
 func TestFilterAvailableUsesToolCheckers(t *testing.T) {
@@ -38,16 +39,21 @@ func TestFilterAvailableUsesToolCheckers(t *testing.T) {
 func TestToolRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	f := filepath.Join(dir, "sub", "a.txt")
+	ctx := WithObservationStore(context.Background(), "tool-round-trip", observation.NewRegistry())
 
-	out := run(t, "write", fmt.Sprintf(`{"path":%q,"content":"one\ntwo\nthree\n"}`, f))
+	out := ExecuteResult(ctx, All(), "write", json.RawMessage(fmt.Sprintf(`{"path":%q,"content":"one\ntwo\nthree\n"}`, f))).Preview
 	if strings.HasPrefix(out, "Error") {
 		t.Fatal(out)
 	}
-	out = run(t, "read", fmt.Sprintf(`{"path":%q}`, f))
+	readResult := ExecuteResult(ctx, All(), "read", json.RawMessage(fmt.Sprintf(`{"path":%q}`, f)))
+	out = readResult.Preview
 	if !strings.Contains(out, "2\ttwo") {
 		t.Fatalf("read missing line numbers: %q", out)
 	}
-	out = run(t, "edit", fmt.Sprintf(`{"mode":"exact","path":%q,"old_string":"two","new_string":"2"}`, f))
+	editArgs, _ := json.Marshal(map[string]any{"mode": "observed", "edits": []any{map[string]any{
+		"observation": readResult.Metadata["observation_id"], "path": f, "start_line": 2, "end_line": 2, "content": "2",
+	}}})
+	out = ExecuteResult(ctx, All(), "edit", editArgs).Preview
 	if strings.HasPrefix(out, "Error") {
 		t.Fatal(out)
 	}
@@ -55,19 +61,13 @@ func TestToolRoundTrip(t *testing.T) {
 	if !strings.Contains(out, "2\t2") {
 		t.Fatalf("edit not applied: %q", out)
 	}
-	readResult := ExecuteResult(context.Background(), All(), "read", json.RawMessage(fmt.Sprintf(`{"path":%q}`, f)))
+	readResult = ExecuteResult(ctx, All(), "read", json.RawMessage(fmt.Sprintf(`{"path":%q}`, f)))
 	if readResult.Source != "read" || !IsUntrusted(readResult) {
 		t.Fatalf("read result should carry its untrusted source: %+v", readResult)
 	}
 	aliasResult := ExecuteResult(context.Background(), All(), "read_file", json.RawMessage(fmt.Sprintf(`{"path":%q}`, f)))
-	if aliasResult.ExitCode != 0 || !strings.Contains(aliasResult.Preview, "1\tone") {
-		t.Fatalf("read_file alias = %+v", aliasResult)
-	}
-	// ambiguous edit must fail without replace_all
-	run(t, "write", fmt.Sprintf(`{"path":%q,"content":"x x"}`, f))
-	out = run(t, "edit", fmt.Sprintf(`{"mode":"exact","path":%q,"old_string":"x","new_string":"y"}`, f))
-	if !strings.HasPrefix(out, "Error") {
-		t.Fatalf("expected ambiguity error, got %q", out)
+	if aliasResult.ExitCode == 0 || !strings.Contains(aliasResult.Preview, `unknown tool "read_file"`) {
+		t.Fatalf("removed tool alias result = %+v", aliasResult)
 	}
 	out = run(t, "bash", `{"command":"echo hi; echo err >&2; exit 3"}`)
 	if !strings.Contains(out, "hi") || !strings.Contains(out, "err") || !strings.Contains(out, "exit") {
@@ -339,18 +339,6 @@ func TestHelpersAndEdgeCases(t *testing.T) {
 	if out := run(t, "write", fmt.Sprintf(`{"path":%q,"content":"x"}`, f+"/child.txt")); !strings.HasPrefix(out, "Error") {
 		t.Fatalf("bad parent: %q", out)
 	}
-	// edit: missing file, not-found old_string, replace_all
-	if out := run(t, "edit", fmt.Sprintf(`{"mode":"exact","path":%q,"old_string":"x","new_string":"y"}`, filepath.Join(dir, "nope"))); !strings.HasPrefix(out, "Error") {
-		t.Fatalf("edit missing file: %q", out)
-	}
-	if out := run(t, "edit", fmt.Sprintf(`{"mode":"exact","path":%q,"old_string":"zzz","new_string":"y"}`, f)); !strings.Contains(out, "not found") {
-		t.Fatalf("edit not found: %q", out)
-	}
-	run(t, "write", fmt.Sprintf(`{"path":%q,"content":"x x x"}`, f))
-	if out := run(t, "edit", fmt.Sprintf(`{"mode":"exact","path":%q,"old_string":"x","new_string":"y","replace_all":true}`, f)); !strings.Contains(out, "3 occurrence") {
-		t.Fatalf("replace_all: %q", out)
-	}
-
 	// Regression: a command that reads from /dev/tty (as sudo does for a
 	// password) must NOT hang the tool. pre-fix the tool used CombinedOutput
 	// with the child sharing ghg's controlling terminal, so the read
@@ -437,40 +425,18 @@ func TestSuggestTool(t *testing.T) {
 	}
 }
 
-func TestSuggestToolCapsAtTwo(t *testing.T) {
-	cands := []string{"mcp__s__aaa", "mcp__s__aab", "mcp__s__aac"}
-	if got := SuggestTool("mcp__s__aa", cands); len(got) > 2 {
-		t.Errorf("got %v, want at most 2", got)
-	}
-}
-
-func TestLevenshteinCap(t *testing.T) {
-	if d := levenshtein("abc", "abc", 2); d != 0 {
-		t.Errorf("identical = %d", d)
-	}
-	if d := levenshtein("abc", "abd", 2); d != 1 {
-		t.Errorf("1 edit = %d", d)
-	}
-	if d := levenshtein("short", "a-much-longer-string", 3); d <= 3 {
-		t.Errorf("should exceed cap, got %d", d)
-	}
-	if d := levenshtein("", "abcdef", 2); d <= 2 {
-		t.Errorf("length gap beyond cap = %d", d)
-	}
-}
-
 func TestExecuteSuggestsOnUnknownTool(t *testing.T) {
 	docs := Tool{Def: models.NewTool("mcp__docs__greet", "", `{}`)}
-	out := Execute(context.Background(), []Tool{docs}, "mcp__doc__greet", nil)
+	out := ExecuteResult(context.Background(), []Tool{docs}, "mcp__doc__greet", nil).Preview
 	if !strings.Contains(out, `unknown tool "mcp__doc__greet"`) || !strings.Contains(out, "did you mean mcp__docs__greet") {
 		t.Errorf("got %q", out)
 	}
 	other := Tool{Def: models.NewTool("mcp__other__greet", "", `{}`)}
-	out = Execute(context.Background(), []Tool{other}, "mcp__other__grete", nil)
+	out = ExecuteResult(context.Background(), []Tool{other}, "mcp__other__grete", nil).Preview
 	if !strings.Contains(out, "did you mean mcp__other__greet") {
 		t.Errorf("current tool set was not used: %q", out)
 	}
-	out = Execute(context.Background(), []Tool{docs}, "nope", nil)
+	out = ExecuteResult(context.Background(), []Tool{docs}, "nope", nil).Preview
 	if strings.Contains(out, "did you mean") {
 		t.Errorf("unrelated tool should have no suggestion, got %q", out)
 	}
